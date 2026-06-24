@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO sessions (session_id, device_id)\n        VALUES ($1, $2)\n        ON CONFLICT (session_id) DO NOTHING\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9a22c765a367d8541873b669dd79f45e70a0d0a3577df147694eab5be18d2b2d"
+}

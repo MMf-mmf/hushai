@@ -1,0 +1,39 @@
+syntax = "proto3";
+package hushai.v1;
+
+enum MediaType { MEDIA_TYPE_UNSPECIFIED = 0; AUDIO = 1; VIDEO = 2; MUXED = 3; }
+
+message SegmentManifest {
+  // --- Identity & ordering ---
+  bytes  segment_id  = 1;  // 16-byte UUIDv7. GLOBAL idempotency key. Minted ONCE; reused on every retry.
+  string device_id   = 2;  // stable per physical client
+  string stream_id   = 3;  // e.g. "cam0-video", "cam0-audio"
+  bytes  session_id  = 4;  // 16-byte UUIDv7. New per capture run/process start.
+  uint64 sequence    = 5;  // monotonic per (stream_id, session_id), starting at 0. Enables gap detection.
+
+  // --- Source tag (DESCRIPTIVE ONLY) ---
+  string source_kind = 6;  // free text, e.g. "android_app", "usb_webcam". The backend MUST NOT branch on this. (§7)
+
+  // --- Media descriptor (client DECLARES what it sent) ---
+  MediaType media_type      = 7;
+  string    codec           = 8;  // e.g. "h264", "aac", "opus", "mjpeg", "pcm_s16le"
+  string    container       = 9;  // e.g. "fmp4", "none", "raw"
+  bytes     codec_init_data = 10; // decoder init (SPS/PPS / extradata) so the body decodes standalone; empty if N/A
+
+  // --- Timing (RAW device clocks, uncorrected — see §5) ---
+  fixed64 capture_start_unix_nanos = 11; // device WALL clock at segment start (UTC ns)
+  uint64  monotonic_start_nanos    = 12; // device MONOTONIC clock at segment start (e.g. Android elapsedRealtimeNanos)
+  uint64  duration_nanos           = 13; // segment length
+
+  // --- Integrity ---
+  bytes  content_sha256 = 14; // 32-byte SHA-256 of the EXACT body bytes
+  uint64 byte_len       = 15; // length of the body in bytes
+
+  // --- Continuity ---
+  bool   gap_before = 16; // true if the client KNOWS data is missing immediately before this segment
+
+  // --- Extension escape hatch ---
+  map<string, string> attrs = 17; // optional, free-form: geo, orientation, battery, future fusion keys, … (§8)
+
+  reserved 18 to 40; // typed fields (e.g. promoted fusion fields) may be added here later, additively
+}

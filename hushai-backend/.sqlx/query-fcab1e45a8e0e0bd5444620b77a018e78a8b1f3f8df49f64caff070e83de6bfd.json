@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO devices (device_id, source_kind, attrs)\n        VALUES ($1, $2, $3)\n        ON CONFLICT (device_id) DO UPDATE SET last_seen = now()\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "fcab1e45a8e0e0bd5444620b77a018e78a8b1f3f8df49f64caff070e83de6bfd"
+}

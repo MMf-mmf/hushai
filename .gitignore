@@ -1,0 +1,23 @@
+# Rust build artifacts (~3.3 GB)
+target/
+**/target/
+
+# Secrets / environment
+.env
+**/.env
+*.env
+!.env.example
+!**/.env.example
+
+# Local data / databases
+hushai-backend/data/
+
+# Python
+__pycache__/
+*.pyc
+
+# OS cruft
+.DS_Store
+
+# Self-managed git repo (has its own history)
+/Agent Ahithophel/

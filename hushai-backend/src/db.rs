@@ -1,0 +1,163 @@
+//! Postgres access: pool construction, the idempotent persist transaction, and
+//! the readiness probe. All `sqlx` query macros live here so the offline
+//! `.sqlx/` data stays localized.
+
+use std::time::Duration;
+
+use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
+
+use crate::config::Config;
+use crate::error::IngestError;
+use crate::proto::DecodedManifest;
+
+/// Outcome of attempting to persist a segment (drives the HTTP status).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Persisted {
+    /// Row newly inserted this request.
+    Inserted,
+    /// `segment_id` already present with identical bytes — a legitimate retry.
+    DuplicateSameBytes,
+    /// `segment_id` already present with DIFFERENT bytes — contract violation.
+    ConflictDifferentBytes,
+}
+
+pub async fn connect(config: &Config) -> anyhow::Result<PgPool> {
+    let pool = PgPoolOptions::new()
+        .max_connections(config.db_max_connections)
+        .acquire_timeout(Duration::from_secs(config.db_acquire_timeout_secs))
+        .connect(&config.database_url)
+        .await?;
+    Ok(pool)
+}
+
+/// Liveness of the DB dependency for `/readyz`.
+pub async fn readiness(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("SELECT 1").execute(pool).await?;
+    Ok(())
+}
+
+/// Persist a fully-validated segment, upholding exactly-once-at-rest semantics.
+///
+/// Upsert order is FK-safe: devices → sessions → streams → segments. The segment
+/// PK (`segment_id`) is the idempotency key; `ON CONFLICT DO NOTHING` + a digest
+/// re-read closes the duplicate race (equal bytes → accept, different → reject).
+pub async fn persist_segment(
+    pool: &PgPool,
+    m: &DecodedManifest,
+    blob_uri: &str,
+    storage_backend: &str,
+) -> Result<Persisted, IngestError> {
+    let mut tx = pool.begin().await?;
+
+    // Device: store source_kind (never branched on), bump last_seen on repeat.
+    sqlx::query!(
+        r#"
+        INSERT INTO devices (device_id, source_kind, attrs)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (device_id) DO UPDATE SET last_seen = now()
+        "#,
+        m.device_id,
+        m.source_kind,
+        m.attrs,
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    // Session.
+    sqlx::query!(
+        r#"
+        INSERT INTO sessions (session_id, device_id)
+        VALUES ($1, $2)
+        ON CONFLICT (session_id) DO NOTHING
+        "#,
+        m.session_id,
+        m.device_id,
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    // Stream (composite PK).
+    sqlx::query!(
+        r#"
+        INSERT INTO streams (session_id, stream_id, device_id, media_type, codec, container, codec_init_data)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
+        ON CONFLICT (session_id, stream_id) DO NOTHING
+        "#,
+        m.session_id,
+        m.stream_id,
+        m.device_id,
+        m.media_type,
+        m.codec,
+        m.container,
+        m.codec_init_data.as_slice(),
+    )
+    .execute(&mut *tx)
+    .await?;
+
+    // Segment: the idempotency-bearing insert.
+    let insert = sqlx::query!(
+        r#"
+        INSERT INTO segments (
+            segment_id, device_id, stream_id, session_id, sequence,
+            media_type, codec, container, codec_init_data,
+            capture_start_unix_nanos, monotonic_start_nanos, duration_nanos,
+            content_sha256, byte_len, gap_before, blob_uri, storage_backend, attrs
+        )
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+        ON CONFLICT (segment_id) DO NOTHING
+        RETURNING segment_id
+        "#,
+        m.segment_id,
+        m.device_id,
+        m.stream_id,
+        m.session_id,
+        m.sequence,
+        m.media_type,
+        m.codec,
+        m.container,
+        m.codec_init_data.as_slice(),
+        m.capture_start_unix_nanos,
+        m.monotonic_start_nanos,
+        m.duration_nanos,
+        &m.content_sha256[..],
+        m.byte_len,
+        m.gap_before,
+        blob_uri,
+        storage_backend,
+        m.attrs,
+    )
+    .fetch_optional(&mut *tx)
+    .await;
+
+    let inserted = match insert {
+        Ok(row) => row.is_some(),
+        // A different segment_id colliding on UNIQUE(session_id, stream_id, sequence).
+        Err(sqlx::Error::Database(db)) if db.is_unique_violation() => {
+            tx.rollback().await.ok();
+            return Err(IngestError::SequenceConflict);
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    if inserted {
+        tx.commit().await?;
+        return Ok(Persisted::Inserted);
+    }
+
+    // Conflict on segment_id PK: compare stored bytes to decide retry vs misuse.
+    let existing = sqlx::query!(
+        r#"SELECT content_sha256 FROM segments WHERE segment_id = $1"#,
+        m.segment_id,
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+
+    if existing.content_sha256.as_slice() == m.content_sha256.as_slice() {
+        tx.commit().await?;
+        Ok(Persisted::DuplicateSameBytes)
+    } else {
+        tx.rollback().await.ok();
+        Ok(Persisted::ConflictDifferentBytes)
+    }
+}

@@ -1,0 +1,31 @@
+# Canonical Postgres + pgvector for the Hushai backend.
+#
+# NOTE: on the current dev machine Docker is not installed and a Homebrew
+# PostgreSQL 16 + pgvector is already running on :5432, so local development can
+# target that directly (DATABASE_URL=postgres://localhost/hushai). This compose
+# file is the canonical/CI artifact and deliberately maps the container to host
+# port 5433 so it coexists with a local Postgres on 5432.
+#
+#   docker compose up -d db
+#   export DATABASE_URL=postgres://hushai:hushai@localhost:5433/hushai
+#   (cd ..; sqlx migrate run)
+
+services:
+  db:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: hushai
+      POSTGRES_PASSWORD: hushai
+      POSTGRES_DB: hushai
+    ports:
+      - "5433:5432"
+    volumes:
+      - hushai_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U hushai -d hushai"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  hushai_pgdata:

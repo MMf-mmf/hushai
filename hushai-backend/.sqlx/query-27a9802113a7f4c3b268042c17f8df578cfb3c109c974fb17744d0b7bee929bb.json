@@ -1,0 +1,39 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO segments (\n            segment_id, device_id, stream_id, session_id, sequence,\n            media_type, codec, container, codec_init_data,\n            capture_start_unix_nanos, monotonic_start_nanos, duration_nanos,\n            content_sha256, byte_len, gap_before, blob_uri, storage_backend, attrs\n        )\n        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)\n        ON CONFLICT (segment_id) DO NOTHING\n        RETURNING segment_id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "segment_id",
+        "type_info": "Uuid"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Uuid",
+        "Int8",
+        "Int4",
+        "Text",
+        "Text",
+        "Bytea",
+        "Int8",
+        "Int8",
+        "Int8",
+        "Bytea",
+        "Int8",
+        "Bool",
+        "Text",
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "27a9802113a7f4c3b268042c17f8df578cfb3c109c974fb17744d0b7bee929bb"
+}
