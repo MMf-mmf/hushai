@@ -1,0 +1,12 @@
+# Hushai Cargo workspace.
+#
+# - hushai-backend: the durable, idempotent segment-ingest server (unchanged; owns the schema).
+# - hushai-worker:  durable/resumable worker that transcribes + embeds stored segments.
+# - hushai-rag:     small Axum service exposing the RAG query endpoint over the embeddings.
+#
+# The worker and RAG service depend on hushai-backend as a library (path dep) to reuse the
+# Config + DB pool rather than duplicating the schema. Added by the
+# transcription-embedding-and-rag ticket.
+[workspace]
+resolver = "2"
+members = ["hushai-backend", "hushai-worker", "hushai-rag"]

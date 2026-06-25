@@ -1,0 +1,68 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd job: run transcript_sentences partition maintenance monthly.
+
+  Runs local_dev/partition_maintenance.sh on the 1st of each month at 00:05 to
+  pre-create the upcoming month's partition (before any insert needs it) and apply
+  the retention window. This is the macOS equivalent of the cron/pg_cron schedules
+  documented in local_dev/partition_maintenance.pg_cron.sql.
+
+  Install (per-user, no sudo):
+    cp local_dev/com.hushai.partition-maintenance.plist ~/Library/LaunchAgents/
+    # edit the copy if your DATABASE_URL / repo path / retention differ, then:
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hushai.partition-maintenance.plist
+    launchctl kickstart -p gui/$(id -u)/com.hushai.partition-maintenance   # run once now to verify
+  Inspect / remove:
+    launchctl print gui/$(id -u)/com.hushai.partition-maintenance
+    launchctl bootout gui/$(id -u)/com.hushai.partition-maintenance
+  Logs: /tmp/hushai-partition-maintenance.log
+
+  NOTE: paths below are absolute and assume this repo lives at
+  /Users/mf/Documents/Rust_Code/Rig AI Agent — adjust if you move it.
+  RETAIN_MONTHS=12 DROPS month partitions older than ~12 months (irreversible);
+  set it to 0 to disable dropping. Rehearse with DRY_RUN first (see the script).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hushai.partition-maintenance</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/mf/Documents/Rust_Code/Rig AI Agent/local_dev/partition_maintenance.sh</string>
+    </array>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>DATABASE_URL</key>
+        <string>postgres://mf@localhost:5432/hushai</string>
+        <key>MONTHS_AHEAD</key>
+        <string>3</string>
+        <key>RETAIN_MONTHS</key>
+        <string>12</string>
+        <!-- launchd starts with a minimal PATH; include Homebrew so psql resolves. -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin</string>
+    </dict>
+
+    <!-- 1st of every month at 00:05 local time. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Day</key>
+        <integer>1</integer>
+        <key>Hour</key>
+        <integer>0</integer>
+        <key>Minute</key>
+        <integer>5</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/hushai-partition-maintenance.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/hushai-partition-maintenance.log</string>
+</dict>
+</plist>

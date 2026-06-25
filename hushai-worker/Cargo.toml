@@ -1,0 +1,43 @@
+[package]
+name = "hushai-worker"
+version = "0.1.0"
+edition = "2024"
+description = "Hushai transcription + embedding worker: durable, resumable, idempotent processing of stored segments into transcript_sentences (Rust + Rig)."
+
+[dependencies]
+# Reuse the ingest backend's Config + DB pool (path dep — do not duplicate the schema).
+hushai-backend = { path = "../hushai-backend" }
+
+# Rig: local embeddings via the Ollama provider (mxbai-embed-large, 1024-dim).
+rig = "0.37"
+
+# Local ASR (whisper.cpp bindings). Builds whisper.cpp via cmake/clang.
+whisper-rs = "0.14"
+
+# Database. Runtime (unchecked) queries — no compile-time DB / .sqlx needed.
+sqlx = { version = "0.9", features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "uuid",
+    "chrono",
+] }
+
+# Native binary vector encoding for transcript_sentences.embedding (vector(1024)).
+# pgvector::Vector implements sqlx 0.9's Encode/Decode/Type for Postgres, so we bind
+# embeddings over the binary protocol instead of a `[..]::vector` text literal.
+pgvector = { version = "0.4.2", features = ["sqlx"] }
+
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+dotenvy = "0.15"
+uuid = { version = "1", features = ["v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

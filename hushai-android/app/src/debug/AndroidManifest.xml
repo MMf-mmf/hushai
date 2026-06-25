@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Debug overlay: permit cleartext HTTP to the LAN backend (it serves plain HTTP
+     on :8080 today; TLS is a future reverse-proxy concern, contract §3). This
+     attribute exists ONLY in debug builds, so release stays cleartext-free. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application android:networkSecurityConfig="@xml/network_security_config" />
+</manifest>

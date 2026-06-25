@@ -141,6 +141,27 @@ pub async fn persist_segment(
     };
 
     if inserted {
+        // Queue the new segment for transcription right here instead of relying on the
+        // worker's periodic full-table backfill scan, and wake idle workers via
+        // LISTEN/NOTIFY. Both ride this transaction, so they only take effect if the
+        // segment commit succeeds (and roll back with it otherwise).
+        sqlx::query!(
+            r#"
+            INSERT INTO segment_transcription_status (segment_id)
+            VALUES ($1)
+            ON CONFLICT (segment_id) DO NOTHING
+            "#,
+            m.segment_id,
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!(
+            r#"SELECT pg_notify('hushai_segment_ingested', $1)"#,
+            m.segment_id.to_string(),
+        )
+        .execute(&mut *tx)
+        .await?;
+
         tx.commit().await?;
         return Ok(Persisted::Inserted);
     }

@@ -12,6 +12,16 @@ target/
 # Local data / databases
 hushai-backend/data/
 
+# Captured test media (regenerable; can be large)
+local_dev/captures/
+
+# Large, downloadable ML model binaries — kept out of git (fetch, don't commit).
+# whisper.cpp model for hushai-worker (see hushai-backend/README); ~141 MB.
+models/
+# Vosk acoustic + speaker models bundled into the Android app's assets; ~82 MB.
+# Re-fetch with local_dev/fetch_vosk_models.sh
+hushai-android/app/src/main/assets/vosk/
+
 # Python
 __pycache__/
 *.pyc

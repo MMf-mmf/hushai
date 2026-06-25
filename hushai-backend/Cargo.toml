@@ -11,8 +11,9 @@ tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util", "limit", "timeout"] }
 tower-http = { version = "0.6", features = ["trace", "timeout", "limit"] }
 
-# Database (Postgres + pgvector)
-sqlx = { version = "0.8", features = [
+# Database (Postgres + pgvector). sqlx 0.9 lets pgvector::Vector bind via the binary
+# protocol (its sqlx trait impls target 0.9); see hushai-worker/src/process.rs.
+sqlx = { version = "0.9", features = [
     "runtime-tokio",
     "tls-rustls",
     "postgres",
@@ -22,7 +23,7 @@ sqlx = { version = "0.8", features = [
     "macros",
     "migrate",
 ] }
-pgvector = { version = "0.4", features = ["sqlx"] }
+pgvector = { version = "0.4.2", features = ["sqlx"] }
 
 # Proto / wire
 prost = "0.14"

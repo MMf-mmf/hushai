@@ -1,0 +1,4 @@
+<resources>
+    <!-- Thin platform theme; the UI is Compose Material3 set in MainActivity. -->
+    <style name="Theme.Hushai" parent="android:Theme.Material.Light.NoActionBar" />
+</resources>

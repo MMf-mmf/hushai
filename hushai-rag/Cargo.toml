@@ -1,0 +1,46 @@
+[package]
+name = "hushai-rag"
+version = "0.1.0"
+edition = "2024"
+description = "Hushai RAG service: single-turn grounded Q&A over transcribed segments via pgvector retrieval + a Rig LLM (Rust + Rig)."
+
+[dependencies]
+# Reuse the ingest backend's Config + DB pool (path dep).
+hushai-backend = { path = "../hushai-backend" }
+
+# Rig: local embeddings + completion via the Ollama provider.
+rig = "0.37"
+
+# HTTP server.
+axum = { version = "0.8", features = ["macros"] }
+tower-http = { version = "0.6", features = ["trace"] }
+
+# Database. Runtime (unchecked) queries — dynamic filters + pgvector operator.
+sqlx = { version = "0.9", features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "uuid",
+    "chrono",
+] }
+
+# Native binary vector encoding: bind the query embedding as pgvector::Vector (binary
+# protocol) instead of a `[..]::vector` text literal. See src/retrieve.rs.
+pgvector = { version = "0.4.2", features = ["sqlx"] }
+
+tokio = { version = "1", features = ["full"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "2"
+dotenvy = "0.15"
+uuid = { version = "1", features = ["v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["full"] }
+# Integration test (tests/retrieve.rs) binds fixtures as native pgvector::Vector.
+pgvector = { version = "0.4.2", features = ["sqlx"] }

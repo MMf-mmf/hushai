@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO segment_transcription_status (segment_id)\n            VALUES ($1)\n            ON CONFLICT (segment_id) DO NOTHING\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6056b046d641447bb118f84128eccca713c059ae4a17fdbbe6d21e53e74a5fc2"
+}
