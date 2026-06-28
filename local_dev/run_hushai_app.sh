@@ -5,21 +5,35 @@
 # an agent) watch real footage flow via logcat, then stops cleanly.
 #
 # Usage:
-#   run_hushai_app.sh [--url URL] [--token TOK] [--device SERIAL]
-#                     [--no-build] [--duration SECS] [--stop]
+#   run_hushai_app.sh [--url URL] [--rag-url URL] [--token TOK] [--device SERIAL]
+#                     [--no-build] [--duration SECS] [--audio-only] [--stop]
 #
-# Defaults: --url http://10.0.2.2:8080 (emulator; use the dev-machine LAN IP for
-# a physical phone, e.g. http://192.168.1.50:8080), --token dev-secret-token.
+# --audio-only drives the app's audio-only capture mode: no camera is opened and
+# no video stream is uploaded (only cam0-audio), saving storage + battery.
+#
+# Connection: for a physical USB phone this runs entirely over the cable with NO
+# shared network — it auto-creates `adb reverse` tunnels (tcp:8080 backend,
+# tcp:8090 RAG/TTS) and defaults both URLs to localhost. For an emulator it
+# defaults to 10.0.2.2 (the emulator's host alias) and skips the tunnels.
+#
+# Defaults (USB phone): --url http://localhost:8080, --rag-url http://localhost:8090,
+# --token dev-secret-token. Pass --url/--rag-url to point at a LAN IP or remote
+# backend instead (then the same network IS required).
 #
 # Re-pointing at a different backend/terminator = same script, different --url/--token.
 set -euo pipefail
 
-URL="http://10.0.2.2:8080"
+# Empty => resolved after device detection (localhost for USB, 10.0.2.2 for emulator).
+URL=""
+URL_SET=0
+RAG_URL=""
+RAG_URL_SET=0
 TOKEN="dev-secret-token"
 DEVICE=""
 NO_BUILD=0
 DURATION=120
 STOP_ONLY=0
+AUDIO_ONLY=0
 
 PKG="com.hushai.android"
 ACTIVITY="$PKG/.MainActivity"
@@ -30,13 +44,15 @@ APK="$APP_DIR/app/build/outputs/apk/debug/app-debug.apk"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --url) URL="$2"; shift 2 ;;
+    --url) URL="$2"; URL_SET=1; shift 2 ;;
+    --rag-url) RAG_URL="$2"; RAG_URL_SET=1; shift 2 ;;
     --token) TOKEN="$2"; shift 2 ;;
     --device) DEVICE="$2"; shift 2 ;;
     --no-build) NO_BUILD=1; shift ;;
     --duration) DURATION="$2"; shift 2 ;;
+    --audio-only) AUDIO_ONLY=1; shift ;;
     --stop) STOP_ONLY=1; shift ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    -h|--help) sed -n '3,23p' "$0"; exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -89,6 +105,22 @@ if [[ "$STOP_ONLY" -eq 1 ]]; then
   exit 0
 fi
 
+# --- Resolve connection ------------------------------------------------------
+# Physical USB phone: drive the WHOLE loop over the cable with no shared network
+# by tunnelling the device's localhost to this host (`adb reverse`) and pointing
+# both services at localhost. Emulator: reach the host via its 10.0.2.2 alias
+# (no tunnel needed). Explicit --url/--rag-url always win (e.g. a LAN/remote IP).
+if [[ "$DEVICE" == emulator-* ]]; then
+  [[ "$URL_SET" -eq 0 ]] && URL="http://10.0.2.2:8080"
+  [[ "$RAG_URL_SET" -eq 0 ]] && RAG_URL="http://10.0.2.2:8090"
+else
+  [[ "$URL_SET" -eq 0 ]] && URL="http://localhost:8080"
+  [[ "$RAG_URL_SET" -eq 0 ]] && RAG_URL="http://localhost:8090"
+  echo "[usb] adb reverse tcp:8080 + tcp:8090 (full loop over the cable, no shared network)"
+  adb reverse tcp:8080 tcp:8080 >/dev/null
+  adb reverse tcp:8090 tcp:8090 >/dev/null
+fi
+
 # --- Build -------------------------------------------------------------------
 if [[ "$NO_BUILD" -eq 0 ]]; then
   echo "[build] :app:assembleDebug"
@@ -101,14 +133,23 @@ fi
 # --- Install + grant runtime permissions ------------------------------------
 echo "[install] $APK"
 adb install -r -g "$APK" >/dev/null
-for perm in CAMERA RECORD_AUDIO POST_NOTIFICATIONS; do
+# Audio-only never opens the camera, so don't bother granting CAMERA.
+PERMS=(RECORD_AUDIO POST_NOTIFICATIONS)
+[[ "$AUDIO_ONLY" -eq 0 ]] && PERMS+=(CAMERA)
+for perm in "${PERMS[@]}"; do
   adb shell pm grant "$PKG" "android.permission.$perm" >/dev/null 2>&1 || true
 done
 
 # --- Launch + configure + autostart via Intent extras (no UI taps) ----------
-echo "[launch] url=$URL token=*** autostart=true"
+echo "[launch] url=$URL rag_url=$RAG_URL token=*** autostart=true audio_only=$AUDIO_ONLY"
+AUDIO_ONLY_EXTRA=()
+[[ "$AUDIO_ONLY" -eq 1 ]] && AUDIO_ONLY_EXTRA=(--ez audio_only true)
+# ${arr[@]+...} guards against "unbound variable" when the array is empty under
+# `set -u` on bash 3.2 (macOS default). rag_url forces the voice-assistant host
+# (overrides any stale LAN-IP left in DataStore by a prior wireless session).
 adb shell am start -n "$ACTIVITY" \
-  --es url "$URL" --es token "$TOKEN" --ez autostart true >/dev/null
+  --es url "$URL" --es rag_url "$RAG_URL" --es token "$TOKEN" \
+  ${AUDIO_ONLY_EXTRA[@]+"${AUDIO_ONLY_EXTRA[@]}"} --ez autostart true >/dev/null
 
 # --- Observe footage flow ----------------------------------------------------
 echo "[observe] tailing HUSHAI_TX for ${DURATION}s (Ctrl-C to stop early)…"

@@ -14,7 +14,10 @@
 #
 # The helper functions it calls (ensure_transcript_partitions /
 # drop_transcript_partitions_before) are defined in
-# hushai-backend/migrations/0003_scalability.sql.
+# hushai-backend/migrations/0003_scalability.sql. It applies the SAME maintenance to
+# speaker_segments (raw 192-d voiceprints, also monthly-partitioned) via
+# ensure_/drop_speaker_segment_partitions from 0006_speaker_identity.sql — so the
+# retention drop here is ALSO the privacy purge for raw voiceprints.
 #
 # Environment:
 #   DATABASE_URL   (required)  e.g. postgres://mf@localhost:5432/hushai
@@ -25,7 +28,8 @@
 #                  transcripts/embeddings. *** Set RETAIN_MONTHS=0 to DISABLE
 #                  retention entirely (only ever create partitions, never drop).
 #   DRY_RUN        (default 0) if 1, only PRINT which partitions retention would drop;
-#                  do not drop anything. Always rehearse with DRY_RUN=1 first.
+#                  do not drop anything. (Partition *creation* still runs — it is
+#                  idempotent and additive.) Always rehearse with DRY_RUN=1 first.
 #
 # Examples:
 #   DATABASE_URL=postgres://mf@localhost:5432/hushai ./partition_maintenance.sh
@@ -38,6 +42,13 @@ MONTHS_AHEAD="${MONTHS_AHEAD:-3}"
 RETAIN_MONTHS="${RETAIN_MONTHS:-12}"
 DRY_RUN="${DRY_RUN:-0}"
 
+# Validate the numeric knobs before they're interpolated into SQL. They're
+# operator-set, but a typo (e.g. RETAIN_MONTHS=off instead of 0) must fail loudly
+# rather than silently leave retention on or splice junk into a statement.
+is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
+is_uint "$MONTHS_AHEAD"  || { echo "MONTHS_AHEAD must be a non-negative integer (got '$MONTHS_AHEAD')" >&2; exit 2; }
+is_uint "$RETAIN_MONTHS" || { echo "RETAIN_MONTHS must be a non-negative integer (got '$RETAIN_MONTHS'); set 0 to disable retention" >&2; exit 2; }
+
 psql_q() { psql "$DATABASE_URL" -X -q -t -A -v ON_ERROR_STOP=1 "$@"; }
 
 ts() { date '+%Y-%m-%dT%H:%M:%S%z'; }
@@ -46,6 +57,7 @@ log() { echo "[$(ts)] partition-maintenance: $*"; }
 # 1. Create the current + next MONTHS_AHEAD month partitions (idempotent).
 log "ensuring current + ${MONTHS_AHEAD} future month partitions"
 psql_q -c "SELECT ensure_transcript_partitions(${MONTHS_AHEAD});" >/dev/null
+psql_q -c "SELECT ensure_speaker_segment_partitions(${MONTHS_AHEAD});" >/dev/null
 log "month partitions now: $(psql_q -c "
   SELECT string_agg(c.relname, ', ' ORDER BY c.relname)
   FROM pg_inherits i
@@ -60,9 +72,9 @@ if [ "${default_rows}" != "0" ]; then
   log "WARNING: transcript_sentences_default holds ${default_rows} rows — a month partition was missing when they were inserted. Schedule this job more reliably."
 fi
 
-# 2. Retention (optional). RETAIN_MONTHS=0 disables it.
-if [ "${RETAIN_MONTHS}" -le 0 ] 2>/dev/null; then
-  log "retention disabled (RETAIN_MONTHS=${RETAIN_MONTHS}); not dropping any partitions"
+# 2. Retention (optional). RETAIN_MONTHS=0 disables it (validated as an int above).
+if [ "${RETAIN_MONTHS}" -eq 0 ]; then
+  log "retention disabled (RETAIN_MONTHS=0); not dropping any partitions"
   exit 0
 fi
 
@@ -93,4 +105,8 @@ if [ "${DRY_RUN}" = "1" ]; then
 fi
 
 psql_q -c "SELECT drop_transcript_partitions_before('${cutoff}'::date);" >/dev/null
-log "dropped $(echo "${targets}" | wc -l | tr -d ' ') partition(s) older than ${cutoff}"
+# Same cutoff purges old raw voiceprints (speaker_segments). NB: dropping voiceprint
+# partitions does NOT recompute the running-mean speakers.centroid — a deleted month's
+# voiceprint lingers in any centroid it fed until a /v1/speakers/recluster.
+psql_q -c "SELECT drop_speaker_segment_partitions_before('${cutoff}'::date);" >/dev/null
+log "dropped $(echo "${targets}" | wc -l | tr -d ' ') transcript partition(s) + matching speaker_segment partition(s) older than ${cutoff}"

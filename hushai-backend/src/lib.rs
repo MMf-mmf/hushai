@@ -11,13 +11,15 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod ingest;
+pub mod persons;
 pub mod proto;
 pub mod routes;
+pub mod speakers;
 pub mod state;
 pub mod storage;
 
-use std::sync::Arc;
 use std::path::Path;
+use std::sync::Arc;
 
 use anyhow::Context;
 use tokio::sync::Semaphore;
@@ -44,7 +46,9 @@ pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
     let blob_root: Arc<Path> =
         Arc::from(std::fs::canonicalize(&config.blob_dir).context("canonicalize BLOB_DIR")?);
 
-    let pool = db::connect(&config).await.context("connecting to Postgres")?;
+    let pool = db::connect(&config)
+        .await
+        .context("connecting to Postgres")?;
     sqlx::migrate!()
         .run(&pool)
         .await

@@ -83,7 +83,10 @@ impl DecodedManifest {
             codec: m.codec,
             container: m.container,
             codec_init_data: m.codec_init_data,
-            capture_start_unix_nanos: u64_to_i64("capture_start_unix_nanos", m.capture_start_unix_nanos)?,
+            capture_start_unix_nanos: u64_to_i64(
+                "capture_start_unix_nanos",
+                m.capture_start_unix_nanos,
+            )?,
             monotonic_start_nanos: u64_to_i64("monotonic_start_nanos", m.monotonic_start_nanos)?,
             duration_nanos: u64_to_i64("duration_nanos", m.duration_nanos)?,
             content_sha256,
@@ -150,7 +153,10 @@ mod tests {
         m.segment_id = vec![0u8; 15];
         assert!(matches!(
             DecodedManifest::decode(&m.encode_to_vec()).unwrap_err(),
-            IngestError::InvalidIdLength { field: "segment_id", .. }
+            IngestError::InvalidIdLength {
+                field: "segment_id",
+                ..
+            }
         ));
     }
 
@@ -160,7 +166,10 @@ mod tests {
         m.content_sha256 = vec![0u8; 31];
         assert!(matches!(
             DecodedManifest::decode(&m.encode_to_vec()).unwrap_err(),
-            IngestError::InvalidIdLength { field: "content_sha256", .. }
+            IngestError::InvalidIdLength {
+                field: "content_sha256",
+                ..
+            }
         ));
     }
 

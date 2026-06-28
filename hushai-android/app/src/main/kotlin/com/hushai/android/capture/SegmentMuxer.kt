@@ -25,6 +25,10 @@ class SegmentMuxer(
     private val codec: String,
     format: MediaFormat,
     private val codecInitData: ByteString,
+    // null = live capture: snapshot the real device clocks at segment start (default,
+    // byte-identical to the original behavior). A non-null clock (manual import) maps
+    // the segment's first-sample PTS onto the file's ORIGINAL capture time.
+    private val clock: SegmentClock? = null,
 ) {
     private val muxer = MediaMuxer(file.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
     private val trackIndex = muxer.addTrack(format)
@@ -34,6 +38,7 @@ class SegmentMuxer(
     private var sampleCount = 0
 
     // Raw, uncorrected device clocks at segment start (§5.5). Never NTP-corrected.
+    // Used only for the live path (clock == null).
     private val captureWallNanos = System.currentTimeMillis() * 1_000_000L
     private val monotonicNanos = SystemClock.elapsedRealtimeNanos()
 
@@ -62,6 +67,7 @@ class SegmentMuxer(
         muxer.stop()
         muxer.release()
         val durationUs = (lastPtsUs - firstPtsUs).coerceAtLeast(0)
+        val startPts = firstPtsUs.coerceAtLeast(0)
         return Segment(
             segmentId = Uuid7.bytes(),
             streamId = streamId,
@@ -73,8 +79,8 @@ class SegmentMuxer(
             codec = codec,
             container = "mp4",
             codecInitData = codecInitData,
-            captureStartUnixNanos = captureWallNanos,
-            monotonicStartNanos = monotonicNanos,
+            captureStartUnixNanos = clock?.captureWallNanos(startPts) ?: captureWallNanos,
+            monotonicStartNanos = clock?.monotonicNanos() ?: monotonicNanos,
             durationNanos = durationUs * 1000L,
             gapBefore = false, // service stamps this from the retry buffer's gap flag
         )
@@ -84,6 +90,17 @@ class SegmentMuxer(
         runCatching { muxer.stop() }
         runCatching { muxer.release() }
         file.delete()
+    }
+
+    /**
+     * Maps a segment's first-sample PTS onto a wall-clock capture time. The live path
+     * uses the muxer's construction-time snapshot (clock == null); manual import injects
+     * an [com.hushai.android.capture.imports.ImportClock] so recovered footage keeps its
+     * ORIGINAL timeline position on the backend (which orders by capture time).
+     */
+    interface SegmentClock {
+        fun captureWallNanos(firstPtsUs: Long): Long
+        fun monotonicNanos(): Long
     }
 
     companion object {

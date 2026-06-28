@@ -105,3 +105,87 @@ the format is as follows:
 
 
 3. [] Create the ticket to create the native adroid application and the axum rust backend server that will intake the data and store it in a database.
+
+
+
+TODO:
+- [] create enable audio only mode where it does not save the video but only the audio since some times the vid is not needed this will save on storage space and processing time....
+- [] create a browser based application where we can see the video and audio that we captured so that the admin can quickly browser through and find audio and video from a given time, it should act like any other flagship security camera software where it stitches together the clips so that the admin can view the video as one video and browse through the timestamps not knowing what is under the hood and how the data is stored.
+you can test it by obviously setting up everything locally and then opening the browser and getting my input when you're ready so that I can validate the work
+
+- [] add a off button to the app since it seems right now it will just always run we need to work on the UI as well at the app. Things are cluttered and not very neat and it's all black and some of the text is pretty dark as well so it's hard to see.
+
+- [] currently our voice detection is working poorly and i'm not quite sure what the issue is all i know is that yesterday i registerd my voice and now when opening the app id did not register my voice when asking a question and then ignored my voice as if i never registerd it..
+
+- [] currently the voice assistant has a very old un natural voice lets get a better more modern voice it should run locally reach the best one and get it hooked up..
+
+- [] now that we got the ability to control the phone wirelessly, let's try to do it over the USB so that we don't need to be connected on the same network. If that doesn't work we can fall back to the previous method that has been working..
+
+- [] security we need to encrypt the audio and video files so that only the admin can actually view them..
+- [] we really need to advance the our webapplication big time so that we can do everything that we already do as far as scrubbing through the video
+and add section for a full chat interface where we can have a chat over all our video record, recordings, and audio record recordings. In the future, we would like to then incorporate different agents that the user can select that I are basically like chat Windows, but with a specific focus and capabilities...
+- [] it should have all the abilities of the mobile app to record audio video if we so choose, we should be able to analyze the voices everything that we can do on the mobile application so please write up a ticket for this functionality
+
+
+- [] currently the open voices on the app has many different open voices and many of them are all the same person just with statick in the background
+    Which is unsustainable to have every bit of static come up as a unknown speaker, and then have to manually merge it into an existing voice. We need to get a serious improvement on this end when it comes to uniquely identifying voices
+
+
+- [] its time to start to add perhaps a new Agent that has the ability to answer question like (how has my conversational skills being.) (how productive have I been? What improvements can you give me?) that will have the entire context of my life and be able to answer these private questions given the access of data. I have given it so it will need to have a broad understanding of the entire transcription time dates times stamps and different people in the conversation.
+
+
+- [] improve the voice and chat assistant so that when i ask it a question it should not return any id's or or other time stamps rather it should be human readable data for example, don't give a timestamp but say yesterday at 5 o'clock or three days ago at 2 aclock for example another would be don't say user and then the user ID would say the user's name if we have one and if we don't just say it's an unidentified user
+Note this should be across the mobile and Web App.
+
+
+- improve the chat in the webapplicatoin so that 
+  - 1 it seems to chat window seems to be a bit off center the send button and part of the chat are out of the screen view
+  - we want to be able to clear the chat and start a new one
+  - we should have the ability to ask regarding just a single camera or across all cameras and all recordings..
+  - I don't see a settings menu where I can tag different speakers like we have in the app however, I should mention the app is quite broken. It does not have all the speakers there the last time I checked it seems like it's still holding the same old speakers/voices
+
+
+
+
+- Now we need to get this application ready begint he opens source project bit
+- we will need to create the needed github repo (Private)
+- there are a lot of files all over the place lots of debt code and things are not documented linearly so that someone else can set this up locally we need to clean up the code base write things up line and read me, etc..
+- we need to have a technical read me on what is going on in the background, etc.
+
+
+- now lets continue building out our application and add deep a AI vision capabilities
+ You'll do research and see that our application already has voice detection to link people to the audio and video clips and then exposes it to our AI assistance. Now let's expand it to give it vision capabilities. We should be able to identify people in the frames identify what people are doing in the frames as well as identify objects what the objects are and add all that Meta data to the video audio so that we can then continue building out our smart agent so that our smart agent can then answer questions such as when did I see a car or when did I see a car with a license plate of X or when did I see this in this person?
+ We must plan carefully to use only the most up-to-date models for all of our tasks so that we get the best results running locally on our computer in line with the rest of our project
+
+
+
+
+
+# NEW immediate tasks
+
+ - do a thorough investigation into the application to understand it's dependencies and we need to see if we can bundle this in a docker file so that we could just do docker compose up and everything spins up and runs correctly. We have had in the few in the past times that certain servers were not connected or certain points were not running, and we have to manually start them up, and this should hopefully solve it.
+
+ - Now that we added vision when viewing the video we need the ability to see the objects we detected so that when viewing the video in the browser applications there should be a tab to view the video with object detection and in that mode it should have the classic boxes around the objects with its labels. If it's a person, it should say a person and it's name if it's identified or unidentified, and then all the objects that it identifies should obviously be marked as such.
+
+
+- We need to have the ability to record offline (not connected to the mother ship) where we have no connection that is sending off the data live so that when the connection is cut/has hiccups/is officially offline to allow the users to upload audio/videos in so for the mobile application if it's not connected, it should continue recording and storing it data locally all while clearly displaying on the screen that it is now storing data locally along with data of how much memory is left on disc and then as soon as the connection does occur, we should try to offload all the local data back to the server and then delete what we uploaded..
+
+
+Simulate high load to see how the system handles it will it be able to ingest 30 video cameras at once?
+ Will the transcription and other AI processes be queued correctly? so that it slowly or hopefully sooner than later does process everything?
+
+ - We must now add video and audio capture functionality to the web application as well so that we can turn on video capture just like we are doing in the mobile app.
+ Like this we go for the first time being able to actually have two video sources streaming in at the same time for our test.
+ In order for this task to be complete, we must have the mobile app and the mobile Web App stream video and audio and make sure that it's being processed correctly.
+
+ - Test Test Test test the application end to end and report bugs and needed improvements
+
+ # Future plan 
+ - have a agent scan social or integrate with 3rd party software to add a lable to the unlabeled peaple
+
+
+
+# Production ready (the must haves for this to be production ready)
+- [] if this is going to run on the local network it must set up some sort of encryption so that not anyone on the network can the application front end backend.
+- [] it must have a correct storage plan for long term storage for this we should go with the typical industry gold standard
+- we must be able to capture

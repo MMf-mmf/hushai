@@ -1,5 +1,6 @@
 package com.hushai.android.net
 
+import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
@@ -25,6 +26,10 @@ class Uploader(
 ) {
     private val endpoint = baseUrl.trimEnd('/') + "/v1/segments"
 
+    // The call currently blocking in execute(), so a stop can abort a hung upload
+    // (e.g. unreachable backend) instead of waiting out the 120s callTimeout.
+    @Volatile private var inFlight: Call? = null
+
     fun upload(manifestBytes: ByteArray, body: File): UploadOutcome {
         val multipart = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
@@ -44,11 +49,21 @@ class Uploader(
             .post(multipart)
             .build()
 
+        val call = client.newCall(request).also { inFlight = it }
         return try {
-            client.newCall(request).execute().use { classify(it.code) }
+            call.execute().use { classify(it.code) }
         } catch (e: IOException) {
+            // A cancelInFlight() abort also surfaces here as an IOException.
             UploadOutcome.RetryLater("io: ${e.message}")
+        } finally {
+            inFlight = null
         }
+    }
+
+    /** Abort an upload currently blocking in execute() (thread-safe). The segment
+     *  stays buffered and re-sends later — segment_id is the idempotency key. */
+    fun cancelInFlight() {
+        inFlight?.cancel()
     }
 
     private fun classify(code: Int): UploadOutcome = when (code) {

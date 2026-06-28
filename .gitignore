@@ -12,8 +12,14 @@ target/
 # Local data / databases
 hushai-backend/data/
 
+# Per-service logs + pid files written by local_dev/run_stack.sh
+local_dev/logs/
+
 # Captured test media (regenerable; can be large)
 local_dev/captures/
+
+# Synthesized object-lane test fixture (make_object_clip.sh) — regenerable, operator-provisioned.
+object_clip.mp4
 
 # Large, downloadable ML model binaries — kept out of git (fetch, don't commit).
 # whisper.cpp model for hushai-worker (see hushai-backend/README); ~141 MB.

@@ -7,6 +7,7 @@ A Cargo workspace for the Hushai data-intake + retrieval system.
 | [`hushai-backend`](hushai-backend/) | Durable, idempotent **segment-ingest** server (camera→backend contract v0.1.0). Owns the DB schema. |
 | [`hushai-worker`](hushai-worker/) | Durable, resumable, idempotent **transcription + embedding** worker: drains stored segments → `transcript_sentences`. |
 | [`hushai-rag`](hushai-rag/) | **RAG** service: `POST /v1/rag/query` — grounded Q&A over the transcripts with source citations. |
+| [`hushai-viewer`](hushai-viewer/) | The unified **browser app** (NVR timeline + chat-over-recordings, `127.0.0.1:8070`); reuses `hushai-backend` as a library. |
 
 The worker and RAG service are the **transcription-embedding-and-rag** ticket
 (`Issues/transcription-embedding-and-rag.md`). Both reuse `hushai-backend` as a library
@@ -38,6 +39,20 @@ Configuration is env-driven (`.env` at the workspace root; see each crate's `.en
 
 ## Run
 
+One command brings up all four services (backend, worker, rag, viewer) and tears the whole
+thing down with a single Ctrl-C:
+
+```bash
+./local_dev/run_stack.sh
+```
+
+It preflights the infra deps (Postgres, Ollama), builds the workspace, launches every service,
+health-checks the ports, and prints a URL map. See [`AGENTS.md`](AGENTS.md) "Run the full stack locally"
+for flags (`--with-android`, `--no-build`, `--release`, `--pull`, `--down`) and the manual
+per-terminal flow with its gotchas.
+
+Or run each service manually:
+
 ```bash
 # 1. Ingest server (accepts segments; also applies migrations)
 cargo run -p hushai-backend            # :8080
@@ -50,6 +65,9 @@ cargo run -p hushai-rag                # :8090
 curl -s -X POST localhost:8090/v1/rag/query \
   -H 'content-type: application/json' \
   -d '{"query":"what did they say about the cameras?","top_k":8}' | jq
+
+# 4. Viewer (unified browser app: NVR timeline + chat)
+cargo run -p hushai-viewer             # http://127.0.0.1:8070
 ```
 
 ## Test
@@ -63,8 +81,8 @@ cargo test --workspace                 # unit + live-DB integration (skips DB te
 
 - **Embedding dimension is fixed at 1024** (`mxbai-embed-large` / BGE-large) to match
   `transcript_sentences.embedding vector(1024)`; every vector is dimension-checked before write.
-- Vectors are bound to Postgres as text + `::vector` cast (avoids a `pgvector`/`sqlx` version
-  conflict — `pgvector 0.4.2` pins `sqlx 0.9`, the workspace uses `sqlx 0.8`).
+- The workspace is on `sqlx 0.9` + `pgvector 0.4.2`; embeddings bind as native `pgvector::Vector`
+  over the binary protocol — there are no `::vector` text casts left.
 - The worker is crash-safe: `segment_transcription_status` + `FOR UPDATE SKIP LOCKED` + a claim
   lease mean a killed worker's in-flight segment is re-leased and finished on restart, with no
   duplicate sentences (atomic delete-then-insert per segment).

@@ -1,10 +1,9 @@
 package com.hushai.android.assistant
 
 import android.content.Context
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
 import com.hushai.android.capture.PcmSink
 import com.hushai.android.net.RagClient
+import com.hushai.android.net.TtsClient
 import com.hushai.android.util.AssistantBus
 import com.hushai.android.util.AssistantPhase
 import com.hushai.android.util.HushaiLog
@@ -12,6 +11,8 @@ import org.json.JSONObject
 import org.vosk.Recognizer
 import java.util.Locale
 import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 /**
@@ -22,14 +23,20 @@ import java.util.concurrent.TimeUnit
  * Threading: [onPcm] (mic thread) only *copies* PCM into a bounded queue; ALL Vosk
  * work — and every recognizer mutation — happens on the single [loop] worker thread,
  * so the recognizer is never touched concurrently. Control requests from other
- * threads (enroll, TTS-done) set @Volatile flags the worker picks up. PCM is dropped
- * while THINKING/SPEAKING so the assistant never transcribes its own TTS.
+ * threads (enroll, speak-done) set @Volatile flags the worker picks up. PCM is
+ * dropped while THINKING/SPEAKING so the assistant never transcribes its own reply.
+ *
+ * Spoken answers are synthesized on the backend (`/v1/tts`, [TtsClient]) and played
+ * locally via [AudioPlayer]; the fetch+play runs on a dedicated speak thread so the
+ * worker loop (and its watchdog) stays responsive, and signals `pendingResume` when
+ * done. The phone does no speech synthesis.
  */
 class VoiceAssistant(
     private val context: Context,
     private val deviceId: String,
     initialWakeWord: String,
     private val ragClient: RagClient,
+    private val ttsClient: TtsClient,
     initialOwnerEmbedding: FloatArray?,
     private val onEnrollComplete: (FloatArray) -> Unit,
 ) : PcmSink {
@@ -45,8 +52,9 @@ class VoiceAssistant(
     private var worker: Thread? = null
 
     private var recognizer: Recognizer? = null
-    private var tts: TextToSpeech? = null
-    @Volatile private var ttsReady = false
+    private val audioPlayer = AudioPlayer()
+    private val speakExecutor: ExecutorService =
+        Executors.newSingleThreadExecutor { r -> Thread(r, "hushai-va-speak") }
 
     // Cross-thread control flags, acted on by the worker only.
     @Volatile private var pendingEnroll = false
@@ -86,27 +94,9 @@ class VoiceAssistant(
             return
         }
         recognizer = rec
-        initTts()
         publish { it.copy(ready = true) }
         worker = Thread({ loop() }, "hushai-va").apply { start() }
         HushaiLog.info("voice assistant ready (wake='$wakeWord' enrolled=${ownerEmbedding != null})")
-    }
-
-    private fun initTts() {
-        tts = TextToSpeech(context.applicationContext) { status ->
-            ttsReady = status == TextToSpeech.SUCCESS
-            if (ttsReady) {
-                tts?.language = Locale.US
-                tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-                    override fun onStart(id: String?) {}
-                    override fun onDone(id: String?) { pendingResume = true }
-                    @Deprecated("deprecated in API 21") override fun onError(id: String?) { pendingResume = true }
-                    override fun onError(id: String?, code: Int) { pendingResume = true }
-                })
-            } else {
-                HushaiLog.warn("TTS init failed; answers will show but not speak")
-            }
-        }
     }
 
     override fun onPcm(data: ByteArray, length: Int) {
@@ -132,9 +122,9 @@ class VoiceAssistant(
                 awaitDeadlineNanos = 0
                 resumeListening(rec, note = "no question heard")
             }
-            // Watchdog: never get stuck SPEAKING if a TTS callback never fires.
+            // Watchdog: never get stuck SPEAKING if synth/playback hangs past the deadline.
             if (phase == AssistantPhase.SPEAKING && speakDeadlineNanos > 0L && now >= speakDeadlineNanos) {
-                HushaiLog.warn("TTS did not report done in time — resuming")
+                HushaiLog.warn("speak did not finish in time — resuming")
                 resumeListening(rec)
             }
             // Enrollment deadline: finish with whatever voiceprints we have (≥1), else fail.
@@ -200,16 +190,19 @@ class VoiceAssistant(
         }
     }
 
-    /** Blocks the worker on the RAG call, then speaks the answer (resume on TTS done). */
+    /** Blocks the worker on the RAG call, then speaks the answer (resume on speak-done). */
     private fun answer(rec: Recognizer, question: String) {
         phase = AssistantPhase.THINKING
+        // Introspective questions ("how have I been?") route to the reflection agent; the
+        // backend scopes them to the owner. Everything else uses the default recordings agent.
+        val agentId = ReflectionIntent.agentFor(question)
         publish { it.copy(phase = AssistantPhase.THINKING, lastQuestion = question, note = null) }
-        when (val r = ragClient.ask(question, deviceId)) {
+        when (val r = ragClient.ask(question, deviceId, agentId)) {
             is RagClient.Result.Answer -> {
                 phase = AssistantPhase.SPEAKING
                 speakDeadlineNanos = System.nanoTime() + SPEAK_TIMEOUT_NANOS
                 publish { it.copy(phase = AssistantPhase.SPEAKING, lastAnswer = r.text) }
-                speak(r.text) // resumes LISTENING when TTS reports done (pendingResume)
+                speak(r.text) // resumes LISTENING once playback finishes (pendingResume)
             }
             is RagClient.Result.Error -> {
                 publish { it.copy(note = "RAG error: ${r.reason}") }
@@ -239,10 +232,21 @@ class VoiceAssistant(
         publish { it.copy(phase = AssistantPhase.LISTENING, note = "speaker not recognized — ignoring") }
     }
 
+    /**
+     * Fetch the spoken answer from the backend and play it, off the worker thread so
+     * the loop/watchdog keep running. Always sets [pendingResume] (success or not) so
+     * the assistant returns to LISTENING; if audio is unavailable the answer text is
+     * still shown.
+     */
     private fun speak(text: String) {
-        val t = tts
-        if (!ttsReady || t == null) { pendingResume = true; return }
-        t.speak(text, TextToSpeech.QUEUE_FLUSH, null, "hushai-answer")
+        speakExecutor.execute {
+            val played = runCatching {
+                val wav = ttsClient.synthesize(text)
+                wav != null && audioPlayer.play(wav)
+            }.getOrElse { e -> HushaiLog.error("speak failed", e); false }
+            if (!played) HushaiLog.warn("spoken answer unavailable — showing text only")
+            pendingResume = true
+        }
     }
 
     private fun resumeListening(rec: Recognizer, note: String? = null) {
@@ -314,8 +318,8 @@ class VoiceAssistant(
         queue.clear()
         runCatching { recognizer?.close() }
         recognizer = null
-        runCatching { tts?.stop(); tts?.shutdown() }
-        tts = null
+        runCatching { audioPlayer.stop() }
+        runCatching { speakExecutor.shutdownNow() }
         AssistantBus.update { it.copy(phase = AssistantPhase.OFF, enabled = false) }
     }
 
@@ -341,7 +345,8 @@ class VoiceAssistant(
         private const val MIN_ENROLL_NANOS = 5_000_000_000L // 1 voiceprint after ~5s of audio is enough
         private const val MIN_QUESTION_WORDS = 2
         private const val QUESTION_TIMEOUT_NANOS = 8_000_000_000L
-        private const val SPEAK_TIMEOUT_NANOS = 30_000_000_000L // watchdog if TTS never calls back
+        // Watchdog backstop covering backend synthesis + network + playback.
+        private const val SPEAK_TIMEOUT_NANOS = 60_000_000_000L
         private const val ENROLL_TIMEOUT_NANOS = 20_000_000_000L // finish with what we have after 20s
     }
 }

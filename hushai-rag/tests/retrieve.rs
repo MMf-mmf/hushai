@@ -25,7 +25,11 @@ async fn insert_fixture_segment(pool: &PgPool, device_id: &str) -> Uuid {
     sqlx::query("INSERT INTO devices (device_id, source_kind) VALUES ($1,'test') ON CONFLICT (device_id) DO NOTHING")
         .bind(device_id).execute(pool).await.unwrap();
     sqlx::query("INSERT INTO sessions (session_id, device_id) VALUES ($1,$2)")
-        .bind(session_id).bind(device_id).execute(pool).await.unwrap();
+        .bind(session_id)
+        .bind(device_id)
+        .execute(pool)
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO streams (session_id, stream_id, device_id, media_type, codec, container) VALUES ($1,'s0',$2,3,'h264+aac','fmp4')")
         .bind(session_id).bind(device_id).execute(pool).await.unwrap();
     sqlx::query(
@@ -37,7 +41,13 @@ async fn insert_fixture_segment(pool: &PgPool, device_id: &str) -> Uuid {
     segment_id
 }
 
-async fn insert_sentence(pool: &PgPool, segment_id: Uuid, device_id: &str, text: &str, emb: Vec<f32>) {
+async fn insert_sentence(
+    pool: &PgPool,
+    segment_id: Uuid,
+    device_id: &str,
+    text: &str,
+    emb: Vec<f32>,
+) {
     sqlx::query(
         "INSERT INTO transcript_sentences (segment_id, device_id, text, start_unix_nanos, end_unix_nanos, embedding, embedding_model, embedding_dim) \
          VALUES ($1,$2,$3,0,0,$4,'test',1024)",
@@ -94,7 +104,11 @@ async fn nearest_orders_by_cosine_distance() {
         .await
         .unwrap();
 
-    assert_eq!(results.len(), 3, "should retrieve exactly our three fixtures");
+    assert_eq!(
+        results.len(),
+        3,
+        "should retrieve exactly our three fixtures"
+    );
     assert_eq!(results[0].text, "A exact match");
     assert_eq!(results[1].text, "C partial match");
     assert_eq!(results[2].text, "B orthogonal");

@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd job: run hushai-worker as a supervised, always-on daemon.
+
+  Why this exists: the worker is the ASR + speaker-attribution pipeline. If it isn't
+  running, ingested audio piles up `pending` in segment_transcription_status and never
+  gets transcribed or voice-printed (which is exactly how a frequent speaker ends up with
+  NO speakers row and "vanishes" from the Voices list). KeepAlive keeps it up across
+  crashes and reboots so the backlog can't silently accumulate again.
+
+  DEPENDENCY: Postgres AND `ollama serve` must be reachable (the worker connects to both
+  at startup: DB for the queue, Ollama for text embeddings + sentiment). launchd has no
+  ordering primitive, so if either is down the worker exits and KeepAlive + ThrottleInterval
+  retry until both are up. Models (./models/ggml-base.en.bin, nemo_en_titanet_large.onnx,
+  silero_vad.onnx) are resolved RELATIVE to WorkingDirectory — so WorkingDirectory MUST be
+  the repo root, else the worker crash-loops on missing models (visible in the log).
+
+  Build first (release binary, for an always-on service):
+    cargo build -p hushai-worker --release
+
+  Install (per-user, no sudo):
+    cp local_dev/com.hushai.worker.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.hushai.worker.plist
+  Inspect / restart / remove:
+    launchctl print     gui/$(id -u)/com.hushai.worker
+    launchctl kickstart -k gui/$(id -u)/com.hushai.worker
+    launchctl bootout   gui/$(id -u)/com.hushai.worker
+  Logs: /tmp/hushai-worker.log
+
+  NOTE: paths below are absolute and assume this repo lives at
+  /Users/mf/Documents/Rust_Code/Rig AI Agent — adjust if you move it. All other config
+  (DATABASE_URL, OLLAMA_BASE_URL, SPEAKER_* thresholds, SPEAKER_BACKFILL_ON_START, …) is
+  loaded from the workspace-root .env via dotenvy given the WorkingDirectory below.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hushai.worker</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/mf/Documents/Rust_Code/Rig AI Agent/target/release/hushai-worker</string>
+    </array>
+
+    <!-- REQUIRED: model paths (./models/*) and .env are resolved relative to this. -->
+    <key>WorkingDirectory</key>
+    <string>/Users/mf/Documents/Rust_Code/Rig AI Agent</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <!-- launchd starts with a minimal PATH; include Homebrew so ffmpeg/ollama resolve. -->
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/bin:/bin</string>
+        <key>RUST_LOG</key>
+        <string>info,hushai_worker=debug</string>
+        <!-- sherpa-rs ships libonnxruntime/libsherpa-onnx-*.dylib next to the built binary but
+             bakes no @loader_path rpath, so a directly-launched binary can't find them. Point
+             the loader at the build dir. Use target/debug here if you run the debug binary. -->
+        <key>DYLD_FALLBACK_LIBRARY_PATH</key>
+        <string>/Users/mf/Documents/Rust_Code/Rig AI Agent/target/release:/usr/local/lib:/usr/lib</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- Restart on crash / clean exit; back off so a hard dependency outage doesn't spin. -->
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/hushai-worker.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/hushai-worker.log</string>
+</dict>
+</plist>

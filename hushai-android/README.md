@@ -40,7 +40,8 @@ ignored; capture/upload unaffected throughout.
   `START_STICKY`, partial wakelock; survives screen-off, backgrounding, Activity death.
 - **Bounded retry buffer** (in-memory + file spill); overflow drops oldest and sets
   `gap_before=true` on the next surviving segment of that stream.
-- **Compose UI** + **headless Intent-extra control** (`url`/`token`/`autostart`/`stop`).
+- **Compose UI** + **headless Intent-extra control** (`url`/`token`/`rag_url`/`autostart`/
+  `stop`/`audio_only`).
 
 ### 2. Live camera preview (this session)
 
@@ -72,7 +73,8 @@ the display off. (Verified: segments keep uploading `200` with the screen `OFF`.
 
 ```
 wake word  →  owner voice-ID  →  question (STT)  →  RAG answer  →  spoken reply
- (Vosk)        (Vosk x-vector)     (Vosk)            (hushai-rag)    (Android TTS)
+ (Vosk)        (Vosk x-vector)     (Vosk)            (hushai-rag)    (backend Kokoro
+                                                                     TTS, played here)
 ```
 
 - **Always-on wake word** — a user-configurable keyword (default `"computer"`),
@@ -84,11 +86,83 @@ wake word  →  owner voice-ID  →  question (STT)  →  RAG answer  →  spoke
   recognizer.
 - **RAG answer** — the question is `POST`ed to `../hushai-rag` `/v1/rag/query`, scoped
   to this device's `device_id`, so answers are grounded in the owner's own recordings.
-- **Spoken reply** — the answer is read aloud via Android `TextToSpeech`.
+- **Spoken reply** — the answer is synthesized on the **backend** (`hushai-rag`
+  `POST /v1/tts`, Kokoro-82M neural voice) and the returned WAV is played here via
+  `AudioTrack` (`assistant/AudioPlayer.kt`). The phone does no speech synthesis —
+  it just plays the audio. (Was Android `TextToSpeech`, which sounded robotic.)
 
-All offline/on-device except the RAG call to the local backend — consistent with the
-local whisper + Ollama stack. Full spec + acceptance criteria:
-`../Issues/voice-assistant-wakeword-rag.md`.
+Wake word + STT + speaker-ID still run on-device (Vosk); the RAG answer and its
+spoken audio come from the local backend. A planned follow-up moves wake-word/STT/
+speaker-ID server-side too, making the phone a pure audio/video gateway. Full spec +
+acceptance criteria: `../Issues/voice-assistant-wakeword-rag.md`.
+
+### 5. Audio-only capture mode (this session)
+
+A pre-Start toggle ("Audio only") that captures **only the `cam0-audio` stream** —
+the camera is never opened and the H.264 encoder never runs — to save storage,
+upload bandwidth, and battery when the video isn't needed. The audio path (mic →
+AAC segments → upload, plus the voice assistant) is **byte-for-byte unchanged**;
+the session simply never produces a `cam0-video` stream, which the backend/worker
+handle fine (audio is the transcription path).
+
+- **Mode is chosen before Start** and the switch is disabled while capturing
+  (changing it mid-session would mean opening/closing the camera) — `Stop`, flip,
+  `Start` to change. Persisted in `Settings` (`audio_only`), reflected on next launch.
+- **Foreground-service type narrows to `microphone`** in audio-only
+  (`CaptureService.foregroundServiceType(audioOnly)`) — a subset of the manifest's
+  declared `camera|microphone`, so it neither needs nor claims the camera FGS type.
+- **No `CAMERA` permission required** in audio-only: `MainActivity.requiredPermissions`
+  drops it, so a user who only wants audio isn't forced to grant camera access. The
+  camera `uses-feature` is therefore `required="false"` (app stays installable on
+  camera-less devices).
+- **No preview** in audio-only — `CaptureScreen` shows an "🎙 Audio-only" placeholder
+  instead of the `SurfaceView`, so no preview surface is ever created/pushed.
+- **Headless:** `am start … --ez audio_only true` (and `run_hushai_app.sh --audio-only`,
+  which also skips the `CAMERA` grant).
+
+### 6. Connectivity gate + non-freezing toggle (this session)
+
+Two fixes to the master on/off control:
+
+- **Start is gated on backend health.** Flipping the master switch ON first runs a
+  fast pre-Start probe (`MainActivity.onCheckConnection` → `Reachability(Http.probe).check()`
+  off the main thread, the same `/healthz`+`/readyz` check the in-service preflight uses).
+  The control shows "Checking connection…"; capture only starts when `/healthz == 200`
+  (`Health.live`). Otherwise a dismiss-only **"Not connected"** `AlertDialog` explains why
+  (unreachable vs. responded-but-unhealthy vs. no URL set) and **capture does not start** —
+  in any mode (audio+video and audio-only), since an unreachable backend only buffers
+  locally. The **headless autostart path is intentionally NOT gated** (automation/testing).
+- **Toggling never freezes the UI.** Start/stop transitions now run on a single
+  `hushai-lifecycle` executor via `CaptureService.reconcile()`, driven by a `desiredRunning`
+  flag set on the main thread. `onStartCommand` returns immediately and publishes
+  `running=false` instantly on STOP, so the switch flips at once while the heavy teardown
+  (thread joins + buffer flush) runs in the background — previously it blocked the main
+  thread for up to ~20s (worst when the backend was unreachable and the flush couldn't
+  drain). Supporting changes: `Uploader.cancelInFlight()` aborts a hung upload on stop,
+  `FLUSH_TIMEOUT_MS` is 3s and interruptible, and `onDestroy` joins the teardown with an
+  8s bound. The single-thread executor serializes transitions, so rapid OFF→ON / ON→OFF
+  toggles converge without races.
+
+### 7. Voices screen — speaker catalog & de-duplication (`ui/VoicesScreen.kt`, `net/SpeakersClient.kt`)
+
+A second screen (reached from the capture screen's "Open Voices" button; a screen-state toggle
+in `MainActivity`, no nav framework) over the **server-side** speaker catalog — distinct from the
+on-device owner voice-ID used by the assistant (§ Speaker verification below). It calls the backend
+(`:8080`, bearer `DEVICE_TOKEN`):
+
+- **List + identify** — `GET /v1/speakers` shows each discovered voice (name or "Unknown (id…)",
+  sample count, a few sample utterances) and **plays a sample-audio snippet** (`GET /v1/speakers/{id}/sample-audio`)
+  so you can recognize a voice by ear.
+- **Name a voice** — a name field → `PATCH /v1/speakers/{id}`.
+- **Merge a duplicate** — per-voice "Merge into…" → `POST /v1/speakers/{loser}/merge`.
+- **Clean up voices (2026-06-26)** — a section at the top surfaces backend-suggested duplicate
+  groups (`GET /v1/speakers/duplicates`) and merges them in one tap: **"Merge group"** /
+  **"Merge all"** → `POST /v1/speakers/merge-group`. Groups whose voices carry different names are
+  shown but not one-tap mergeable (so a label is never silently lost). This is the client side of the
+  server's static-induced-duplicate fix — see the backend's de-dup overhaul in the repo `AGENTS.md`.
+
+All `SpeakersClient` calls are blocking OkHttp run off the main thread (org.json + bearer, mirrors
+`RagClient`); failures degrade to an empty list / no-op.
 
 ---
 
@@ -119,9 +193,11 @@ unaffected. Teardown order in `CaptureService.stopCapture` is **mic first** (so 
 
 `VoiceAssistant.onPcm` only copies PCM into a bounded queue, and **only while
 LISTENING / AWAIT_QUESTION / ENROLLING** — it drops audio during THINKING/SPEAKING so
-the assistant never transcribes its own TTS. **All Vosk work and every recognizer
-mutation happen on a single worker thread**; the recognizer is not thread-safe, so
-cross-thread requests (`enroll`, TTS-done) set `@Volatile` flags the worker reads.
+the assistant never transcribes its own spoken reply. **All Vosk work and every
+recognizer mutation happen on a single worker thread**; the recognizer is not
+thread-safe, so cross-thread requests (`enroll`, speak-done) set `@Volatile` flags the
+worker reads. Synthesizing+playing the answer (fetch `/v1/tts` → `AudioPlayer`) runs on
+a dedicated speak thread, which sets `pendingResume` when playback ends.
 
 Phases: `LISTENING → AWAIT_QUESTION → THINKING → SPEAKING → LISTENING`, plus
 `ENROLLING`. Robustness watchdogs (so it can never wedge):
@@ -129,7 +205,7 @@ Phases: `LISTENING → AWAIT_QUESTION → THINKING → SPEAKING → LISTENING`, 
 | Guard | Constant | Purpose |
 |---|---|---|
 | Question wait | `QUESTION_TIMEOUT_NANOS` = 8 s | bare wake word with no follow-up → back to LISTENING |
-| Speaking | `SPEAK_TIMEOUT_NANOS` = 30 s | if a TTS callback never fires, force-resume |
+| Speaking | `SPEAK_TIMEOUT_NANOS` = 60 s | if backend synth + network + playback hangs, force-resume |
 | Enrolling | `ENROLL_TIMEOUT_NANOS` = 20 s | finish with whatever voiceprints we have (≥1), else fail |
 | Init | try/catch in `init()` | model/recognizer load failure sets `running=false` (no zombie queue) |
 
@@ -168,7 +244,12 @@ moves to AWAIT_QUESTION and verifies on the (longer, better) follow-up.
   {"device_id":..}}`, parses `{answer, sources[…]}`. Uses `Http.rag` (180 s read timeout
   — local LLM generation on CPU is slow). Bearer sent only if a token is set; the dev
   `hushai-rag` runs with no `RAG_TOKEN`, so `RAG_TOKEN = ""` in `CaptureService`.
-- TTS = Android `TextToSpeech`; an `UtteranceProgressListener` `onDone` resumes listening.
+- `net/TtsClient.kt` → `POST {ragUrl}/v1/tts` body `{"text":..}`, returns a 16-bit PCM
+  WAV (Kokoro voice synthesized on the backend). Same `Http.rag` client + bearer rule.
+  Returns `null` on any failure (incl. 503 when TTS is off) → the answer text still shows.
+- `assistant/AudioPlayer.kt` plays that WAV via `AudioTrack` (parsed by the pure,
+  unit-tested `assistant/WavPcm.kt`). The phone does **no** speech synthesis — synthesis
+  moved to the backend so the voice is modern/natural instead of robotic.
 
 ### Settings + control surface
 
@@ -196,19 +277,28 @@ app/src/main/kotlin/com/hushai/android/
     CameraController.kt        Camera2 open + (re)configurable session (encoder + optional preview)  [+preview]
     VideoEncoder.kt            H.264 MediaCodec, keyframe-aligned ~2s cutting, CSD capture
     AudioEncoder.kt            push-based PcmSink: own worker thread, AAC ~2s cutting, CSD capture    [refactored]
-    SegmentMuxer / Segment / SegmentManifestBuilder / RetryBuffer / CaptureNotification   (capture v1)
+    SegmentMuxer / Segment / SegmentManifestBuilder / CaptureNotification   (capture v1)
+    DurableSegmentBuffer.kt    crash-durable, disk-byte-bounded store-and-forward (sidecar manifests   [new]
+                               under noBackupFilesDir; recover() on startup; drop-oldest overflow)
+    imports/                   manual file import: SAF-picked audio/video -> decode+re-encode to the   [new]
+                               same 2s segments (ImportPipeline/ImportManager/MediaProbe/ImportClock)
   assistant/
-    VoiceAssistant.kt          Vosk recognizer + wake/verify/STT/RAG/TTS state machine + enrollment  [new]
+    VoiceAssistant.kt          Vosk recognizer + wake/verify/STT/RAG state machine + enrollment      [new]
     VoiceModels.kt             unpack Vosk assets to filesDir; load Model + SpeakerModel             [new]
     SpeakerMath.kt             cosine / centroid / wake-word token match (pure, unit-tested)         [new]
+    AudioPlayer.kt             play backend TTS WAV via AudioTrack (replaces Android TextToSpeech)   [new]
+    WavPcm.kt                  pure RIFF/WAVE parser for the /v1/tts audio (unit-tested)             [new]
   net/
     RagClient.kt               OkHttp POST /v1/rag/query -> answer                                   [new]
+    TtsClient.kt               OkHttp POST /v1/tts -> WAV bytes (backend Kokoro voice)               [new]
+    NetworkMonitor.kt          ConnectivityManager callback (validated link up/down)                 [new]
+    ConnectivityState.kt       fuses link + upload outcomes + probe -> offline/draining/online       [new]
     Uploader / UploadOutcome / Reachability / Http.kt   (Http.kt adds a long-timeout `rag` client)  [+rag]
   config/{Settings,DeviceIdentity}.kt   DataStore: url/token/device_id + wake_word/rag_url/enabled/owner_embedding
-  util/{AssistantBus,Status,HushaiLog,Uuid7,Sha}.kt    status buses; HUSHAI_TX logging; UUIDv7; SHA-256
+  util/{AssistantBus,Status,HushaiLog,Uuid7,Sha,Format}.kt    status buses; HUSHAI_TX logging; UUIDv7; SHA-256; byte/duration formatting
 app/src/main/res/xml/device_admin.xml   force-lock policy
 app/src/main/assets/vosk/{model-en,model-spk}/   Vosk models (GITIGNORED; fetch via script)
-app/src/test/kotlin/...   JVM unit tests: ManifestRoundTrip, Uploader, RetryBuffer, SpeakerMath, RagClient
+app/src/test/kotlin/...   JVM unit tests: ManifestRoundTrip, Uploader, DurableSegmentBuffer, SpeakerMath, RagClient, WavPcm
 ```
 
 ---
@@ -238,20 +328,23 @@ OkHttp 4.12, Compose BOM 2024.09.03, **vosk-android 0.3.47**. Tests add `org.jso
 
 ```bash
 # backend up (separate terminal): cd ../hushai-backend && SQLX_OFFLINE=true cargo run   # :8080
-../local_dev/run_hushai_app.sh --url http://localhost:8080 --token dev-secret-token --duration 120
+# USB phone: script auto-creates the `adb reverse` tunnel + defaults to localhost (no --url needed).
+../local_dev/run_hushai_app.sh --duration 120
 ```
+
+> `../local_dev/run_stack.sh --with-android` brings up the backend (+worker+rag+viewer) **and** drives the phone client together.
 
 ### Full voice-assistant stack (all local, no egress)
 
 ```bash
-ollama serve                                                  # :11434 (models mxbai-embed-large + llama3.2:3b)
-cd ../hushai-backend && SQLX_OFFLINE=true cargo run           # :8080  ingest
-cd ..                && SQLX_OFFLINE=true cargo run -p hushai-rag   # :8090  RAG  (needs transcribed history; run hushai-worker to populate)
+../local_dev/run_stack.sh                                     # ollama :11434 + backend :8080 + worker + rag :8090 + viewer :8070
+# The worker is what transcribes captured audio into transcript history, which RAG then answers over.
+# Over USB, run_hushai_app.sh sets these reverse tunnels for you; do it by hand only if launching the app another way:
 adb reverse tcp:8080 tcp:8080 && adb reverse tcp:8090 tcp:8090
 ```
 
 Then in the app: enable **Voice assistant**, tap **Enroll my voice** and talk ~6–8 s
-(→ "enrolled ✓"), then say **"computer, <question>"**. (`../hushai-worker` must have
+(→ "enrolled ✓"), then say **"computer, <question>"**. (The worker must have
 transcribed some audio into `transcript_sentences` for RAG to have anything to answer.)
 
 > ⚠️ Long-running `cargo run` dev servers get **reaped when idle** — if the assistant
@@ -259,10 +352,20 @@ transcribed some audio into `transcript_sentences` for RAG to have anything to a
 
 ### Connecting / verifying on device
 
-USB only for the S8 (Android 9 → no `adb pair`). `adb reverse` + `http://localhost:…`
-is the most robust networking. Watch the pipeline via `adb logcat -s HUSHAI_TX`
-(capture `status=200`; assistant `voice assistant ready`, `enroll: …`, `speaker
-cosine=…`). Full adb verification playbook + gotchas: memory `hushai-android-adb-verification`.
+**Default: USB, no shared network.** Plug the S8 in over USB (Android 9 → plain USB
+debugging; `adb pair` is 11+). The whole loop then runs on the cable — control (adb),
+uploads (:8080), and the voice assistant's RAG/TTS (:8090) — via `adb reverse` +
+`http://localhost:…` (debug builds permit cleartext, so the phone needs no WiFi).
+`run_hushai_app.sh` does this for you (auto reverse tunnels, localhost defaults, and a
+`--rag-url` flag that forces the RAG host even if a wireless session left a LAN IP in
+DataStore). Watch the pipeline via `adb logcat -s HUSHAI_TX` (capture `status=200`;
+assistant `voice assistant ready`, `enroll: …`, `speaker cosine=…`). Full adb
+verification playbook + gotchas: memory `hushai-android-adb-verification`.
+
+**Fallback — wireless adb (requires the same LAN).** If USB isn't available: over an
+initial USB link run `adb tcpip 5555`, then `adb connect <phone-ip>:5555`, and launch
+with `--url http://<mac-lan-ip>:8080 --rag-url http://<mac-lan-ip>:8090`. `adb usb`
+returns adbd to USB-only listening afterward.
 
 ---
 

@@ -97,14 +97,28 @@ async fn ingest_end_to_end() {
 
     // Happy path -> 200.
     assert_eq!(
-        post(&client, &url, "test-token", manifest_bytes(seg, sess, dev, stream, 0, &body), body.clone()).await,
+        post(
+            &client,
+            &url,
+            "test-token",
+            manifest_bytes(seg, sess, dev, stream, 0, &body),
+            body.clone()
+        )
+        .await,
         200,
         "happy path should be 200"
     );
 
     // Idempotent retry (same segment_id, same bytes) -> 200.
     assert_eq!(
-        post(&client, &url, "test-token", manifest_bytes(seg, sess, dev, stream, 0, &body), body.clone()).await,
+        post(
+            &client,
+            &url,
+            "test-token",
+            manifest_bytes(seg, sess, dev, stream, 0, &body),
+            body.clone()
+        )
+        .await,
         200,
         "idempotent retry should be 200"
     );
@@ -112,7 +126,14 @@ async fn ingest_end_to_end() {
     // Same segment_id, DIFFERENT bytes -> 422.
     let other = b"completely-different-bytes".to_vec();
     assert_eq!(
-        post(&client, &url, "test-token", manifest_bytes(seg, sess, dev, stream, 0, &other), other.clone()).await,
+        post(
+            &client,
+            &url,
+            "test-token",
+            manifest_bytes(seg, sess, dev, stream, 0, &other),
+            other.clone()
+        )
+        .await,
         422,
         "segment_id reused for different bytes should be 422"
     );
@@ -120,7 +141,14 @@ async fn ingest_end_to_end() {
     // Integrity mismatch: manifest describes `body`, but we send corrupted bytes -> 422.
     let seg2 = *Uuid::now_v7().as_bytes();
     assert_eq!(
-        post(&client, &url, "test-token", manifest_bytes(seg2, sess, dev, stream, 1, &body), b"corrupted".to_vec()).await,
+        post(
+            &client,
+            &url,
+            "test-token",
+            manifest_bytes(seg2, sess, dev, stream, 1, &body),
+            b"corrupted".to_vec()
+        )
+        .await,
         422,
         "body not matching content_sha256 should be 422"
     );
@@ -128,7 +156,14 @@ async fn ingest_end_to_end() {
     // Bad token -> 401.
     let seg3 = *Uuid::now_v7().as_bytes();
     assert_eq!(
-        post(&client, &url, "wrong-token", manifest_bytes(seg3, sess, dev, stream, 2, &body), body.clone()).await,
+        post(
+            &client,
+            &url,
+            "wrong-token",
+            manifest_bytes(seg3, sess, dev, stream, 2, &body),
+            body.clone()
+        )
+        .await,
         401,
         "bad token should be 401"
     );
@@ -154,7 +189,14 @@ async fn ingest_end_to_end() {
     let seg5 = *Uuid::now_v7().as_bytes();
     let collide = b"a-new-segment-for-an-existing-sequence-slot".to_vec();
     assert_eq!(
-        post(&client, &url, "test-token", manifest_bytes(seg5, sess, dev, stream, 0, &collide), collide.clone()).await,
+        post(
+            &client,
+            &url,
+            "test-token",
+            manifest_bytes(seg5, sess, dev, stream, 0, &collide),
+            collide.clone()
+        )
+        .await,
         409,
         "reusing (session, stream, sequence) with a new segment_id should be 409"
     );

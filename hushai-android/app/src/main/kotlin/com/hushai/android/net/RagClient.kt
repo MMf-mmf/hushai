@@ -23,10 +23,16 @@ class RagClient(
         data class Error(val reason: String) : Result
     }
 
-    fun ask(question: String, deviceId: String): Result {
+    /**
+     * @param agentId optional agent to route to (e.g. "reflection" for introspective
+     *   "how have I been" questions). When null/blank the server uses its default grounded
+     *   agent — and an older server that doesn't know the field simply ignores it.
+     */
+    fun ask(question: String, deviceId: String, agentId: String? = null): Result {
         val payload = JSONObject().apply {
             put("query", question)
             put("filters", JSONObject().put("device_id", deviceId))
+            if (!agentId.isNullOrBlank()) put("agent_id", agentId)
         }.toString()
         val builder = Request.Builder()
             .url(endpoint)

@@ -97,6 +97,9 @@ cargo run
 curl -w '%{http_code}\n' localhost:8080/healthz   # 200
 ```
 
+> To bring up the **whole stack** (backend + worker + rag + viewer + infra) with one
+> command, run `../local_dev/run_stack.sh` (see AGENTS.md "Run the full stack locally").
+
 ## Feed the real video
 
 `../local_dev/feed_segments.py` splits `IMG_7256.mp4` into conforming MUXED ~2 s fMP4

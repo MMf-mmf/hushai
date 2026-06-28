@@ -24,9 +24,16 @@ pub enum IngestError {
     #[error("failed to decode SegmentManifest: {0}")]
     ManifestDecode(#[from] prost::DecodeError),
 
+    #[error("bad request: {0}")]
+    BadRequest(String),
+
     // ---- 401 Unauthorized ----
     #[error("missing or invalid bearer token")]
     Unauthorized,
+
+    // ---- 404 Not Found ----
+    #[error("not found: {0}")]
+    NotFound(&'static str),
 
     // ---- 413 Payload Too Large ----
     #[error("request body exceeds the configured limit")]
@@ -66,8 +73,10 @@ impl IngestError {
             | InvalidIdLength { .. }
             | ValueOutOfRange(_)
             | EmptyField(_)
-            | ManifestDecode(_) => StatusCode::BAD_REQUEST,
+            | ManifestDecode(_)
+            | BadRequest(_) => StatusCode::BAD_REQUEST,
             Unauthorized => StatusCode::UNAUTHORIZED,
+            NotFound(_) => StatusCode::NOT_FOUND,
             PayloadTooLarge => StatusCode::PAYLOAD_TOO_LARGE,
             IntegrityMismatch(_) | IdempotencyConflict => StatusCode::UNPROCESSABLE_ENTITY,
             // A new segment_id reusing a taken (session, stream, sequence) is a
@@ -124,20 +133,47 @@ mod tests {
     fn status_mapping_covers_contract_codes() {
         let cases: &[(IngestError, StatusCode)] = &[
             (IngestError::MissingPart("body"), StatusCode::BAD_REQUEST),
-            (IngestError::MalformedMultipart("x".into()), StatusCode::BAD_REQUEST),
             (
-                IngestError::InvalidIdLength { field: "segment_id", expected: 16, got: 15 },
+                IngestError::MalformedMultipart("x".into()),
                 StatusCode::BAD_REQUEST,
             ),
-            (IngestError::ValueOutOfRange("sequence"), StatusCode::BAD_REQUEST),
-            (IngestError::EmptyField("device_id"), StatusCode::BAD_REQUEST),
+            (
+                IngestError::InvalidIdLength {
+                    field: "segment_id",
+                    expected: 16,
+                    got: 15,
+                },
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                IngestError::ValueOutOfRange("sequence"),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                IngestError::EmptyField("device_id"),
+                StatusCode::BAD_REQUEST,
+            ),
             (IngestError::Unauthorized, StatusCode::UNAUTHORIZED),
+            (IngestError::NotFound("speaker"), StatusCode::NOT_FOUND),
+            (
+                IngestError::BadRequest("bad".into()),
+                StatusCode::BAD_REQUEST,
+            ),
             (IngestError::PayloadTooLarge, StatusCode::PAYLOAD_TOO_LARGE),
-            (IngestError::IntegrityMismatch("content_sha256"), StatusCode::UNPROCESSABLE_ENTITY),
-            (IngestError::IdempotencyConflict, StatusCode::UNPROCESSABLE_ENTITY),
+            (
+                IngestError::IntegrityMismatch("content_sha256"),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
+            (
+                IngestError::IdempotencyConflict,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
             (IngestError::SequenceConflict, StatusCode::CONFLICT),
             (IngestError::Overloaded, StatusCode::TOO_MANY_REQUESTS),
-            (IngestError::StoragePressure, StatusCode::INSUFFICIENT_STORAGE),
+            (
+                IngestError::StoragePressure,
+                StatusCode::INSUFFICIENT_STORAGE,
+            ),
             (IngestError::PoolExhausted, StatusCode::INSUFFICIENT_STORAGE),
         ];
         for (err, want) in cases {

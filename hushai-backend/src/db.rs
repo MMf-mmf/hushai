@@ -145,22 +145,49 @@ pub async fn persist_segment(
         // worker's periodic full-table backfill scan, and wake idle workers via
         // LISTEN/NOTIFY. Both ride this transaction, so they only take effect if the
         // segment commit succeeds (and roll back with it otherwise).
-        sqlx::query!(
-            r#"
-            INSERT INTO segment_transcription_status (segment_id)
-            VALUES ($1)
-            ON CONFLICT (segment_id) DO NOTHING
-            "#,
-            m.segment_id,
-        )
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query!(
-            r#"SELECT pg_notify('hushai_segment_ingested', $1)"#,
-            m.segment_id.to_string(),
-        )
-        .execute(&mut *tx)
-        .await?;
+        //
+        // Only AUDIO (1) / MUXED (3) carry audio the worker can transcribe + voiceprint;
+        // VIDEO-only (2) segments have nothing for it to do (and would just fail ffmpeg
+        // audio extraction), so they are never queued or notified.
+        if matches!(m.media_type, 1 | 3) {
+            sqlx::query!(
+                r#"
+                INSERT INTO segment_transcription_status (segment_id)
+                VALUES ($1)
+                ON CONFLICT (segment_id) DO NOTHING
+                "#,
+                m.segment_id,
+            )
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query!(
+                r#"SELECT pg_notify('hushai_segment_ingested', $1)"#,
+                m.segment_id.to_string(),
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // VIDEO (2) / MUXED (3) carry frames the vision worker processes (face identity +
+        // objects), on a SEPARATE queue (migration 0009). A MUXED segment is queued for BOTH.
+        // Runtime query (not the `query!` macro) so adding the vision table needs no
+        // `cargo sqlx prepare` — same deliberate choice as `speakers.rs`.
+        if matches!(m.media_type, 2 | 3) {
+            sqlx::query(
+                r#"
+                INSERT INTO segment_vision_status (segment_id)
+                VALUES ($1)
+                ON CONFLICT (segment_id) DO NOTHING
+                "#,
+            )
+            .bind(m.segment_id)
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query("SELECT pg_notify('hushai_segment_ingested', $1)")
+                .bind(m.segment_id.to_string())
+                .execute(&mut *tx)
+                .await?;
+        }
 
         tx.commit().await?;
         return Ok(Persisted::Inserted);

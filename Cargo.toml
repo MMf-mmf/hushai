@@ -7,6 +7,9 @@
 # The worker and RAG service depend on hushai-backend as a library (path dep) to reuse the
 # Config + DB pool rather than duplicating the schema. Added by the
 # transcription-embedding-and-rag ticket.
+#
+# - hushai-viewer: read-only browser NVR — stitches stored segments into a scrubbable
+#   HLS timeline. Also reuses hushai-backend as a library (Config + pool + storage helpers).
 [workspace]
 resolver = "2"
-members = ["hushai-backend", "hushai-worker", "hushai-rag"]
+members = ["hushai-backend", "hushai-worker", "hushai-rag", "hushai-viewer"]

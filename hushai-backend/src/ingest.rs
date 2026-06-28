@@ -40,13 +40,17 @@ pub async fn post_segment(
         match field.name() {
             Some("manifest") => {
                 if manifest_bytes.is_some() {
-                    return Err(IngestError::MalformedMultipart("duplicate manifest part".into()));
+                    return Err(IngestError::MalformedMultipart(
+                        "duplicate manifest part".into(),
+                    ));
                 }
                 // Bounded read so the manifest can't balloon to the full body limit.
                 let mut buf = Vec::new();
                 while let Some(chunk) = field.chunk().await? {
                     if buf.len() + chunk.len() > MANIFEST_MAX_BYTES {
-                        return Err(IngestError::MalformedMultipart("manifest part too large".into()));
+                        return Err(IngestError::MalformedMultipart(
+                            "manifest part too large".into(),
+                        ));
                     }
                     buf.extend_from_slice(&chunk);
                 }
@@ -54,7 +58,9 @@ pub async fn post_segment(
             }
             Some("body") => {
                 if hashed.is_some() {
-                    return Err(IngestError::MalformedMultipart("duplicate body part".into()));
+                    return Err(IngestError::MalformedMultipart(
+                        "duplicate body part".into(),
+                    ));
                 }
                 // Stream to disk + hash regardless of manifest arrival order.
                 hashed = Some(storage::stream_to_temp_and_hash(field, &state.blob_root).await?);
@@ -91,7 +97,8 @@ pub async fn post_segment(
     async move {
         // Durable blob first, then the committed row (durability ordering §6).
         let blob_uri = storage::promote(&state.blob_root, &mut hashed).await?;
-        let outcome = db::persist_segment(&state.pool, &manifest, &blob_uri, STORAGE_BACKEND).await?;
+        let outcome =
+            db::persist_segment(&state.pool, &manifest, &blob_uri, STORAGE_BACKEND).await?;
 
         match outcome {
             Persisted::Inserted => {

@@ -27,4 +27,8 @@ data class Segment(
     val monotonicStartNanos: Long,    // raw elapsedRealtimeNanos, uncorrected
     val durationNanos: Long,
     val gapBefore: Boolean,           // true iff captured data was dropped just before this (§5.8)
+    // Per-segment session override. null = "use the live capture session" (the
+    // identity the drain loop carries). Imported files set a FRESH session here so
+    // their sequence space is independent of live capture (Workstream 3).
+    val sessionId: ByteString? = null,
 )

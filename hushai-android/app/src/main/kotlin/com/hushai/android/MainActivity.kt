@@ -12,16 +12,30 @@ import android.os.Bundle
 import android.os.IBinder
 import android.view.Surface
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface as ComposeSurface
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
 import com.hushai.android.capture.CaptureService
 import com.hushai.android.config.Settings
+import com.hushai.android.net.Http
+import com.hushai.android.net.Reachability
+import com.hushai.android.net.PersonsClient
+import com.hushai.android.net.SpeakersClient
 import com.hushai.android.ui.CaptureScreen
+import com.hushai.android.ui.PeopleScreen
+import com.hushai.android.ui.VoicesScreen
+import com.hushai.android.ui.theme.HushaiTheme
+import com.hushai.android.util.StatusBus
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 
 /**
  * Thin controller: gathers runtime permissions, hosts the Compose settings UI,
@@ -38,7 +52,9 @@ class MainActivity : ComponentActivity() {
     private val adminComponent by lazy { ComponentName(this, HushaiDeviceAdminReceiver::class.java) }
 
     // Start requested before permissions resolved; replayed once granted.
-    private var pendingStart: Pair<String, String>? = null
+    private var pendingStart: PendingStart? = null
+
+    private data class PendingStart(val url: String, val token: String, val audioOnly: Boolean)
 
     // Live preview wiring: the SurfaceView's surface and the bound service binder
     // arrive independently; whenever both exist we push the surface to the camera.
@@ -58,9 +74,9 @@ class MainActivity : ComponentActivity() {
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
-            pendingStart?.let { (url, token) ->
+            pendingStart?.let { p ->
                 pendingStart = null
-                if (hasCapturePermissions()) launchService(url, token)
+                if (hasCapturePermissions(p.audioOnly)) launchService(p.url, p.token, p.audioOnly)
             }
         }
 
@@ -69,6 +85,13 @@ class MainActivity : ComponentActivity() {
     private val deviceAdminLauncher =
         registerForActivityResult(ActivityResultContracts.StartActivityForResult()) {
             if (dpm.isAdminActive(adminComponent)) dpm.lockNow()
+        }
+
+    // SAF multi-file picker for manual import: returns content:// URIs we can take a
+    // persistable read grant on (so a queued import survives process death).
+    private val importPicker =
+        registerForActivityResult(ActivityResultContracts.OpenMultipleDocuments()) { uris ->
+            onFilesPicked(uris)
         }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -80,10 +103,43 @@ class MainActivity : ComponentActivity() {
         val initialWakeWord = settings.wakeWordBlocking()
         val initialRagUrl = settings.ragUrlBlocking()
         val initialAssistantEnabled = settings.assistantEnabledBlocking()
+        val initialAudioOnly = settings.audioOnlyBlocking()
+        val initialDiskCapGb = settings.diskCapBytesBlocking() / (1024f * 1024f * 1024f)
 
         setContent {
-            MaterialTheme {
+            HushaiTheme {
+                // Two screens, no nav framework: a simple toggle + system-back handling.
+                var screen by remember { mutableStateOf(Screen.Capture) }
                 ComposeSurface(modifier = Modifier.fillMaxSize()) {
+                    when (screen) {
+                    Screen.Voices -> {
+                        BackHandler { screen = Screen.Capture }
+                        // This branch is freshly composed each time Voices opens, so read the
+                        // current backend target once on entry; key the client on it so a
+                        // changed URL/token rebuilds it rather than reusing a stale one.
+                        val voicesUrl = remember { settings.urlBlocking() }
+                        val voicesToken = remember { settings.tokenBlocking() }
+                        VoicesScreen(
+                            client = remember(voicesUrl, voicesToken) {
+                                SpeakersClient(Http.upload, voicesUrl, voicesToken)
+                            },
+                            onBack = { screen = Screen.Capture },
+                        )
+                    }
+                    Screen.People -> {
+                        BackHandler { screen = Screen.Capture }
+                        // Freshly composed on entry; read the current backend target once and key
+                        // the client on it so a changed URL/token rebuilds it (same as Voices).
+                        val peopleUrl = remember { settings.urlBlocking() }
+                        val peopleToken = remember { settings.tokenBlocking() }
+                        PeopleScreen(
+                            client = remember(peopleUrl, peopleToken) {
+                                PersonsClient(Http.upload, peopleUrl, peopleToken)
+                            },
+                            onBack = { screen = Screen.Capture },
+                        )
+                    }
+                    Screen.Capture ->
                     CaptureScreen(
                         initialUrl = initialUrl,
                         initialToken = initialToken,
@@ -91,8 +147,30 @@ class MainActivity : ComponentActivity() {
                         initialWakeWord = initialWakeWord,
                         initialRagUrl = initialRagUrl,
                         initialAssistantEnabled = initialAssistantEnabled,
-                        onStart = { url, token -> requestStart(url, token) },
+                        initialAudioOnly = initialAudioOnly,
+                        initialDiskCapGb = initialDiskCapGb,
+                        onOpenVoices = { screen = Screen.Voices },
+                        onOpenPeople = { screen = Screen.People },
+                        onStart = { url, token, audioOnly -> requestStart(url, token, audioOnly) },
+                        onAudioOnlyChange = { ao -> Thread { settings.setAudioOnlyBlocking(ao) }.start() },
+                        onDiskCapChange = { gb ->
+                            val bytes = (gb.coerceAtLeast(0.5f).toDouble() * 1024 * 1024 * 1024).toLong()
+                            Thread { settings.setDiskCapBytesBlocking(bytes) }.start()
+                        },
+                        onPickImport = { runCatching { importPicker.launch(arrayOf("audio/*", "video/*")) } },
+                        onCancelImport = { captureBinder?.cancelImport() },
                         onStop = { stopService() },
+                        // Pre-start health probe (GET /healthz + /readyz) off the main
+                        // thread; seeds StatusBus so the Debug "Backend" line reflects it.
+                        onCheckConnection = { url ->
+                            val health = withContext(Dispatchers.IO) {
+                                Reachability(Http.probe, url.trim()).check()
+                            }
+                            StatusBus.update {
+                                it.copy(reachable = health.reachable, live = health.live, ready = health.ready)
+                            }
+                            health
+                        },
                         onBatterySaver = { enterBatterySaver() },
                         onAssistantEnabledChange = { enabled ->
                             Thread { settings.setAssistantEnabledBlocking(enabled) }.start()
@@ -117,6 +195,7 @@ class MainActivity : ComponentActivity() {
                             }
                         },
                     )
+                    }
                 }
             }
         }
@@ -162,28 +241,51 @@ class MainActivity : ComponentActivity() {
         }
         val url = intent.getStringExtra(CaptureService.EXTRA_URL)
         val token = intent.getStringExtra(CaptureService.EXTRA_TOKEN)
+        val ragUrl = intent.getStringExtra(CaptureService.EXTRA_RAG_URL)
         url?.let { settings.setUrlBlocking(it) }
         token?.let { settings.setTokenBlocking(it) }
-        if (intent.getBooleanExtra(EXTRA_AUTOSTART, false)) {
-            requestStart(url ?: settings.urlBlocking(), token ?: settings.tokenBlocking())
-        }
-    }
-
-    private fun requestStart(url: String, token: String) {
-        if (hasCapturePermissions()) {
-            launchService(url, token)
+        // Voice-assistant RAG/TTS host. Lets the headless harness force localhost
+        // (USB `adb reverse` tunnel) and override any stale LAN-IP value a prior
+        // wireless session persisted to DataStore (which survives `install -r`).
+        ragUrl?.let { settings.setRagUrlBlocking(it) }
+        // Audio-only is sticky: persist an explicit extra so it survives restarts
+        // and the UI reflects it; otherwise fall back to the persisted setting.
+        val audioOnly = if (intent.hasExtra(CaptureService.EXTRA_AUDIO_ONLY)) {
+            intent.getBooleanExtra(CaptureService.EXTRA_AUDIO_ONLY, false)
+                .also { settings.setAudioOnlyBlocking(it) }
         } else {
-            pendingStart = url to token
-            permissionLauncher.launch(requiredPermissions())
+            settings.audioOnlyBlocking()
+        }
+        if (intent.getBooleanExtra(EXTRA_AUTOSTART, false)) {
+            requestStart(url ?: settings.urlBlocking(), token ?: settings.tokenBlocking(), audioOnly)
         }
     }
 
-    private fun launchService(url: String, token: String) {
-        ContextCompat.startForegroundService(this, CaptureService.startIntent(this, url, token))
+    private fun requestStart(url: String, token: String, audioOnly: Boolean) {
+        if (hasCapturePermissions(audioOnly)) {
+            launchService(url, token, audioOnly)
+        } else {
+            pendingStart = PendingStart(url, token, audioOnly)
+            permissionLauncher.launch(requiredPermissions(audioOnly))
+        }
+    }
+
+    private fun launchService(url: String, token: String, audioOnly: Boolean) {
+        ContextCompat.startForegroundService(this, CaptureService.startIntent(this, url, token, audioOnly))
     }
 
     private fun stopService() {
         ContextCompat.startForegroundService(this, CaptureService.stopIntent(this))
+    }
+
+    /** Take a persistable read grant on each picked file, then hand them to the
+     *  service to convert into segments and upload (works while capturing or not). */
+    private fun onFilesPicked(uris: List<android.net.Uri>) {
+        if (uris.isEmpty()) return
+        for (u in uris) runCatching {
+            contentResolver.takePersistableUriPermission(u, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+        }
+        ContextCompat.startForegroundService(this, CaptureService.importIntent(this, uris))
     }
 
     /**
@@ -207,22 +309,30 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun requiredPermissions(): Array<String> = buildList {
-        add(Manifest.permission.CAMERA)
+    // Audio-only needs no CAMERA permission (the camera is never opened), so we
+    // neither request nor gate on it — a user who only wants audio isn't forced
+    // to grant camera access.
+    private fun requiredPermissions(audioOnly: Boolean): Array<String> = buildList {
+        if (!audioOnly) add(Manifest.permission.CAMERA)
         add(Manifest.permission.RECORD_AUDIO)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             add(Manifest.permission.POST_NOTIFICATIONS)
         }
     }.toTypedArray()
 
-    private fun hasCapturePermissions(): Boolean =
-        ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
-            PackageManager.PERMISSION_GRANTED &&
-            ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
+    private fun hasCapturePermissions(audioOnly: Boolean): Boolean {
+        val audioGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
+        val cameraGranted = audioOnly || ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) ==
+            PackageManager.PERMISSION_GRANTED
+        return audioGranted && cameraGranted
+    }
 
     companion object {
         const val EXTRA_AUTOSTART = "autostart"
         const val EXTRA_STOP = "stop"
     }
 }
+
+/** The two top-level screens (no nav framework — a simple state toggle in [MainActivity]). */
+private enum class Screen { Capture, Voices, People }

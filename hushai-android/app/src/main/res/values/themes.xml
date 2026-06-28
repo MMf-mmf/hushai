@@ -1,4 +1,11 @@
 <resources>
-    <!-- Thin platform theme; the UI is Compose Material3 set in MainActivity. -->
-    <style name="Theme.Hushai" parent="android:Theme.Material.Light.NoActionBar" />
+    <!-- Thin platform theme; the UI is Compose Material3 (HushaiTheme) set in
+         MainActivity. White window/status-bar chrome matches the Uber-style light
+         theme so there's no dark flash before Compose draws, and status-bar icons
+         render dark for legibility on the white bar. -->
+    <style name="Theme.Hushai" parent="android:Theme.Material.Light.NoActionBar">
+        <item name="android:windowBackground">@android:color/white</item>
+        <item name="android:statusBarColor">@android:color/white</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
 </resources>

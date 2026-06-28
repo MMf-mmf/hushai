@@ -16,19 +16,42 @@ axum = { version = "0.8", features = ["macros"] }
 tower-http = { version = "0.6", features = ["trace"] }
 
 # Database. Runtime (unchecked) queries — dynamic filters + pgvector operator.
+# `json` for binding/reading chat_messages.sources as jsonb (Vec<Source> citations).
 sqlx = { version = "0.9", features = [
     "runtime-tokio",
     "tls-rustls",
     "postgres",
     "uuid",
     "chrono",
+    "json",
 ] }
 
 # Native binary vector encoding: bind the query embedding as pgvector::Vector (binary
 # protocol) instead of a `[..]::vector` text literal. See src/retrieve.rs.
 pgvector = { version = "0.4.2", features = ["sqlx"] }
 
+# Open-vocabulary object retrieval (Phase B): the CLIP TEXT tower that embeds a query phrase
+# ("a car") into the SAME 512-d space the worker's CLIP IMAGE tower wrote into scene_objects.
+# CRITICAL (mirrors hushai-worker): this crate ALSO links sherpa-onnx (bundled onnxruntime 1.17.1),
+# so `ort` MUST use `load-dynamic` (no link-time onnxruntime) and dlopen() the SAME 1.20 dylib via
+# ORT_DYLIB_PATH — two ORT copies can't be statically linked. See src/clip_text.rs.
+ort = { version = "=2.0.0-rc.9", default-features = false, features = ["load-dynamic", "ndarray"] }
+ndarray = "0.16"
+# CLIP BPE tokenizer (loads the HF clip tokenizer.json). `onig` gives the regex engine the CLIP
+# pre-tokenizer needs; default features (progressbar/esaxx training) are off — inference only.
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+
+# Local neural TTS (Kokoro via onnxruntime) for the assistant's spoken answers.
+# The build script downloads a prebuilt sherpa-onnx/onnxruntime for the host
+# (macOS arm64) and links it statically — no system library or cmake needed.
+sherpa-onnx = "1.13"
+# Encode the synthesized PCM as a 16-bit WAV returned to the Android client.
+hound = "3.5"
+
 tokio = { version = "1", features = ["full"] }
+# SSE chat: build the event stream and consume Rig's token stream.
+async-stream = "0.3"
+futures-util = "0.3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 serde = { version = "1", features = ["derive"] }
@@ -44,3 +67,6 @@ reqwest = { version = "0.12", features = ["json"] }
 tokio = { version = "1", features = ["full"] }
 # Integration test (tests/retrieve.rs) binds fixtures as native pgvector::Vector.
 pgvector = { version = "0.4.2", features = ["sqlx"] }
+# Cross-modal CLIP test (tests/clip_text.rs): loads a car image + the CLIP image tower to prove the
+# text and image towers share one 512-d space (the decisive Phase B correctness gate).
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }

@@ -10,11 +10,19 @@
 use crate::asr::Utterance;
 
 /// A sentence ready to embed + persist.
+///
+/// `speaker_id`, `sentiment`, and `emotion` are segment-level signals stamped by
+/// `process_segment` AFTER chunking (chunking itself is pure text/timestamp work, so it
+/// leaves them `None`). `emotion` is always `None` in v1 (acoustic prosody is out of
+/// scope — the column stays a NULL-ready slot).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Sentence {
     pub text: String,
     pub start_unix_nanos: i64,
     pub end_unix_nanos: i64,
+    pub speaker_id: Option<String>,
+    pub sentiment: Option<String>,
+    pub emotion: Option<String>,
 }
 
 const NANOS_PER_MS: i64 = 1_000_000;
@@ -79,6 +87,9 @@ pub fn chunk_into_sentences(
                 text: piece.clone(),
                 start_unix_nanos: capture_start_unix_nanos + start_ms * NANOS_PER_MS,
                 end_unix_nanos: capture_start_unix_nanos + end_ms * NANOS_PER_MS,
+                speaker_id: None,
+                sentiment: None,
+                emotion: None,
             });
         }
     }

@@ -39,7 +39,12 @@ fn no_server_logic_branches_on_source_kind() {
                 continue;
             }
             if FORBIDDEN.iter().any(|tok| line.contains(tok)) {
-                violations.push(format!("{}:{}: {}", file.display(), lineno + 1, line.trim()));
+                violations.push(format!(
+                    "{}:{}: {}",
+                    file.display(),
+                    lineno + 1,
+                    line.trim()
+                ));
             }
         }
     }

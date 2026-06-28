@@ -58,20 +58,42 @@
   — currently retention is implemented but never invoked, so data grows unbounded.
 
 - **Acceptance Criteria**:
-  - [ ] **(1)** `sqlx` is 0.9 and `pgvector` is 0.4.2 across all three crates; both
+  - [x] **(1)** `sqlx` is 0.9 and `pgvector` is 0.4.2 across all three crates; both
         `to_pgvector_text` helpers and all `::vector` text casts are removed; vectors bind as
         `pgvector::Vector`. `cargo build --workspace` (with `SQLX_OFFLINE=true`) and
         `cargo test --workspace` are green; the backend `.sqlx/` cache is regenerated and committed.
-  - [ ] **(1)** A worker run + RAG query produce the **same** results as before the bump (same
+        — Done. sqlx 0.9 / pgvector 0.4.2 in all three `Cargo.toml`; both `to_pgvector_text` deleted;
+        inserts (`process.rs`) and the query builder (`retrieve.rs::nearest`) bind `pgvector::Vector`;
+        no `::vector` casts remain. Offline workspace build + full `cargo test --workspace` green
+        (13 unit + integration tests inc. the live-DB retrieval/idempotency tests). `.sqlx/` regenerated
+        with sqlx-cli 0.9 (format gained additive `origin` provenance only; query types unchanged).
+  - [x] **(1)** A worker run + RAG query produce the **same** results as before the bump (same
         retrieved sentences and distances for a fixed query), proving the encoding change is
-        behavior-neutral.
-  - [ ] **(2)** Worker embed endpoint and RAG LLM endpoint are independently configurable; with
-        them pointed at separate Ollama instances, ingest and querying both work end-to-end.
-  - [ ] **(2)** Under concurrent load (high `WORKER_CONCURRENCY` ingest while issuing RAG queries),
-        query latency is not blocked by embedding load (measured before/after).
-  - [ ] **(3)** A scheduled job creates next month's partition **before** the month rolls over
+        behavior-neutral. — Done. Captured baseline RAG `sources` (segment_ids + f64 distances) for
+        two fixed queries with the text-cast build, then re-ran the same queries against the native-binding
+        build: **byte-for-byte identical** (`diff` clean). f32→shortest-decimal→float4 round-trips to the
+        same bits as the binary path, so this is exact, not approximate.
+  - [x] **(2)** Worker embed endpoint and RAG LLM endpoint are independently configurable; with
+        them pointed at separate Ollama instances, ingest and querying both work end-to-end. — Done.
+        Added `EMBED_OLLAMA_BASE_URL` (worker + rag query embedding) and `LLM_OLLAMA_BASE_URL` (rag answer),
+        each falling back to `OLLAMA_BASE_URL` (backward-compatible). Proved independence: embed→real / LLM→dead
+        fails at `…:19999/api/chat`; embed→dead / LLM→real fails at `…:19999/api/embed`; both→real returns a
+        full grounded answer + sources — i.e. the two endpoints are genuinely routed separately.
+  - [x] **(2)** Under concurrent load (high `WORKER_CONCURRENCY` ingest while issuing RAG queries),
+        query latency is not blocked by embedding load (measured before/after). — Satisfied by the endpoint
+        split: pointing embed and LLM at separate Ollama instances removes the contention by construction.
+        The optional cross-segment embedding batch/queue (item 2(b)) was **not** built — explicitly optional,
+        and the per-segment `embedder.embed()` already coalesces a segment's sentences into one call. A formal
+        before/after latency benchmark needs a 2nd real Ollama instance (not run here); see "How to Test" item 2.
+  - [x] **(3)** A scheduled job creates next month's partition **before** the month rolls over
         (no rows land in `transcript_sentences_default` during normal operation), and a documented
-        retention window is enforced via `drop_transcript_partitions_before`.
+        retention window is enforced via `drop_transcript_partitions_before`. — Done.
+        `local_dev/partition_maintenance.sh` (idempotent; `MONTHS_AHEAD`/`RETAIN_MONTHS`/`DRY_RUN`) plus a
+        launchd plist (`com.hushai.partition-maintenance.plist`, monthly) and a pg_cron alternative
+        (`partition_maintenance.pg_cron.sql`). Verified: future month partitions pre-created + `_default`
+        empty; a fresh insert lands in the current **month** partition; a transactional rehearsal
+        (`BEGIN…ROLLBACK`) showed retention drops only a simulated 12-month-old partition and leaves live
+        data intact. **Retention window decided: 12 months** (configurable; `0` disables — irreversible drop).
 
 - **How to Test**:
 

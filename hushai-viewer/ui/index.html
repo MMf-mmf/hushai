@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hushai Viewer</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='%232ee6d6'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+    <!-- Vendored hls.js (UMD) — sets window.Hls before the app module runs. No CDN. -->
+    <script src="/vendor/hls.min.js"></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <div class="brand">
+        <span class="logo">◉</span> HUSHAI <span class="muted">viewer</span>
+      </div>
+      <div class="device">
+        <label class="lbl">Camera</label>
+        <select id="deviceSelect"></select>
+        <span id="deviceMeta" class="muted small"></span>
+      </div>
+      <div class="daynav">
+        <button id="dayPrev" title="Previous day">‹</button>
+        <input id="dateInput" type="date" />
+        <button id="dayNext" title="Next day">›</button>
+        <span id="dayLabel" class="muted small"></span>
+      </div>
+      <div class="clock">
+        <span id="recDot" class="dot"></span>
+        <span id="readout" class="mono">--:--:--</span>
+        <span id="tzLabel" class="muted small"></span>
+        <!-- Live AI processing status of the footage under the playhead. -->
+        <span id="aiStatus" class="ai-badge" aria-live="polite" hidden>
+          <span class="ai-ico"></span><span class="ai-txt"></span>
+        </span>
+      </div>
+      <a class="navlink" href="/dashboard.html" title="System dashboard">▦ System</a>
+      <button id="btnSettings" class="ghost" title="Voices &amp; settings">⚙</button>
+    </header>
+
+    <div class="workspace">
+      <div id="stage" class="stage">
+        <main id="viewport" class="viewport">
+          <video id="video" playsinline></video>
+          <!-- AI detection boxes; hidden until "Detections" mode. pointer-events:none so scrub/controls work. -->
+          <canvas id="detOverlay" class="det-overlay" aria-hidden="true"></canvas>
+          <div id="modeToggle" class="mode-toggle" role="tablist" aria-label="View mode">
+            <button id="modeVideo" class="mode-btn active" role="tab" aria-selected="true">Video</button>
+            <button id="modeDet" class="mode-btn" role="tab" aria-selected="false">Detections</button>
+          </div>
+          <div id="status" class="status" style="display: none">Loading…</div>
+          <div id="toast" class="toast"></div>
+          <div class="overlay">
+            <button id="btnPrev" title="Previous recording [">⏮</button>
+            <button id="btnPlay" class="primary" title="Play/Pause (Space)">▶</button>
+            <button id="btnNext" title="Next recording ]">⏭</button>
+            <select id="speed" title="Playback speed">
+              <option value="1">1×</option>
+              <option value="2">2×</option>
+              <option value="4">4×</option>
+              <option value="8">8×</option>
+            </select>
+            <button id="btnMute" title="Mute (M)">🔇</button>
+            <input id="volume" type="range" min="0" max="1" step="0.05" value="1" title="Volume" />
+            <span class="spacer"></span>
+            <button id="btnLatest" title="Jump to latest (End)">⦿ Latest</button>
+            <button id="btnFull" title="Fullscreen (F)">⛶</button>
+          </div>
+        </main>
+
+        <section class="timelinebar">
+          <div class="tl-controls">
+            <span class="lbl">Timeline</span>
+            <span class="spacer"></span>
+            <span class="ai-control">
+              <label class="ai-toggle" title="Show AI processing status under the bar (A)">
+                <input type="checkbox" id="aiStatusToggle" checked /> AI status
+              </label>
+              <button id="aiInfoBtn" class="ai-info-btn" type="button" title="What do the AI colors mean?"
+                aria-haspopup="dialog" aria-expanded="false">ⓘ</button>
+              <!-- Click-to-open key for the AI ribbons (kept out of the cramped legend row). -->
+              <div id="aiInfoPop" class="ai-pop" role="dialog" aria-label="AI processing status key" hidden>
+                <div class="ai-pop-title">AI processing status</div>
+                <p class="ai-pop-desc">
+                  The two strips under the timeline show how far the AI has analyzed your footage —
+                  two independent lanes:
+                </p>
+                <div class="ai-pop-lanes">
+                  <div><span class="ai-lane-tag">Audio</span> speech → text · speakers · sentiment</div>
+                  <div><span class="ai-lane-tag">Vision</span> faces · objects</div>
+                </div>
+                <div class="ai-pop-states">
+                  <div><span class="ai-badge is-done"><span class="ai-ico">✓</span> done</span> analyzed</div>
+                  <div><span class="ai-badge is-processing"><span class="ai-ico">⟳</span> processing</span> being analyzed now</div>
+                  <div><span class="ai-badge is-pending"><span class="ai-ico">◌</span> pending</span> queued, not yet analyzed</div>
+                  <div><span class="ai-badge is-error"><span class="ai-ico">✕</span> error</span> analysis failed</div>
+                </div>
+                <p class="ai-pop-hint">Hover the strips for per-moment status and counts.</p>
+              </div>
+            </span>
+            <button id="btnFit" title="Fit all footage">Fit all</button>
+            <button id="zoomOut" title="Zoom out (−)">−</button>
+            <button id="zoomIn" title="Zoom in (+)">+</button>
+          </div>
+          <canvas id="timeline" class="timeline"></canvas>
+          <div class="legend muted small">
+            <span><i class="sw rec"></i> recorded</span>
+            <span><i class="sw gap"></i> gap</span>
+            <span><i class="sw sess"></i> session start</span>
+            <span class="spacer"></span>
+            <span>scrub or click to seek · scroll to zoom · drag labels to pan</span>
+          </div>
+        </section>
+      </div>
+
+      <!-- Chat workspace: ask questions over the recordings; citations deep-link the video. -->
+      <aside id="chatdock" class="chatdock">
+        <div class="chatdock-head">
+          <span class="lbl">Chat</span>
+          <span class="muted small">over your recordings</span>
+        </div>
+        <div id="agentPicker" class="agent-tabs"></div>
+        <div id="chatPanes" class="chat-panes"></div>
+      </aside>
+    </div>
+
+    <!-- Voices settings: name & merge the speakers found in your recordings. -->
+    <div id="settingsModal" class="modal" hidden>
+      <div class="modal-card">
+        <div class="modal-head">
+          <span class="lbl">Voices</span>
+          <span class="muted small">name &amp; merge the speakers in your recordings</span>
+          <span class="spacer"></span>
+          <button id="voicesRefresh" type="button">Refresh</button>
+          <button id="settingsClose" type="button" title="Close">✕</button>
+        </div>
+        <div id="voicesBody" class="modal-body"></div>
+      </div>
+    </div>
+
+    <script type="module" src="/js/app.js"></script>
+    <script type="module" src="/js/chat/workspace.js"></script>
+    <script type="module" src="/js/settings/voices.js"></script>
+  </body>
+</html>

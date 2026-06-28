@@ -40,6 +40,13 @@ android {
         compose = true
         buildConfig = true
     }
+    testOptions {
+        unitTests {
+            // android.util.Log (and other framework stubs) return defaults instead of
+            // throwing, so pure-JVM tests can exercise code that logs.
+            isReturnDefaultValues = true
+        }
+    }
 }
 
 // Compile the IDENTICAL hushai.v1.SegmentManifest the backend uses (prost) from the

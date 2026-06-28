@@ -14,6 +14,27 @@ rig = "0.37"
 # Local ASR (whisper.cpp bindings). Builds whisper.cpp via cmake/clang.
 whisper-rs = "0.14"
 
+# Server-side speaker embeddings (192-dim) via sherpa-onnx. We pass raw 16 kHz mono f32
+# PCM; sherpa does the mel-fbank front-end in C++ (no Rust front-end to maintain) and
+# runs the NVIDIA TitaNet-large ONNX at SPEAKER_MODEL_PATH. `download-binaries` fetches
+# a prebuilt sherpa-onnx native lib (onnxruntime baked in) once at build, then runtime
+# is fully offline. `default-features=false` drops the unused `tts` feature.
+sherpa-rs = { version = "0.6.8", default-features = false, features = ["download-binaries"] }
+
+# Vision ONNX models (face detect YuNet, face embed ArcFace, object detect RF-DETR, CLIP image)
+# run via the `ort` (ONNX Runtime) crate. CRITICAL: sherpa-rs (above) statically bundles its OWN
+# onnxruntime 1.17.1; if `ort` also link-time/downloads onnxruntime the binary holds two ORT copies
+# with colliding C symbols. We therefore use `load-dynamic` (no link-time onnxruntime dep — ort
+# dlopen()s libonnxruntime at runtime via ORT_DYLIB_PATH) and `default-features=false` to drop the
+# `download-binaries`/`copy-dylibs` defaults. ort-sys rc.9 targets ONNX Runtime 1.20.0, so point
+# ORT_DYLIB_PATH at a 1.20.x libonnxruntime.dylib (provisioned by local_dev/fetch_onnxruntime.sh,
+# NOT committed) — a SECOND dylib alongside sherpa's 1.17.1, which coexist under macOS two-level
+# namespaces. See AGENTS.md "vision ONNX runtime".
+ort = { version = "=2.0.0-rc.9", default-features = false, features = ["load-dynamic", "ndarray", "coreml"] }
+ndarray = "0.16"
+# Frame decode/crop/resize + similarity-transform alignment for face crops.
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+
 # Database. Runtime (unchecked) queries — no compile-time DB / .sqlx needed.
 sqlx = { version = "0.9", features = [
     "runtime-tokio",

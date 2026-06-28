@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hushai · System</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='%232ee6d6'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="dash-body">
+    <header class="topbar">
+      <div class="brand"><span class="logo">◉</span> HUSHAI <span class="muted">system</span></div>
+      <a class="navlink" href="/" title="Back to the viewer">‹ Viewer</a>
+      <span class="spacer"></span>
+      <div class="clock dash-updated">
+        <span id="liveDot" class="dot"></span>
+        <span id="generatedAt" class="muted small">connecting…</span>
+      </div>
+    </header>
+
+    <main class="dash">
+      <div id="dashBanner" class="dash-banner loading">Loading system status…</div>
+
+      <!-- At-a-glance KPI tiles (populated by dashboard.js). -->
+      <div id="kpis" class="kpi-row"></div>
+
+      <section class="dash-section">
+        <div class="dash-head">
+          <h2>Cameras</h2>
+          <span id="cameraCount" class="count-chip"></span>
+        </div>
+        <div id="cameras" class="card-grid"></div>
+      </section>
+
+      <section class="dash-section">
+        <div class="dash-head">
+          <h2>Services &amp; dependencies</h2>
+          <span id="serviceCount" class="count-chip"></span>
+        </div>
+        <div id="services" class="status-table"></div>
+      </section>
+
+      <section class="dash-section">
+        <div class="dash-head"><h2>Work queues</h2></div>
+        <div id="queues" class="queue-grid"></div>
+      </section>
+    </main>
+
+    <script type="module" src="/js/dashboard/dashboard.js"></script>
+  </body>
+</html>
