@@ -11,6 +11,9 @@
 #   ./local_dev/run_stack.sh --with-android     # ...also build+drive the phone client (best effort)
 #   ./local_dev/run_stack.sh --release          # build/run the release binaries
 #   ./local_dev/run_stack.sh --no-build         # skip cargo build (run existing target/<profile> bins)
+#   ./local_dev/run_stack.sh --tls              # serve all services over HTTPS (auto-gen certs if absent)
+#   ./local_dev/run_stack.sh --add-camera NAME  # onboard a camera: mint+save a per-device token, print
+#                                               #   its config card, then exit (see docs/onboarding-a-camera.md)
 #   ./local_dev/run_stack.sh --pull             # `ollama pull` any missing models, then continue
 #   ./local_dev/run_stack.sh --down             # stop a stack started earlier, then exit
 #   ./local_dev/run_stack.sh --with-android -- --audio-only --duration 60
@@ -47,6 +50,8 @@ DO_BUILD=1
 PROFILE="debug"
 PULL_MODELS=0
 DOWN_ONLY=0
+TLS=0
+ADD_CAMERA=""
 ANDROID_ARGS=()
 
 while [[ $# -gt 0 ]]; do
@@ -55,6 +60,8 @@ while [[ $# -gt 0 ]]; do
     --no-build)     DO_BUILD=0; shift ;;
     --release)      PROFILE="release"; shift ;;
     --pull)         PULL_MODELS=1; shift ;;
+    --tls)          TLS=1; shift ;;
+    --add-camera)   ADD_CAMERA="${2:-}"; shift 2 || shift ;;
     --down)         DOWN_ONLY=1; shift ;;
     --)             shift; ANDROID_ARGS=("$@"); break ;;
     -h|--help)      sed -n '3,30p' "$0"; exit 0 ;;
@@ -103,6 +110,77 @@ if [[ "$DOWN_ONLY" -eq 1 ]]; then
 fi
 
 # ---------------------------------------------------------------------------
+# --add-camera NAME: onboard a new capture client (camera). Mints a per-device
+# bearer token, persists `NAME:token` into hushai-backend/.env's DEVICE_TOKENS,
+# and prints the config card. Full runbook: docs/onboarding-a-camera.md.
+# ---------------------------------------------------------------------------
+detect_lan_ip() {
+  ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -Ev '^127\.|^169\.254\.' | head -1
+}
+
+add_camera() {
+  local label="$1"
+  local backend_env="$REPO_ROOT/hushai-backend/.env"
+  local cert_dir="$SCRIPT_DIR/certs"
+  [[ -n "$label" ]] || die "--add-camera needs a label, e.g. --add-camera garage-cam"
+  [[ "$label" == *[:,]* ]] && die "camera label must not contain ':' or ',' (got '$label')"
+  command -v openssl >/dev/null 2>&1 || die "--add-camera needs openssl to mint a token."
+  [[ -f "$backend_env" ]] || die "missing $backend_env (copy hushai-backend/.env.example to it first)."
+
+  local token; token="$(openssl rand -hex 32)"
+
+  # Read the current DEVICE_TOKENS (if any). When first creating it, seed an `admin`
+  # entry from the single DEVICE_TOKEN so the viewer proxy (BACKEND_TOKEN defaults to
+  # DEVICE_TOKEN) keeps authenticating once per-device tokens supersede the single one.
+  local current; current="$(grep -E '^DEVICE_TOKENS=' "$backend_env" | head -1 | cut -d= -f2- || true)"
+  if [[ -z "$current" ]]; then
+    local devtok; devtok="$(grep -E '^DEVICE_TOKEN=' "$backend_env" | head -1 | cut -d= -f2- || true)"
+    [[ -n "$devtok" ]] && current="admin:$devtok"
+  elif grep -qE "(^|,)${label}:" <<<"$current"; then
+    die "a camera labelled '$label' already exists in DEVICE_TOKENS — pick another name or edit $backend_env."
+  fi
+  local updated; if [[ -n "$current" ]]; then updated="$current,$label:$token"; else updated="$label:$token"; fi
+
+  # Rewrite hushai-backend/.env: drop any existing DEVICE_TOKENS line, append the new one.
+  local tmp; tmp="$(mktemp)"
+  grep -vE '^DEVICE_TOKENS=' "$backend_env" > "$tmp" || true
+  echo "DEVICE_TOKENS=$updated" >> "$tmp"
+  mv "$tmp" "$backend_env"
+
+  local lan; lan="$(detect_lan_ip)"; [[ -n "$lan" ]] || lan="<this-host-LAN-IP>"
+  local scheme="http"; [[ -f "$cert_dir/server.fullchain.crt" ]] && scheme="https"
+  local fp="(no CA yet — run ./local_dev/gen_certs.sh)"
+  [[ -f "$cert_dir/ca.crt" ]] && fp="$(openssl x509 -in "$cert_dir/ca.crt" -noout -fingerprint -sha256 2>/dev/null | cut -d= -f2)"
+
+  cat <<EOF
+
+  ┌─ Camera onboarded: $label ─────────────────────────────────────
+  │  device token   →  $token
+  │  backend ingest →  $scheme://$lan:8080   (POST /v1/segments, Bearer <token>)
+  │  rag/assistant  →  $scheme://$lan:8090
+  │  saved to       →  $backend_env  (DEVICE_TOKENS)
+  │  LAN CA (trust) →  $cert_dir/ca.crt
+  │  CA SHA-256     →  $fp
+  └────────────────────────────────────────────────────────────────
+
+  Next (full runbook: docs/onboarding-a-camera.md):
+   1. (Re)start the backend so the token is live:   ./local_dev/run_stack.sh --tls
+   2. Android over USB (debug/cleartext):
+        ./local_dev/run_hushai_app.sh --token $token --rag-token "\${RAG_TOKEN:-}"
+   3. Android over Wi-Fi (release/HTTPS): bundle the CA, build, set URL+token in-app:
+        cp $cert_dir/ca.crt hushai-android/app/src/release/res/raw/hushai_lan_ca.pem
+        (cd hushai-android && ./gradlew assembleRelease)   # then URL=$scheme://$lan:8080
+   4. Any other conforming client: send 'Authorization: Bearer $token' over $scheme,
+        trusting the CA above (e.g. feed_segments.py --cacert $cert_dir/ca.crt).
+EOF
+}
+
+if [[ -n "$ADD_CAMERA" ]]; then
+  add_camera "$ADD_CAMERA"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
 # Teardown — reverse order, idempotent, runs on Ctrl-C / error / normal exit.
 # Postgres (a brew service) is deliberately left running.
 # ---------------------------------------------------------------------------
@@ -147,6 +225,54 @@ for p in 8080 8090 8070; do
     die "port $p already in use — is the stack already running? Run '$0 --down' first (or free the port)."
   fi
 done
+
+# ---------------------------------------------------------------------------
+# Security: TLS (optional) + admin/rag credentials (always on, dev defaults).
+# Vars exported here are inherited by every `launch` subshell → the services pick
+# them up. dotenvy does NOT override a var already in the environment, so these win.
+# ---------------------------------------------------------------------------
+CERT_DIR="$SCRIPT_DIR/certs"
+SCHEME="http"
+CURL_CACERT=()
+if [[ "$TLS" -eq 1 ]]; then
+  command -v openssl >/dev/null 2>&1 || die "--tls needs openssl (for gen_certs.sh)."
+  if [[ ! -f "$CERT_DIR/server.fullchain.crt" || ! -f "$CERT_DIR/server.pkcs8.key" ]]; then
+    log infra "TLS requested but certs missing — generating (local_dev/gen_certs.sh)…"
+    "$SCRIPT_DIR/gen_certs.sh" >/dev/null || die "gen_certs.sh failed."
+  fi
+  SCHEME="https"
+  CURL_CACERT=(--cacert "$CERT_DIR/ca.crt")
+  export TLS_CERT_PATH="$CERT_DIR/server.fullchain.crt"
+  export TLS_KEY_PATH="$CERT_DIR/server.pkcs8.key"
+  export VIEWER_COOKIE_SECURE=true
+  # The siblings now serve https, so the viewer must proxy/probe them over https and
+  # trust the LAN CA (its reqwest client otherwise rejects the self-signed cert).
+  export RAG_BASE_URL="https://127.0.0.1:8090"
+  export BACKEND_BASE_URL="https://127.0.0.1:8080"
+  export VIEWER_UPSTREAM_CA="$CERT_DIR/ca.crt"
+  log infra "TLS on — all services serve https (trust CA: $CERT_DIR/ca.crt)"
+fi
+
+# rag bearer so rag isn't world-open on 0.0.0.0:8090 (the viewer proxy + phone present it).
+if [[ -z "${RAG_TOKEN:-}" ]]; then
+  if command -v openssl >/dev/null 2>&1; then RAG_TOKEN="$(openssl rand -hex 32)"; else RAG_TOKEN="dev-rag-token"; fi
+fi
+export RAG_TOKEN
+# viewer admin password (the viewer IS the admin panel; loopback is always allowed).
+: "${VIEWER_ADMIN_PASSWORD:=hushai-dev}"
+export VIEWER_ADMIN_PASSWORD
+# Stable session secret so logins survive restarts (persisted under logs/, gitignored).
+SECRET_FILE="$LOG_DIR/session_secret"
+if [[ -z "${VIEWER_SESSION_SECRET:-}" ]]; then
+  if [[ -f "$SECRET_FILE" ]]; then
+    VIEWER_SESSION_SECRET="$(cat "$SECRET_FILE")"
+  elif command -v openssl >/dev/null 2>&1; then
+    VIEWER_SESSION_SECRET="$(openssl rand -hex 32)"; echo "$VIEWER_SESSION_SECRET" >"$SECRET_FILE"
+  else
+    VIEWER_SESSION_SECRET="dev-session-secret-change-me-0123456789"
+  fi
+fi
+export VIEWER_SESSION_SECRET
 
 # --- Postgres -------------------------------------------------------------
 log infra "checking Postgres on :5432…"
@@ -249,7 +375,7 @@ launch() {
 wait_http() {
   local url="$1" name="$2" timeout="${3:-30}" code
   for _ in $(seq 1 $((timeout*2))); do
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$url" 2>/dev/null)" || code="000"
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 ${CURL_CACERT[@]+"${CURL_CACERT[@]}"} "$url" 2>/dev/null)" || code="000"
     if [[ -n "$code" && "$code" != "000" ]]; then
       log ok "$name healthy ($url → $code)"; return 0
     fi
@@ -271,7 +397,7 @@ log boot "starting services ($PROFILE)…"
 
 # 1. backend (everything depends on it) — fatal if it doesn't come up.
 launch backend "$REPO_ROOT/hushai-backend" hushai-backend
-wait_http "http://localhost:8080/healthz" backend 40 \
+wait_http "$SCHEME://localhost:8080/healthz" backend 40 \
   || { log warn "backend never answered :8080/healthz — last log lines:"; tail -n 20 "$LOG_DIR/backend.log" || true; die "backend failed to start."; }
 
 # 2. worker (no port) — drains the queue; degraded-but-ok if a model is missing.
@@ -280,12 +406,12 @@ alive_or_report worker "$LAST_PID"
 
 # 3. rag (:8090) — warn (not fatal) if unhealthy; backend+viewer still useful.
 launch rag "$REPO_ROOT" hushai-rag
-wait_http "http://localhost:8090/healthz" rag 40 \
+wait_http "$SCHEME://localhost:8090/healthz" rag 40 \
   || { log warn "rag never answered :8090/healthz — see $LOG_DIR/rag.log"; }
 
-# 4. viewer (:8070) — the webapp; root path returns the UI.
+# 4. viewer (:8070) — the webapp; /healthz is open (the app routes are IP+password gated).
 launch viewer "$REPO_ROOT" hushai-viewer
-wait_http "http://127.0.0.1:8070/" viewer 30 \
+wait_http "$SCHEME://127.0.0.1:8070/healthz" viewer 30 \
   || { log warn "viewer never answered :8070 — see $LOG_DIR/viewer.log"; }
 
 # ---------------------------------------------------------------------------
@@ -309,15 +435,21 @@ fi
 # ---------------------------------------------------------------------------
 cat <<EOF
 
-  ┌─ Hushai stack is up ($PROFILE) ───────────────────────────────
-  │  webapp (NVR + chat)   →  http://127.0.0.1:8070
-  │  rag api               →  http://localhost:8090   (/v1/rag/query, /v1/rag/chat, /v1/tts)
-  │  backend ingest        →  http://localhost:8080   (/v1/segments, /v1/speakers, /v1/persons)
+  ┌─ Hushai stack is up ($PROFILE${TLS:+, TLS}) ──────────────────────────
+  │  webapp (NVR + chat)   →  $SCHEME://127.0.0.1:8070   (admin: IP-allowlist + password)
+  │  rag api               →  $SCHEME://localhost:8090   (/v1/rag/query, /v1/rag/chat, /v1/tts — RAG_TOKEN required)
+  │  backend ingest        →  $SCHEME://localhost:8080   (/v1/segments, /v1/speakers, /v1/persons)
   │  worker                →  draining segments (transcribe + embed + speaker + vision)
+  │  admin login           →  password "$VIEWER_ADMIN_PASSWORD"  (set VIEWER_ADMIN_PASSWORD to change)
+  │  rag token             →  $RAG_TOKEN
   │  logs                  →  local_dev/logs/<service>.log
   │  Ctrl-C                →  stop everything cleanly
   └───────────────────────────────────────────────────────────────
 EOF
+if [[ "$TLS" -eq 1 ]]; then
+  echo "  TLS: trust the CA once for browsers — sudo security add-trusted-cert -d -r trustRoot \\"
+  echo "       -k /Library/Keychains/System.keychain $CERT_DIR/ca.crt"
+fi
 
 # Liveness poll: exit (→ trap cleanup) if any service dies; Ctrl-C interrupts the sleep.
 while true; do

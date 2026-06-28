@@ -242,12 +242,15 @@ class MainActivity : ComponentActivity() {
         val url = intent.getStringExtra(CaptureService.EXTRA_URL)
         val token = intent.getStringExtra(CaptureService.EXTRA_TOKEN)
         val ragUrl = intent.getStringExtra(CaptureService.EXTRA_RAG_URL)
+        val ragToken = intent.getStringExtra(CaptureService.EXTRA_RAG_TOKEN)
         url?.let { settings.setUrlBlocking(it) }
         token?.let { settings.setTokenBlocking(it) }
         // Voice-assistant RAG/TTS host. Lets the headless harness force localhost
         // (USB `adb reverse` tunnel) and override any stale LAN-IP value a prior
         // wireless session persisted to DataStore (which survives `install -r`).
         ragUrl?.let { settings.setRagUrlBlocking(it) }
+        // Bearer for the voice assistant's rag calls (matches the server's RAG_TOKEN).
+        ragToken?.let { settings.setRagTokenBlocking(it) }
         // Audio-only is sticky: persist an explicit extra so it survives restarts
         // and the UI reflects it; otherwise fall back to the persisted setting.
         val audioOnly = if (intent.hasExtra(CaptureService.EXTRA_AUDIO_ONLY)) {

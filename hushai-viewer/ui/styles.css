@@ -744,6 +744,92 @@ input[type="date"] {
   font: inherit;
 }
 
+/* ---- People modal (name/merge the faces in recordings; twin of Voices) ---- */
+.person-card {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 12px;
+}
+.person-info {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.person-face {
+  width: 72px;
+  height: 72px;
+  flex: 0 0 auto;
+  border-radius: 8px;
+  object-fit: cover;
+  background: var(--panel);
+  border: 1px solid var(--line);
+}
+.person-face.is-missing {
+  visibility: hidden;
+}
+
+/* ---- capture modal (stream this browser into the backend) ---- */
+.capture-preview {
+  width: 100%;
+  max-height: 280px;
+  background: #000;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  object-fit: contain;
+}
+.capture-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.capture-row .lbl {
+  min-width: 92px;
+}
+.capture-row select {
+  flex: 1;
+  min-width: 0;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font: inherit;
+}
+.capture-toggle {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 13px;
+}
+.capture-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.capture-status {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 4px 16px;
+}
+.capture-stat {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  border-bottom: 1px dotted var(--line);
+  padding-bottom: 2px;
+  font-size: 13px;
+}
+.capture-error {
+  color: var(--bad, #ff5d5d);
+  background: rgba(255, 93, 93, 0.08);
+  border: 1px solid #5a2b2b;
+  border-radius: 6px;
+  padding: 8px 10px;
+}
+
 /* Narrow screens: stack the chat dock under the video stage. */
 @media (max-width: 880px) {
   .workspace {

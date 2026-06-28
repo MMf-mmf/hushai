@@ -53,6 +53,10 @@ class Settings(private val context: Context) {
     // --- Voice assistant settings ---
     suspend fun wakeWord(): String = context.dataStore.data.map { it[KEY_WAKE_WORD] ?: DEFAULT_WAKE_WORD }.first()
     suspend fun ragUrl(): String = context.dataStore.data.map { it[KEY_RAG_URL] ?: DEFAULT_RAG_URL }.first()
+    /** Bearer the voice assistant presents to hushai-rag (`/v1/rag/query`, `/v1/tts`).
+     *  Empty ⇒ no bearer (a dev rag with no RAG_TOKEN). Set it to match the server's
+     *  RAG_TOKEN once rag auth is on. */
+    suspend fun ragToken(): String = context.dataStore.data.map { it[KEY_RAG_TOKEN] ?: DEFAULT_RAG_TOKEN }.first()
     suspend fun assistantEnabled(): Boolean = context.dataStore.data.map { it[KEY_ASSISTANT_ENABLED] ?: false }.first()
     suspend fun ownerEmbedding(): String = context.dataStore.data.map { it[KEY_OWNER_EMBEDDING] ?: "" }.first()
 
@@ -70,6 +74,8 @@ class Settings(private val context: Context) {
 
     fun wakeWordBlocking(): String = runBlocking { wakeWord() }
     fun ragUrlBlocking(): String = runBlocking { ragUrl() }
+    fun ragTokenBlocking(): String = runBlocking { ragToken() }
+    fun setRagTokenBlocking(value: String) = runBlocking { edit(KEY_RAG_TOKEN, value.trim()) }
     fun assistantEnabledBlocking(): Boolean = runBlocking { assistantEnabled() }
     fun ownerEmbeddingBlocking(): String = runBlocking { ownerEmbedding() }
     fun setWakeWordBlocking(value: String) = runBlocking { edit(KEY_WAKE_WORD, value.trim()) }
@@ -90,10 +96,16 @@ class Settings(private val context: Context) {
         val KEY_DISK_CAP_BYTES = longPreferencesKey("disk_cap_bytes")
         val KEY_WAKE_WORD = stringPreferencesKey("wake_word")
         val KEY_RAG_URL = stringPreferencesKey("rag_url")
+        val KEY_RAG_TOKEN = stringPreferencesKey("rag_token")
         val KEY_ASSISTANT_ENABLED = booleanPreferencesKey("assistant_enabled")
         val KEY_OWNER_EMBEDDING = stringPreferencesKey("owner_embedding")
+        // Debug/dev defaults (cleartext over the USB `adb reverse` tunnel / emulator).
+        // RELEASE builds forbid cleartext (see src/release/network_security_config.xml),
+        // so a release deployment MUST set an `https://<lan-ip>:8080` URL (cert SAN) via
+        // the Settings UI or the `url`/`rag_url` Intent extras; the bundled LAN CA is trusted.
         const val DEFAULT_URL = "http://10.0.2.2:8080"
         const val DEFAULT_TOKEN = "dev-secret-token"
+        const val DEFAULT_RAG_TOKEN = ""
         // 2 GB default offline buffer cap; generous for hours of audio + a long
         // video outage, well within typical free space. User-adjustable.
         const val DEFAULT_DISK_CAP_BYTES = 2L * 1024 * 1024 * 1024

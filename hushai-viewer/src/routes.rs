@@ -10,7 +10,7 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::header;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get};
+use axum::routing::{any, get, post};
 use serde::Deserialize;
 use tokio_util::io::ReaderStream;
 use tower_http::services::ServeDir;
@@ -28,8 +28,15 @@ use crate::timeline;
 
 pub fn router(state: ViewerState) -> Router {
     let ui_dir = state.cfg.ui_dir.clone();
-    Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+
+    // The login surface: reachable past the password gate but still behind the IP gate.
+    let public = Router::new().route(
+        "/login",
+        get(crate::auth::login_page).post(crate::auth::login_submit),
+    );
+
+    // Everything else requires a valid session cookie (the password gate).
+    let gated = Router::new()
         .route("/api/devices", get(devices))
         .route("/api/devices/{device_id}/timeline", get(get_timeline))
         .route("/api/devices/{device_id}/detections", get(get_detections))
@@ -39,9 +46,29 @@ pub fn router(state: ViewerState) -> Router {
         // Static segment "seg" takes priority over the {device_id} param for /hls/*.
         .route("/hls/seg/{seg}", get(segment_ts))
         .route("/hls/{device_id}/{name}", get(get_playlist))
+        // Browser capture uploads → hushai-backend `POST /v1/segments` (token injected,
+        // large body). Dedicated route so it never falls into the `/v1/*` rag branch below.
+        .route("/api/capture/segments", post(proxy::forward_capture))
         // Reverse-proxy the chat/RAG API to hushai-rag (one origin; see proxy.rs).
         .route("/v1/{*rest}", any(proxy::forward))
+        .route("/logout", post(crate::auth::logout))
         .fallback_service(ServeDir::new(ui_dir).append_index_html_on_directories(true))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::require_session,
+        ));
+
+    // The IP allowlist wraps BOTH the login surface and the gated app (but not /healthz).
+    let protected = public.merge(gated).layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        crate::auth::ip_allowlist,
+    ));
+
+    Router::new()
+        // Liveness probe: outside both gates so external monitors + the dashboard's own
+        // server-side probes work without being in the allowlist (returns only "ok").
+        .route("/healthz", get(|| async { "ok" }))
+        .merge(protected)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }

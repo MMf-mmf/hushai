@@ -11,6 +11,14 @@ tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util", "limit", "timeout"] }
 tower-http = { version = "0.6", features = ["trace", "timeout", "limit"] }
 
+# Native rustls TLS termination (shared by all three services via `src/tls.rs`).
+# `tls-rustls-no-provider` so WE install the aws-lc-rs crypto provider explicitly
+# (it's already vendored via sqlx `tls-rustls`) instead of axum-server pulling a
+# second/duplicate `ring` provider — which would panic at the first handshake.
+axum-server = { version = "0.7", default-features = false, features = ["tls-rustls-no-provider"] }
+# Direct handle to rustls so `tls.rs` can install the aws-lc-rs provider exactly once.
+rustls = "0.23"
+
 # Database (Postgres + pgvector). sqlx 0.9 lets pgvector::Vector bind via the binary
 # protocol (its sqlx trait impls target 0.9); see hushai-worker/src/process.rs.
 sqlx = { version = "0.9", features = [
@@ -32,6 +40,8 @@ prost = "0.14"
 uuid = { version = "1", features = ["v7", "serde"] }
 sha2 = "0.10"
 hex = "0.4"
+# Constant-time bearer-token comparison (no early-exit timing oracle on the secret).
+subtle = "2"
 
 # Serde / json
 serde = { version = "1", features = ["derive"] }

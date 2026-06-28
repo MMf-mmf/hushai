@@ -61,7 +61,14 @@ per stream. The backend reassembles a timeline from the segment metadata, **not*
 
 That is the entire required surface. A client that can `POST` this is a conforming source.
 (Service discovery — how a client learns the backend's host/port and obtains its token — is an
-operational concern outside this contract.)
+operational concern outside this contract; the operational runbook is
+[`docs/onboarding-a-camera.md`](../docs/onboarding-a-camera.md).)
+
+> **Implementation note (informative, non-normative).** As of 2026-06-28 the backend terminates
+> rustls TLS natively when `TLS_CERT_PATH`/`TLS_KEY_PATH` are configured (the LAN uses a self-signed
+> CA with IP SANs — see `local_dev/gen_certs.sh`; clients trust the CA). Tokens may be issued
+> per-device via `DEVICE_TOKENS` (`label:token,…`) so one device can be revoked individually. None of
+> this changes the contract surface — it's how the §3 HTTPS + Bearer requirements are met today.
 
 ---
 

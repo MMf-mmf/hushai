@@ -168,7 +168,7 @@ Viewer-specific knobs (all optional, with defaults):
 
 | Env var | Default | Meaning |
 |---------|---------|---------|
-| `VIEWER_BIND_ADDR` | `127.0.0.1:8070` | Bind address. **Localhost-only** by default (no auth — keep it off-box). |
+| `VIEWER_BIND_ADDR` | `127.0.0.1:8070` | Bind address. Set `0.0.0.0:8070` to reach it from admin computers — the IP allowlist + password gate then restrict who gets in. |
 | `VIEWER_UI_DIR` | `hushai-viewer/ui` | Directory of the static UI (relative to CWD). |
 | `VIEWER_CACHE_DIR` | `{BLOB_DIR}/viewer-cache` | Where remuxed `.ts` segments are cached. |
 | `FFMPEG_BIN` | `ffmpeg` | ffmpeg binary (shared with the worker). |
@@ -179,6 +179,28 @@ Viewer-specific knobs (all optional, with defaults):
 | `RAG_TOKEN` | _(none)_ | Bearer injected on rag-bound `/v1/*` requests. |
 | `BACKEND_BASE_URL` | `http://127.0.0.1:8080` | hushai-backend upstream for proxied `/v1/speakers*` (the Voices page). |
 | `BACKEND_TOKEN` | `DEVICE_TOKEN` | Bearer injected on `/v1/speakers*` requests. Falls back to `DEVICE_TOKEN` (already loaded from `hushai-backend/.env`), so a single-host setup needs no extra config. |
+
+### Admin access control & TLS (`src/auth.rs`)
+
+The viewer **is** the admin panel, so every route (except `/healthz`) is gated by an **IP allowlist
+plus a password** (defense in depth). See AGENTS.md "LAN security model" for the full picture.
+
+| Env var | Default | Meaning |
+|---------|---------|---------|
+| `VIEWER_ADMIN_IP_ALLOWLIST` | _(empty)_ | Comma-separated IPs/CIDRs allowed to reach any route. Empty ⇒ loopback only. |
+| `VIEWER_ALLOW_LOOPBACK` | `true` | Always allow `127.0.0.1`/`::1` (host box + curl). |
+| `VIEWER_ADMIN_PASSWORD` | _(none)_ | Admin password (hashed in-memory at startup with argon2). |
+| `VIEWER_ADMIN_PASSWORD_HASH` | _(none)_ | Pre-computed argon2 PHC hash (preferred in prod; wins over the plaintext). |
+| `VIEWER_SESSION_SECRET` | _(random)_ | HMAC key for the signed session cookie. Set it so logins survive restarts. |
+| `VIEWER_SESSION_TTL_SECS` | `604800` (7d) | Session lifetime. |
+| `VIEWER_COOKIE_SECURE` | _(TLS on?)_ | Add `Secure` to the cookie; defaults to whether TLS is configured. |
+| `VIEWER_AUTH_DISABLED` | `false` | Skip the password gate for pure-local dev (the IP gate still applies). |
+| `VIEWER_TLS_CERT_PATH` / `VIEWER_TLS_KEY_PATH` | _(bare `TLS_*`)_ | Native rustls TLS; both set ⇒ HTTPS. Falls back to the shared `TLS_CERT_PATH`/`TLS_KEY_PATH`. See `local_dev/gen_certs.sh`. |
+| `VIEWER_UPSTREAM_CA` | _(none)_ | CA bundle the proxy/dashboard HTTP client trusts when `RAG_BASE_URL`/`BACKEND_BASE_URL` are `https://` with the private LAN CA. `run_stack.sh --tls` sets this + the https upstream URLs automatically. |
+
+Startup **fails** if neither `VIEWER_ADMIN_PASSWORD` nor `VIEWER_ADMIN_PASSWORD_HASH` is set (unless
+`VIEWER_AUTH_DISABLED=true`). `./local_dev/run_stack.sh [--tls]` wires sensible dev defaults and prints
+them in its banner.
 
 ---
 
@@ -288,14 +310,16 @@ Chromium lacks H.264/AAC): `npm i puppeteer-core` and launch with
 
 **In scope (this version):** recorded/historical browsing + **multi-turn chat over the
 recordings** (SSE-streamed, DB-backed conversations, citations that deep-link the timeline,
-one default "Recordings" agent with the registry ready for more), localhost-only, no auth.
+one default "Recordings" agent with the registry ready for more). **LAN-ready:** the whole app
+is gated by an IP allowlist + password and can serve native TLS (see "Admin access control & TLS").
 
 **Deliberately deferred (clean follow-ups):**
 - **More agents** — extra personas/scopes are one registry entry in `hushai-rag/src/agents.rs`;
   the agent-tab UI (`ui/js/chat/agent-picker.js`) already loops over N.
 - **Near-live tailing** — a non-`ENDLIST`, sliding playlist off the newest session. Reuses ~90% of
   `playlist.rs` / `remux.rs`.
-- **Auth / LAN exposure** — an optional `VIEWER_TOKEN` and binding `0.0.0.0`.
+- ~~**Auth / LAN exposure**~~ — **done (2026-06-28):** IP allowlist + password gate + native TLS
+  (see "Admin access control & TLS"). Future hardening: per-user accounts, hot token revocation.
 - **Hover thumbnails** — a keyframe-JPEG endpoint shown on timeline hover.
 - **Retrieval query-condensation across chat turns** — currently retrieval re-anchors on the
   latest message (prior turns inform the LLM only); a future `RAG_CHAT_CONDENSE` flag would

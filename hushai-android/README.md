@@ -11,6 +11,10 @@ life-log", fully on-device except the local RAG call.
 The capture wire boundary is fixed by `../contracts/cameraToBackendContract.md`
 (v0.1.0); that document wins.
 
+To **onboard this phone (or any client) as a camera** on the LAN — minting its per-device
+token, pointing it at the HTTPS backend, and trusting the LAN CA in the release build —
+follow the runbook: [`../docs/onboarding-a-camera.md`](../docs/onboarding-a-camera.md).
+
 **Status (2026-06-25): capture + live preview + battery-saver + voice assistant
 all built and verified end-to-end on a physical Galaxy S8 (Android 9).** Owner
 enrolled, owner-asked questions answered aloud, a different speaker correctly

@@ -1,7 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Debug overlay: permit cleartext HTTP to the LAN backend (it serves plain HTTP
-     on :8080 today; TLS is a future reverse-proxy concern, contract §3). This
-     attribute exists ONLY in debug builds, so release stays cleartext-free. -->
+<!-- Debug overlay: permit cleartext HTTP so the USB/adb dev loop (adb reverse to
+     localhost) and the emulator work without certs. This attribute exists ONLY in
+     debug builds. The RELEASE build (app/src/release/) forbids cleartext and trusts
+     the bundled LAN CA — the backend serves rustls TLS when configured (contract §3). -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application android:networkSecurityConfig="@xml/network_security_config" />
 </manifest>

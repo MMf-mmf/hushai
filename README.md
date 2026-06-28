@@ -48,8 +48,13 @@ thing down with a single Ctrl-C:
 
 It preflights the infra deps (Postgres, Ollama), builds the workspace, launches every service,
 health-checks the ports, and prints a URL map. See [`AGENTS.md`](AGENTS.md) "Run the full stack locally"
-for flags (`--with-android`, `--no-build`, `--release`, `--pull`, `--down`) and the manual
-per-terminal flow with its gotchas.
+for flags (`--with-android`, `--no-build`, `--release`, `--pull`, `--tls`, `--add-camera`, `--down`)
+and the manual per-terminal flow with its gotchas.
+
+Run it on a shared network with `--tls` (HTTPS + admin IP-allowlist/password + per-device camera
+tokens — see [`AGENTS.md`](AGENTS.md) "LAN security model"). To onboard a new camera, run
+`./local_dev/run_stack.sh --add-camera <name>` and follow
+[`docs/onboarding-a-camera.md`](docs/onboarding-a-camera.md).
 
 Or run each service manually:
 

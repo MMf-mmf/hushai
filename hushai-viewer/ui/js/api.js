@@ -3,8 +3,20 @@
 
 import { nsToMs, msToNsStr } from "./time.js";
 
+// When the admin session has lapsed the viewer returns 401 to fetch/XHR/SSE (and 303
+// to HTML navigations). Bounce the SPA to the login page on any 401 so the user can
+// re-authenticate instead of seeing opaque errors. Returns true if it redirected.
+function redirectIfUnauth(res) {
+  if (res.status === 401) {
+    window.location.href = "/login";
+    return true;
+  }
+  return false;
+}
+
 async function getJson(url) {
   const res = await fetch(url);
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
   if (!res.ok) throw new Error(`${url} -> ${res.status}`);
   return res.json();
 }
@@ -150,6 +162,7 @@ export async function renameSpeaker(id, displayName) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ display_name: displayName }),
   });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
   if (!res.ok) throw new Error(`rename -> ${res.status}`);
   return res.json().catch(() => ({}));
 }
@@ -161,6 +174,7 @@ export async function mergeSpeaker(loserId, intoId) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ into: intoId }),
   });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
   if (!res.ok) throw new Error(`merge -> ${res.status}`);
   return res.json().catch(() => ({}));
 }
@@ -172,6 +186,7 @@ export async function mergeSpeakerGroup(intoId, memberIds) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ into: intoId, members: memberIds }),
   });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
   if (!res.ok) throw new Error(`merge-group -> ${res.status}`);
   return res.json().catch(() => ({}));
 }
@@ -181,6 +196,13 @@ export async function getUnattributed() {
   return getJson("/v1/speakers/unattributed");
 }
 
+// URL for a still-unattributed cluster's sample clip. These clusters have no speaker_id yet,
+// so we key on a segment_id from the cluster (used directly as an <audio> src; the proxy adds
+// the bearer). Lets a user hear a candidate voice before naming it.
+export function unattributedSampleAudioUrl(segmentId) {
+  return `/v1/speakers/unattributed/sample-audio?segment_id=${encodeURIComponent(segmentId)}`;
+}
+
 // Mint a NEW named speaker from a cluster's segments (claims the still-unattributed ones).
 export async function nameUnattributed(displayName, segmentIds) {
   const res = await fetch("/v1/speakers/unattributed/name", {
@@ -188,7 +210,45 @@ export async function nameUnattributed(displayName, segmentIds) {
     headers: { "content-type": "application/json" },
     body: JSON.stringify({ display_name: displayName, segment_ids: segmentIds }),
   });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
   if (!res.ok) throw new Error(`name-unattributed -> ${res.status}`);
+  return res.json().catch(() => ({}));
+}
+
+// ---- person (face) admin (proxied to hushai-backend at /v1/persons*) ------------
+// The visual twin of the speaker surface: list/name/merge the faces discovered in recordings.
+// The viewer proxy routes these to hushai-backend and injects the device bearer.
+
+export async function getPersons() {
+  return getJson("/v1/persons");
+}
+
+// URL for a person's representative cropped face — used directly as an <img> src (the proxy
+// adds the bearer), so no fetch-to-blob dance is needed. Mirrors sampleAudioUrl for voices.
+export function sampleFaceUrl(id) {
+  return `/v1/persons/${encodeURIComponent(id)}/sample-face`;
+}
+
+export async function renamePerson(id, displayName) {
+  const res = await fetch(`/v1/persons/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ display_name: displayName }),
+  });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
+  if (!res.ok) throw new Error(`rename person -> ${res.status}`);
+  return res.json().catch(() => ({}));
+}
+
+// Fold `loserId` into `intoId` (two ids that are the same person).
+export async function mergePerson(loserId, intoId) {
+  const res = await fetch(`/v1/persons/${encodeURIComponent(loserId)}/merge`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ into: intoId }),
+  });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
+  if (!res.ok) throw new Error(`merge person -> ${res.status}`);
   return res.json().catch(() => ({}));
 }
 
@@ -207,6 +267,7 @@ export async function streamChat({ sessionId, agentId, message, filters }, onEve
       filters: filters ?? null,
     }),
   });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
   if (!res.ok || !res.body) {
     const text = await res.text().catch(() => "");
     throw new Error(`chat -> ${res.status} ${text}`.trim());

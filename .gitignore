@@ -15,6 +15,12 @@ hushai-backend/data/
 # Per-service logs + pid files written by local_dev/run_stack.sh
 local_dev/logs/
 
+# Local TLS material (CA + LAN server cert + keys) from local_dev/gen_certs.sh.
+# Never commit private keys; regenerate per host.
+local_dev/certs/
+# The LAN CA copied into the Android release build to trust the self-signed cert.
+hushai-android/app/src/release/res/raw/hushai_lan_ca.pem
+
 # Captured test media (regenerable; can be large)
 local_dev/captures/
 

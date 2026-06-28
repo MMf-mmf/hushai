@@ -18,7 +18,7 @@ use std::collections::{HashMap, HashSet};
 
 use axum::Json;
 use axum::body::Body;
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::http::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use axum::response::Response;
@@ -1478,31 +1478,8 @@ pub async fn sample_audio(
     let container: String = row.get("container");
     let codec_init_data: Option<Vec<u8>> = row.try_get("codec_init_data").unwrap_or(None);
 
-    let raw = blob_uri
-        .strip_prefix("file://")
-        .ok_or(IngestError::BadRequest("unsupported blob scheme".into()))?;
-
-    // Path-traversal guard: canonicalize (resolves .. / symlinks) and require the result to
-    // live under the canonical blob_root. Return 404 off-root to avoid leaking existence.
-    let path = tokio::fs::canonicalize(raw)
-        .await
-        .map_err(|_| IngestError::NotFound("blob"))?;
-    if !path.starts_with(&*st.blob_root) {
-        return Err(IngestError::NotFound("blob"));
-    }
-
-    let media = tokio::fs::read(&path)
-        .await
-        .map_err(|e| IngestError::Internal(e.into()))?;
-
-    // Reconstruct a decodable file: only a bare fMP4 fragment needs the init prepended.
-    let mut bytes = Vec::new();
-    if container.eq_ignore_ascii_case("fmp4") {
-        if let Some(init) = &codec_init_data {
-            bytes.extend_from_slice(init);
-        }
-    }
-    bytes.extend_from_slice(&media);
+    let bytes =
+        reconstruct_segment_file(&st, &blob_uri, &container, codec_init_data.as_deref()).await?;
     let len = bytes.len();
 
     Response::builder()
@@ -1510,6 +1487,76 @@ pub async fn sample_audio(
         .header(CONTENT_LENGTH, len)
         .body(Body::from(bytes))
         .map_err(|e| IngestError::Internal(anyhow::anyhow!("building response: {e}")))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SampleAudioSegmentQuery {
+    pub segment_id: Uuid,
+}
+
+/// `GET /v1/speakers/unattributed/sample-audio?segment_id=<uuid>` — play a representative clip
+/// of a still-unattributed candidate voice so a human can identify it by ear BEFORE naming the
+/// cluster. The cluster has no `speaker_id` yet, so (unlike `sample_audio`) we key directly on
+/// a `segment_id` taken from the cluster's `segment_ids`. Same reconstruction as `sample_audio`.
+pub async fn sample_audio_segment(
+    State(st): State<AppState>,
+    Query(q): Query<SampleAudioSegmentQuery>,
+) -> Result<Response, IngestError> {
+    let row = sqlx::query(
+        "SELECT blob_uri, container, codec_init_data FROM segments WHERE segment_id = $1",
+    )
+    .bind(q.segment_id)
+    .fetch_optional(&st.pool)
+    .await?
+    .ok_or(IngestError::NotFound("segment"))?;
+
+    let blob_uri: String = row.get("blob_uri");
+    let container: String = row.get("container");
+    let codec_init_data: Option<Vec<u8>> = row.try_get("codec_init_data").unwrap_or(None);
+
+    let bytes =
+        reconstruct_segment_file(&st, &blob_uri, &container, codec_init_data.as_deref()).await?;
+    let len = bytes.len();
+
+    Response::builder()
+        .header(CONTENT_TYPE, "video/mp4")
+        .header(CONTENT_LENGTH, len)
+        .body(Body::from(bytes))
+        .map_err(|e| IngestError::Internal(anyhow::anyhow!("building response: {e}")))
+}
+
+/// Read a segment blob from disk and reconstruct a decodable file: a bare `fmp4` fragment
+/// needs its `codec_init_data` (`ftyp`+`moov`) prepended; an `mp4` blob is already
+/// self-contained (key off `container`, never the source — the same rule the worker and viewer
+/// remux use). Path-traversal guarded: the resolved path must live under `blob_root`. Shared by
+/// the speaker- and segment-keyed sample-audio endpoints.
+async fn reconstruct_segment_file(
+    st: &AppState,
+    blob_uri: &str,
+    container: &str,
+    codec_init_data: Option<&[u8]>,
+) -> Result<Vec<u8>, IngestError> {
+    let raw = blob_uri
+        .strip_prefix("file://")
+        .ok_or(IngestError::BadRequest("unsupported blob scheme".into()))?;
+    let path = tokio::fs::canonicalize(raw)
+        .await
+        .map_err(|_| IngestError::NotFound("blob"))?;
+    if !path.starts_with(&*st.blob_root) {
+        return Err(IngestError::NotFound("blob"));
+    }
+    let media = tokio::fs::read(&path)
+        .await
+        .map_err(|e| IngestError::Internal(e.into()))?;
+
+    let mut bytes = Vec::new();
+    if container.eq_ignore_ascii_case("fmp4") {
+        if let Some(init) = codec_init_data {
+            bytes.extend_from_slice(init);
+        }
+    }
+    bytes.extend_from_slice(&media);
+    Ok(bytes)
 }
 
 #[cfg(test)]

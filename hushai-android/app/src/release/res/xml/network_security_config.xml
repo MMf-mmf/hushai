@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Release: HTTPS only. Trust the system CAs PLUS the bundled Hushai LAN CA so the
+     phone trusts the self-signed LAN server certificate. NO cleartext.
+
+     The CA file (res/raw/hushai_lan_ca.pem) is gitignored — copy it from
+     local_dev/certs/ca.crt before `./gradlew assembleRelease` (gen_certs.sh prints
+     the exact command). Trusting the CA (not the leaf) means a server-cert rotation
+     needs no new APK. -->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false">
+        <trust-anchors>
+            <certificates src="system" />
+            <certificates src="@raw/hushai_lan_ca" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

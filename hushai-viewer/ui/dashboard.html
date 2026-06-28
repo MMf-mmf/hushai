@@ -19,6 +19,8 @@
         <span id="liveDot" class="dot"></span>
         <span id="generatedAt" class="muted small">connecting…</span>
       </div>
+      <button id="btnLogout" class="ghost" title="Log out"
+        onclick="fetch('/logout',{method:'POST'}).finally(()=>location.href='/login')">⎋</button>
     </header>
 
     <main class="dash">

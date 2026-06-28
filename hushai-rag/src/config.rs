@@ -21,6 +21,9 @@ pub struct RagConfig {
     pub rag_llm_model: String,
     /// Address/port the HTTP server binds to.
     pub bind_addr: SocketAddr,
+    /// Optional native TLS (`RAG_TLS_CERT_PATH`/`RAG_TLS_KEY_PATH`, falling back to the
+    /// bare `TLS_CERT_PATH`/`TLS_KEY_PATH`). Both set ⇒ HTTPS; neither ⇒ cleartext.
+    pub tls: Option<hushai_backend::tls::TlsPaths>,
     /// Default number of nearest passages to retrieve.
     pub top_k_default: i64,
     /// Cosine-distance cutoff; matches beyond this are dropped from context/sources.
@@ -113,6 +116,7 @@ impl RagConfig {
             embed_model: opt("EMBED_MODEL", "mxbai-embed-large"),
             rag_llm_model: opt("RAG_LLM_MODEL", "llama3.2:3b"),
             bind_addr: parse("RAG_BIND_ADDR", "0.0.0.0:8090")?,
+            tls: hushai_backend::tls::TlsPaths::from_env("RAG_")?,
             top_k_default: parse("RAG_TOP_K_DEFAULT", "8")?,
             distance_threshold: parse("RAG_DISTANCE_THRESHOLD", "0.6")?,
             hnsw_ef_search: parse("RAG_HNSW_EF_SEARCH", "100")?,

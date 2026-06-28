@@ -17,6 +17,7 @@ pub mod routes;
 pub mod speakers;
 pub mod state;
 pub mod storage;
+pub mod tls;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -54,7 +55,12 @@ pub async fn build_state(config: Config) -> anyhow::Result<AppState> {
         .await
         .context("running database migrations")?;
 
-    let tokens = Arc::new(TokenStore::single(config.device_token.clone()));
+    // Per-device tokens (DEVICE_TOKENS, `label:token,…`) supersede the single
+    // DEVICE_TOKEN when set, so a lost device can be revoked individually.
+    let tokens = Arc::new(match &config.device_tokens {
+        Some(spec) => TokenStore::from_spec(spec),
+        None => TokenStore::single(config.device_token.clone()),
+    });
     let limiter = Arc::new(Semaphore::new(config.concurrency_cap));
 
     Ok(AppState {
@@ -73,19 +79,12 @@ pub async fn run() -> anyhow::Result<()> {
 
     let config = Config::from_env()?;
     let bind_addr = config.bind_addr;
+    let tls = config.tls.clone();
     let state = build_state(config).await?;
     let app = routes::router(state);
 
-    let listener = tokio::net::TcpListener::bind(bind_addr)
-        .await
-        .with_context(|| format!("binding {bind_addr}"))?;
-    tracing::info!(%bind_addr, "hushai-backend listening");
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("server error")?;
-    Ok(())
+    tracing::info!(%bind_addr, tls = tls.is_some(), "hushai-backend listening");
+    crate::tls::serve(bind_addr, app, tls, shutdown_signal()).await
 }
 
 /// Resolve when the process should begin a graceful shutdown: Ctrl-C or SIGTERM.

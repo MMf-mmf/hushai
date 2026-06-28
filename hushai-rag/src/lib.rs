@@ -83,6 +83,13 @@ pub async fn run() -> anyhow::Result<()> {
     let embedder = Arc::new(Embedder::new(&cfg.embed_ollama_base_url, &cfg.embed_model)?);
     let llm = Arc::new(Llm::new(&cfg.llm_ollama_base_url, &cfg.rag_llm_model)?);
     let bind_addr = cfg.bind_addr;
+    let tls = cfg.tls.clone();
+    if cfg.rag_token.is_none() {
+        tracing::warn!(
+            "RAG_TOKEN is unset — the rag service is UNAUTHENTICATED. Set RAG_TOKEN so \
+             it isn't world-open on the LAN (the viewer proxy + Android assistant present it)."
+        );
+    }
 
     // Load the local Kokoro TTS engine (warm for every /v1/tts request). A missing
     // model or load failure is non-fatal: log and serve without spoken answers.
@@ -164,16 +171,8 @@ pub async fn run() -> anyhow::Result<()> {
     };
 
     let app = router(state);
-    let listener = tokio::net::TcpListener::bind(bind_addr)
-        .await
-        .with_context(|| format!("binding {bind_addr}"))?;
-    tracing::info!(%bind_addr, "hushai-rag listening");
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("server error")?;
-    Ok(())
+    tracing::info!(%bind_addr, tls = tls.is_some(), "hushai-rag listening");
+    hushai_backend::tls::serve(bind_addr, app, tls, shutdown_signal()).await
 }
 
 async fn shutdown_signal() {

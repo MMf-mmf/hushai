@@ -174,9 +174,24 @@ Note this should be across the mobile and Web App.
 Simulate high load to see how the system handles it will it be able to ingest 30 video cameras at once?
  Will the transcription and other AI processes be queued correctly? so that it slowly or hopefully sooner than later does process everything?
 
- - We must now add video and audio capture functionality to the web application as well so that we can turn on video capture just like we are doing in the mobile app.
+ - [] We must now add video and audio capture functionality to the web application as well so that we can turn on video capture just like we are doing in the mobile app.
  Like this we go for the first time being able to actually have two video sources streaming in at the same time for our test.
  In order for this task to be complete, we must have the mobile app and the mobile Web App stream video and audio and make sure that it's being processed correctly.
+
+# Bugs and needed updates
+- [] in the Known peaple section it has says:
+People
+name & merge the faces in your recordings
+Refresh
+✕
+Known people (1)
+Mendel
+Mendel
+20 sightings · last seen 6/28/2026, 4:06:11 PM
+which is only partially correct since it was not 20 sightings. It was only seemingly one sighting in one single video...
+I'm not sure where I got the number 20. Maybe it's from 20 video segments definitely something that needs to be locked into unfixed since it was in fact, part of the same few second clip
+
+- [] under the known people and known voices, if someone was already identified, it should be in a drop-down so that it only displays the unknowns for us to select since overtime with the amount of known voices and known people grow, it is not important to have all of them in a drop-down as soon as we open up the tab only if we actually want to view them.
 
  - Test Test Test test the application end to end and report bugs and needed improvements
 
@@ -187,5 +202,17 @@ Simulate high load to see how the system handles it will it be able to ingest 30
 
 # Production ready (the must haves for this to be production ready)
 - [] if this is going to run on the local network it must set up some sort of encryption so that not anyone on the network can the application front end backend.
+as you can see we can connect cameras over the local wifi network so this needs to be further secured
+in addition we are talking about the admin panel should be perhaps locket to go given computers ip and not just any computer on the network...
+- [] instead of connecting to http://127.0.0.1:8070/ in the browser we need to be able to write a real name in the url that sill points to the same port only it looks nicer to a user
 - [] it must have a correct storage plan for long term storage for this we should go with the typical industry gold standard
-- we must be able to capture
+- we must be able to capture video from up to 30 cameras at once (we must do research on computer hardware needed to make this possible such as if i want it to all be sending the video feed with a cable 
+
+
+# A must for the developers 
+- for us to go live with a gentic workflows this meens the developers is an ai agent which meens the ai must be able to fully maintain the application for this to be done we need to break the application down into its parts and have Agents review each part of the application 
+   - a update agent that looks over all the dependence/the ai models and others to see if there is a newer model that is more efficient and faster Wyoming maintaining the existing quality or better for the same compute for example
+   and before actualy doing any update we must varify everting works end to end...
+
+
+   

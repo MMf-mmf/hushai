@@ -9,6 +9,7 @@ import {
   getUnattributed,
   nameUnattributed,
   sampleAudioUrl,
+  unattributedSampleAudioUrl,
   renameSpeaker,
   mergeSpeaker,
   mergeSpeakerGroup,
@@ -172,6 +173,15 @@ function unattributedCard(cluster, ctx) {
   }
 
   const actions = div("voice-actions");
+  // Hear the candidate before naming it (no speaker_id yet → play a clip by segment_id).
+  const sampleSegment = (cluster.segment_ids || [])[0];
+  const play = document.createElement("button");
+  play.type = "button";
+  play.textContent = "▶ Play";
+  play.disabled = !sampleSegment;
+  play.addEventListener("click", () => {
+    if (sampleSegment) ctx.playUrl(unattributedSampleAudioUrl(sampleSegment));
+  });
   const input = document.createElement("input");
   input.type = "text";
   input.placeholder = "Name this voice";
@@ -190,7 +200,7 @@ function unattributedCard(cluster, ctx) {
       ctx.flash("Couldn't name that voice (it may have been attributed since — Refresh).");
     }
   });
-  actions.append(input, save);
+  actions.append(play, input, save);
   card.appendChild(actions);
   return card;
 }
@@ -284,6 +294,10 @@ function boot() {
   const ctx = {
     play(id) {
       audio.src = sampleAudioUrl(id);
+      audio.play().catch(() => {});
+    },
+    playUrl(url) {
+      audio.src = url;
       audio.play().catch(() => {});
     },
     reload: () => load(),

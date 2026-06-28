@@ -68,7 +68,9 @@ async fn ingest_end_to_end() {
         database_url,
         blob_dir,
         device_token: "test-token".into(),
+        device_tokens: None,
         bind_addr: "127.0.0.1:0".parse().unwrap(),
+        tls: None,
         max_body_bytes: 1024 * 1024,
         concurrency_cap: 64,
         disk_watermark_bytes: 0, // never shed in tests

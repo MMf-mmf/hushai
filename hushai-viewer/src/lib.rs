@@ -9,6 +9,7 @@
 //! Reuses `hushai-backend` as a library for the DB `Config` + pool + shared migrations,
 //! mirroring `hushai-worker`/`hushai-rag`. Strictly read-only against DB and blobs.
 
+pub mod auth;
 pub mod config;
 pub mod dashboard;
 pub mod detections;
@@ -62,8 +63,22 @@ pub async fn run() -> anyhow::Result<()> {
         .with_context(|| format!("creating TS cache dir {}", cfg.cache_dir.display()))?;
 
     let bind_addr = cfg.bind_addr;
+    let tls = cfg.tls.clone();
     let ffmpeg_sem = Arc::new(Semaphore::new(cfg.ffmpeg_concurrency.max(1)));
-    let http = reqwest::Client::new();
+    // HTTP client for the `/v1/*` reverse-proxy + dashboard probes. When the sibling
+    // backend/rag serve TLS behind a private LAN CA, trust that CA so the loopback
+    // proxy/probe calls verify instead of failing the handshake.
+    let http = {
+        let mut builder = reqwest::Client::builder();
+        if let Some(ca_path) = &cfg.upstream_ca {
+            let pem = std::fs::read(ca_path)
+                .with_context(|| format!("reading VIEWER_UPSTREAM_CA {}", ca_path.display()))?;
+            let cert = reqwest::Certificate::from_pem(&pem)
+                .with_context(|| format!("parsing VIEWER_UPSTREAM_CA {}", ca_path.display()))?;
+            builder = builder.add_root_certificate(cert);
+        }
+        builder.build().context("building viewer HTTP client")?
+    };
 
     tracing::info!(
         %bind_addr,
@@ -84,16 +99,13 @@ pub async fn run() -> anyhow::Result<()> {
     };
 
     let app = routes::router(state);
-    let listener = tokio::net::TcpListener::bind(bind_addr)
-        .await
-        .with_context(|| format!("binding {bind_addr}"))?;
-    tracing::info!(%bind_addr, "hushai-viewer listening — open http://{bind_addr}/");
-
-    axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
-        .await
-        .context("server error")?;
-    Ok(())
+    // `serve_with_connect_info` populates `ConnectInfo<SocketAddr>` (the peer IP) on
+    // BOTH the cleartext and TLS branches — the IP allowlist middleware (auth.rs) reads
+    // it the same way in either world. Keep this serve variant whenever the IP gate is
+    // in play; TLS terminates in-process so the peer addr is the real client.
+    let scheme = if tls.is_some() { "https" } else { "http" };
+    tracing::info!(%bind_addr, tls = tls.is_some(), "hushai-viewer listening — open {scheme}://{bind_addr}/");
+    hushai_backend::tls::serve_with_connect_info(bind_addr, app, tls, shutdown_signal()).await
 }
 
 async fn shutdown_signal() {

@@ -5,8 +5,12 @@
 # an agent) watch real footage flow via logcat, then stops cleanly.
 #
 # Usage:
-#   run_hushai_app.sh [--url URL] [--rag-url URL] [--token TOK] [--device SERIAL]
-#                     [--no-build] [--duration SECS] [--audio-only] [--stop]
+#   run_hushai_app.sh [--url URL] [--rag-url URL] [--token TOK] [--rag-token TOK]
+#                     [--device SERIAL] [--no-build] [--duration SECS] [--audio-only] [--stop]
+#
+# --rag-token sets the voice-assistant's bearer for hushai-rag (defaults to the
+# $RAG_TOKEN environment variable, which run_stack.sh exports). Needed once rag auth
+# is on, so the assistant's /v1/rag/query + /v1/tts calls aren't 401'd.
 #
 # --audio-only drives the app's audio-only capture mode: no camera is opened and
 # no video stream is uploaded (only cam0-audio), saving storage + battery.
@@ -29,6 +33,9 @@ URL_SET=0
 RAG_URL=""
 RAG_URL_SET=0
 TOKEN="dev-secret-token"
+# Voice-assistant bearer for hushai-rag; defaults to $RAG_TOKEN from the environment
+# (run_stack.sh exports one) so the assistant matches a rag started with auth on.
+RAG_TOKEN="${RAG_TOKEN:-}"
 DEVICE=""
 NO_BUILD=0
 DURATION=120
@@ -47,6 +54,7 @@ while [[ $# -gt 0 ]]; do
     --url) URL="$2"; URL_SET=1; shift 2 ;;
     --rag-url) RAG_URL="$2"; RAG_URL_SET=1; shift 2 ;;
     --token) TOKEN="$2"; shift 2 ;;
+    --rag-token) RAG_TOKEN="$2"; shift 2 ;;
     --device) DEVICE="$2"; shift 2 ;;
     --no-build) NO_BUILD=1; shift ;;
     --duration) DURATION="$2"; shift 2 ;;
@@ -141,14 +149,18 @@ for perm in "${PERMS[@]}"; do
 done
 
 # --- Launch + configure + autostart via Intent extras (no UI taps) ----------
-echo "[launch] url=$URL rag_url=$RAG_URL token=*** autostart=true audio_only=$AUDIO_ONLY"
+echo "[launch] url=$URL rag_url=$RAG_URL token=*** rag_token=${RAG_TOKEN:+***} autostart=true audio_only=$AUDIO_ONLY"
 AUDIO_ONLY_EXTRA=()
 [[ "$AUDIO_ONLY" -eq 1 ]] && AUDIO_ONLY_EXTRA=(--ez audio_only true)
+# Only pass the rag bearer when one is set, so we don't clobber a stored token with "".
+RAG_TOKEN_EXTRA=()
+[[ -n "$RAG_TOKEN" ]] && RAG_TOKEN_EXTRA=(--es rag_token "$RAG_TOKEN")
 # ${arr[@]+...} guards against "unbound variable" when the array is empty under
 # `set -u` on bash 3.2 (macOS default). rag_url forces the voice-assistant host
 # (overrides any stale LAN-IP left in DataStore by a prior wireless session).
 adb shell am start -n "$ACTIVITY" \
   --es url "$URL" --es rag_url "$RAG_URL" --es token "$TOKEN" \
+  ${RAG_TOKEN_EXTRA[@]+"${RAG_TOKEN_EXTRA[@]}"} \
   ${AUDIO_ONLY_EXTRA[@]+"${AUDIO_ONLY_EXTRA[@]}"} --ez autostart true >/dev/null
 
 # --- Observe footage flow ----------------------------------------------------

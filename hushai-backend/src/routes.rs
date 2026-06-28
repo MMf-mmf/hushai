@@ -53,6 +53,10 @@ pub fn router(state: AppState) -> Router {
             "/v1/speakers/unattributed/name",
             post(speakers::name_unattributed),
         )
+        .route(
+            "/v1/speakers/unattributed/sample-audio",
+            get(speakers::sample_audio_segment),
+        )
         .route("/v1/speakers/{id}", patch(speakers::rename_speaker))
         .route("/v1/speakers/{id}/merge", post(speakers::merge_speaker))
         .route(

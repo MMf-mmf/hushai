@@ -23,6 +23,11 @@ use crate::state::ViewerState;
 /// Max proxied request-body size. Chat/query payloads are tiny JSON; this is a guard.
 const MAX_PROXY_BODY: usize = 1024 * 1024;
 
+/// Max capture-upload body. A 2s muxed H.264 segment (~2 Mbps video + AAC) is well under
+/// this; it stays below the backend's own 32 MiB `MAX_BODY_BYTES`. Much larger than
+/// `MAX_PROXY_BODY` because media segments dwarf chat/admin JSON.
+const MAX_CAPTURE_BODY: usize = 16 * 1024 * 1024;
+
 /// Forward any method on `/v1/*` to the right upstream (rag or backend), streaming back.
 pub async fn forward(State(state): State<ViewerState>, req: Request) -> Response {
     match forward_inner(state, req).await {
@@ -32,6 +37,70 @@ pub async fn forward(State(state): State<ViewerState>, req: Request) -> Response
             (StatusCode::BAD_GATEWAY, msg).into_response()
         }
     }
+}
+
+/// Forward a browser capture upload (`POST /api/capture/segments`) to hushai-backend's
+/// `POST /v1/segments`. A dedicated route (not the `/v1/*` branch in `forward`) because:
+///   - the upstream is **always** the backend (never rag), and
+///   - media bodies are large, so we use `MAX_CAPTURE_BODY` instead of the 1 MiB chat guard.
+/// Same same-origin rationale as `forward`: the browser holds no token and triggers no CORS;
+/// the backend `DEVICE_TOKEN` bearer is injected here, server-side.
+pub async fn forward_capture(State(state): State<ViewerState>, req: Request) -> Response {
+    match forward_capture_inner(state, req).await {
+        Ok(resp) => resp,
+        Err(msg) => {
+            tracing::warn!(error = %msg, "capture proxy failed");
+            (StatusCode::BAD_GATEWAY, msg).into_response()
+        }
+    }
+}
+
+async fn forward_capture_inner(state: ViewerState, req: Request) -> Result<Response, String> {
+    let method = req.method().clone();
+    let url = format!(
+        "{}/v1/segments",
+        state.cfg.backend_base_url.trim_end_matches('/')
+    );
+
+    // Preserve the multipart Content-Type **verbatim** — it carries the `boundary=` the
+    // backend's `Multipart` extractor needs; reconstructing it would break parsing. Inject
+    // the backend bearer ourselves so the page never holds the secret.
+    let mut headers = HeaderMap::new();
+    if let Some(v) = req.headers().get(header::CONTENT_TYPE) {
+        headers.insert(header::CONTENT_TYPE, v.clone());
+    }
+    if let Some(token) = state.cfg.backend_token.as_ref() {
+        if let Ok(v) = HeaderValue::from_str(&format!("Bearer {token}")) {
+            headers.insert(header::AUTHORIZATION, v);
+        }
+    }
+
+    // Buffer the segment, bounded to 16 MiB. A 2s muxed H.264 segment is ~0.5 MB, so this is
+    // a generous cap, not a memory concern; the backend separately enforces its 32 MiB limit.
+    let body_bytes = axum::body::to_bytes(req.into_body(), MAX_CAPTURE_BODY)
+        .await
+        .map_err(|e| format!("reading capture body: {e}"))?;
+
+    let upstream = state
+        .http
+        .request(method, &url)
+        .headers(headers)
+        .body(body_bytes.to_vec())
+        .send()
+        .await
+        .map_err(|e| format!("upstream capture request to {url} failed: {e}"))?;
+
+    // Pass the upstream status through verbatim: 200/401/422/429/507 are all
+    // contract-meaningful to the capture client's retry logic.
+    let status = upstream.status();
+    let mut builder = Response::builder().status(status);
+    if let Some(v) = upstream.headers().get(header::CONTENT_TYPE) {
+        builder = builder.header(header::CONTENT_TYPE, v.clone());
+    }
+    let body = Body::from_stream(upstream.bytes_stream());
+    builder
+        .body(body)
+        .map_err(|e| format!("building proxied capture response: {e}"))
 }
 
 /// `/v1/speakers*` and `/v1/persons*` are hushai-backend's catalog-admin surfaces (voices and

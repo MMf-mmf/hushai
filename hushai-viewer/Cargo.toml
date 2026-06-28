@@ -39,3 +39,11 @@ dotenvy = "0.15"
 uuid = { version = "1", features = ["v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 hex = "0.4"
+
+# Admin access control: IP allowlist (CIDR) + a signed session-cookie password gate.
+ipnet = "2"                  # parse + match admin IP/CIDR allowlist
+hmac = "0.12"                # HMAC-SHA256 session-cookie signing (constant-time verify)
+sha2 = "0.10"                # paired with hmac 0.12
+base64 = "0.22"             # url-safe encode of the cookie HMAC tag
+rand = "0.9"                 # random session secret when VIEWER_SESSION_SECRET is unset
+argon2 = "0.5"               # verify/derive the admin password hash (at-rest credential)

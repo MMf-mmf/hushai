@@ -160,8 +160,9 @@ class CaptureService : Service() {
 
     private fun buildAssistant(): VoiceAssistant {
         val ragUrl = settings.ragUrlBlocking()
-        val ragClient = RagClient(Http.rag, ragUrl, RAG_TOKEN)
-        val ttsClient = TtsClient(Http.rag, ragUrl, RAG_TOKEN)
+        val ragToken = settings.ragTokenBlocking()
+        val ragClient = RagClient(Http.rag, ragUrl, ragToken)
+        val ttsClient = TtsClient(Http.rag, ragUrl, ragToken)
         val owner = SpeakerMath.parse(settings.ownerEmbeddingBlocking())
         return VoiceAssistant(
             context = applicationContext,
@@ -716,6 +717,7 @@ class CaptureService : Service() {
         const val EXTRA_URL = "url"
         const val EXTRA_TOKEN = "token"
         const val EXTRA_RAG_URL = "rag_url"
+        const val EXTRA_RAG_TOKEN = "rag_token"
         const val EXTRA_AUDIO_ONLY = "audio_only"
         const val EXTRA_IMPORT_URIS = "import_uris"
 
@@ -741,8 +743,6 @@ class CaptureService : Service() {
         private const val AUDIO_SAMPLE_RATE = 16_000
         private const val AUDIO_CHANNELS = 1
         private const val AUDIO_BITRATE = 96_000
-        // The local hushai-rag dev server runs with no RAG_TOKEN, so no bearer is sent.
-        private const val RAG_TOKEN = ""
 
         // Keep at least this much free on the device regardless of the user's cap, so
         // the offline buffer can never fill the phone. Enforced alongside the cap.

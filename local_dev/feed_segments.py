@@ -152,7 +152,15 @@ def main() -> int:
                     help="flip a byte in the sent body but not the manifest (expect 422)")
     ap.add_argument("--conflict", action="store_true",
                     help="reuse stored segment_ids with DIFFERENT (self-consistent) bytes (expect 422)")
+    ap.add_argument("--cacert", default=os.environ.get("HUSHAI_CACERT"),
+                    help="CA bundle to verify the server's TLS cert (e.g. local_dev/certs/ca.crt). "
+                         "Use this for an https:// --url with the self-signed LAN CA.")
+    ap.add_argument("--insecure", action="store_true",
+                    help="skip TLS certificate verification (testing only; prefer --cacert)")
     args = ap.parse_args()
+
+    # requests `verify`: False to skip, a CA path to pin, or True for the system store.
+    verify = False if args.insecure else (args.cacert or True)
 
     video = Path(args.video).resolve()
     if not video.exists():
@@ -230,7 +238,7 @@ def main() -> int:
             parts.reverse()
 
         try:
-            resp = requests.post(args.url, headers=headers, files=parts, timeout=60)
+            resp = requests.post(args.url, headers=headers, files=parts, timeout=60, verify=verify)
             status = resp.status_code
         except requests.RequestException as e:
             print(f"  seq={seq:>3} ERROR {e}")

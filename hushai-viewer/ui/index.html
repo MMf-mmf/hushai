@@ -38,7 +38,11 @@
         </span>
       </div>
       <a class="navlink" href="/dashboard.html" title="System dashboard">▦ System</a>
+      <button id="btnCapture" class="ghost" title="Capture from this browser's camera &amp; mic">●</button>
+      <button id="btnPeople" class="ghost" title="People &amp; faces">👤</button>
       <button id="btnSettings" class="ghost" title="Voices &amp; settings">⚙</button>
+      <button id="btnLogout" class="ghost" title="Log out"
+        onclick="fetch('/logout',{method:'POST'}).finally(()=>location.href='/login')">⎋</button>
     </header>
 
     <div class="workspace">
@@ -141,8 +145,57 @@
       </div>
     </div>
 
+    <!-- People: name & merge the faces found in your recordings (visual twin of Voices). -->
+    <div id="peopleModal" class="modal" hidden>
+      <div class="modal-card">
+        <div class="modal-head">
+          <span class="lbl">People</span>
+          <span class="muted small">name &amp; merge the faces in your recordings</span>
+          <span class="spacer"></span>
+          <button id="peopleRefresh" type="button">Refresh</button>
+          <button id="peopleClose" type="button" title="Close">✕</button>
+        </div>
+        <div id="peopleBody" class="modal-body"></div>
+      </div>
+    </div>
+
+    <!-- Capture: stream this browser's camera + mic into the backend, like the Android app. -->
+    <div id="captureModal" class="modal" hidden>
+      <div class="modal-card">
+        <div class="modal-head">
+          <span class="lbl">Capture</span>
+          <span class="muted small">stream this browser's camera &amp; mic into hushai</span>
+          <span class="spacer"></span>
+          <button id="captureClose" type="button" title="Close">✕</button>
+        </div>
+        <div class="modal-body">
+          <video id="capturePreview" class="capture-preview" autoplay muted playsinline></video>
+          <div class="capture-row">
+            <label class="lbl">Camera</label>
+            <select id="captureCam"></select>
+          </div>
+          <div class="capture-row">
+            <label class="lbl">Microphone</label>
+            <select id="captureMic"></select>
+          </div>
+          <label class="capture-toggle">
+            <input type="checkbox" id="captureAudioOnly" /> Audio only (no video)
+          </label>
+          <div class="capture-controls">
+            <button id="captureStart" class="primary" type="button">● Start capture</button>
+            <button id="captureStop" type="button" disabled>■ Stop</button>
+            <span id="captureRecDot" class="dot"></span>
+          </div>
+          <div id="captureStatus" class="capture-status"></div>
+          <div id="captureError" class="capture-error small" hidden></div>
+        </div>
+      </div>
+    </div>
+
     <script type="module" src="/js/app.js"></script>
     <script type="module" src="/js/chat/workspace.js"></script>
     <script type="module" src="/js/settings/voices.js"></script>
+    <script type="module" src="/js/settings/people.js"></script>
+    <script type="module" src="/js/capture/capture-ui.js"></script>
   </body>
 </html>
