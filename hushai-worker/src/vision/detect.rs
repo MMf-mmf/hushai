@@ -9,6 +9,8 @@ use image::RgbImage;
 use ndarray::Array4;
 use ort::session::Session;
 
+use super::geom;
+
 const INPUT: usize = 640;
 const STRIDES: [usize; 3] = [8, 16, 32];
 
@@ -30,6 +32,14 @@ impl Face {
     }
 }
 
+/// A face detector that emits `Face`s (bbox + 5 landmarks + score) in original-frame pixels.
+/// Implemented by YuNet (`FaceDetector`) and SCRFD (`detect_scrfd::ScrfdDetector`); the rest of the
+/// pipeline holds an `Arc<dyn FaceDetect>` and never branches on which model is active.
+pub trait FaceDetect: Send + Sync {
+    /// Detect faces in an RGB frame. Pure-CPU-bound; call inside `spawn_blocking`.
+    fn detect(&self, frame: &RgbImage) -> Result<Vec<Face>>;
+}
+
 pub struct FaceDetector {
     session: Session,
     score_threshold: f32,
@@ -44,9 +54,11 @@ impl FaceDetector {
             nms_iou: 0.3,
         }
     }
+}
 
+impl FaceDetect for FaceDetector {
     /// Detect faces in an RGB frame. Pure-CPU-bound; call inside `spawn_blocking`.
-    pub fn detect(&self, frame: &RgbImage) -> Result<Vec<Face>> {
+    fn detect(&self, frame: &RgbImage) -> Result<Vec<Face>> {
         let (ow, oh) = (frame.width() as f32, frame.height() as f32);
         // Letterbox: scale to fit 640² preserving aspect, pad the remainder with 0.
         let scale = (INPUT as f32 / ow).min(INPUT as f32 / oh);
@@ -111,7 +123,7 @@ impl FaceDetector {
             }
         }
 
-        Ok(nms(cands, self.nms_iou))
+        Ok(geom::nms_by(cands, self.nms_iou, |f| f.bbox, |f| f.score))
     }
 }
 
@@ -124,65 +136,4 @@ fn extract<'a>(outputs: &'a ort::session::SessionOutputs, name: &str) -> Result<
 
 fn clamp01(v: f32) -> f32 {
     v.clamp(0.0, 1.0)
-}
-
-/// Greedy non-max suppression by descending score.
-fn nms(mut faces: Vec<Face>, iou_thresh: f32) -> Vec<Face> {
-    faces.sort_by(|a, b| {
-        b.score
-            .partial_cmp(&a.score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
-    let mut keep: Vec<Face> = Vec::new();
-    for f in faces {
-        if keep.iter().all(|k| iou(&k.bbox, &f.bbox) <= iou_thresh) {
-            keep.push(f);
-        }
-    }
-    keep
-}
-
-/// IoU of two [x, y, w, h] boxes.
-fn iou(a: &[f32; 4], b: &[f32; 4]) -> f32 {
-    let (ax2, ay2) = (a[0] + a[2], a[1] + a[3]);
-    let (bx2, by2) = (b[0] + b[2], b[1] + b[3]);
-    let ix1 = a[0].max(b[0]);
-    let iy1 = a[1].max(b[1]);
-    let ix2 = ax2.min(bx2);
-    let iy2 = ay2.min(by2);
-    let iw = (ix2 - ix1).max(0.0);
-    let ih = (iy2 - iy1).max(0.0);
-    let inter = iw * ih;
-    let union = a[2] * a[3] + b[2] * b[3] - inter;
-    if union <= 0.0 { 0.0 } else { inter / union }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn iou_basics() {
-        // identical boxes
-        assert!((iou(&[0.0, 0.0, 10.0, 10.0], &[0.0, 0.0, 10.0, 10.0]) - 1.0).abs() < 1e-6);
-        // disjoint
-        assert_eq!(iou(&[0.0, 0.0, 10.0, 10.0], &[20.0, 20.0, 10.0, 10.0]), 0.0);
-        // half overlap: 5x10 inter / (100+100-50) = 50/150
-        assert!(
-            (iou(&[0.0, 0.0, 10.0, 10.0], &[5.0, 0.0, 10.0, 10.0]) - (50.0 / 150.0)).abs() < 1e-6
-        );
-    }
-
-    #[test]
-    fn nms_suppresses_overlap_keeps_distinct() {
-        let f = |x: f32, score: f32| Face {
-            bbox: [x, 0.0, 10.0, 10.0],
-            score,
-            landmarks: [[0.0; 2]; 5],
-        };
-        // two heavily overlapping (keep the higher score) + one far away (keep)
-        let out = nms(vec![f(0.0, 0.9), f(1.0, 0.8), f(50.0, 0.7)], 0.3);
-        assert_eq!(out.len(), 2);
-        assert!((out[0].score - 0.9).abs() < 1e-6);
-    }
 }

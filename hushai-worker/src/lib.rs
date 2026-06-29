@@ -90,6 +90,11 @@ pub async fn run() -> anyhow::Result<()> {
         .execute(&pool)
         .await
         .context("ensuring scene_object partitions")?;
+    // And the ALPR detections table (plate_detections is RANGE-partitioned, migration 0013).
+    sqlx::query("SELECT ensure_plate_detection_partitions(3)")
+        .execute(&pool)
+        .await
+        .context("ensuring plate_detection partitions")?;
 
     tracing::info!(
         whisper_model = %cfg.whisper_model_path,
@@ -219,25 +224,100 @@ pub async fn run() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Load the vision ONNX models (ORT load-dynamic + YuNet + ArcFace). Fails if the dylib or a model
-/// file is missing — the caller treats that as "vision disabled" rather than aborting the worker.
+/// Build the configured face detector (`Arc<dyn FaceDetect>`), falling back to whichever model IS
+/// provisioned: a dev box without SCRFD weights still gets identity via YuNet, and vice-versa.
+fn build_face_detector(
+    cfg: &WorkerConfig,
+) -> anyhow::Result<Arc<dyn crate::vision::detect::FaceDetect>> {
+    use crate::vision::{
+        detect::{FaceDetect, FaceDetector},
+        detect_scrfd::ScrfdDetector,
+        enhance::DetectorKind,
+        model,
+    };
+    let coreml = cfg.vision_coreml;
+    let scrfd = || -> anyhow::Result<Arc<dyn FaceDetect>> {
+        Ok(Arc::new(ScrfdDetector::new(
+            model::load_session(&cfg.face_scrfd_model_path, coreml)?,
+            cfg.face_min_det_score,
+        )))
+    };
+    let yunet = || -> anyhow::Result<Arc<dyn FaceDetect>> {
+        Ok(Arc::new(FaceDetector::new(
+            model::load_session(&cfg.face_detect_model_path, coreml)?,
+            cfg.face_min_det_score,
+        )))
+    };
+    match cfg.face_detector_kind {
+        DetectorKind::Scrfd => match scrfd() {
+            Ok(d) => {
+                tracing::info!(model = %cfg.face_scrfd_model_path, "face detector: SCRFD");
+                Ok(d)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "SCRFD failed to load; falling back to YuNet (provision scrfd_10g_bnkps.onnx — see fetch_scrfd.sh)");
+                yunet().context("loading YuNet fallback face detector (FACE_DETECT_MODEL_PATH)")
+            }
+        },
+        DetectorKind::YuNet => match yunet() {
+            Ok(d) => {
+                tracing::info!(model = %cfg.face_detect_model_path, "face detector: YuNet");
+                Ok(d)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "YuNet failed to load; trying SCRFD");
+                scrfd().context("loading SCRFD fallback face detector (FACE_SCRFD_MODEL_PATH)")
+            }
+        },
+    }
+}
+
+/// Load the vision ONNX models (ORT load-dynamic + detector + ArcFace, plus the optional cleanup +
+/// object lanes). Fails if the dylib or a REQUIRED model is missing — the caller treats that as
+/// "vision disabled" rather than aborting the worker.
 fn build_vision_models(cfg: &WorkerConfig) -> anyhow::Result<VisionModels> {
     use crate::vision::{
-        detect::FaceDetector,
+        enhance::{FaceRestorer, Upscaler},
         face_embed::FaceEmbedder,
         model,
         objects::{ClipEmbedder, ObjectDetector},
+        plates::{detect::PlateDetector, ocr::PlateOcr},
     };
     model::init_ort(&cfg.ort_dylib_path);
-    let detector = FaceDetector::new(
-        model::load_session(&cfg.face_detect_model_path, cfg.vision_coreml)
-            .context("loading face-detect model (FACE_DETECT_MODEL_PATH)")?,
-        cfg.face_min_det_score,
-    );
+    let detector = build_face_detector(cfg)?;
     let embedder = FaceEmbedder::new(
         model::load_session(&cfg.face_embed_model_path, cfg.vision_coreml)
             .context("loading face-embed model (FACE_EMBED_MODEL_PATH)")?,
-    );
+    )
+    .with_flip_tta(cfg.face_embed_flip_tta);
+
+    // Optional image-cleanup sub-lane (blind-face-restore + super-res). Each self-disables on a
+    // missing/unloadable model; low-quality faces are then dropped as before (the face lane runs).
+    let restorer = match model::load_session(&cfg.face_restore_model_path, cfg.vision_coreml) {
+        Ok(s) => {
+            tracing::info!(
+                model = %cfg.face_restore_model_path,
+                kind = ?cfg.face_restore_kind,
+                "face restoration enabled (recover-then-embed for low-quality faces) — validate the decode against the real export"
+            );
+            Some(Arc::new(FaceRestorer::new(
+                s,
+                cfg.face_restore_kind,
+                cfg.face_restore_codeformer_w,
+            )))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "face restoration disabled: model not provisioned (FACE_RESTORE_MODEL_PATH) — low-quality faces are dropped as before");
+            None
+        }
+    };
+    let upscaler = match model::load_session(&cfg.face_upscale_model_path, cfg.vision_coreml) {
+        Ok(s) => {
+            tracing::info!(model = %cfg.face_upscale_model_path, "face super-resolution enabled (Real-ESRGAN)");
+            Some(Arc::new(Upscaler::new(s)))
+        }
+        Err(_) => None,
+    };
 
     // Optional open-vocab object lane (RF-DETR + CLIP). Enabled only when BOTH models load; any
     // failure disables objects with a warning but keeps the (required) face lane running, so an
@@ -283,12 +363,68 @@ fn build_vision_models(cfg: &WorkerConfig) -> anyhow::Result<VisionModels> {
         }
     };
 
+    // Optional ALPR lane (plate detector + OCR). Needs RF-DETR (object_detector) for vehicle ROIs;
+    // self-disables if either plate model (or the OCR charset) is missing — faces/objects still run.
+    let (plate_detector, plate_ocr) = if !cfg.plate_enabled {
+        (None, None)
+    } else {
+        let det = model::load_session(&cfg.plate_detect_model_path, cfg.vision_coreml).map(|s| {
+            Arc::new(PlateDetector::new(
+                s,
+                cfg.plate_detect_input_size,
+                cfg.plate_min_det_score,
+            ))
+        });
+        let ocr = load_plate_charset(&cfg.plate_ocr_charset_path).and_then(|charset| {
+            model::load_session(&cfg.plate_ocr_model_path, cfg.vision_coreml)
+                .map(|s| Arc::new(PlateOcr::new(s, charset)))
+        });
+        match (det, ocr) {
+            (Ok(d), Ok(o)) => {
+                tracing::info!(
+                    detector = %cfg.plate_detect_model_path,
+                    ocr = %cfg.plate_ocr_model_path,
+                    "vision plate lane enabled (ALPR) — validate the decode against the real export (see AGENTS.md vision)"
+                );
+                (Some(d), Some(o))
+            }
+            _ if cfg.plate_required => anyhow::bail!(
+                "PLATE_REQUIRED=true but the plate detector/OCR failed to load \
+                 (PLATE_DETECT_MODEL_PATH={}, PLATE_OCR_MODEL_PATH={}, PLATE_OCR_CHARSET_PATH={})",
+                cfg.plate_detect_model_path,
+                cfg.plate_ocr_model_path,
+                cfg.plate_ocr_charset_path
+            ),
+            _ => {
+                tracing::warn!(
+                    "vision plate lane disabled: detector/OCR/charset not provisioned — faces + objects still run"
+                );
+                (None, None)
+            }
+        }
+    };
+
     Ok(VisionModels {
-        detector: Arc::new(detector),
+        detector,
         embedder: Arc::new(embedder),
+        restorer,
+        upscaler,
         object_detector,
         clip,
+        plate_detector,
+        plate_ocr,
     })
+}
+
+/// Load the plate-OCR class→char map (a JSON array of single-character strings) from the export's
+/// sidecar. Each entry maps to its first char; missing/invalid file disables the OCR lane.
+fn load_plate_charset(path: &str) -> anyhow::Result<Vec<char>> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading plate OCR charset {path}"))?;
+    let arr: Vec<String> = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing plate OCR charset {path} (want a JSON array of strings)"))?;
+    anyhow::ensure!(!arr.is_empty(), "plate OCR charset {path} is empty");
+    Ok(arr.iter().map(|s| s.chars().next().unwrap_or('?')).collect())
 }
 
 /// Drain VIDEO/MUXED segments through the face-identity pipeline (claim → process → done/error),
@@ -313,9 +449,15 @@ async fn vision_worker_loop(
                         tracing::debug!(%segment_id, faces = n, "vision segment processed");
                     }
                     Err(e) => {
-                        let msg = format!("{e:#}");
-                        tracing::warn!(%segment_id, error = %msg, "vision processing failed");
-                        let _ = claim::mark_vision_error(&pool, segment_id, &msg).await;
+                        if !claim::segment_exists(&pool, segment_id).await {
+                            // Deleted mid-flight (footage/device delete or retention); status row
+                            // is cascade-gone. Benign skip, not a failure.
+                            tracing::debug!(%segment_id, "vision segment vanished mid-flight; skipping");
+                        } else {
+                            let msg = format!("{e:#}");
+                            tracing::warn!(%segment_id, error = %msg, "vision processing failed");
+                            let _ = claim::mark_vision_error(&pool, segment_id, &msg).await;
+                        }
                     }
                 }
             }
@@ -491,11 +633,17 @@ async fn worker_loop(
                         tracing::info!(%segment_id, sentences = n, worker_id, "processed segment");
                     }
                     Err(e) => {
-                        tracing::error!(%segment_id, worker_id, error = format!("{e:#}"), "segment failed");
-                        if let Err(e2) =
-                            claim::mark_error(&pool, segment_id, &format!("{e:#}")).await
-                        {
-                            tracing::error!(%segment_id, error = %e2, "could not record error status");
+                        if !claim::segment_exists(&pool, segment_id).await {
+                            // Deleted mid-flight (footage/device delete or retention). The status row
+                            // is cascade-gone, so there's nothing to mark; not a failure.
+                            tracing::debug!(%segment_id, worker_id, "segment vanished mid-flight; skipping");
+                        } else {
+                            tracing::error!(%segment_id, worker_id, error = format!("{e:#}"), "segment failed");
+                            if let Err(e2) =
+                                claim::mark_error(&pool, segment_id, &format!("{e:#}")).await
+                            {
+                                tracing::error!(%segment_id, error = %e2, "could not record error status");
+                            }
                         }
                     }
                 }

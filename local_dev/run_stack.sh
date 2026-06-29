@@ -12,6 +12,8 @@
 #   ./local_dev/run_stack.sh --release          # build/run the release binaries
 #   ./local_dev/run_stack.sh --no-build         # skip cargo build (run existing target/<profile> bins)
 #   ./local_dev/run_stack.sh --tls              # serve all services over HTTPS (auto-gen certs if absent)
+#   ./local_dev/run_stack.sh --lan              # expose the viewer on the LAN for https://hushai.local/ (implies
+#                                               #   --tls; binds 0.0.0.0 + allowlists this host's IP — run setup_hostname.sh too)
 #   ./local_dev/run_stack.sh --add-camera NAME  # onboard a camera: mint+save a per-device token, print
 #                                               #   its config card, then exit (see docs/onboarding-a-camera.md)
 #   ./local_dev/run_stack.sh --pull             # `ollama pull` any missing models, then continue
@@ -51,6 +53,7 @@ PROFILE="debug"
 PULL_MODELS=0
 DOWN_ONLY=0
 TLS=0
+LAN=0
 ADD_CAMERA=""
 ANDROID_ARGS=()
 
@@ -61,6 +64,7 @@ while [[ $# -gt 0 ]]; do
     --release)      PROFILE="release"; shift ;;
     --pull)         PULL_MODELS=1; shift ;;
     --tls)          TLS=1; shift ;;
+    --lan)          LAN=1; TLS=1; shift ;;
     --add-camera)   ADD_CAMERA="${2:-}"; shift 2 || shift ;;
     --down)         DOWN_ONLY=1; shift ;;
     --)             shift; ANDROID_ARGS=("$@"); break ;;
@@ -253,6 +257,22 @@ if [[ "$TLS" -eq 1 ]]; then
   log infra "TLS on — all services serve https (trust CA: $CERT_DIR/ca.crt)"
 fi
 
+# --lan: expose the viewer on the LAN so https://hushai.local/ works (run setup_hostname.sh
+# for the Bonjour name + the 443->8070 redirect). Safe because every viewer route is gated by
+# the IP allowlist + password. We bind 0.0.0.0 and allowlist THIS host's LAN IP(s): a host
+# hitting its own hushai.local presents its LAN IP (not loopback). Add other admin machines'
+# IPs by exporting VIEWER_ADMIN_IP_ALLOWLIST yourself (it wins — we only fill it when unset).
+if [[ "$LAN" -eq 1 ]]; then
+  export VIEWER_BIND_ADDR="0.0.0.0:8070"
+  export VIEWER_HOSTNAME="hushai.local"   # cosmetic: the viewer's listening-log URL
+  if [[ -z "${VIEWER_ADMIN_IP_ALLOWLIST:-}" ]]; then
+    VIEWER_ADMIN_IP_ALLOWLIST="$(ifconfig 2>/dev/null | awk '/inet /{print $2}' \
+      | grep -Ev '^127\.|^169\.254\.' | tr '\n' ',' | sed 's/,$//')"
+    export VIEWER_ADMIN_IP_ALLOWLIST
+  fi
+  log infra "LAN mode — viewer binds 0.0.0.0:8070; admin IP allowlist: ${VIEWER_ADMIN_IP_ALLOWLIST:-<none detected>} (+loopback)"
+fi
+
 # rag bearer so rag isn't world-open on 0.0.0.0:8090 (the viewer proxy + phone present it).
 if [[ -z "${RAG_TOKEN:-}" ]]; then
   if command -v openssl >/dev/null 2>&1; then RAG_TOKEN="$(openssl rand -hex 32)"; else RAG_TOKEN="dev-rag-token"; fi
@@ -310,10 +330,11 @@ elif command -v ollama >/dev/null 2>&1; then
 else
   log warn "ollama not installed — worker embeddings + rag answers will fail."
 fi
-# Required models for the worker (embeddings) + rag (LLM).
+# Required models: worker embeddings (mxbai-embed-large) + sentiment (llama3.2:3b) + rag answer
+# generation (qwen2.5:7b — the faithful attribution model; see RAG_LLM_MODEL).
 if command -v ollama >/dev/null 2>&1; then
   HAVE_MODELS="$(ollama list 2>/dev/null || true)"
-  for m in mxbai-embed-large llama3.2:3b; do
+  for m in mxbai-embed-large llama3.2:3b qwen2.5:7b; do
     if ! grep -q "$m" <<<"$HAVE_MODELS"; then
       if [[ "$PULL_MODELS" -eq 1 ]]; then
         log infra "pulling missing model: $m"; ollama pull "$m"
@@ -433,10 +454,12 @@ fi
 # ---------------------------------------------------------------------------
 # Up. Print the map, then hold the foreground until a service dies or Ctrl-C.
 # ---------------------------------------------------------------------------
+WEBAPP_URL="$SCHEME://127.0.0.1:8070"
+[[ "$LAN" -eq 1 ]] && WEBAPP_URL="https://hushai.local/  (no-port; after setup_hostname.sh) · $SCHEME://127.0.0.1:8070"
 cat <<EOF
 
-  ┌─ Hushai stack is up ($PROFILE${TLS:+, TLS}) ──────────────────────────
-  │  webapp (NVR + chat)   →  $SCHEME://127.0.0.1:8070   (admin: IP-allowlist + password)
+  ┌─ Hushai stack is up ($PROFILE${TLS:+, TLS}${LAN:+, LAN}) ──────────────────────────
+  │  webapp (NVR + chat)   →  $WEBAPP_URL   (admin: IP-allowlist + password)
   │  rag api               →  $SCHEME://localhost:8090   (/v1/rag/query, /v1/rag/chat, /v1/tts — RAG_TOKEN required)
   │  backend ingest        →  $SCHEME://localhost:8080   (/v1/segments, /v1/speakers, /v1/persons)
   │  worker                →  draining segments (transcribe + embed + speaker + vision)
@@ -449,6 +472,9 @@ EOF
 if [[ "$TLS" -eq 1 ]]; then
   echo "  TLS: trust the CA once for browsers — sudo security add-trusted-cert -d -r trustRoot \\"
   echo "       -k /Library/Keychains/System.keychain $CERT_DIR/ca.crt"
+fi
+if [[ "$LAN" -eq 1 ]]; then
+  echo "  LAN: for the no-port name https://hushai.local/ run once — ./local_dev/setup_hostname.sh"
 fi
 
 # Liveness poll: exit (→ trap cleanup) if any service dies; Ctrl-C interrupts the sleep.

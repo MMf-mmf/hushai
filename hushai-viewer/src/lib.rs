@@ -14,6 +14,7 @@ pub mod config;
 pub mod dashboard;
 pub mod detections;
 pub mod error;
+pub mod export;
 pub mod playlist;
 pub mod processing;
 pub mod proxy;
@@ -63,6 +64,7 @@ pub async fn run() -> anyhow::Result<()> {
         .with_context(|| format!("creating TS cache dir {}", cfg.cache_dir.display()))?;
 
     let bind_addr = cfg.bind_addr;
+    let display_host = cfg.display_host.clone(); // captured before `cfg` moves into ViewerState
     let tls = cfg.tls.clone();
     let ffmpeg_sem = Arc::new(Semaphore::new(cfg.ffmpeg_concurrency.max(1)));
     // HTTP client for the `/v1/*` reverse-proxy + dashboard probes. When the sibling
@@ -104,7 +106,13 @@ pub async fn run() -> anyhow::Result<()> {
     // it the same way in either world. Keep this serve variant whenever the IP gate is
     // in play; TLS terminates in-process so the peer addr is the real client.
     let scheme = if tls.is_some() { "https" } else { "http" };
-    tracing::info!(%bind_addr, tls = tls.is_some(), "hushai-viewer listening — open {scheme}://{bind_addr}/");
+    // Prefer the friendly host (VIEWER_HOSTNAME, e.g. hushai.local) in the "open …" hint when set
+    // — and drop the port for it, since setup_hostname.sh redirects the default 443 → bind port.
+    let open_url = match &display_host {
+        Some(h) => format!("{scheme}://{h}/"),
+        None => format!("{scheme}://{bind_addr}/"),
+    };
+    tracing::info!(%bind_addr, tls = tls.is_some(), "hushai-viewer listening — open {open_url}");
     hushai_backend::tls::serve_with_connect_info(bind_addr, app, tls, shutdown_signal()).await
 }
 

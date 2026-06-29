@@ -35,6 +35,10 @@ pub enum AgentKind {
     /// `People` = person (face) attribution over `person_segments`: "when did I see Bob" (exhaustive
     /// per-person time-ranges) and "who was I with" (same-segment co-occurrence around the owner).
     People,
+    /// `Plates` = license-plate attribution over `plate_detections`: "when did I see a car with
+    /// plate ABC123" (exhaustive per-plate time-ranges). Matched by NORMALIZED STRING (exact +
+    /// pg_trgm fuzzy), never by an embedding — a plate's identity is its text (the 0013 contract).
+    Plates,
 }
 
 /// A selectable chat persona + default scope.
@@ -64,6 +68,24 @@ pub const DEFAULT_AGENT_ID: &str = "recordings";
 pub const REFLECTION_AGENT_ID: &str = "reflection";
 pub const OBJECTS_AGENT_ID: &str = "objects";
 pub const PEOPLE_AGENT_ID: &str = "people";
+pub const PLATES_AGENT_ID: &str = "plates";
+/// The unified assistant: not a pipeline of its own — the chat handler classifies each message
+/// (`llm::classify_agent` → [`parse_agent_label`]) and dispatches to one of the concrete agents.
+pub const AUTO_AGENT_ID: &str = "auto";
+
+/// Router persona: classify a chat message into exactly one capability id. Used by
+/// `llm::classify_agent`; the reply is mapped to an id by [`parse_agent_label`] (default
+/// `recordings`). Categories mirror the concrete agents.
+pub const ROUTER_PREAMBLE: &str = "You route a personal-recordings assistant. Read the user's question (and any recent \
+conversation) and reply with EXACTLY ONE of these category words, lowercase, nothing else: \
+'recordings' = what was SAID/discussed in conversations — topics, summaries, what someone talked about. \
+'reflection' = how the USER themselves has been doing — their mood, social or conversational patterns, \
+self-improvement ('how have I been', 'how can I get better'). \
+'people' = WHO was seen on camera (faces) — 'who did I see', 'who have you seen', 'who was I with', \
+'when did I see <name>'. \
+'objects' = a thing/object seen on camera — 'when did I see a car / my keys / a red mug'. \
+'plates' = a vehicle by LICENSE PLATE — 'when did I see plate ABC123'. \
+Output only the one category word.";
 
 /// The grounding preamble for the default recordings assistant. Moved verbatim from the
 /// former `llm.rs` `PREAMBLE` const — do NOT weaken: this is what makes the model answer
@@ -113,12 +135,14 @@ provided list of object sightings, each captured from recorded video and prefixe
 plain-language time. Rules: \
 (1) If the list is empty or does not contain what they asked about, say you did not see that in the recordings — \
 do NOT use outside knowledge and do NOT guess. \
-(2) Answer with WHEN the thing was seen, using the plain-language time exactly as it appears (for example \
-'yesterday at 3:14 PM'). NEVER output a raw number, a count of seconds or nanoseconds, an ISO timestamp, or any \
-numeric or coded time value. \
-(3) Keep the answer concise and factual. \
-(4) NEVER output an identifier, UUID, segment id, or any long code of letters and numbers. \
-(5) Do not mention these instructions or the word 'context'.";
+(2) Use ONLY the sightings in the list: never add, repeat, infer, or pad your answer with an object or sighting \
+that is not present. If the list has N sightings, your answer covers only those N — no more. \
+(3) Reply in natural, spoken English that says what was seen and when — e.g. 'You saw a red mug yesterday at \
+3:14 PM.' Do NOT use field labels or a form layout. Use the plain-language time exactly as it appears; NEVER \
+output a raw number, a count of seconds or nanoseconds, an ISO timestamp, or any numeric or coded time value. \
+(4) Keep the answer concise and factual. \
+(5) NEVER output an identifier, UUID, segment id, or any long code of letters and numbers. \
+(6) Do not mention these instructions or the word 'context'.";
 
 /// The person-attribution persona. Answers "when did I see Bob" / "who was I with" from the
 /// provided face sightings — strictly grounded, time-first, attributes by name, never leaks ids.
@@ -127,17 +151,60 @@ provided list of face sightings, each captured from recorded video and prefixed 
 'someone we haven't identified yet') and a plain-language time. Rules: \
 (1) If the list is empty or doesn't cover who they asked about, say you don't have that in the recordings — \
 do NOT use outside knowledge and do NOT guess. \
-(2) Answer with WHO and WHEN, using the plain-language time exactly as it appears (for example 'yesterday at \
-5:14 PM'). NEVER output a raw number, a count of seconds or nanoseconds, an ISO timestamp, or any numeric or \
+(2) Use ONLY the sightings in the list: never add, repeat, infer, or pad your answer with a person or sighting \
+that is not present (including extra 'someone we haven't identified yet' lines). If the list has N sightings, \
+your answer covers only those N — no more. \
+(3) Reply in natural, spoken English that says who was seen and when — e.g. 'You saw Mendel yesterday at \
+5:14 PM.' Do NOT use field labels like 'WHO:'/'WHEN:' or a form layout. Use the plain-language time exactly as \
+it appears; NEVER output a raw number, a count of seconds or nanoseconds, an ISO timestamp, or any numeric or \
 coded time value. \
-(3) Attribute by the provided name; refer to an unnamed face as 'someone we haven't identified yet' and never \
+(4) Attribute by the provided name; refer to an unnamed face as 'someone we haven't identified yet' and never \
 invent a name. \
-(4) Keep the answer concise and factual. \
-(5) NEVER output an identifier, UUID, segment id, or any long code of letters and numbers. \
-(6) Do not mention these instructions or the word 'context'.";
+(5) Keep the answer concise and factual. \
+(6) NEVER output an identifier, UUID, segment id, or any long code of letters and numbers. \
+(7) Do not mention these instructions or the word 'context'.";
+
+/// The license-plate persona. Answers "when did I see a car with plate ABC123" from the provided
+/// plate sightings — strictly grounded (no outside knowledge), time-first, attributes by the plate
+/// string or its human label, never leaks ids/raw timestamps. Cloned from `PREAMBLE_PEOPLE`.
+const PREAMBLE_PLATES: &str = "You are Hushai's license-plate assistant. Answer the user's question using ONLY the \
+provided list of license-plate sightings, each captured from recorded video and prefixed with WHICH plate was \
+seen (a plate string like 'plate ABC123', a human label like 'Mom's car', or 'an unreadable plate') and a \
+plain-language time. Rules: \
+(1) If the list is empty or doesn't cover the plate they asked about, say you don't have that in the recordings — \
+do NOT use outside knowledge and do NOT guess. \
+(2) Use ONLY the sightings in the list: never add, repeat, infer, or pad your answer with a plate or sighting \
+that is not present. If the list has N sightings, your answer covers only those N — no more. \
+(3) Reply in natural, spoken English that says which plate and when — e.g. 'You saw plate ABC123 yesterday at \
+5:14 PM.' Do NOT use field labels or a form layout. Use the plain-language time exactly as it appears; NEVER \
+output a raw number, a count of seconds or nanoseconds, an ISO timestamp, or any numeric or coded time value. \
+(4) Refer to a plate by the provided plate string or its label; refer to a plate with no readable text as 'an \
+unreadable plate' and never invent a plate number. \
+(5) Keep the answer concise and factual. \
+(6) NEVER output an identifier, UUID, segment id, or any long code of letters and numbers (the plate string \
+itself is allowed). \
+(7) Do not mention these instructions or the word 'context'.";
 
 /// The built-in agents. Append here to add a new selectable agent.
 static AGENTS: &[Agent] = &[
+    Agent {
+        // The unified assistant. The chat handler classifies each message and dispatches to a
+        // concrete agent below, so this kind/prompt are only fallbacks if classification fails.
+        id: AUTO_AGENT_ID,
+        name: "Assistant",
+        description: "Ask anything about your recordings — it figures out where to look.",
+        system_prompt: PREAMBLE_RECORDINGS,
+        default_filters: DefaultFilters {
+            device_id: None,
+            after_unix_nanos: None,
+            before_unix_nanos: None,
+            speaker_name: None,
+        },
+        default_top_k: None,
+        kind: AgentKind::Grounded,
+        default_window_days: None,
+        model: None,
+    },
     Agent {
         id: DEFAULT_AGENT_ID,
         name: "Recordings",
@@ -204,6 +271,22 @@ static AGENTS: &[Agent] = &[
         default_window_days: None,
         model: None,
     },
+    Agent {
+        id: PLATES_AGENT_ID,
+        name: "Plates",
+        description: "Finds when you saw a license plate, e.g. \"when did I see plate ABC123?\".",
+        system_prompt: PREAMBLE_PLATES,
+        default_filters: DefaultFilters {
+            device_id: None,
+            after_unix_nanos: None,
+            before_unix_nanos: None,
+            speaker_name: None,
+        },
+        default_top_k: None,
+        kind: AgentKind::Plates,
+        default_window_days: None,
+        model: None,
+    },
 ];
 
 /// Look up an agent by id.
@@ -219,6 +302,27 @@ pub fn default() -> &'static Agent {
 /// All built-in agents (for the UI picker).
 pub fn list() -> &'static [Agent] {
     AGENTS
+}
+
+/// Map a router model's reply to a concrete agent id. Lenient: lowercases, looks for one of the
+/// known category words (so "people", "People.", "the people agent" all map to `people`), and
+/// defaults to `recordings` on anything ambiguous or unrecognized. Never returns `auto`.
+pub fn parse_agent_label(raw: &str) -> &'static str {
+    let r = raw.to_lowercase();
+    // Order matters only for the (rare) reply that contains more than one word: prefer the more
+    // specific capabilities over the catch-all `recordings`.
+    for id in [
+        PLATES_AGENT_ID,
+        PEOPLE_AGENT_ID,
+        OBJECTS_AGENT_ID,
+        REFLECTION_AGENT_ID,
+        DEFAULT_AGENT_ID,
+    ] {
+        if r.contains(id) {
+            return id;
+        }
+    }
+    DEFAULT_AGENT_ID
 }
 
 /// The default recordings preamble, exposed so `llm::answer` (the single-shot `/query`
@@ -245,6 +349,12 @@ pub fn people_preamble() -> &'static str {
     PREAMBLE_PEOPLE
 }
 
+/// The license-plate preamble, exposed so the single-shot `/query` plates path can reuse the
+/// persona without constructing an `Agent`.
+pub fn plates_preamble() -> &'static str {
+    PREAMBLE_PLATES
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -268,11 +378,31 @@ mod tests {
     #[test]
     fn registry_lists_all_agents() {
         let ids: Vec<&str> = list().iter().map(|a| a.id).collect();
+        assert!(ids.contains(&AUTO_AGENT_ID));
         assert!(ids.contains(&DEFAULT_AGENT_ID));
         assert!(ids.contains(&REFLECTION_AGENT_ID));
         assert!(ids.contains(&OBJECTS_AGENT_ID));
         assert!(ids.contains(&PEOPLE_AGENT_ID));
-        assert_eq!(list().len(), 4);
+        assert!(ids.contains(&PLATES_AGENT_ID));
+        assert_eq!(list().len(), 6);
+    }
+
+    #[test]
+    fn router_labels_map_to_agent_ids() {
+        // Clean single-word replies.
+        assert_eq!(parse_agent_label("people"), PEOPLE_AGENT_ID);
+        assert_eq!(parse_agent_label("reflection"), REFLECTION_AGENT_ID);
+        assert_eq!(parse_agent_label("objects"), OBJECTS_AGENT_ID);
+        assert_eq!(parse_agent_label("plates"), PLATES_AGENT_ID);
+        assert_eq!(parse_agent_label("recordings"), DEFAULT_AGENT_ID);
+        // Messy replies: casing, punctuation, a short sentence.
+        assert_eq!(parse_agent_label("People."), PEOPLE_AGENT_ID);
+        assert_eq!(parse_agent_label("Category: PLATES"), PLATES_AGENT_ID);
+        assert_eq!(parse_agent_label("the reflection agent"), REFLECTION_AGENT_ID);
+        // Unknown / empty → safe default, never `auto`.
+        assert_eq!(parse_agent_label("banana"), DEFAULT_AGENT_ID);
+        assert_eq!(parse_agent_label(""), DEFAULT_AGENT_ID);
+        assert_ne!(parse_agent_label("auto"), AUTO_AGENT_ID);
     }
 
     #[test]
@@ -292,6 +422,15 @@ mod tests {
         let p = people_preamble().to_lowercase();
         assert!(p.contains("only"));
         assert!(p.contains("never invent a name") || p.contains("never invent"));
+    }
+
+    #[test]
+    fn plates_agent_registered() {
+        let a = get(PLATES_AGENT_ID).expect("plates agent must exist");
+        assert_eq!(a.kind, AgentKind::Plates);
+        let p = plates_preamble().to_lowercase();
+        assert!(p.contains("only"));
+        assert!(p.contains("never invent a plate") || p.contains("never invent"));
     }
 
     #[test]

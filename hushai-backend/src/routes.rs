@@ -9,14 +9,16 @@ use std::time::Duration;
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
-use axum::routing::{get, patch, post};
+use axum::routing::{delete, get, patch, post, put};
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use crate::auth;
 use crate::db;
+use crate::devices;
 use crate::ingest;
 use crate::persons;
+use crate::plates;
 use crate::speakers;
 use crate::state::AppState;
 use crate::storage;
@@ -80,12 +82,55 @@ pub fn router(state: AppState) -> Router {
             auth::require_bearer,
         ));
 
+    // License-plate (ALPR) catalog read/admin surface — the vehicle sibling of `persons`,
+    // bearer-authenticated the same way. The literal `/search` route is registered before the
+    // bare `/{id}` so "search" isn't captured as a plate id.
+    let plates = Router::new()
+        .route("/v1/plates", get(plates::list_plates))
+        .route("/v1/plates/search", get(plates::search_plates))
+        .route("/v1/plates/{id}", patch(plates::rename_plate))
+        .route("/v1/plates/{id}/merge", post(plates::merge_plate))
+        .route(
+            "/v1/plates/{id}/sample-crop",
+            get(plates::sample_plate_crop),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_bearer,
+        ));
+
+    // Device management + footage deletion (rename, usage, retention, delete) — bearer-authed,
+    // proxied through the viewer like the speaker/person surfaces. Literal sub-paths are registered
+    // before the bare `/{device_id}` so they aren't captured as ids.
+    let devices = Router::new()
+        .route("/v1/devices", get(devices::list_devices))
+        .route("/v1/devices/{device_id}/usage", get(devices::device_usage))
+        .route("/v1/devices/{device_id}/retention", put(devices::set_retention))
+        .route(
+            "/v1/devices/{device_id}/footage/bulk-delete",
+            post(devices::bulk_delete_footage),
+        )
+        .route(
+            "/v1/devices/{device_id}/footage",
+            delete(devices::delete_footage),
+        )
+        .route(
+            "/v1/devices/{device_id}",
+            patch(devices::rename_device).delete(devices::delete_device),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_bearer,
+        ));
+
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
         .merge(ingest)
         .merge(speakers)
         .merge(persons)
+        .merge(plates)
+        .merge(devices)
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,

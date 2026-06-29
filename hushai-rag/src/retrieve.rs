@@ -445,6 +445,65 @@ pub async fn list_by_person(
     Ok(sources)
 }
 
+/// Exhaustive, non-semantic listing of every segment a given license PLATE appeared in, in time
+/// order — the "when did I see the car with plate ABC123 / every time I saw it" path. Deduped to one
+/// sighting per (plate, segment) since `plate_detections` holds many rows per segment (one per OCR
+/// read). Backed by `plate_detections_plate_time_idx (plate_id, start_unix_nanos)`. `plate_ids` are
+/// uuid strings → bound `::uuid[]` (the 0013 contract — like the person filter, NOT the text[]
+/// speaker filter).
+///
+/// Rows carry `plate_id::text` in `Source.speaker_id` (the display chokepoint expects strings) and a
+/// sentinel `Source.text` ("(license plate seen on camera)"); `distance` is 0.0 so they survive the
+/// caller's threshold retain. The plate label is resolved at prompt time via `plates::label_map`.
+pub async fn list_by_plate(
+    pool: &PgPool,
+    plate_ids: &[String],
+    device_id: Option<&str>,
+    after: Option<i64>,
+    before: Option<i64>,
+    limit: i64,
+) -> anyhow::Result<Vec<Source>> {
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
+        "SELECT DISTINCT ON (pd.plate_id, pd.segment_id) \
+         pd.segment_id, pd.device_id, pd.plate_id, pd.start_unix_nanos \
+         FROM plate_detections pd WHERE pd.plate_id = ANY(",
+    );
+    qb.push_bind(plate_ids.to_vec())
+        .push("::uuid[]) AND pd.start_unix_nanos IS NOT NULL");
+    if let Some(d) = device_id {
+        qb.push(" AND pd.device_id = ").push_bind(d.to_string());
+    }
+    if let Some(a) = after {
+        qb.push(" AND pd.start_unix_nanos >= ").push_bind(a);
+    }
+    if let Some(b) = before {
+        qb.push(" AND pd.start_unix_nanos < ").push_bind(b);
+    }
+    // DISTINCT ON needs the matching leading ORDER BY keys; we re-sort by time after the fetch.
+    qb.push(" ORDER BY pd.plate_id, pd.segment_id, pd.start_unix_nanos ASC LIMIT ")
+        .push_bind(limit);
+
+    let rows = qb.build().fetch_all(pool).await?;
+    let mut sources = Vec::with_capacity(rows.len());
+    for row in rows {
+        let plate_id: Uuid = row.try_get("plate_id")?;
+        sources.push(Source {
+            segment_id: row.try_get("segment_id")?,
+            device_id: row
+                .try_get::<Option<String>, _>("device_id")?
+                .unwrap_or_default(),
+            text: "(license plate seen on camera)".to_string(),
+            start_unix_nanos: row.try_get("start_unix_nanos")?,
+            distance: 0.0,
+            speaker_id: Some(plate_id.to_string()),
+            speaker_name: None,
+            time_label: String::new(),
+        });
+    }
+    sources.sort_by_key(|s| s.start_unix_nanos);
+    Ok(sources)
+}
+
 /// "Who was I with": persons present in the SAME segments the owner appeared in (exact same-segment
 /// co-presence — cheap + precise on `person_segments_segment_id_idx`), excluding the owner. One row
 /// per co-present person (earliest co-sighting), in time order. `owner_person_ids` are the owner's
@@ -508,6 +567,57 @@ pub async fn list_co_occurring_persons(
                 .unwrap_or_default(),
             text: "(seen on camera)".to_string(),
             start_unix_nanos: row.try_get("first_seen")?,
+            distance: 0.0,
+            speaker_id: Some(person_id.to_string()),
+            speaker_name: None,
+            time_label: String::new(),
+        });
+    }
+    Ok(sources)
+}
+
+/// "Who have you seen (so far)": the roster of DISTINCT persons seen across all recordings, most
+/// recently seen first — the answer to a general "who's been around" question that names nobody and
+/// isn't anchored on the owner (unlike `list_co_occurring_persons`). One row per person (their most
+/// recent sighting, so a citation deep-links to where they were last seen). Time/device bounded like
+/// the other person queries; backed by `person_segments`.
+pub async fn list_recent_persons(
+    pool: &PgPool,
+    device_id: Option<&str>,
+    after: Option<i64>,
+    before: Option<i64>,
+    limit: i64,
+) -> anyhow::Result<Vec<Source>> {
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
+        "SELECT ps.person_id, MAX(ps.start_unix_nanos) AS last_seen, \
+                (array_agg(ps.device_id ORDER BY ps.start_unix_nanos DESC))[1] AS device_id, \
+                (array_agg(ps.segment_id ORDER BY ps.start_unix_nanos DESC))[1] AS segment_id \
+         FROM person_segments ps \
+         WHERE ps.person_id IS NOT NULL AND ps.start_unix_nanos IS NOT NULL",
+    );
+    if let Some(d) = device_id {
+        qb.push(" AND ps.device_id = ").push_bind(d.to_string());
+    }
+    if let Some(a) = after {
+        qb.push(" AND ps.start_unix_nanos >= ").push_bind(a);
+    }
+    if let Some(b) = before {
+        qb.push(" AND ps.start_unix_nanos < ").push_bind(b);
+    }
+    qb.push(" GROUP BY ps.person_id ORDER BY last_seen DESC LIMIT ")
+        .push_bind(limit);
+
+    let rows = qb.build().fetch_all(pool).await?;
+    let mut sources = Vec::with_capacity(rows.len());
+    for row in rows {
+        let person_id: Uuid = row.try_get("person_id")?;
+        sources.push(Source {
+            segment_id: row.try_get("segment_id")?,
+            device_id: row
+                .try_get::<Option<String>, _>("device_id")?
+                .unwrap_or_default(),
+            text: "(seen on camera)".to_string(),
+            start_unix_nanos: row.try_get("last_seen")?,
             distance: 0.0,
             speaker_id: Some(person_id.to_string()),
             speaker_name: None,

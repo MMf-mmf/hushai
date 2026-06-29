@@ -38,8 +38,10 @@
         </span>
       </div>
       <a class="navlink" href="/dashboard.html" title="System dashboard">▦ System</a>
+      <a class="navlink" href="/manage.html" title="Manage devices &amp; footage (rename, retention, delete)">🗄 Files</a>
       <button id="btnCapture" class="ghost" title="Capture from this browser's camera &amp; mic">●</button>
       <button id="btnPeople" class="ghost" title="People &amp; faces">👤</button>
+      <button id="btnPlates" class="ghost" title="License plates">🚗</button>
       <button id="btnSettings" class="ghost" title="Voices &amp; settings">⚙</button>
       <button id="btnLogout" class="ghost" title="Log out"
         onclick="fetch('/logout',{method:'POST'}).finally(()=>location.href='/login')">⎋</button>
@@ -159,6 +161,21 @@
       </div>
     </div>
 
+    <!-- Plates: search/name/merge the license plates found in your recordings (vehicle twin of People). -->
+    <div id="platesModal" class="modal" hidden>
+      <div class="modal-card">
+        <div class="modal-head">
+          <span class="lbl">Plates</span>
+          <span class="muted small">search, name &amp; merge the license plates in your recordings</span>
+          <span class="spacer"></span>
+          <input id="platesSearch" type="search" placeholder="Search plate text…" />
+          <button id="platesRefresh" type="button">Refresh</button>
+          <button id="platesClose" type="button" title="Close">✕</button>
+        </div>
+        <div id="platesBody" class="modal-body"></div>
+      </div>
+    </div>
+
     <!-- Capture: stream this browser's camera + mic into the backend, like the Android app. -->
     <div id="captureModal" class="modal" hidden>
       <div class="modal-card">
@@ -196,6 +213,7 @@
     <script type="module" src="/js/chat/workspace.js"></script>
     <script type="module" src="/js/settings/voices.js"></script>
     <script type="module" src="/js/settings/people.js"></script>
+    <script type="module" src="/js/settings/plates.js"></script>
     <script type="module" src="/js/capture/capture-ui.js"></script>
   </body>
 </html>

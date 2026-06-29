@@ -63,3 +63,16 @@ export function humanDur(ms) {
   const h = Math.floor(m / 60);
   return `${h}h ${m % 60}m`;
 }
+
+// Human byte size, e.g. "0 B", "934 KB", "2.1 GB" (binary units; mirrors the backend's human_bytes).
+export function humanBytes(bytes) {
+  const n = Number(bytes) || 0;
+  const units = ["B", "KB", "MB", "GB", "TB", "PB"];
+  let v = n;
+  let i = 0;
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return i === 0 ? `${n} B` : `${v.toFixed(1)} ${units[i]}`;
+}

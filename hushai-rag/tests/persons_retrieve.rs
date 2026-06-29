@@ -182,3 +182,46 @@ async fn co_occurring_persons_finds_co_present_excludes_owner() {
 
     cleanup(&pool, &device).await;
 }
+
+#[tokio::test]
+async fn recent_persons_lists_everyone_seen_once_most_recent_first() {
+    // The "who have you seen so far" roster: every distinct person, deduped to one row, ordered by
+    // most-recent sighting — and crucially needing NO owner (the bug was declining without one).
+    let Some(pool) = pool().await else {
+        eprintln!("skipping recent_persons_lists_everyone_seen_once_most_recent_first: DATABASE_URL unset");
+        return;
+    };
+    let device = format!("test-pe-{}", Uuid::now_v7());
+    let session = insert_dss(&pool, &device).await;
+    let alice = insert_person(&pool, &device, Some("Alice"), 0).await;
+    let bob = insert_person(&pool, &device, Some("Bob"), 1).await;
+    let carol = insert_person(&pool, &device, None, 2).await; // an unnamed face still counts
+
+    // Alice: two sightings across two segments (last_seen = 2_000) → must appear ONCE.
+    let seg0 = insert_segment(&pool, &device, session, 0).await;
+    insert_person_segment(&pool, seg0, &device, alice, 1_000, 0).await;
+    let seg1 = insert_segment(&pool, &device, session, 1).await;
+    insert_person_segment(&pool, seg1, &device, alice, 2_000, 0).await;
+    // Bob: most recent overall (5_000). Carol: in between (3_000).
+    let seg2 = insert_segment(&pool, &device, session, 2).await;
+    insert_person_segment(&pool, seg2, &device, bob, 5_000, 1).await;
+    let seg3 = insert_segment(&pool, &device, session, 3).await;
+    insert_person_segment(&pool, seg3, &device, carol, 3_000, 2).await;
+
+    let roster = retrieve::list_recent_persons(&pool, Some(&device), None, None, 100)
+        .await
+        .unwrap();
+
+    let order: Vec<String> = roster.iter().filter_map(|s| s.speaker_id.clone()).collect();
+    assert_eq!(
+        order,
+        vec![bob.to_string(), carol.to_string(), alice.to_string()],
+        "one row per person, most-recently-seen first"
+    );
+    // Alice's row points at her LATEST sighting (so a citation deep-links to where she was last seen).
+    let alice_row = roster.iter().find(|s| s.speaker_id.as_deref() == Some(alice.to_string().as_str())).unwrap();
+    assert_eq!(alice_row.start_unix_nanos, 2_000, "roster row carries the most recent sighting");
+    assert_eq!(alice_row.text, "(seen on camera)");
+
+    cleanup(&pool, &device).await;
+}

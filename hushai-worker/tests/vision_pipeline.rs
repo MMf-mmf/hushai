@@ -8,10 +8,10 @@ use std::path::PathBuf;
 
 use hushai_worker::config::WorkerConfig;
 use hushai_worker::media::SegmentRow;
-use hushai_worker::vision::detect::FaceDetector;
+use hushai_worker::vision::detect::{FaceDetect, FaceDetector};
 use hushai_worker::vision::face_embed::{self, FaceEmbedder};
 use hushai_worker::vision::objects::{self, ClipEmbedder, ObjectDetector};
-use hushai_worker::vision::{frames, model};
+use hushai_worker::vision::{enhance, frames, model};
 use uuid::Uuid;
 
 fn repo_root() -> PathBuf {
@@ -392,6 +392,135 @@ async fn detect_objects_from_real_video() {
         labels.iter().any(|l| !l.starts_with("class_")),
         "all labels were class_<i> — COCO class indexing is wrong; fix coco_label()/class offset in objects.rs \
          (see models/rf-detr-classes.json from export_rf_detr.py)"
+    );
+}
+
+/// Print the REAL I/O contract of the SCRFD detector + the cleanup models (Real-ESRGAN, GFPGAN/
+/// CodeFormer). Run after provisioning to confirm the SCRFD decode in `detect_scrfd.rs` (score/bbox/
+/// kps grouped by trailing dim) and the 512² restorer / dynamic super-res contracts match the export.
+///   cargo test -p hushai-worker --test vision_pipeline inspect_enhance_model_io_shapes -- --nocapture
+#[test]
+fn inspect_enhance_model_io_shapes() {
+    let dy = dylib();
+    if !dy.exists() {
+        eprintln!("SKIP: dylib missing");
+        return;
+    }
+    model::init_ort(dy.to_str().unwrap());
+    for (name, rel) in [
+        ("SCRFD", "models/scrfd_10g_bnkps.onnx"),
+        ("Real-ESRGAN", "models/realesrgan_x4plus.onnx"),
+        ("GFPGAN", "models/gfpgan_v1.4.onnx"),
+        ("CodeFormer", "models/codeformer.onnx"),
+    ] {
+        let p = repo_root().join(rel);
+        if !p.exists() {
+            eprintln!("SKIP {name}: {} missing (run local_dev/fetch_*.sh / export_*.py)", p.display());
+            continue;
+        }
+        let s = model::load_session(p.to_str().unwrap(), false).expect("load");
+        eprintln!("== {name} ({rel}) ==");
+        for i in &s.inputs {
+            eprintln!("  IN  {} : {:?}", i.name, i.input_type.tensor_dimensions());
+        }
+        for o in &s.outputs {
+            eprintln!("  OUT {} : {:?}", o.name, o.output_type.tensor_dimensions());
+        }
+    }
+}
+
+/// THE recover-then-embed correctness gate: take a clean frontal face, ARTIFICIALLY DEGRADE it
+/// (downscale + blur, as a small/distant capture would be), and confirm that the restoration cascade
+/// pulls the degraded face's ArcFace embedding markedly CLOSER to the clean reference than the raw
+/// degraded crop does. If restoration moved identity the wrong way this fails — the guard that lets
+/// restored faces fold into centroids only after this passes. Gated on FACE_TEST_DIR + the restorer.
+///   FACE_TEST_DIR=/path cargo test -p hushai-worker --test vision_pipeline restored_low_quality_recovers_identity -- --nocapture
+#[test]
+fn restored_low_quality_recovers_identity() {
+    let dir = match std::env::var("FACE_TEST_DIR") {
+        Ok(d) => PathBuf::from(d),
+        Err(_) => {
+            eprintln!("SKIP: set FACE_TEST_DIR (needs obama.jpg)");
+            return;
+        }
+    };
+    let dy = dylib();
+    let scrfd = repo_root().join("models/scrfd_10g_bnkps.onnx");
+    let yunet = repo_root().join("models/face_detection_yunet_2023mar.onnx");
+    let arcface = repo_root().join("models/w600k_r50.onnx");
+    let gfpgan = repo_root().join("models/gfpgan_v1.4.onnx");
+    if !dy.exists() || !arcface.exists() || !gfpgan.exists() || (!scrfd.exists() && !yunet.exists()) {
+        eprintln!("SKIP: arcface/gfpgan/(scrfd|yunet) not all provisioned");
+        return;
+    }
+    model::init_ort(dy.to_str().unwrap());
+    let detector: Box<dyn FaceDetect> = if scrfd.exists() {
+        Box::new(hushai_worker::vision::detect_scrfd::ScrfdDetector::new(
+            model::load_session(scrfd.to_str().unwrap(), false).unwrap(),
+            0.5,
+        ))
+    } else {
+        Box::new(FaceDetector::new(
+            model::load_session(yunet.to_str().unwrap(), false).unwrap(),
+            0.5,
+        ))
+    };
+    let embedder = FaceEmbedder::new(model::load_session(arcface.to_str().unwrap(), false).unwrap());
+    let restorer = enhance::FaceRestorer::new(
+        model::load_session(gfpgan.to_str().unwrap(), false).unwrap(),
+        enhance::RestorerKind::Gfpgan,
+        0.6,
+    );
+
+    let img = image::open(dir.join("obama.jpg")).expect("open obama.jpg").to_rgb8();
+    let mut faces = detector.detect(&img).expect("detect");
+    assert!(!faces.is_empty(), "no face detected in reference");
+    faces.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap());
+    let face = &faces[0];
+
+    // Clean reference embedding.
+    let clean = embedder.embed(&img, face).expect("clean embed");
+
+    // Degrade the WHOLE frame: 4× downscale then back up + blur (a small/distant, soft capture).
+    let small = enhance::resize_rgb(&img, img.width() / 4, img.height() / 4);
+    let back = enhance::resize_rgb(&small, img.width(), img.height());
+    let degraded = image::imageops::blur(&back, 2.0);
+    let dfaces = detector.detect(&degraded).expect("detect degraded");
+    if dfaces.is_empty() {
+        eprintln!("NOTE: detector lost the degraded face entirely — restoration can't help; skipping");
+        return;
+    }
+    let dface = dfaces
+        .iter()
+        .max_by(|a, b| a.score.partial_cmp(&b.score).unwrap())
+        .unwrap();
+
+    // Raw degraded embedding (the old behavior).
+    let raw = embedder.embed(&degraded, dface).expect("raw degraded embed");
+
+    // Restored path (mirror write.rs::try_restore): margin-crop → restore → align → embed.
+    let (cur, off) = enhance::crop_with_margin(&degraded, &dface.bbox, 0.35);
+    let mut lmk = dface.landmarks;
+    for l in lmk.iter_mut() {
+        l[0] -= off[0];
+        l[1] -= off[1];
+    }
+    let restored = restorer.restore(&cur).expect("restore");
+    let sx = restored.width() as f32 / cur.width().max(1) as f32;
+    let sy = restored.height() as f32 / cur.height().max(1) as f32;
+    for l in lmk.iter_mut() {
+        l[0] *= sx;
+        l[1] *= sy;
+    }
+    let aligned = face_embed::align_crop(&restored, &lmk);
+    let restored_emb = embedder.embed_aligned(&aligned).expect("restored embed");
+
+    let raw_sim = cosine(&clean, &raw);
+    let restored_sim = cosine(&clean, &restored_emb);
+    eprintln!("cosine to clean — raw degraded {raw_sim:.3}, restored {restored_sim:.3}");
+    assert!(
+        restored_sim >= raw_sim,
+        "restoration moved identity the WRONG way: restored {restored_sim:.3} < raw {raw_sim:.3}"
     );
 }
 

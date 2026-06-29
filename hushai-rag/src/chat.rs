@@ -33,9 +33,9 @@ use uuid::Uuid;
 use crate::agents::AgentKind;
 use crate::retrieve::{self, Filters, Source, Tuning};
 use crate::routes::{
-    PEOPLE_NO_OWNER, QueryFilters, REFLECTION_NO_TARGET, check_auth, enrich_persons_for_display,
-    internal, resolve_owner_person, resolve_person_filter, resolve_speaker_filter,
-    resolve_target_speaker,
+    PEOPLE_NO_OWNER, PeopleSources, QueryFilters, REFLECTION_NO_TARGET, check_auth,
+    enrich_persons_for_display, enrich_plates_for_display, internal, resolve_people_sources,
+    resolve_plate_filter, resolve_speaker_filter, resolve_target_speaker,
 };
 use crate::state::AppState;
 
@@ -54,6 +54,11 @@ pub struct ChatRequest {
     pub filters: Option<QueryFilters>,
     #[serde(default)]
     pub top_k: Option<i64>,
+    /// Caller's UTC offset in seconds (e.g. -14400 for EDT) for rendering "today/yesterday at
+    /// h:MM PM". The browser sends its live offset so spoken times match the user's local clock;
+    /// absent (e.g. non-browser callers) falls back to `ANALYSIS_TZ_OFFSET_SECS`.
+    #[serde(default)]
+    pub tz_offset_secs: Option<i64>,
 }
 
 /// `POST /v1/rag/chat` — stream a grounded, multi-turn answer as Server-Sent Events.
@@ -108,6 +113,16 @@ pub async fn rag_chat(
     let history_rows = load_history(&st.pool, session_id, st.cfg.chat_history_turns * 2)
         .await
         .map_err(internal)?;
+    // The last turn or two as plain text, for the auto-router (so a follow-up like "Mendel" after
+    // a clarifying question routes with context).
+    let recent_context: String = history_rows
+        .iter()
+        .rev()
+        .take(2)
+        .rev()
+        .map(|(role, content)| format!("{role}: {content}"))
+        .collect::<Vec<_>>()
+        .join("\n");
     let history: Vec<Message> = history_rows
         .into_iter()
         .map(|(role, content)| {
@@ -119,6 +134,20 @@ pub async fn rag_chat(
         })
         .collect();
 
+    // Unified assistant: classify each message and dispatch to the right capability. A session
+    // bound to a concrete agent keeps that agent (manual override / older sessions).
+    let agent = if agent.id == crate::agents::AUTO_AGENT_ID {
+        let routed = st
+            .llm
+            .classify_agent(&message, &recent_context)
+            .await
+            .map_err(internal)?;
+        tracing::info!(routed_to = %routed, "auto-router selected capability");
+        crate::agents::get(routed).unwrap_or_else(crate::agents::default)
+    } else {
+        agent
+    };
+
     // Persist the user turn immediately: a crash mid-answer still records it, and seq stays
     // gap-free.
     insert_message(&st.pool, session_id, "user", &message, None, &agent_id)
@@ -129,6 +158,8 @@ pub async fn rag_chat(
     // build this turn's context: a grounded retrieval OR (reflection) an analytics digest.
     let qf = req.filters.unwrap_or_default();
     let df = &agent.default_filters;
+    // Render times in the caller's local civil time (browser offset), falling back to the env default.
+    let tz = req.tz_offset_secs.unwrap_or(st.cfg.analysis_tz_offset_secs);
 
     // For reflection-with-no-target we skip the LLM entirely and stream a setup hint.
     let mut precomputed_answer: Option<String> = None;
@@ -136,6 +167,22 @@ pub async fn rag_chat(
     let mut sources: Vec<Source>;
     let names;
 
+    // "This video" with no camera scoped + more than one camera -> ask which one instead of
+    // silently answering across everything. Reflection isn't camera-scoped, so it never triggers.
+    let scope_is_all = qf.device_id.is_none() && df.device_id.is_none();
+    let clarify_camera = scope_is_all
+        && matches!(
+            agent.kind,
+            AgentKind::People | AgentKind::Objects | AgentKind::Plates | AgentKind::Grounded
+        )
+        && crate::routes::is_deictic_video_query(&message)
+        && crate::routes::camera_count(&st.pool).await.map_err(internal)? > 1;
+
+    if clarify_camera {
+        precomputed_answer = Some(crate::routes::CAMERA_CLARIFY.to_string());
+        sources = vec![];
+        names = std::collections::HashMap::new();
+    } else {
     match agent.kind {
         AgentKind::Reflection => {
             let target = resolve_target_speaker(
@@ -261,11 +308,8 @@ pub async fn rag_chat(
                     s.retain(|x| x.distance <= st.cfg.object_distance_threshold);
                     let now = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
                     for src in &mut s {
-                        src.time_label = crate::humanize::humanize_time(
-                            src.start_unix_nanos,
-                            now,
-                            st.cfg.analysis_tz_offset_secs,
-                        );
+                        src.time_label =
+                            crate::humanize::humanize_time(src.start_unix_nanos, now, tz);
                     }
                     precomputed_answer = Some(
                         st.llm
@@ -288,55 +332,26 @@ pub async fn rag_chat(
                 .or(agent.default_top_k)
                 .unwrap_or(st.cfg.person_top_k_default)
                 .clamp(1, 200);
-            let explicit =
-                resolve_person_filter(&st.pool, qf.person_id.clone(), qf.person_name.clone())
-                    .await
-                    .map_err(internal)?;
-            let mut s = match explicit {
-                Some(ids) => retrieve::list_by_person(
-                    &st.pool,
-                    &ids,
-                    device_id.as_deref(),
-                    after,
-                    before,
-                    limit,
-                )
-                .await
-                .map_err(internal)?,
-                None => {
-                    let mentioned = crate::persons::resolve_names_in_text(&st.pool, &message)
-                        .await
-                        .map_err(internal)?;
-                    if !mentioned.is_empty() {
-                        let ids: Vec<String> = mentioned.iter().map(|u| u.to_string()).collect();
-                        retrieve::list_by_person(
-                            &st.pool,
-                            &ids,
-                            device_id.as_deref(),
-                            after,
-                            before,
-                            limit,
-                        )
-                        .await
-                        .map_err(internal)?
-                    } else {
-                        let owner = resolve_owner_person(&st).await.map_err(internal)?;
-                        if owner.is_empty() {
-                            precomputed_answer = Some(PEOPLE_NO_OWNER.to_string());
-                            Vec::new()
-                        } else {
-                            retrieve::list_co_occurring_persons(
-                                &st.pool,
-                                &owner,
-                                device_id.as_deref(),
-                                after,
-                                before,
-                                limit,
-                            )
-                            .await
-                            .map_err(internal)?
-                        }
-                    }
+            // Same routing as the single-shot path (explicit name → mentioned name → "who was I
+            // with" co-occurrence → roster of everyone seen). The roster is what answers
+            // "who have you seen so far" without a configured owner.
+            let mut s = match resolve_people_sources(
+                &st,
+                &message,
+                qf.person_id.clone(),
+                qf.person_name.clone(),
+                device_id.as_deref(),
+                after,
+                before,
+                limit,
+            )
+            .await
+            .map_err(internal)?
+            {
+                PeopleSources::Found(s) => s,
+                PeopleSources::NeedsOwner => {
+                    precomputed_answer = Some(PEOPLE_NO_OWNER.to_string());
+                    Vec::new()
                 }
             };
             let pids: Vec<String> = s.iter().filter_map(|x| x.speaker_id.clone()).collect();
@@ -348,7 +363,7 @@ pub async fn rag_chat(
                     &mut s,
                     &names,
                     Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
-                    st.cfg.analysis_tz_offset_secs,
+                    tz,
                 );
                 precomputed_answer = Some(
                     st.llm
@@ -359,18 +374,89 @@ pub async fn rag_chat(
             }
             sources = s;
         }
+        AgentKind::Plates => {
+            // License-plate attribution — answered synchronously (precomputed), with its own
+            // plate-label enrichment (not the speaker enrichment below). Mirrors the People arm but
+            // without an owner anchor: no plate filter / no plate token in the message -> no
+            // sightings -> the LLM declines.
+            let device_id = qf.device_id.or_else(|| df.device_id.clone());
+            let after = qf.after_unix_nanos.or(df.after_unix_nanos);
+            let before = qf.before_unix_nanos.or(df.before_unix_nanos);
+            let limit = req
+                .top_k
+                .or(agent.default_top_k)
+                .unwrap_or(st.cfg.plate_top_k_default)
+                .clamp(1, 200);
+            let explicit = resolve_plate_filter(&st.pool, qf.plate_id.clone(), qf.plate_text.clone())
+                .await
+                .map_err(internal)?;
+            let mut s = match explicit {
+                Some(ids) => retrieve::list_by_plate(
+                    &st.pool,
+                    &ids,
+                    device_id.as_deref(),
+                    after,
+                    before,
+                    limit,
+                )
+                .await
+                .map_err(internal)?,
+                None => {
+                    let mentioned = crate::plates::resolve_plates_in_text(&st.pool, &message)
+                        .await
+                        .map_err(internal)?;
+                    if mentioned.is_empty() {
+                        Vec::new()
+                    } else {
+                        let ids: Vec<String> = mentioned.iter().map(|u| u.to_string()).collect();
+                        retrieve::list_by_plate(
+                            &st.pool,
+                            &ids,
+                            device_id.as_deref(),
+                            after,
+                            before,
+                            limit,
+                        )
+                        .await
+                        .map_err(internal)?
+                    }
+                }
+            };
+            let plate_ids: Vec<String> = s.iter().filter_map(|x| x.speaker_id.clone()).collect();
+            names = crate::plates::label_map(&st.pool, &plate_ids)
+                .await
+                .map_err(internal)?;
+            enrich_plates_for_display(
+                &mut s,
+                &names,
+                Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+                tz,
+            );
+            precomputed_answer = Some(
+                st.llm
+                    .answer_plates(&message, &s, &names)
+                    .await
+                    .map_err(internal)?,
+            );
+            sources = s;
+        }
     }
+    } // end else (no camera clarification)
 
     // Attach human-readable speaker names + relative time once, before the sources are sent
     // to the LLM prompt, streamed as the `sources` SSE event, and persisted to jsonb — so all
-    // three render the identical natural-language phrasing (no UUIDs / nanoseconds). Objects + People
-    // set their own display fields above (object label / person label), so they skip this.
-    if !matches!(agent.kind, AgentKind::Objects | AgentKind::People) {
+    // three render the identical natural-language phrasing (no UUIDs / nanoseconds). Objects, People,
+    // and Plates set their own display fields above (object label / person label / plate label), so
+    // they skip this.
+    if !matches!(
+        agent.kind,
+        AgentKind::Objects | AgentKind::People | AgentKind::Plates
+    ) {
         retrieve::enrich_for_display(
             &mut sources,
             &names,
             Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
-            st.cfg.analysis_tz_offset_secs,
+            tz,
         );
     }
 

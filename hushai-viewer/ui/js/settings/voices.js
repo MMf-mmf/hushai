@@ -48,6 +48,26 @@ function sectionTitle(text, count) {
   return el;
 }
 
+// A collapsed-by-default disclosure ("Known voices (N)") wrapping its cards. Already-named voices
+// are tucked away so opening the modal surfaces the unidentified ones (the voices you actually
+// need to name); the known list grows over time and isn't useful on every open.
+function collapsibleSection(text, count, cardEls) {
+  const details = document.createElement("details");
+  details.className = "voice-section";
+  const summary = document.createElement("summary");
+  summary.className = "voice-section-title";
+  summary.textContent = text;
+  const c = document.createElement("span");
+  c.className = "muted small";
+  c.textContent = `  (${count})`;
+  summary.appendChild(c);
+  details.appendChild(summary);
+  const body = div("voice-section-body");
+  for (const el of cardEls) body.appendChild(el);
+  details.appendChild(body);
+  return details;
+}
+
 // One speaker: name + sample count + sample utterances, with rename, play, and "merge into".
 function voiceCard(sp, others, ctx) {
   const card = div("voice-card");
@@ -260,24 +280,22 @@ function render(container, speakers, dups, unattributed, ctx) {
     return;
   }
 
-  const addCard = (sp) =>
-    container.appendChild(voiceCard(sp, speakers.filter((o) => o.speaker_id !== sp.speaker_id), ctx));
-
-  // Identified (named) voices first, so the known voices are visible at a glance,
-  // then the ones still waiting to be named.
+  // The known (named) voices collapse into a closed disclosure; the still-unidentified voices —
+  // the ones you open this modal to name — stay shown.
   const known = speakers.filter(isIdentified);
   const unknown = speakers.filter((sp) => !isIdentified(sp));
+  const cardFor = (sp) => voiceCard(sp, speakers.filter((o) => o.speaker_id !== sp.speaker_id), ctx);
 
-  container.appendChild(sectionTitle("Known voices", known.length));
   if (known.length) {
-    known.forEach(addCard);
+    container.appendChild(collapsibleSection("Known voices", known.length, known.map(cardFor)));
   } else {
+    container.appendChild(sectionTitle("Known voices", 0));
     container.appendChild(note("No voices identified yet — name one below to build your known-voices list."));
   }
 
   if (unknown.length) {
     container.appendChild(sectionTitle("Unidentified voices", unknown.length));
-    unknown.forEach(addCard);
+    unknown.forEach((sp) => container.appendChild(cardFor(sp)));
   }
 }
 

@@ -28,13 +28,34 @@ use crate::state::AppState;
 pub struct PersonSummary {
     pub person_id: Uuid,
     pub display_name: Option<String>,
+    /// Raw per-face template count (one `person_segments` row PER DETECTED FACE PER SAMPLED FRAME).
+    /// Internal weight for centroid math / merge blending — NOT a human "sightings" count, since a
+    /// single short clip is sampled across many frames (and many contiguous ~2s segments), so this
+    /// over-counts a single appearance. The UI shows `n_sightings` instead.
     pub n_samples: i64,
+    /// Human-meaningful number of distinct appearances: detections sessionized by time gap, so the
+    /// many frames of one short clip — and a run of contiguous segments of one continuous
+    /// appearance — collapse to a single sighting. See [`sighting_gap_nanos`].
+    pub n_sightings: i64,
     /// Absolute timestamps of up to 3 recent sightings (a "when did we see this face" hint).
     pub sample_sighting_unix_nanos: Vec<i64>,
 }
 
-/// `GET /v1/persons` — the global (cross-device) catalog with up to 3 recent sighting times
-/// per person (LATERAL correlated LIMIT, cheap on the partitioned `person_segments`).
+/// A new "sighting" begins when consecutive detections of the same face are more than this many
+/// nanoseconds apart; closer detections collapse into one. Tunable via `PERSON_SIGHTING_GAP_SECONDS`
+/// (default 60s). This turns the raw per-frame `person_segments` rows into the count of distinct
+/// appearances the UI labels "N sightings" — so a single few-second clip reads as 1, not ~20.
+fn sighting_gap_nanos() -> i64 {
+    let secs: i64 = std::env::var("PERSON_SIGHTING_GAP_SECONDS")
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(60);
+    secs.max(0).saturating_mul(1_000_000_000)
+}
+
+/// `GET /v1/persons` — the global (cross-device) catalog with a time-clustered sighting count and
+/// up to 3 recent sighting times per person (LATERAL correlated subqueries, cheap on the
+/// partitioned `person_segments`).
 pub async fn list_persons(
     State(st): State<AppState>,
 ) -> Result<Json<Vec<PersonSummary>>, IngestError> {
@@ -43,8 +64,22 @@ pub async fn list_persons(
         SELECT p.person_id,
                p.display_name,
                p.n_samples,
+               COALESCE(sight.n, 0) AS n_sightings,
                COALESCE(samp.ts, ARRAY[]::bigint[]) AS sample_sightings
         FROM persons p
+        LEFT JOIN LATERAL (
+            -- Sessionize this face's detections by time gap: a sighting starts at the first
+            -- detection (gap IS NULL) and whenever the gap to the previous one exceeds $1 ns.
+            SELECT count(*) AS n
+            FROM (
+                SELECT start_unix_nanos
+                         - lag(start_unix_nanos) OVER (ORDER BY start_unix_nanos) AS gap
+                FROM person_segments
+                WHERE person_id = p.person_id
+                  AND start_unix_nanos IS NOT NULL
+            ) g
+            WHERE g.gap IS NULL OR g.gap > $1
+        ) sight ON true
         LEFT JOIN LATERAL (
             SELECT array_agg(q.t ORDER BY q.t DESC) AS ts
             FROM (
@@ -56,9 +91,10 @@ pub async fn list_persons(
                 LIMIT 3
             ) q
         ) samp ON true
-        ORDER BY p.n_samples DESC
+        ORDER BY n_sightings DESC, p.n_samples DESC
         "#,
     )
+    .bind(sighting_gap_nanos())
     .fetch_all(&st.pool)
     .await?;
 
@@ -70,6 +106,7 @@ pub async fn list_persons(
                 .try_get::<Option<String>, _>("display_name")
                 .unwrap_or(None),
             n_samples: r.get("n_samples"),
+            n_sightings: r.get("n_sightings"),
             sample_sighting_unix_nanos: r
                 .try_get::<Vec<i64>, _>("sample_sightings")
                 .unwrap_or_default(),
@@ -248,18 +285,45 @@ pub async fn sample_face(
     State(st): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Response, IngestError> {
+    // Prefer the persisted CLEANED (restored) best-shot crop: the image-cleanup stage already did
+    // the zoom/restore, so this shows the operator the clearest face instead of a raw re-crop. Order
+    // best-shot → quality_score → det_score so we surface the best available regardless of which
+    // columns are populated (older rows have neither crop_uri nor quality_score).
     let row = sqlx::query(
         "SELECT seg.blob_uri, seg.container, seg.codec_init_data, \
-                ps.bbox::text AS bbox_json, ps.frame_offset_nanos \
+                ps.bbox::text AS bbox_json, ps.frame_offset_nanos, ps.crop_uri \
          FROM person_segments ps JOIN segments seg ON seg.segment_id = ps.segment_id \
          WHERE ps.person_id = $1 \
-         ORDER BY ps.det_score DESC NULLS LAST, ps.created_at \
+         ORDER BY ps.is_best_shot DESC, ps.quality_score DESC NULLS LAST, \
+                  ps.det_score DESC NULLS LAST, ps.created_at \
          LIMIT 1",
     )
     .bind(id)
     .fetch_optional(&st.pool)
     .await?
     .ok_or(IngestError::NotFound("sample face for person"))?;
+
+    // Fast path: a stored cleaned crop. Canonicalize + require under blob_root (same guard as raw
+    // blobs); on any miss, fall through to re-cropping the source frame so the endpoint never fails.
+    let crop_uri: Option<String> = row.try_get("crop_uri").unwrap_or(None);
+    if let Some(crop) = crop_uri.as_deref().filter(|s| !s.is_empty()) {
+        if let Ok(path) = tokio::fs::canonicalize(crop).await {
+            if path.starts_with(&*st.blob_root) {
+                if let Ok(bytes) = tokio::fs::read(&path).await {
+                    if !bytes.is_empty() {
+                        let len = bytes.len();
+                        return Response::builder()
+                            .header(CONTENT_TYPE, "image/jpeg")
+                            .header(CONTENT_LENGTH, len)
+                            .body(Body::from(bytes))
+                            .map_err(|e| {
+                                IngestError::Internal(anyhow::anyhow!("building response: {e}"))
+                            });
+                    }
+                }
+            }
+        }
+    }
 
     let blob_uri: String = row.get("blob_uri");
     let container: String = row.get("container");
@@ -319,7 +383,8 @@ pub async fn sample_face(
 }
 
 /// Decode a single frame at `offset_secs`, optionally cropped to `[x,y,w,h]` (pixels), as JPEG.
-async fn extract_jpeg(
+/// `pub(crate)` so the ALPR sample-crop path (`plates.rs`) reuses the exact same ffmpeg invocation.
+pub(crate) async fn extract_jpeg(
     path: &std::path::Path,
     offset_secs: f64,
     bbox: Option<[f32; 4]>,
@@ -354,8 +419,9 @@ async fn extract_jpeg(
     Ok(out.stdout)
 }
 
-/// Parse a JSONB-as-text bbox `[x,y,w,h]`; `None` if malformed.
-fn parse_bbox(s: &str) -> Option<[f32; 4]> {
+/// Parse a JSONB-as-text bbox `[x,y,w,h]`; `None` if malformed. `pub(crate)` so `plates.rs`
+/// parses `plate_bbox` with the identical contract.
+pub(crate) fn parse_bbox(s: &str) -> Option<[f32; 4]> {
     serde_json::from_str::<[f32; 4]>(s).ok()
 }
 

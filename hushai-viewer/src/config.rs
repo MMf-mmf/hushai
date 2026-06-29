@@ -15,6 +15,12 @@ pub struct ViewerConfig {
     /// `VIEWER_BIND_ADDR=0.0.0.0:8070` to let admin computers reach it (the IP allowlist
     /// + password gate then restrict who actually gets in — see `auth.rs`).
     pub bind_addr: SocketAddr,
+    /// **Cosmetic only.** Friendly host shown in the startup "open …" log so it matches what a
+    /// user types (e.g. `hushai.local` → "open https://hushai.local/"). From `VIEWER_HOSTNAME`.
+    /// Does NOT affect the bind address or routing; `None` ⇒ log the bind addr. Resolution
+    /// (Bonjour) + the no-port 443→8070 redirect are set up out-of-process by
+    /// `local_dev/setup_hostname.sh`.
+    pub display_host: Option<String>,
     /// Optional native TLS (`VIEWER_TLS_CERT_PATH`/`VIEWER_TLS_KEY_PATH`, falling back to
     /// the bare `TLS_CERT_PATH`/`TLS_KEY_PATH`). Both set ⇒ HTTPS; neither ⇒ cleartext.
     pub tls: Option<hushai_backend::tls::TlsPaths>,
@@ -125,6 +131,9 @@ impl ViewerConfig {
 
         Ok(Self {
             bind_addr: parse("VIEWER_BIND_ADDR", "127.0.0.1:8070")?,
+            display_host: std::env::var("VIEWER_HOSTNAME")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
             tls,
             admin_ip_allowlist,
             allow_loopback,

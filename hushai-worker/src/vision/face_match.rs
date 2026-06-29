@@ -37,6 +37,9 @@ pub struct FaceMatchConfig {
     pub knn_ef_search: i64,
     pub knn_statement_timeout_ms: i64,
     pub centroid_window: i64,
+    /// When false, a generatively-RESTORED face may match/attach but may NOT mint a new identity or
+    /// fold into a centroid (protects existing centroids from restoration drift during a transition).
+    pub restored_may_mint: bool,
 }
 
 /// One detected face, ready to assign + persist. `quality` is `Mint` or `AttachOnly` only
@@ -50,6 +53,17 @@ pub struct FaceWrite {
     pub start_unix_nanos: i64,
     pub end_unix_nanos: i64,
     pub quality: FaceQuality,
+    /// True if this embedding came from a generatively-restored crop (recover-then-embed path).
+    pub restored: bool,
+    /// Approximate head pose (degrees) from the landmark proxy; stored for calibration/auditing.
+    pub yaw: f32,
+    pub pitch: f32,
+    /// Composite crop quality (sharpness×frontality×det_score×size); drives best-shot selection.
+    pub quality_score: f32,
+    /// Tagged best-shot for the segment (the thumbnail the UI prefers).
+    pub is_best_shot: bool,
+    /// Filesystem path of the persisted cleaned crop, if `face_persist_crop` wrote one.
+    pub crop_uri: Option<String>,
 }
 
 enum Action {
@@ -153,10 +167,13 @@ pub async fn assign_faces(
             _ => nearest_centroid(tx, &f.embedding).await?,
         };
 
-        // 4c. Mint-guard hysteresis (only clean faces may mint; gray zone always attaches).
+        // 4c. Mint-guard hysteresis (only clean faces may mint; gray zone always attaches). A
+        //     restored face may match/attach but may not mint or fold into a centroid unless the
+        //     operator has cleared `restored_may_mint` (protects centroids from generative drift).
+        let may_fold = !f.restored || cfg.restored_may_mint;
         let action = match decided {
             Some((id, d)) if d <= cfg.match_threshold => {
-                if f.quality == FaceQuality::Mint {
+                if f.quality == FaceQuality::Mint && may_fold {
                     Action::Match(id)
                 } else {
                     Action::Attach(id)
@@ -164,7 +181,7 @@ pub async fn assign_faces(
             }
             Some((id, d)) if d <= cfg.mint_distance_floor => Action::Attach(id),
             _ => {
-                if f.quality == FaceQuality::Mint {
+                if f.quality == FaceQuality::Mint && may_fold {
                     Action::Mint
                 } else {
                     Action::Null
@@ -203,8 +220,9 @@ pub async fn assign_faces(
         sqlx::query(
             "INSERT INTO person_segments \
              (segment_id, device_id, person_id, start_unix_nanos, end_unix_nanos, \
-              frame_offset_nanos, embedding, bbox, det_score, quality) \
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10)",
+              frame_offset_nanos, embedding, bbox, det_score, quality, \
+              crop_uri, is_best_shot, restored, yaw, pitch, quality_score) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13, $14, $15, $16)",
         )
         .bind(segment_id)
         .bind(device_id)
@@ -216,6 +234,12 @@ pub async fn assign_faces(
         .bind(bbox_json)
         .bind(f.det_score)
         .bind(quality_tag)
+        .bind(f.crop_uri.as_deref())
+        .bind(f.is_best_shot)
+        .bind(f.restored)
+        .bind(f.yaw)
+        .bind(f.pitch)
+        .bind(f.quality_score)
         .execute(&mut **tx)
         .await
         .context("inserting person_segment")?;

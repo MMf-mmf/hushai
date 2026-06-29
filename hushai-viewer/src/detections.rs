@@ -1,6 +1,6 @@
 //! Read-only detection queries over the vision tables (`person_segments`,
-//! `scene_objects`), grouped by sampled-frame timestamp so the UI can overlay
-//! bounding boxes synced to playback.
+//! `scene_objects`, `plate_detections`), grouped by sampled-frame timestamp so the UI can
+//! overlay bounding boxes synced to playback.
 //!
 //! Two tables, two coordinate-agnostic facts the overlay relies on:
 //!   * `bbox` is stored as JSONB `[x, y, w, h]` in **original-frame pixels** — the same
@@ -45,7 +45,7 @@ pub struct DetectionFrame {
 
 #[derive(Debug, Serialize)]
 pub struct Detection {
-    /// "person" | "object".
+    /// "person" | "object" | "plate".
     pub kind: &'static str,
     /// Object class for objects; the person's `display_name`, or `null` when unidentified/unnamed
     /// (the client renders `null` as "Unidentified").
@@ -69,8 +69,10 @@ pub async fn windowed_detections(
     let (mut rows, obj_trunc) = fetch_objects(pool, device_id, from, to, max_rows).await?;
     let (persons, ppl_trunc) = fetch_persons(pool, device_id, from, to, max_rows).await?;
     rows.extend(persons);
+    let (plates, plate_trunc) = fetch_plates(pool, device_id, from, to, max_rows).await?;
+    rows.extend(plates);
 
-    let truncated = obj_trunc || ppl_trunc;
+    let truncated = obj_trunc || ppl_trunc || plate_trunc;
     if truncated {
         tracing::warn!(
             device_id,
@@ -186,6 +188,64 @@ async fn fetch_persons(
                     kind: "person",
                     label: display_name,
                     person_id,
+                    bbox,
+                    det_score,
+                },
+            ))
+        })
+        .collect();
+    Ok((out, truncated))
+}
+
+/// Plates: `plate_detections` (one row PER OCR READ) LEFT JOIN `license_plates`. LEFT JOIN
+/// because `plate_id` is nullable (reads below the catalog gate); for those the catalog text is
+/// unknown, so we fall back to this read's raw `ocr_text` so the box still carries a label. The
+/// catalog `display_name` (a human-given name like "Mom's car") wins, then the voted `plate_text`,
+/// then the per-read `ocr_text`. `plate_bbox` is the JSONB `[x,y,w,h]` to draw.
+async fn fetch_plates(
+    pool: &PgPool,
+    device_id: &str,
+    from: i64,
+    to: i64,
+    max_rows: i64,
+) -> ViewerResult<(Vec<(i64, Detection)>, bool)> {
+    // (label, bbox_json, det_score, t_ns) — label already coalesced display_name→plate_text→ocr_text.
+    let raw: Vec<(Option<String>, String, Option<f32>, i64)> = sqlx::query_as(
+        r#"
+        SELECT
+            COALESCE(lp.display_name, lp.plate_text, pd.ocr_text) AS label,
+            pd.plate_bbox::text AS bbox_json,
+            pd.det_score,
+            pd.start_unix_nanos + COALESCE(pd.frame_offset_nanos, 0) AS t_ns
+        FROM plate_detections pd
+        LEFT JOIN license_plates lp ON lp.plate_id = pd.plate_id
+        WHERE pd.device_id = $1
+          AND pd.start_unix_nanos < $3
+          AND pd.end_unix_nanos   > $2
+          AND pd.plate_bbox IS NOT NULL
+        ORDER BY t_ns
+        LIMIT $4
+        "#,
+    )
+    .bind(device_id)
+    .bind(from)
+    .bind(to)
+    .bind(max_rows + 1)
+    .fetch_all(pool)
+    .await?;
+
+    let truncated = raw.len() as i64 > max_rows;
+    let out = raw
+        .into_iter()
+        .take(max_rows as usize)
+        .filter_map(|(label, bbox_json, det_score, t)| {
+            let bbox = parse_bbox(&bbox_json)?;
+            Some((
+                t,
+                Detection {
+                    kind: "plate",
+                    label,
+                    person_id: None,
                     bbox,
                     det_score,
                 },

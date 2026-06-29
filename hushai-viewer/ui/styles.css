@@ -714,6 +714,22 @@ input[type="date"] {
 .voice-section-title {
   font-weight: 700;
 }
+/* Collapsible "Known people / Known voices" section: identified entries are tucked behind a
+   closed disclosure so the unidentified ones (the ones you open the modal to name) lead. */
+details.voice-section > summary {
+  cursor: pointer;
+  user-select: none;
+  padding: 2px 0;
+}
+details.voice-section > summary::marker {
+  color: var(--muted);
+}
+.voice-section-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 12px;
+}
 .voice-name {
   font-weight: 600;
 }
@@ -1200,4 +1216,226 @@ input[type="date"] {
   .srow-latency {
     grid-column: 2 / -1;
   }
+}
+
+/* =========================================================================
+   File management page (manage.html) + shared destructive-action affordances
+   ========================================================================= */
+
+/* Destructive button variant (delete footage / device). Reused by confirm.js. */
+.danger {
+  background: transparent;
+  border: 1px solid var(--bad);
+  color: var(--bad);
+  border-radius: 8px;
+  padding: 5px 10px;
+  font-size: 13px;
+  cursor: pointer;
+}
+.danger:hover {
+  background: rgba(255, 93, 93, 0.12);
+}
+.danger:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* Quick "Manage files ›" link on a dashboard camera card. */
+.card-foot {
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+.navlink.small {
+  font-size: 12px;
+}
+
+.mgmt-help {
+  margin: -4px 0 10px;
+}
+.mgmt-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+/* One device = a <details> card; the <summary> holds name/stats/retention/delete. */
+.mgmt-device > summary {
+  list-style: none;
+  cursor: pointer;
+}
+.mgmt-device > summary::-webkit-details-marker {
+  display: none;
+}
+.mgmt-summary {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+}
+.mgmt-summary::before {
+  content: "▸";
+  color: var(--muted);
+  transition: transform 0.15s;
+}
+.mgmt-device[open] > .mgmt-summary::before {
+  transform: rotate(90deg);
+}
+.mgmt-name {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.mgmt-name-input,
+.mgmt-ret-input {
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 5px 8px;
+  font-size: 13px;
+}
+.mgmt-name-input {
+  min-width: 160px;
+}
+.mgmt-ret-input {
+  width: 64px;
+  text-align: right;
+}
+.mgmt-rawid {
+  opacity: 0.8;
+}
+.mgmt-stats {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.mgmt-retention {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.mgmt-summary .spacer,
+.mgmt-summary .mgmt-stats {
+  margin-left: auto;
+}
+.mgmt-del-device {
+  margin-left: 8px;
+}
+
+.mgmt-body {
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.mgmt-bulkbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.mgmt-selall {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.mgmt-usage-empty {
+  padding: 8px 0;
+}
+
+.usage-table {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  overflow: hidden;
+}
+.usage-row {
+  display: grid;
+  grid-template-columns: 28px 1fr auto auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 12px;
+}
+.usage-row:nth-child(odd) {
+  background: var(--panel2);
+}
+.usage-pick {
+  display: inline-flex;
+  align-items: center;
+}
+.usage-date {
+  font-weight: 500;
+}
+.usage-num {
+  text-align: right;
+  color: var(--muted);
+  font-size: 13px;
+}
+.num {
+  font-variant-numeric: tabular-nums;
+}
+.usage-act {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  justify-content: flex-end;
+}
+.usage-export {
+  color: var(--accent);
+  text-decoration: none;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+.usage-export:hover {
+  border-color: var(--accent-dim);
+}
+
+/* Shared confirm dialog (confirm.js). Reuses .modal / .modal-card. */
+.confirm-card {
+  width: min(480px, 100%);
+}
+.confirm-msg {
+  margin: 0;
+  line-height: 1.5;
+}
+.confirm-type {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.confirm-type-input {
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  color: var(--text);
+  padding: 7px 9px;
+  font-size: 14px;
+}
+.confirm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--line);
+}
+
+/* Transient toast for mutation failures. */
+.mgmt-flash {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  background: var(--panel2);
+  border: 1px solid var(--bad);
+  color: var(--text);
+  padding: 10px 16px;
+  border-radius: 10px;
+  z-index: 60;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
 }

@@ -29,6 +29,8 @@ pub fn kind_of(media_type: i32) -> &'static str {
 #[derive(Debug, Serialize)]
 pub struct DeviceSummary {
     pub device_id: String,
+    /// Operator-assigned friendly name (set via the management surface); `null` until renamed.
+    pub display_name: Option<String>,
     pub source_kind: String,
     pub first_capture_unix_nanos: Option<i64>,
     pub last_capture_unix_nanos: Option<i64>,
@@ -43,6 +45,7 @@ pub async fn list_devices(pool: &PgPool) -> ViewerResult<Vec<DeviceSummary>> {
     // LEFT JOIN so a device with no segments still appears (counts 0, bounds NULL).
     let rows: Vec<(
         String,
+        Option<String>,
         String,
         Option<i64>,
         Option<i64>,
@@ -55,6 +58,7 @@ pub async fn list_devices(pool: &PgPool) -> ViewerResult<Vec<DeviceSummary>> {
         r#"
         SELECT
             d.device_id,
+            d.display_name,
             d.source_kind,
             min(s.capture_start_unix_nanos)                       AS first_ns,
             max(s.capture_start_unix_nanos + s.duration_nanos)    AS last_ns,
@@ -65,7 +69,7 @@ pub async fn list_devices(pool: &PgPool) -> ViewerResult<Vec<DeviceSummary>> {
             bool_or(s.media_type = 3)                             AS has_muxed
         FROM devices d
         LEFT JOIN segments s USING (device_id)
-        GROUP BY d.device_id, d.source_kind
+        GROUP BY d.device_id, d.display_name, d.source_kind
         ORDER BY last_ns DESC NULLS LAST
         "#,
     )
@@ -76,14 +80,15 @@ pub async fn list_devices(pool: &PgPool) -> ViewerResult<Vec<DeviceSummary>> {
         .into_iter()
         .map(|r| DeviceSummary {
             device_id: r.0,
-            source_kind: r.1,
-            first_capture_unix_nanos: r.2,
-            last_capture_unix_nanos: r.3,
-            segment_count: r.4,
-            session_count: r.5,
-            has_video: r.6.unwrap_or(false),
-            has_audio: r.7.unwrap_or(false),
-            has_muxed: r.8.unwrap_or(false),
+            display_name: r.1,
+            source_kind: r.2,
+            first_capture_unix_nanos: r.3,
+            last_capture_unix_nanos: r.4,
+            segment_count: r.5,
+            session_count: r.6,
+            has_video: r.7.unwrap_or(false),
+            has_audio: r.8.unwrap_or(false),
+            has_muxed: r.9.unwrap_or(false),
         })
         .collect())
 }

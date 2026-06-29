@@ -38,6 +38,26 @@ function sectionTitle(text, count) {
   return el;
 }
 
+// A collapsed-by-default disclosure ("Known people (N)") wrapping its cards. Already-identified
+// people are tucked away so opening the modal surfaces the unidentified ones (the faces you
+// actually need to name); the known list grows over time and isn't useful on every open.
+function collapsibleSection(text, count, cardEls) {
+  const details = document.createElement("details");
+  details.className = "voice-section";
+  const summary = document.createElement("summary");
+  summary.className = "voice-section-title";
+  summary.textContent = text;
+  const c = document.createElement("span");
+  c.className = "muted small";
+  c.textContent = `  (${count})`;
+  summary.appendChild(c);
+  details.appendChild(summary);
+  const body = div("voice-section-body");
+  for (const el of cardEls) body.appendChild(el);
+  details.appendChild(body);
+  return details;
+}
+
 // Short "last seen" from the most recent of up to 3 sighting timestamps (ns).
 function lastSeenLabel(sightings) {
   if (!sightings || !sightings.length) return "no recent sightings";
@@ -60,8 +80,11 @@ function personCard(p, others, ctx) {
 
   const info = div("person-info");
   info.appendChild(div("voice-name", personLabel(p.display_name, p.person_id)));
+  // Distinct appearances, not raw per-frame face templates (n_samples over-counts a short clip).
+  // Fall back to n_samples only if talking to an older backend that doesn't send n_sightings.
+  const sightings = p.n_sightings != null ? p.n_sightings : p.n_samples;
   info.appendChild(
-    div("voice-meta", `${p.n_samples} sighting${p.n_samples === 1 ? "" : "s"} · ${lastSeenLabel(p.sample_sighting_unix_nanos)}`),
+    div("voice-meta", `${sightings} sighting${sightings === 1 ? "" : "s"} · ${lastSeenLabel(p.sample_sighting_unix_nanos)}`),
   );
 
   const actions = div("voice-actions");
@@ -130,23 +153,23 @@ function render(container, persons, ctx) {
     return;
   }
 
-  const addCard = (p) =>
-    container.appendChild(personCard(p, persons.filter((o) => o.person_id !== p.person_id), ctx));
+  const cardFor = (p) => personCard(p, persons.filter((o) => o.person_id !== p.person_id), ctx);
 
-  // Named people first, then the still-unidentified faces waiting to be named.
+  // The known (named) people collapse into a closed disclosure; the still-unidentified faces —
+  // the ones you open this modal to name — stay shown.
   const known = persons.filter(isIdentified);
   const unknown = persons.filter((p) => !isIdentified(p));
 
-  container.appendChild(sectionTitle("Known people", known.length));
   if (known.length) {
-    known.forEach(addCard);
+    container.appendChild(collapsibleSection("Known people", known.length, known.map(cardFor)));
   } else {
+    container.appendChild(sectionTitle("Known people", 0));
     container.appendChild(note("No faces identified yet — name one below to build your known-people list."));
   }
 
   if (unknown.length) {
     container.appendChild(sectionTitle("Unidentified people", unknown.length));
-    unknown.forEach(addCard);
+    unknown.forEach((p) => container.appendChild(cardFor(p)));
   }
 }
 

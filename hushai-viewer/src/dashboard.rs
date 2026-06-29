@@ -42,6 +42,8 @@ pub struct DashboardResponse {
 #[derive(Debug, Serialize)]
 pub struct CameraStatus {
     pub device_id: String,
+    /// Operator-assigned friendly name (management surface); `null` until renamed.
+    pub display_name: Option<String>,
     pub source_kind: String,
     /// "connected" | "idle" | "offline" (by `last_seen` recency — server receipt time).
     pub state: String,
@@ -178,6 +180,7 @@ async fn build_cameras(
     // connectivity signal. Segment aggregates mirror timeline::list_devices for the card details.
     let rows: Vec<(
         String,
+        Option<String>,
         String,
         DateTime<Utc>,
         DateTime<Utc>,
@@ -193,6 +196,7 @@ async fn build_cameras(
         r#"
         SELECT
             d.device_id,
+            d.display_name,
             d.source_kind,
             d.first_seen,
             d.last_seen,
@@ -206,7 +210,7 @@ async fn build_cameras(
             bool_or(s.media_type = 3)                         AS has_muxed
         FROM devices d
         LEFT JOIN segments s USING (device_id)
-        GROUP BY d.device_id, d.source_kind, d.first_seen, d.last_seen
+        GROUP BY d.device_id, d.display_name, d.source_kind, d.first_seen, d.last_seen
         ORDER BY d.last_seen DESC
         "#,
     )
@@ -217,7 +221,7 @@ async fn build_cameras(
     let cameras = rows
         .into_iter()
         .map(|r| {
-            let age = r.4;
+            let age = r.5;
             let state = if age <= cfg.dash_connected_secs {
                 summary.connected += 1;
                 "connected"
@@ -231,18 +235,19 @@ async fn build_cameras(
             summary.total += 1;
             CameraStatus {
                 device_id: r.0,
-                source_kind: r.1,
+                display_name: r.1,
+                source_kind: r.2,
                 state: state.to_string(),
-                first_seen: r.2.to_rfc3339(),
-                last_seen: r.3.to_rfc3339(),
+                first_seen: r.3.to_rfc3339(),
+                last_seen: r.4.to_rfc3339(),
                 last_seen_age_secs: age,
-                first_capture_unix_nanos: r.5,
-                last_capture_unix_nanos: r.6,
-                segment_count: r.7,
-                session_count: r.8,
-                has_video: r.9.unwrap_or(false),
-                has_audio: r.10.unwrap_or(false),
-                has_muxed: r.11.unwrap_or(false),
+                first_capture_unix_nanos: r.6,
+                last_capture_unix_nanos: r.7,
+                segment_count: r.8,
+                session_count: r.9,
+                has_video: r.10.unwrap_or(false),
+                has_audio: r.11.unwrap_or(false),
+                has_muxed: r.12.unwrap_or(false),
             }
         })
         .collect();

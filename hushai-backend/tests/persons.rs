@@ -144,6 +144,12 @@ async fn list_persons_returns_catalog_with_recent_sightings() {
         .expect("our person must appear in the global catalog");
     assert_eq!(ours.display_name.as_deref(), Some("Test Face"));
     assert_eq!(ours.n_samples, 4);
+    // Four near-simultaneous detections (1µs apart) are one continuous appearance → one sighting,
+    // even though they are four raw face templates (n_samples).
+    assert_eq!(
+        ours.n_sightings, 1,
+        "four detections within the gap window collapse to a single sighting"
+    );
     assert!(
         ours.sample_sighting_unix_nanos.len() <= 3,
         "at most 3 recent sightings"
@@ -159,6 +165,50 @@ async fn list_persons_returns_catalog_with_recent_sightings() {
     assert_eq!(
         ours.sample_sighting_unix_nanos[0], 4_000,
         "newest sighting first"
+    );
+
+    cleanup(&pool, &device).await;
+}
+
+#[tokio::test]
+async fn list_persons_clusters_sightings_by_time_gap() {
+    let Some(state) = make_state().await else {
+        eprintln!("SKIP list_persons_clusters_sightings_by_time_gap: DATABASE_URL unset");
+        return;
+    };
+    let pool = state.pool.clone();
+    let device = format!("test-persons-{}", Uuid::now_v7());
+    let session = insert_device_session_stream(&pool, &device).await;
+
+    // Default gap is 60s. Two real appearances, two hours apart, each made of several closely
+    // spaced per-frame detections: the kind of data the old per-template count inflated.
+    let person = insert_person(&pool, &device, Some("Cluster Face"), 0, 6).await;
+    let base = 10_000_000_000i64; // 10s, comfortably positive
+    let two_hours = 7_200_000_000_000i64;
+    let detections = [
+        base,                       // appearance #1 ...
+        base + 1_000,
+        base + 2_000,
+        base + two_hours,           // appearance #2 (well beyond the 60s gap) ...
+        base + two_hours + 1_000,
+        base + two_hours + 2_000,
+    ];
+    // One segment per appearance; a segment legitimately holds many per-frame face rows.
+    let seg1 = insert_segment(&pool, &device, session, 0).await;
+    let seg2 = insert_segment(&pool, &device, session, 1).await;
+    for (i, &t) in detections.iter().enumerate() {
+        let seg = if i < 3 { seg1 } else { seg2 };
+        insert_person_segment(&pool, seg, &device, person, t, 0).await;
+    }
+
+    let Json(list) = persons::list_persons(State(state.clone())).await.unwrap();
+    let ours = list
+        .iter()
+        .find(|p| p.person_id == person)
+        .expect("our person must appear in the global catalog");
+    assert_eq!(
+        ours.n_sightings, 2,
+        "six detections in two time-separated bursts = two sightings (not six)"
     );
 
     cleanup(&pool, &device).await;

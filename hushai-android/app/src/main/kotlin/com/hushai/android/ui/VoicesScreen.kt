@@ -2,6 +2,7 @@ package com.hushai.android.ui
 
 import android.content.Context
 import android.media.MediaPlayer
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -53,6 +54,8 @@ fun VoicesScreen(client: SpeakersClient, onBack: () -> Unit) {
     var unattr by remember { mutableStateOf<List<SpeakersClient.UnattributedCluster>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf(false) }
+    // Known (named) voices collapse behind a closed disclosure so the unidentified ones lead.
+    var knownExpanded by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val ctx = LocalContext.current
 
@@ -167,15 +170,20 @@ fun VoicesScreen(client: SpeakersClient, onBack: () -> Unit) {
                 val known = speakers.filter { !it.name.isNullOrBlank() }
                 val unknown = speakers.filter { it.name.isNullOrBlank() }
 
-                Text("Known voices (${known.size})", style = MaterialTheme.typography.titleMedium)
                 if (known.isEmpty()) {
+                    Text("Known voices (0)", style = MaterialTheme.typography.titleMedium)
                     Text(
                         "No voices identified yet — name one below to build your known-voices list.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 } else {
-                    known.forEach { card(it) }
+                    Text(
+                        "${if (knownExpanded) "▾" else "▸"} Known voices (${known.size})",
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.clickable { knownExpanded = !knownExpanded },
+                    )
+                    if (knownExpanded) known.forEach { card(it) }
                 }
                 if (unknown.isNotEmpty()) {
                     Text("Unidentified voices (${unknown.size})", style = MaterialTheme.typography.titleMedium)

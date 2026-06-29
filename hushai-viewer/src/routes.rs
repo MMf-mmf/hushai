@@ -19,6 +19,7 @@ use tower_http::trace::TraceLayer;
 use crate::dashboard;
 use crate::detections;
 use crate::error::{ViewerError, ViewerResult};
+use crate::export;
 use crate::playlist;
 use crate::processing;
 use crate::proxy;
@@ -41,6 +42,8 @@ pub fn router(state: ViewerState) -> Router {
         .route("/api/devices/{device_id}/timeline", get(get_timeline))
         .route("/api/devices/{device_id}/detections", get(get_detections))
         .route("/api/devices/{device_id}/processing", get(get_processing))
+        // Footage export (streamed MP4 download); viewer-owned (ffmpeg + blob cache), not proxied.
+        .route("/api/devices/{device_id}/export.mp4", get(export::export_mp4))
         // System dashboard: cameras + background-process status (one aggregating payload).
         .route("/api/dashboard", get(dashboard::get_dashboard))
         // Static segment "seg" takes priority over the {device_id} param for /hls/*.

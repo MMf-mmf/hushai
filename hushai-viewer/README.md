@@ -8,7 +8,8 @@ timeline to any moment, see where recording has gaps — and lets you **ask ques
 all the recordings** in a chat that streams its answer and cites the exact moments;
 **clicking a citation jumps the video timeline there.**
 
-It is an Axum service (`127.0.0.1:8070`) plus a self-contained web UI. The NVR side is
+It is an Axum service (`127.0.0.1:8070` by default; reachable as **`https://hushai.local/`** on the
+LAN — see "Friendly URL" below) plus a self-contained web UI. The NVR side is
 strictly **read-only** against the DB and blob store (reusing `hushai-backend` as a
 library for the pool/config). The chat side is a thin **reverse proxy**: `/v1/*` is
 forwarded to **hushai-rag** (`proxy.rs`) so the browser talks to one origin (no CORS), the
@@ -27,7 +28,7 @@ timeline/player modules are untouched). Sibling of `hushai-worker` and `hushai-r
 
 **Easiest:** [`../local_dev/run_stack.sh`](../local_dev/run_stack.sh) brings up the viewer
 together with the rag service (`:8090`) + Ollama + backend that its **chat** panel needs, then
-open **http://127.0.0.1:8070/**.
+open **http://127.0.0.1:8070/** (or **https://hushai.local/** with `--lan` — see "Friendly URL").
 
 To run the viewer **alone** against an already-running stack, from the **workspace root** (so
 `BLOB_DIR=./hushai-backend/data` and the UI dir resolve):
@@ -41,8 +42,44 @@ SQLX_OFFLINE=true cargo run -p hushai-viewer
 
 Then open **http://127.0.0.1:8070/** in a browser.
 
-Config is read from the root `.env` and `hushai-backend/.env` (same as worker/rag). The
-defaults bind to localhost only and require no login.
+Config is read from the root `.env` and `hushai-backend/.env` (same as worker/rag). The viewer
+binds to localhost only by default. It **is** the admin panel, so every route (except `/healthz`)
+is gated by an IP allowlist (loopback always allowed) **and a password**: set `VIEWER_ADMIN_PASSWORD`
+(or `VIEWER_ADMIN_PASSWORD_HASH`), or `VIEWER_AUTH_DISABLED=true` for pure-local dev. `run_stack.sh`
+sets a dev password for you. See "Admin access control & TLS" below.
+
+### Friendly URL — `https://hushai.local/`
+
+The default address is `http://127.0.0.1:8070/`. To reach the viewer by a nicer, no-port name over
+HTTPS — the same name the TLS cert is issued for (`local_dev/gen_certs.sh` → `CN=hushai.local`) —
+**one command does it all (macOS):**
+
+```bash
+./local_dev/serve.sh              # cert + CA-trust + Bonjour name + 443→8070 redirect + serve (idempotent)
+./local_dev/serve.sh --check      # report what's set up; change nothing
+# → open https://hushai.local/
+```
+
+**Linux/Windows:** see [`../docs/friendly-url-linux.md`](../docs/friendly-url-linux.md) and
+[`../docs/friendly-url-windows.md`](../docs/friendly-url-windows.md).
+
+`serve.sh` just chains these (skipping any already done), if you'd rather run them by hand:
+
+```bash
+./local_dev/gen_certs.sh          # cert valid for hushai.local + this host's LAN IP(s)
+sudo security add-trusted-cert -d -r trustRoot \
+  -k /Library/Keychains/System.keychain local_dev/certs/ca.crt
+./local_dev/setup_hostname.sh     # sudo once: LocalHostName=hushai (Bonjour) + a 443→8070 redirect
+./local_dev/run_stack.sh --lan    # binds 0.0.0.0:8070 + allowlists this host; serves HTTPS
+```
+
+How it fits together: `setup_hostname.sh` makes macOS **Bonjour** advertise `hushai.local` → this
+host's LAN IP and adds a `pf` redirect **443 → 8070** (so the port can be dropped); the viewer keeps
+binding the unprivileged `8070` and terminates TLS there with the `hushai.local` cert. Because
+`hushai.local` resolves to the LAN IP (not loopback), the viewer must bind `0.0.0.0` (`--lan` does
+this) and the connecting machine's IP must be in `VIEWER_ADMIN_IP_ALLOWLIST` — `--lan` allowlists
+this host automatically; add other admin machines' IPs yourself. Undo with
+`./local_dev/setup_hostname.sh --remove`. Re-run after a DHCP IP change (same as `gen_certs.sh`).
 
 ---
 
@@ -62,6 +99,7 @@ A new workspace crate `hushai-viewer/` with:
 | [`src/remux.rs`](src/remux.rs) | Lazily remuxes a stored blob into an MPEG-TS segment with `ffmpeg -c copy`, cached on disk by content hash. Single-flight + a semaphore bound concurrent ffmpeg. |
 | [`src/playlist.rs`](src/playlist.rs) | HLS playlist generation — the master playlist and the per-stream media playlists with `#EXT-X-PROGRAM-DATE-TIME` and `#EXT-X-DISCONTINUITY`. |
 | [`src/routes.rs`](src/routes.rs) | The HTTP surface: `/api/*` JSON, `/hls/*` playlists + segments, and the static UI. |
+| [`src/export.rs`](src/export.rs) | **Footage export:** `GET /api/devices/{id}/export.mp4` — streams a window's segments (per-segment TS remux, shared cache) through one ffmpeg into a fragmented MP4 download. Powers the **Files** page's per-day ⬇ MP4 links. |
 | [`src/error.rs`](src/error.rs) | `ViewerError` → HTTP status mapping. |
 
 Plus a shared, additive migration
@@ -87,6 +125,10 @@ system is no-egress). Files under [`ui/`](ui/):
 | `ui/js/app.js` | Orchestration: device list, state, controls, keyboard, window/seek logic, and the **Video\|Detections** mode toggle (wires `detections.js` into the ticker). |
 | `ui/js/chat/*` | Chat dock: `workspace.js` (agent tabs), `chat-pane.js` (one conversation — message list, composer, **camera-scope dropdown**, **New chat**), `citation.js`. |
 | `ui/js/settings/voices.js` | The **⚙ Voices** modal: list/name/merge speakers + play sample audio (mirrors the Android Voices screen). |
+| `ui/manage.html` + `ui/js/manage/manage.js` | The **🗄 Files** page (sibling of the System dashboard): per-device + per-date storage usage, inline **rename**, **retention** ("keep last N days"), **delete** footage by date / in bulk / a whole device, and per-date **⬇ MP4 export**. All mutations proxy to hushai-backend's `/v1/devices*`. |
+| `ui/js/confirm.js` | Shared destructive-action confirm dialog — shows impact (segments + size); **type-to-confirm** (the device name) for whole-device / entire-history deletes. |
+
+The friendly `display_name` set on the Files page also shows in the **camera dropdown** (`app.js`) and the **System-dashboard camera cards** (`dashboard.js`), and each dashboard card links to `manage.html?device=<id>`.
 
 ---
 
@@ -169,6 +211,7 @@ Viewer-specific knobs (all optional, with defaults):
 | Env var | Default | Meaning |
 |---------|---------|---------|
 | `VIEWER_BIND_ADDR` | `127.0.0.1:8070` | Bind address. Set `0.0.0.0:8070` to reach it from admin computers — the IP allowlist + password gate then restrict who gets in. |
+| `VIEWER_HOSTNAME` | _(none)_ | **Cosmetic only.** Friendly host shown in the startup "open …" log (e.g. `hushai.local` → `https://hushai.local/`). Does not change the bind or routing. Set automatically by `run_stack.sh --lan`. |
 | `VIEWER_UI_DIR` | `hushai-viewer/ui` | Directory of the static UI (relative to CWD). |
 | `VIEWER_CACHE_DIR` | `{BLOB_DIR}/viewer-cache` | Where remuxed `.ts` segments are cached. |
 | `FFMPEG_BIN` | `ffmpeg` | ffmpeg binary (shared with the worker). |
@@ -218,9 +261,11 @@ localizes for display.
 | `GET` | `/hls/{id}/master.m3u8?from&to` | Master playlist (video variant + alt-audio rendition, or a single muxed variant). |
 | `GET` | `/hls/{id}/{video\|audio\|muxed}.m3u8?from&to` | Media playlist (`#EXTINF`, `#EXT-X-PROGRAM-DATE-TIME`, `#EXT-X-DISCONTINUITY`, `#EXT-X-ENDLIST`). |
 | `GET` | `/hls/seg/{sha256}.{video\|audio\|muxed}.ts` | The remuxed TS segment (remux-on-demand, then cached; `Cache-Control: immutable`). |
+| `GET` | `/api/devices/{id}/export.mp4?from&to&kind` | **Footage export** (`export.rs`): streams the window's segments of one `kind` (`muxed` default, or `video`) into a single fragmented-MP4 download (`Content-Disposition: attachment`). Per-segment TS remux (shared cache) piped through one ffmpeg. Used by the Files page's per-day ⬇ MP4 links. |
 | `ANY` | `/v1/rag/*`, `/v1/tts` | **Reverse-proxied to hushai-rag** (`RAG_BASE_URL`): chat (`POST /v1/rag/chat` SSE, `GET /v1/rag/agents`, `GET /v1/rag/chat/sessions[/{id}/messages]`), plus the existing `/v1/rag/query` + `/v1/tts`. `RAG_TOKEN` injected server-side; body streamed unbuffered (SSE). |
 | `ANY` | `/v1/speakers*` | **Reverse-proxied to hushai-backend** (`BACKEND_BASE_URL`): the speaker-admin surface behind the **Voices** page — `GET /v1/speakers`, `PATCH /v1/speakers/{id}`, `GET /v1/speakers/duplicates`, `POST /v1/speakers/{id}/merge`, `POST /v1/speakers/merge-group`, `GET /v1/speakers/{id}/sample-audio`. `BACKEND_TOKEN` injected server-side. |
 | `ANY` | `/v1/persons*` | **Reverse-proxied to hushai-backend**: the person (face) catalog — `GET /v1/persons`, `PATCH /v1/persons/{id}` (name a face), `POST /v1/persons/{id}/merge`, `GET /v1/persons/{id}/sample-face` (cropped JPEG). Same server-side bearer as `/v1/speakers*`. |
+| `ANY` | `/v1/devices*` | **Reverse-proxied to hushai-backend**: the device-management + footage-deletion surface behind the **🗄 Files** page — `GET /v1/devices`, `GET /v1/devices/{id}/usage?tz=`, `PATCH /v1/devices/{id}` (rename), `PUT /v1/devices/{id}/retention`, `DELETE /v1/devices/{id}/footage?tz=&day=`, `POST /v1/devices/{id}/footage/bulk-delete`, `DELETE /v1/devices/{id}` (device + all footage). Same server-side bearer as `/v1/speakers*`. See [`../docs/device-and-footage-management.md`](../docs/device-and-footage-management.md). |
 | `GET` | `/` and any other path | The static UI (`ServeDir`) — NVR scrubber + chat panel. |
 
 `{kind}` is derived from `media_type`: `1`→`audio`, `2`→`video`, `3`→`muxed`.
@@ -250,6 +295,12 @@ localizes for display.
   **Known voices** (already named/identified) and **Unidentified voices**. **Name** a voice, **play a
   sample** to recognize it by ear, and **merge** duplicates the matcher over-split (the web counterpart
   of the Android Voices screen; talks to hushai-backend via the proxy).
+- **🗄 Files** (top bar → `/manage.html`) — device & footage management. **Rename** a device, see
+  **per-device and per-date storage usage**, set a **retention** policy ("keep last N days", auto-purged
+  by the backend), **delete** footage by date (one day or a bulk multi-select) or a whole device, and
+  **⬇ export** a date to MP4 before deleting. Destructive deletes confirm with impact (segments + size);
+  deleting a whole device / its entire history requires typing the device name. Full reference:
+  [`../docs/device-and-footage-management.md`](../docs/device-and-footage-management.md).
 
 ### Keyboard shortcuts
 

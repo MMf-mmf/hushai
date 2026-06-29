@@ -1,6 +1,7 @@
 // Detection overlay: draws AI bounding boxes + labels over the playing video, synced
 // to wall-clock playback. People show their name (or "Unidentified"); objects show
-// their class label. Detections are sampled ~3 frames per ~2s segment (so boxes update
+// their class label; plates show the license-plate string. Detections are sampled
+// ~3 frames per ~2s segment (so boxes update
 // ~1.5x/sec), so we snap the overlay to the nearest sampled frame for the current time
 // and clear it when no sample is within tolerance.
 //
@@ -191,13 +192,16 @@ export class Detections {
 
 function labelFor(b) {
   if (b.kind === "person") return b.label && b.label.trim() ? b.label.trim() : UNIDENTIFIED;
+  if (b.kind === "plate") return b.label && b.label.trim() ? b.label.trim() : "plate";
   return b.label && b.label.trim() ? b.label.trim() : "object";
 }
 
 // People: stable hashed hue when identified, amber when not. Objects: accent teal
-// (the class label already disambiguates them). Dark chip text reads on all three.
+// (the class label already disambiguates them). Plates: a distinct warm amber so a license
+// plate reads apart from faces/objects at a glance. Dark chip text reads on all of them.
 function colorFor(b) {
   if (b.kind === "object") return "#2ee6d6";
+  if (b.kind === "plate") return "#ffd24a";
   if (b.personId) return `hsl(${hueFromId(b.personId)} 75% 58%)`;
   return "#ffae57";
 }

@@ -103,13 +103,18 @@ async fn forward_capture_inner(state: ViewerState, req: Request) -> Result<Respo
         .map_err(|e| format!("building proxied capture response: {e}"))
 }
 
-/// `/v1/speakers*` and `/v1/persons*` are hushai-backend's catalog-admin surfaces (voices and
-/// faces); everything else is hushai-rag.
+/// `/v1/speakers*`, `/v1/persons*`, `/v1/plates*`, and `/v1/devices*` are hushai-backend's
+/// catalog-/device-admin surfaces (voices, faces, license plates, and device management + footage
+/// deletion); everything else is hushai-rag.
 fn is_backend_path(path: &str) -> bool {
     path == "/v1/speakers"
         || path.starts_with("/v1/speakers/")
         || path == "/v1/persons"
         || path.starts_with("/v1/persons/")
+        || path == "/v1/plates"
+        || path.starts_with("/v1/plates/")
+        || path == "/v1/devices"
+        || path.starts_with("/v1/devices/")
 }
 
 async fn forward_inner(state: ViewerState, req: Request) -> Result<Response, String> {

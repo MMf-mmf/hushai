@@ -25,6 +25,7 @@ export async function getDevices() {
   const { devices } = await getJson("/api/devices");
   return devices.map((d) => ({
     id: d.device_id,
+    displayName: d.display_name ?? null,
     sourceKind: d.source_kind,
     earliestMs: d.first_capture_unix_nanos != null ? nsToMs(d.first_capture_unix_nanos) : null,
     latestMs: d.last_capture_unix_nanos != null ? nsToMs(d.last_capture_unix_nanos) : null,
@@ -252,6 +253,146 @@ export async function mergePerson(loserId, intoId) {
   return res.json().catch(() => ({}));
 }
 
+// ---- license plates (ALPR) — the vehicle twin of persons, proxied to hushai-backend ----
+// List/search/name/merge the license plates discovered in recordings, and pull a representative
+// rectified-plate crop. Identity is the plate STRING (matched by normalized text), so a search box
+// over the text is the natural lookup ("when did I see plate ABC123").
+
+export async function getPlates() {
+  return getJson("/v1/plates");
+}
+
+// Fuzzy text search over the plate catalog (exact + trigram). Returns the same shape as getPlates.
+export async function searchPlates(q) {
+  return getJson(`/v1/plates/search?q=${encodeURIComponent(q)}`);
+}
+
+// URL for a plate's representative rectified crop — used directly as an <img> src (proxy adds the
+// bearer). Mirrors sampleFaceUrl for faces.
+export function samplePlateUrl(id) {
+  return `/v1/plates/${encodeURIComponent(id)}/sample-crop`;
+}
+
+export async function renamePlate(id, displayName) {
+  const res = await fetch(`/v1/plates/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ display_name: displayName }),
+  });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
+  if (!res.ok) throw new Error(`rename plate -> ${res.status}`);
+  return res.json().catch(() => ({}));
+}
+
+// Fold `loserId` into `intoId` (OCR variance split one plate into two ids).
+export async function mergePlate(loserId, intoId) {
+  const res = await fetch(`/v1/plates/${encodeURIComponent(loserId)}/merge`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ into: intoId }),
+  });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
+  if (!res.ok) throw new Error(`merge plate -> ${res.status}`);
+  return res.json().catch(() => ({}));
+}
+
+// ---- device management (proxied to hushai-backend at /v1/devices*) --------------
+// Rename a device, read its per-day footage usage, set a keep-last-N-days retention policy, and
+// delete footage (a day / several days) or a whole device. Proxied to hushai-backend (the bearer is
+// injected server-side). Export is a viewer route (it owns ffmpeg) — see exportUrl below.
+
+export async function getManagedDevices() {
+  const list = await getJson("/v1/devices");
+  return list.map((d) => ({
+    id: d.device_id,
+    displayName: d.display_name ?? null,
+    sourceKind: d.source_kind,
+    segmentCount: d.segment_count,
+    sessionCount: d.session_count,
+    bytes: d.logical_bytes,
+    earliestMs: d.first_capture_unix_nanos != null ? nsToMs(d.first_capture_unix_nanos) : null,
+    latestMs: d.last_capture_unix_nanos != null ? nsToMs(d.last_capture_unix_nanos) : null,
+    retentionDays: d.retention_days ?? null,
+    hasVideo: d.has_video,
+    hasAudio: d.has_audio,
+    hasMuxed: d.has_muxed,
+  }));
+}
+
+// Per-day footage breakdown in the caller's local tz (server buckets by that tz).
+export async function getDeviceUsage(deviceId, tz) {
+  const url = `/v1/devices/${encodeURIComponent(deviceId)}/usage?tz=${encodeURIComponent(tz)}`;
+  const days = await getJson(url);
+  return days.map((d) => ({
+    date: d.day, // YYYY-MM-DD (local)
+    segmentCount: d.segment_count,
+    bytes: d.logical_bytes,
+    startMs: nsToMs(d.first_capture_unix_nanos),
+    endMs: nsToMs(d.last_capture_unix_nanos),
+  }));
+}
+
+export async function renameDevice(deviceId, displayName) {
+  const res = await fetch(`/v1/devices/${encodeURIComponent(deviceId)}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ display_name: displayName }),
+  });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
+  if (!res.ok) throw new Error(`rename device -> ${res.status}`);
+  return res.json().catch(() => ({}));
+}
+
+// `days` is a positive integer to keep the last N days, or null to clear the policy (keep forever).
+export async function setRetention(deviceId, days) {
+  const res = await fetch(`/v1/devices/${encodeURIComponent(deviceId)}/retention`, {
+    method: "PUT",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ retention_days: days }),
+  });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
+  if (!res.ok) throw new Error(`set retention -> ${res.status}`);
+  return res.json().catch(() => ({}));
+}
+
+export async function deleteDevice(deviceId) {
+  const res = await fetch(`/v1/devices/${encodeURIComponent(deviceId)}`, { method: "DELETE" });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
+  if (!res.ok) throw new Error(`delete device -> ${res.status}`);
+  return res.json().catch(() => ({}));
+}
+
+// Delete one local-day bucket (server re-derives the day boundaries in `tz`, so the deleted set
+// exactly matches what getDeviceUsage reported — no boundary bleed).
+export async function deleteFootageDay(deviceId, tz, day) {
+  const url = `/v1/devices/${encodeURIComponent(deviceId)}/footage?tz=${encodeURIComponent(
+    tz,
+  )}&day=${encodeURIComponent(day)}`;
+  const res = await fetch(url, { method: "DELETE" });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
+  if (!res.ok) throw new Error(`delete footage -> ${res.status}`);
+  return res.json().catch(() => ({}));
+}
+
+// Delete several days in one request; returns a per-day result array.
+export async function bulkDeleteFootageDays(deviceId, tz, days) {
+  const res = await fetch(`/v1/devices/${encodeURIComponent(deviceId)}/footage/bulk-delete`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ tz, days }),
+  });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
+  if (!res.ok) throw new Error(`bulk delete -> ${res.status}`);
+  return res.json().catch(() => []);
+}
+
+// A normal `<a download>` href — the viewer streams an MP4 and the session cookie authorizes it.
+export function exportUrl(deviceId, fromMs, toMs, kind = "muxed") {
+  return `/api/devices/${encodeURIComponent(deviceId)}/export.mp4?from=${msToNsStr(
+    fromMs,
+  )}&to=${msToNsStr(toMs)}&kind=${encodeURIComponent(kind)}`;
+}
+
 // POST a chat turn and stream the answer as Server-Sent Events. `onEvent({event, data})`
 // is called per SSE frame: `session` {session_id, agent_id}, `sources` [Source...],
 // `token` {delta}, `done` {message_id}, or `error` {message}. EventSource can't POST a
@@ -265,6 +406,9 @@ export async function streamChat({ sessionId, agentId, message, filters }, onEve
       agent_id: agentId ?? null,
       message,
       filters: filters ?? null,
+      // The user's live local UTC offset (seconds) so spoken times ("today at 4:06 PM") match
+      // their clock. getTimezoneOffset() is minutes-behind-UTC with inverted sign → negate.
+      tz_offset_secs: -new Date().getTimezoneOffset() * 60,
     }),
   });
   if (redirectIfUnauth(res)) throw new Error("unauthorized");

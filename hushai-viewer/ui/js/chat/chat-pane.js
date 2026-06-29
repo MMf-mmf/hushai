@@ -7,7 +7,7 @@ import { renderCitation } from "./citation.js";
 
 const SESSION_KEY = (agentId) => `hushai.chat.session.${agentId}`;
 const PLACEHOLDER =
-  "Ask a question about your recordings. Answers cite the moment — click a citation to jump the video there.";
+  "Ask anything about your recordings — who you saw, what was said, things or plates on camera, or how you've been. Answers cite the moment; click a citation to jump the video there.";
 
 export class ChatPane {
   constructor(container, agent) {
@@ -57,7 +57,7 @@ export class ChatPane {
     form.className = "chat-input";
     this.input = document.createElement("textarea");
     this.input.rows = 1;
-    this.input.placeholder = "Ask about your recordings…";
+    this.input.placeholder = "Ask anything…";
     this.sendBtn = document.createElement("button");
     this.sendBtn.type = "submit";
     this.sendBtn.textContent = "Send";

@@ -75,6 +75,7 @@ fun CaptureScreen(
     initialDiskCapGb: Float,
     onOpenVoices: () -> Unit,
     onOpenPeople: () -> Unit,
+    onOpenPlates: () -> Unit,
     onStart: (url: String, token: String, audioOnly: Boolean) -> Unit,
     onAudioOnlyChange: (Boolean) -> Unit,
     onDiskCapChange: (gb: Float) -> Unit,
@@ -250,6 +251,20 @@ fun CaptureScreen(
             Spacer(Modifier.height(12.dp))
             OutlinedButton(onClick = onOpenPeople, modifier = Modifier.fillMaxWidth()) {
                 Text("Open People")
+            }
+        }
+
+        // Plates: review license plates seen on camera, name them, and merge duplicates.
+        SectionCard {
+            Text("Plates", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "Review license plates seen, name a plate, and merge duplicates.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(12.dp))
+            OutlinedButton(onClick = onOpenPlates, modifier = Modifier.fillMaxWidth()) {
+                Text("Open Plates")
             }
         }
 

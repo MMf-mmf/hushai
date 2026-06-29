@@ -9,9 +9,11 @@
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod devices;
 pub mod error;
 pub mod ingest;
 pub mod persons;
+pub mod plates;
 pub mod proto;
 pub mod routes;
 pub mod speakers;
@@ -81,6 +83,11 @@ pub async fn run() -> anyhow::Result<()> {
     let bind_addr = config.bind_addr;
     let tls = config.tls.clone();
     let state = build_state(config).await?;
+
+    // Per-device retention: a background task that purges footage past each device's keep-last-N-days
+    // policy (once at startup, then on an interval). Idempotent, so it's safe regardless of restarts.
+    devices::spawn_retention_task(state.clone());
+
     let app = routes::router(state);
 
     tracing::info!(%bind_addr, tls = tls.is_some(), "hushai-backend listening");

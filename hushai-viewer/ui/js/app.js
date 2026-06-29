@@ -96,7 +96,8 @@ function populateDeviceSelect() {
     const opt = document.createElement("option");
     opt.value = d.id;
     const span = d.earliestMs && d.latestMs ? humanDur(d.latestMs - d.earliestMs) : "—";
-    opt.textContent = `${d.id} · ${d.segmentCount} segs · ${span}`;
+    // Prefer the operator-assigned friendly name (set on the Files page); fall back to the id.
+    opt.textContent = `${d.displayName || d.id} · ${d.segmentCount} segs · ${span}`;
     sel.appendChild(opt);
   }
   sel.onchange = () => selectDevice(sel.value);

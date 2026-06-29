@@ -32,6 +32,17 @@ pub struct QueryRequest {
     /// (the voice "how have I been" case). Unknown id -> 400.
     #[serde(default)]
     pub agent_id: Option<String>,
+    /// Caller's UTC offset in seconds for rendering relative times in local civil time; absent
+    /// falls back to `ANALYSIS_TZ_OFFSET_SECS`. Mirrors `ChatRequest::tz_offset_secs`.
+    #[serde(default)]
+    pub tz_offset_secs: Option<i64>,
+}
+
+impl QueryRequest {
+    /// The tz offset to render times with: the caller's, else the configured default.
+    pub(crate) fn tz_offset(&self, st: &AppState) -> i64 {
+        self.tz_offset_secs.unwrap_or(st.cfg.analysis_tz_offset_secs)
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -49,6 +60,12 @@ pub struct QueryFilters {
     pub person_id: Option<Vec<String>>,
     /// Person display name; resolved globally to ids (same contract as `speaker_name`).
     pub person_name: Option<String>,
+    /// Explicit license-plate ids (uuids as strings). Takes precedence over `plate_text`.
+    /// Used by the `plates` agent ("when did I see plate ABC123").
+    pub plate_id: Option<Vec<String>>,
+    /// A raw plate string; resolved to ids by NORMALIZED match (exact + pg_trgm fuzzy). Unknown ->
+    /// no sources; matches several catalog rows -> union of all matching ids.
+    pub plate_text: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -83,8 +100,12 @@ pub async fn rag_query(
     if agent.kind == crate::agents::AgentKind::People {
         return people_query(&st, &req).await;
     }
+    if agent.kind == crate::agents::AgentKind::Plates {
+        return plates_query(&st, &req).await;
+    }
 
     let top_k = req.top_k.unwrap_or(st.cfg.top_k_default).clamp(1, 50);
+    let tz = req.tz_offset(&st); // capture before `req.filters` is moved out below
     let qf = req.filters.unwrap_or_default();
 
     let speaker_id = resolve_speaker_filter(&st.pool, qf.speaker_id, qf.speaker_name)
@@ -146,7 +167,7 @@ pub async fn rag_query(
         &mut sources,
         &names,
         Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
-        st.cfg.analysis_tz_offset_secs,
+        tz,
     );
     let answer = st
         .llm
@@ -281,9 +302,9 @@ async fn objects_query(
 
     // Humanize the sighting time (no speaker enrichment for objects).
     let now = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+    let tz = req.tz_offset(&st);
     for s in &mut sources {
-        s.time_label =
-            crate::humanize::humanize_time(s.start_unix_nanos, now, st.cfg.analysis_tz_offset_secs);
+        s.time_label = crate::humanize::humanize_time(s.start_unix_nanos, now, tz);
     }
 
     let answer = st
@@ -319,10 +340,11 @@ fn normalize_object_label(query: &str) -> String {
 pub(crate) const PEOPLE_NO_OWNER: &str = "I'm not sure which face is yours yet. Open the People screen, name your own face, and set \
      OWNER_PERSON_NAME so I can tell who you were with — then ask me again.";
 
-/// Single-shot PERSON answer (the "when did I see Bob" / "who was I with" path). Routing:
+/// Single-shot PERSON answer. Routing lives in [`resolve_people_sources`]:
 ///   - an explicit person filter (id/name) OR a catalog name mentioned in the query → exhaustive
 ///     per-person sightings (`list_by_person`);
-///   - otherwise → "who was I with": same-segment co-occurrence around the configured owner.
+///   - first-person "who was I with" → same-segment co-occurrence around the configured owner;
+///   - otherwise → the roster of everyone seen ("who have you seen so far").
 async fn people_query(
     st: &AppState,
     req: &QueryRequest,
@@ -336,51 +358,25 @@ async fn people_query(
         .unwrap_or(st.cfg.person_top_k_default)
         .clamp(1, 200);
 
-    let explicit = resolve_person_filter(
-        &st.pool,
+    let mut sources = match resolve_people_sources(
+        st,
+        &req.query,
         qf.and_then(|f| f.person_id.clone()),
         qf.and_then(|f| f.person_name.clone()),
+        device_id.as_deref(),
+        after,
+        before,
+        limit,
     )
     .await
-    .map_err(internal)?;
-
-    let mut sources = match explicit {
-        Some(ids) => {
-            // Targeted "when did I see X". Unknown name -> empty ids -> empty sightings -> decline.
-            retrieve::list_by_person(&st.pool, &ids, device_id.as_deref(), after, before, limit)
-                .await
-                .map_err(internal)?
-        }
-        None => {
-            // No explicit filter: try names mentioned in the free-text query first.
-            let mentioned = crate::persons::resolve_names_in_text(&st.pool, &req.query)
-                .await
-                .map_err(internal)?;
-            if !mentioned.is_empty() {
-                let ids: Vec<String> = mentioned.iter().map(|u| u.to_string()).collect();
-                retrieve::list_by_person(&st.pool, &ids, device_id.as_deref(), after, before, limit)
-                    .await
-                    .map_err(internal)?
-            } else {
-                // "Who was I with": co-occurrence around the configured owner.
-                let owner = resolve_owner_person(st).await.map_err(internal)?;
-                if owner.is_empty() {
-                    return Ok(Json(QueryResponse {
-                        answer: PEOPLE_NO_OWNER.to_string(),
-                        sources: vec![],
-                    }));
-                }
-                retrieve::list_co_occurring_persons(
-                    &st.pool,
-                    &owner,
-                    device_id.as_deref(),
-                    after,
-                    before,
-                    limit,
-                )
-                .await
-                .map_err(internal)?
-            }
+    .map_err(internal)?
+    {
+        PeopleSources::Found(s) => s,
+        PeopleSources::NeedsOwner => {
+            return Ok(Json(QueryResponse {
+                answer: PEOPLE_NO_OWNER.to_string(),
+                sources: vec![],
+            }));
         }
     };
 
@@ -396,7 +392,7 @@ async fn people_query(
         &mut sources,
         &names,
         Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
-        st.cfg.analysis_tz_offset_secs,
+        req.tz_offset(&st),
     );
 
     let answer = st
@@ -435,6 +431,130 @@ pub(crate) fn enrich_persons_for_display(
     }
 }
 
+/// Outcome of routing a People-agent question to its sightings (shared by the single-shot query
+/// path and the chat path, so the two can't drift).
+pub(crate) enum PeopleSources {
+    /// Real sightings to enrich + feed the LLM (possibly empty → the LLM says it saw no one).
+    Found(Vec<Source>),
+    /// A first-person "who was I with" question but the owner face is unknown — the caller renders
+    /// the [`PEOPLE_NO_OWNER`] setup hint instead.
+    NeedsOwner,
+}
+
+/// Is this a first-person "who was I with / around me" question (co-occurrence anchored on the
+/// owner) rather than a general roster ("who have you seen", "who's been around")? Only the former
+/// needs to know which face is the owner; everything else is answered from the full roster. Kept
+/// deliberately narrow so a roster question never gets misrouted into the owner-required path.
+pub(crate) fn is_co_occurrence_query(query: &str) -> bool {
+    let q = query.to_lowercase();
+    [
+        "with me",
+        "was i with",
+        "were with me",
+        "been with me",
+        "around me",
+        "near me",
+        "next to me",
+        "i was with",
+        "i been with",
+        "with whom",
+        "accompany me",
+        "accompanied me",
+    ]
+    .iter()
+    .any(|p| q.contains(p))
+}
+
+/// Shown when a question points at "this video/camera" but no camera is scoped and there's more
+/// than one — we can't know which one they mean, so we ask instead of answering across all.
+pub(crate) const CAMERA_CLARIFY: &str = "You're searching across all cameras, so I'm not sure which video you mean. \
+     Pick a camera from the dropdown above and ask again — or tell me a name and I'll say where and when \
+     they were last seen across all of them.";
+
+/// Does the question point at a SPECIFIC currently-viewed video/camera ("this video", "in the
+/// clip", "on screen") rather than the whole archive? Deliberately narrow phrase match — the caller
+/// only acts on it when no camera is scoped AND more than one camera exists.
+pub(crate) fn is_deictic_video_query(query: &str) -> bool {
+    let q = query.to_lowercase();
+    [
+        "this video",
+        "this clip",
+        "this camera",
+        "this feed",
+        "this footage",
+        "this recording",
+        "this stream",
+        "in the video",
+        "in the clip",
+        "on screen",
+        "on the screen",
+        "on-screen",
+        "currently watching",
+        "currently playing",
+        "right now on",
+    ]
+    .iter()
+    .any(|p| q.contains(p))
+}
+
+/// Count of registered cameras (devices). Used to decide whether "this video" is ambiguous: with a
+/// single camera there's nothing to clarify. Cheap; the catalog is tiny.
+pub(crate) async fn camera_count(pool: &PgPool) -> anyhow::Result<i64> {
+    let n: i64 = sqlx::query_scalar("SELECT count(*) FROM devices")
+        .fetch_one(pool)
+        .await?;
+    Ok(n)
+}
+
+/// Route a People-agent question to its sightings, in precedence order (the single source of truth
+/// for both the query and chat paths):
+///   1. explicit person filter (id/name) → that person's exhaustive sightings;
+///   2. a catalog name mentioned in the free text → that person's sightings;
+///   3. first-person "who was I with" → co-occurrence around the owner (or `NeedsOwner` if unset);
+///   4. otherwise → the ROSTER of everyone seen ("who have you seen so far").
+///
+/// (4) is the key fix: a no-name question used to fall straight into (3) and decline when no owner
+/// was configured, even though "who have you seen" needs no owner at all.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn resolve_people_sources(
+    st: &AppState,
+    query: &str,
+    person_id: Option<Vec<String>>,
+    person_name: Option<String>,
+    device_id: Option<&str>,
+    after: Option<i64>,
+    before: Option<i64>,
+    limit: i64,
+) -> anyhow::Result<PeopleSources> {
+    if let Some(ids) = resolve_person_filter(&st.pool, person_id, person_name).await? {
+        // Targeted "when did I see X". Unknown name -> empty ids -> empty sightings -> the LLM declines.
+        return Ok(PeopleSources::Found(
+            retrieve::list_by_person(&st.pool, &ids, device_id, after, before, limit).await?,
+        ));
+    }
+    let mentioned = crate::persons::resolve_names_in_text(&st.pool, query).await?;
+    if !mentioned.is_empty() {
+        let ids: Vec<String> = mentioned.iter().map(|u| u.to_string()).collect();
+        return Ok(PeopleSources::Found(
+            retrieve::list_by_person(&st.pool, &ids, device_id, after, before, limit).await?,
+        ));
+    }
+    if is_co_occurrence_query(query) {
+        let owner = resolve_owner_person(st).await?;
+        if owner.is_empty() {
+            return Ok(PeopleSources::NeedsOwner);
+        }
+        return Ok(PeopleSources::Found(
+            retrieve::list_co_occurring_persons(&st.pool, &owner, device_id, after, before, limit)
+                .await?,
+        ));
+    }
+    // Roster: "who have you seen (so far)" — no name, not first-person → everyone seen, recent first.
+    Ok(PeopleSources::Found(
+        retrieve::list_recent_persons(&st.pool, device_id, after, before, limit).await?,
+    ))
+}
+
 /// Resolve a person filter with the same strict precedence as `resolve_speaker_filter`:
 /// explicit `person_id` wins; else `person_name` -> ids (unknown -> `Some(vec![])` matches nothing);
 /// else `None` (no explicit person — the caller falls back to free-text names / co-occurrence).
@@ -447,6 +567,120 @@ pub(crate) async fn resolve_person_filter(
         (Some(ids), _) => Ok(Some(ids)),
         (None, Some(name)) => {
             let uuids = crate::persons::resolve_name(pool, &name).await?;
+            Ok(Some(uuids.iter().map(|u| u.to_string()).collect()))
+        }
+        (None, None) => Ok(None),
+    }
+}
+
+/// Single-shot license-PLATE answer (the "when did I see a car with plate ABC123" path). Routing:
+///   - an explicit plate filter (id/text) OR a plate-shaped token found in the free-text query →
+///     exhaustive per-plate sightings (`list_by_plate`);
+///   - otherwise → no sightings (the LLM declines): unlike `people`, plates have no "who was I with"
+///     owner anchor — a plate's identity is its string, so without one there's nothing to list.
+async fn plates_query(
+    st: &AppState,
+    req: &QueryRequest,
+) -> Result<Json<QueryResponse>, (StatusCode, String)> {
+    let qf = req.filters.as_ref();
+    let device_id = qf.and_then(|f| f.device_id.clone());
+    let after = qf.and_then(|f| f.after_unix_nanos);
+    let before = qf.and_then(|f| f.before_unix_nanos);
+    let limit = req
+        .top_k
+        .unwrap_or(st.cfg.plate_top_k_default)
+        .clamp(1, 200);
+
+    let explicit = resolve_plate_filter(
+        &st.pool,
+        qf.and_then(|f| f.plate_id.clone()),
+        qf.and_then(|f| f.plate_text.clone()),
+    )
+    .await
+    .map_err(internal)?;
+
+    let mut sources = match explicit {
+        Some(ids) => {
+            // Targeted "when did I see plate X". Unknown plate -> empty ids -> empty sightings ->
+            // the LLM declines.
+            retrieve::list_by_plate(&st.pool, &ids, device_id.as_deref(), after, before, limit)
+                .await
+                .map_err(internal)?
+        }
+        None => {
+            // No explicit filter: resolve plate-shaped tokens mentioned in the free-text query.
+            let mentioned = crate::plates::resolve_plates_in_text(&st.pool, &req.query)
+                .await
+                .map_err(internal)?;
+            if mentioned.is_empty() {
+                Vec::new()
+            } else {
+                let ids: Vec<String> = mentioned.iter().map(|u| u.to_string()).collect();
+                retrieve::list_by_plate(&st.pool, &ids, device_id.as_deref(), after, before, limit)
+                    .await
+                    .map_err(internal)?
+            }
+        }
+    };
+
+    // Plate attribution display: resolve plate labels, humanize the sighting time.
+    let ids: Vec<String> = sources
+        .iter()
+        .filter_map(|s| s.speaker_id.clone())
+        .collect();
+    let names = crate::plates::label_map(&st.pool, &ids)
+        .await
+        .map_err(internal)?;
+    enrich_plates_for_display(
+        &mut sources,
+        &names,
+        Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
+        req.tz_offset(&st),
+    );
+
+    let answer = st
+        .llm
+        .answer_plates(&req.query, &sources, &names)
+        .await
+        .map_err(internal)?;
+    Ok(Json(QueryResponse { answer, sources }))
+}
+
+/// Plate analogue of `retrieve::enrich_for_display`: set `speaker_name` via the PLATE label rules
+/// (`plates::display_label` — "plate ABC123" / "Mom's car" / "an unreadable plate") and the
+/// humanized `time_label`. (A plate row carries `plate_id::text` in `speaker_id`; a label not in the
+/// map falls back to "an unreadable plate".)
+pub(crate) fn enrich_plates_for_display(
+    sources: &mut [Source],
+    names: &std::collections::HashMap<String, String>,
+    now_unix_nanos: i64,
+    tz_offset_secs: i64,
+) {
+    for s in sources.iter_mut() {
+        let label = s
+            .speaker_id
+            .as_deref()
+            .and_then(|id| names.get(id).cloned())
+            .unwrap_or_else(|| crate::plates::UNREADABLE_PLATE.to_string());
+        s.speaker_name = Some(label);
+        s.time_label =
+            crate::humanize::humanize_time(s.start_unix_nanos, now_unix_nanos, tz_offset_secs);
+    }
+}
+
+/// Resolve a plate filter with the same strict precedence as `resolve_person_filter`: explicit
+/// `plate_id` wins; else `plate_text` -> ids via normalized exact+fuzzy match (unknown ->
+/// `Some(vec![])` matches nothing); else `None` (no explicit plate — the caller falls back to
+/// plate-shaped tokens in the free-text query).
+pub(crate) async fn resolve_plate_filter(
+    pool: &PgPool,
+    plate_id: Option<Vec<String>>,
+    plate_text: Option<String>,
+) -> anyhow::Result<Option<Vec<String>>> {
+    match (plate_id, plate_text) {
+        (Some(ids), _) => Ok(Some(ids)),
+        (None, Some(text)) => {
+            let uuids = crate::plates::resolve_plate_text(pool, &text).await?;
             Ok(Some(uuids.iter().map(|u| u.to_string()).collect()))
         }
         (None, None) => Ok(None),
@@ -579,4 +813,67 @@ pub(crate) fn check_auth(headers: &HeaderMap, st: &AppState) -> Result<(), (Stat
 pub(crate) fn internal(e: anyhow::Error) -> (StatusCode, String) {
     tracing::error!(error = format!("{e:#}"), "rag request failed");
     (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_co_occurrence_query, is_deictic_video_query};
+
+    #[test]
+    fn deictic_video_questions_are_detected() {
+        for q in [
+            "who did we see in this video",
+            "who is in this clip?",
+            "what's on screen right now",
+            "anyone in this camera?",
+            "what do you see in the video",
+            "who is in the clip currently playing",
+        ] {
+            assert!(is_deictic_video_query(q), "should be deictic: {q:?}");
+        }
+    }
+
+    #[test]
+    fn archive_wide_questions_are_not_deictic() {
+        // These ask across the whole archive, not a specific open video → must NOT clarify.
+        for q in [
+            "who have you seen so far?",
+            "when did I see a car",
+            "what did I talk about yesterday",
+            "how have I been lately",
+            "did you see plate ABC123",
+        ] {
+            assert!(!is_deictic_video_query(q), "should not be deictic: {q:?}");
+        }
+    }
+
+    #[test]
+    fn roster_questions_are_not_co_occurrence() {
+        // "Who have you seen so far?" and friends must NOT route to the owner-anchored path —
+        // this is the bug: they used to fall through to co-occurrence and decline with no owner.
+        for q in [
+            "Who have you seen so far?",
+            "who have you seen",
+            "Who's been around?",
+            "who did you see today",
+            "list everyone you've seen",
+            "people you have seen",
+        ] {
+            assert!(!is_co_occurrence_query(q), "should be a roster question: {q:?}");
+        }
+    }
+
+    #[test]
+    fn first_person_with_questions_are_co_occurrence() {
+        for q in [
+            "Who was I with yesterday?",
+            "who was around me",
+            "who was near me at lunch",
+            "show me who has been with me",
+            "with whom did I meet",
+            "who accompanied me",
+        ] {
+            assert!(is_co_occurrence_query(q), "should be co-occurrence: {q:?}");
+        }
+    }
 }

@@ -51,11 +51,17 @@ pub struct FaceGates {
 /// comfortable headroom above every reject gate (a clean, large, sharp, confident face); marginal
 /// faces `AttachOnly` (can identify a known person but never mint); failures `Reject`.
 pub fn assess_quality(face: &Face, sharpness: f32, g: &FaceGates) -> FaceQuality {
-    if face.score < g.min_det_score || face.min_side() < g.min_px || sharpness < g.min_sharpness {
+    assess_quality_parts(face.score, face.min_side(), sharpness, g)
+}
+
+/// Same gate as `assess_quality` but on raw parts — used after restoration re-measures a crop whose
+/// effective size/sharpness changed (the detector score is unchanged).
+pub fn assess_quality_parts(det_score: f32, min_side: f32, sharpness: f32, g: &FaceGates) -> FaceQuality {
+    if det_score < g.min_det_score || min_side < g.min_px || sharpness < g.min_sharpness {
         return FaceQuality::Reject;
     }
-    let confident = face.score >= (g.min_det_score + 0.2).min(0.95);
-    let large = face.min_side() >= g.min_px * 1.5;
+    let confident = det_score >= (g.min_det_score + 0.2).min(0.95);
+    let large = min_side >= g.min_px * 1.5;
     let sharp = sharpness >= g.min_sharpness * 1.5;
     if confident && large && sharp {
         FaceQuality::Mint
@@ -64,18 +70,86 @@ pub fn assess_quality(face: &Face, sharpness: f32, g: &FaceGates) -> FaceQuality
     }
 }
 
+/// Approximate head pose in degrees, estimated closed-form from the 5 landmarks (no extra model).
+/// `roll` = eye-line tilt; `yaw` = nose horizontal offset between the eyes; `pitch` = nose vertical
+/// position between the eye line and the mouth line. Coarse but good enough to gate minting and
+/// weight best-shot selection. Landmark order: [eye-image-left, eye-image-right, nose, mouth-left,
+/// mouth-right] (the convention both YuNet and SCRFD emit: index 0 sits on the image-left).
+#[derive(Debug, Clone, Copy)]
+pub struct Pose {
+    pub yaw: f32,
+    pub pitch: f32,
+    pub roll: f32,
+}
+
+pub fn pose_from_landmarks(l: &[[f32; 2]; 5]) -> Pose {
+    let (eye_l, eye_r, nose, mouth_l, mouth_r) = (l[0], l[1], l[2], l[3], l[4]);
+    let eye_mid = [(eye_l[0] + eye_r[0]) * 0.5, (eye_l[1] + eye_r[1]) * 0.5];
+    let mouth_mid = [(mouth_l[0] + mouth_r[0]) * 0.5, (mouth_l[1] + mouth_r[1]) * 0.5];
+    let eye_dx = eye_r[0] - eye_l[0];
+    let eye_dy = eye_r[1] - eye_l[1];
+    let roll = eye_dy.atan2(eye_dx).to_degrees();
+    let eye_dist = (eye_dx * eye_dx + eye_dy * eye_dy).sqrt().max(1e-3);
+    // Yaw: nose horizontal offset from the eye midpoint, normalized by half the inter-eye distance.
+    let r_yaw = ((nose[0] - eye_mid[0]) / (eye_dist * 0.5)).clamp(-1.0, 1.0);
+    let yaw = r_yaw * 60.0;
+    // Pitch: nose vertical position between eye line (≈0) and mouth line (≈1); neutral ≈0.5.
+    let face_h = (mouth_mid[1] - eye_mid[1]).abs().max(1e-3);
+    let r_pitch = (((nose[1] - eye_mid[1]) / face_h) - 0.5).clamp(-1.0, 1.0);
+    let pitch = r_pitch * 60.0;
+    Pose { yaw, pitch, roll }
+}
+
+/// True when the pose is frontal enough to MINT a new identity.
+pub fn is_frontal(pose: &Pose, max_yaw_deg: f32, max_pitch_deg: f32) -> bool {
+    pose.yaw.abs() <= max_yaw_deg && pose.pitch.abs() <= max_pitch_deg
+}
+
 pub struct FaceEmbedder {
     session: Session,
+    flip_tta: bool,
 }
 
 impl FaceEmbedder {
     pub fn new(session: Session) -> Self {
-        Self { session }
+        Self {
+            session,
+            flip_tta: true,
+        }
     }
 
-    /// Embed one detected face into a 512-d L2-normalized vector. CPU-bound; call in spawn_blocking.
+    pub fn with_flip_tta(mut self, on: bool) -> Self {
+        self.flip_tta = on;
+        self
+    }
+
+    /// Embed one detected face from the raw frame: align via landmarks → ArcFace (+flip-TTA).
     pub fn embed(&self, frame: &RgbImage, face: &Face) -> Result<Vec<f32>> {
         let crop = align_crop(frame, &face.landmarks);
+        self.embed_aligned(&crop)
+    }
+
+    /// Embed an already-aligned 112×112 RGB face crop (the restoration cascade aligns on restored
+    /// pixels, then calls this). Flip-TTA averages the crop's embedding with its horizontal mirror.
+    pub fn embed_aligned(&self, crop: &RgbImage) -> Result<Vec<f32>> {
+        let mut v = self.embed_once(crop)?;
+        if self.flip_tta {
+            let flipped = image::imageops::flip_horizontal(crop);
+            let v2 = self.embed_once(&flipped)?;
+            for (a, b) in v.iter_mut().zip(v2.iter()) {
+                *a += *b;
+            }
+            crate::vad::l2_normalize(&mut v);
+        }
+        Ok(v)
+    }
+
+    fn embed_once(&self, crop: &RgbImage) -> Result<Vec<f32>> {
+        let crop = if crop.width() == SIZE as u32 && crop.height() == SIZE as u32 {
+            std::borrow::Cow::Borrowed(crop)
+        } else {
+            std::borrow::Cow::Owned(super::enhance::resize_rgb(crop, SIZE as u32, SIZE as u32))
+        };
         let mut input = Array4::<f32>::zeros((1, SIZE, SIZE, 3)); // NHWC, RGB
         for y in 0..SIZE {
             for x in 0..SIZE {
@@ -141,7 +215,6 @@ pub fn align_crop(frame: &RgbImage, landmarks: &[[f32; 2]; 5]) -> RgbImage {
     let det = c * c + d * d;
     let det = if det.abs() < 1e-9 { 1e-9 } else { det };
 
-    let (fw, fh) = (frame.width() as i32, frame.height() as i32);
     let mut out = RgbImage::new(SIZE as u32, SIZE as u32);
     for oy in 0..SIZE {
         for ox in 0..SIZE {
@@ -149,33 +222,9 @@ pub fn align_crop(frame: &RgbImage, landmarks: &[[f32; 2]; 5]) -> RgbImage {
             let vy = oy as f32 - ty;
             let sx = (c * vx + d * vy) / det;
             let sy = (-d * vx + c * vy) / det;
-            let px = bilinear(frame, sx, sy, fw, fh);
+            let px = super::enhance::bilinear_sample(frame, sx, sy);
             out.put_pixel(ox as u32, oy as u32, image::Rgb(px));
         }
-    }
-    out
-}
-
-/// Bilinear-sample an RGB frame at (x, y); out-of-bounds returns black.
-fn bilinear(frame: &RgbImage, x: f32, y: f32, w: i32, h: i32) -> [u8; 3] {
-    if x < 0.0 || y < 0.0 || x > (w - 1) as f32 || y > (h - 1) as f32 {
-        return [0, 0, 0];
-    }
-    let x0 = x.floor() as i32;
-    let y0 = y.floor() as i32;
-    let x1 = (x0 + 1).min(w - 1);
-    let y1 = (y0 + 1).min(h - 1);
-    let dx = x - x0 as f32;
-    let dy = y - y0 as f32;
-    let mut out = [0u8; 3];
-    for c in 0..3 {
-        let p00 = frame.get_pixel(x0 as u32, y0 as u32).0[c] as f32;
-        let p10 = frame.get_pixel(x1 as u32, y0 as u32).0[c] as f32;
-        let p01 = frame.get_pixel(x0 as u32, y1 as u32).0[c] as f32;
-        let p11 = frame.get_pixel(x1 as u32, y1 as u32).0[c] as f32;
-        let top = p00 * (1.0 - dx) + p10 * dx;
-        let bot = p01 * (1.0 - dx) + p11 * dx;
-        out[c] = (top * (1.0 - dy) + bot * dy).round().clamp(0.0, 255.0) as u8;
     }
     out
 }

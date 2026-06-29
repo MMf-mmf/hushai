@@ -7,7 +7,7 @@ A Cargo workspace for the Hushai data-intake + retrieval system.
 | [`hushai-backend`](hushai-backend/) | Durable, idempotent **segment-ingest** server (camera→backend contract v0.1.0). Owns the DB schema. |
 | [`hushai-worker`](hushai-worker/) | Durable, resumable, idempotent **transcription + embedding** worker: drains stored segments → `transcript_sentences`. |
 | [`hushai-rag`](hushai-rag/) | **RAG** service: `POST /v1/rag/query` — grounded Q&A over the transcripts with source citations. |
-| [`hushai-viewer`](hushai-viewer/) | The unified **browser app** (NVR timeline + chat-over-recordings, `127.0.0.1:8070`); reuses `hushai-backend` as a library. |
+| [`hushai-viewer`](hushai-viewer/) | The unified **browser app** (NVR timeline + chat-over-recordings, `127.0.0.1:8070`); reuses `hushai-backend` as a library. Includes a **🗄 Files** page for device & footage management — rename, per-date storage usage, retention, delete, export ([`docs/device-and-footage-management.md`](docs/device-and-footage-management.md)). |
 
 The worker and RAG service are the **transcription-embedding-and-rag** ticket
 (`Issues/transcription-embedding-and-rag.md`). Both reuse `hushai-backend` as a library
@@ -56,6 +56,13 @@ tokens — see [`AGENTS.md`](AGENTS.md) "LAN security model"). To onboard a new 
 `./local_dev/run_stack.sh --add-camera <name>` and follow
 [`docs/onboarding-a-camera.md`](docs/onboarding-a-camera.md).
 
+To reach the admin viewer by a friendly, no-port name — **`https://hushai.local/`** — just run
+**`./local_dev/serve.sh`** (macOS): one command that generates + trusts the TLS cert, sets the
+Bonjour name + a 443→8070 redirect, then starts the stack on the LAN. It's idempotent (re-running
+skips whatever's already set up; `./local_dev/serve.sh --check` reports status without changing
+anything). **Linux/Windows:** see [`docs/friendly-url-linux.md`](docs/friendly-url-linux.md) and
+[`docs/friendly-url-windows.md`](docs/friendly-url-windows.md).
+
 Or run each service manually:
 
 ```bash
@@ -72,7 +79,7 @@ curl -s -X POST localhost:8090/v1/rag/query \
   -d '{"query":"what did they say about the cameras?","top_k":8}' | jq
 
 # 4. Viewer (unified browser app: NVR timeline + chat)
-cargo run -p hushai-viewer             # http://127.0.0.1:8070
+cargo run -p hushai-viewer             # http://127.0.0.1:8070 (or https://hushai.local/ — see --lan / setup_hostname.sh)
 ```
 
 ## Test

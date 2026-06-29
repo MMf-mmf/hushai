@@ -214,6 +214,19 @@ pub async fn mark_vision_error(
     Ok(())
 }
 
+/// True if the segment still exists. Used to demote a processing failure from a real error to a
+/// benign skip: a footage/device delete (or retention) can remove a segment WHILE the worker is
+/// mid-flight (the worker claims the *status* row, not the segment), so the derived-row INSERTs
+/// FK-violate (`23503`) and the status row is itself cascade-gone — there's nothing to retry or
+/// record. On a transient DB error we assume it still exists, so a genuine failure is never hidden.
+pub async fn segment_exists(pool: &PgPool, segment_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>("SELECT EXISTS(SELECT 1 FROM segments WHERE segment_id = $1)")
+        .bind(segment_id)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(true)
+}
+
 /// Record a failed attempt. `attempts` was already incremented at claim time;
 /// once it reaches `max_attempts` the row stops being re-claimed by `claim_one`.
 pub async fn mark_error(pool: &PgPool, segment_id: Uuid, last_error: &str) -> sqlx::Result<()> {

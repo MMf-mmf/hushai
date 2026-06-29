@@ -102,6 +102,10 @@ pub struct RagConfig {
     pub owner_person_name: Option<String>,
     /// Default number of person sightings to list per person query.
     pub person_top_k_default: i64,
+
+    /// License-plate attribution — default number of plate sightings to list per plate query.
+    /// (Plates have no "who was I with" owner anchor; resolution is by plate string, not identity.)
+    pub plate_top_k_default: i64,
 }
 
 impl RagConfig {
@@ -114,7 +118,10 @@ impl RagConfig {
             embed_ollama_base_url: opt("EMBED_OLLAMA_BASE_URL", &ollama_base_url),
             llm_ollama_base_url: opt("LLM_OLLAMA_BASE_URL", &ollama_base_url),
             embed_model: opt("EMBED_MODEL", "mxbai-embed-large"),
-            rag_llm_model: opt("RAG_LLM_MODEL", "llama3.2:3b"),
+            // qwen2.5:7b (modern, strongly instruction-following) is far more faithful at the strict
+            // extractive grounding the answer paths need — the small llama3.2:3b would embellish
+            // attribution answers with sightings not in the sources. Override with RAG_LLM_MODEL.
+            rag_llm_model: opt("RAG_LLM_MODEL", "qwen2.5:7b"),
             bind_addr: parse("RAG_BIND_ADDR", "0.0.0.0:8090")?,
             tls: hushai_backend::tls::TlsPaths::from_env("RAG_")?,
             top_k_default: parse("RAG_TOP_K_DEFAULT", "8")?,
@@ -157,6 +164,7 @@ impl RagConfig {
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
             person_top_k_default: parse("RAG_PERSON_TOP_K_DEFAULT", "50")?,
+            plate_top_k_default: parse("RAG_PLATE_TOP_K_DEFAULT", "50")?,
         })
     }
 }

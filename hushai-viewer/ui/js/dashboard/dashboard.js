@@ -131,11 +131,13 @@ function renderCameras(cameras, summary) {
 
   for (const c of cameras) {
     const media = [c.has_video ? "V" : null, c.has_audio ? "A" : null, c.has_muxed ? "M" : null].filter(Boolean);
+    // Prefer the operator-assigned friendly name; keep the raw id discoverable via the title.
+    const friendly = c.display_name || c.device_id;
     const card = el("div", { class: "card cam" }, [
       el("div", { class: "card-top" }, [
         el("span", { class: "card-id" }, [
           el("span", { class: `dot ${statusClass(c.state)}` }),
-          el("span", { class: "card-title mono", title: c.device_id, text: c.device_id }),
+          el("span", { class: c.display_name ? "card-title" : "card-title mono", title: c.device_id, text: friendly }),
         ]),
         pill(c.state),
       ]),
@@ -144,6 +146,14 @@ function renderCameras(cameras, summary) {
         el("span", {}, [`${(c.segment_count || 0).toLocaleString()} segments`]),
         el("span", {}, [`${c.session_count || 0} sessions`]),
         media.length ? el("span", { class: "badges" }, media.map((m) => el("i", { class: "badge", text: m }))) : null,
+      ]),
+      // Quick jump to the file-management page focused on this device (rename / retention / delete).
+      el("div", { class: "card-foot" }, [
+        el("a", {
+          class: "navlink small",
+          href: `/manage.html?device=${encodeURIComponent(c.device_id)}`,
+          text: "Manage files ›",
+        }),
       ]),
     ]);
     grid.appendChild(card);

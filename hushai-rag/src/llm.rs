@@ -41,6 +41,33 @@ impl Llm {
         })
     }
 
+    /// Route a chat message to one capability for the unified "auto" assistant: returns one of
+    /// the agent ids (`recordings`/`reflection`/`people`/`objects`/`plates`). A single cheap
+    /// classification call to the same local model; `recent_context` (the last turn or two) lets
+    /// follow-ups like "Mendel" after a clarifying question route correctly. Always returns a valid
+    /// id (`recordings` on any uncertainty) — see [`crate::agents::parse_agent_label`].
+    pub async fn classify_agent(
+        &self,
+        message: &str,
+        recent_context: &str,
+    ) -> anyhow::Result<&'static str> {
+        let agent = self
+            .client
+            .agent(&self.model)
+            .preamble(crate::agents::ROUTER_PREAMBLE)
+            .build();
+        let prompt = if recent_context.trim().is_empty() {
+            format!("Question: {message}\nCategory:")
+        } else {
+            format!("Recent conversation:\n{recent_context}\n\nQuestion: {message}\nCategory:")
+        };
+        let raw = agent
+            .prompt(prompt)
+            .await
+            .map_err(|e| anyhow!("LLM router prompt failed: {e}"))?;
+        Ok(crate::agents::parse_agent_label(&raw))
+    }
+
     /// Produce a grounded answer for `question` given the retrieved `sources`. `names`
     /// maps speaker-id strings to display names for per-passage attribution. Single-shot
     /// (no history) using the default recordings persona — this is the `/v1/rag/query`
@@ -135,6 +162,29 @@ impl Llm {
             .prompt(prompt)
             .await
             .map_err(|e| anyhow!("LLM people prompt failed: {e}"))
+    }
+
+    /// Produce a grounded answer for a license-PLATE question ("when did I see a car with plate
+    /// ABC123") from plate sightings. Single-shot, plates persona. Sources carry the resolved plate
+    /// label in `speaker_name` ("plate ABC123" / "Mom's car" / "an unreadable plate") + a humanized
+    /// `time_label`, so the shared `build_prompt` renders "[1] (plate ABC123, yesterday at 5:14 PM)
+    /// (license plate seen on camera)".
+    pub async fn answer_plates(
+        &self,
+        question: &str,
+        sources: &[Source],
+        names: &HashMap<String, String>,
+    ) -> anyhow::Result<String> {
+        let agent = self
+            .client
+            .agent(&self.model)
+            .preamble(crate::agents::plates_preamble())
+            .build();
+        let prompt = build_prompt(question, sources, names);
+        agent
+            .prompt(prompt)
+            .await
+            .map_err(|e| anyhow!("LLM plates prompt failed: {e}"))
     }
 
     /// Single-shot reflection answer for `POST /v1/rag/query` (reflection persona, no

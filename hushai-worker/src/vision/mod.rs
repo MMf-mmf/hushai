@@ -13,9 +13,13 @@
 //!   * `write`      — the single idempotent vision write transaction.
 
 pub mod detect;
+pub mod detect_scrfd;
+pub mod enhance;
 pub mod face_embed;
 pub mod face_match;
 pub mod frames;
+pub mod geom;
 pub mod model;
 pub mod objects;
+pub mod plates;
 pub mod write;

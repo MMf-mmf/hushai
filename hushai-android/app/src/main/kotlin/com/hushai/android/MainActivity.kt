@@ -28,9 +28,11 @@ import com.hushai.android.config.Settings
 import com.hushai.android.net.Http
 import com.hushai.android.net.Reachability
 import com.hushai.android.net.PersonsClient
+import com.hushai.android.net.PlatesClient
 import com.hushai.android.net.SpeakersClient
 import com.hushai.android.ui.CaptureScreen
 import com.hushai.android.ui.PeopleScreen
+import com.hushai.android.ui.PlatesScreen
 import com.hushai.android.ui.VoicesScreen
 import com.hushai.android.ui.theme.HushaiTheme
 import com.hushai.android.util.StatusBus
@@ -139,6 +141,19 @@ class MainActivity : ComponentActivity() {
                             onBack = { screen = Screen.Capture },
                         )
                     }
+                    Screen.Plates -> {
+                        BackHandler { screen = Screen.Capture }
+                        // Freshly composed on entry; read the current backend target once and key
+                        // the client on it so a changed URL/token rebuilds it (same as People).
+                        val platesUrl = remember { settings.urlBlocking() }
+                        val platesToken = remember { settings.tokenBlocking() }
+                        PlatesScreen(
+                            client = remember(platesUrl, platesToken) {
+                                PlatesClient(Http.upload, platesUrl, platesToken)
+                            },
+                            onBack = { screen = Screen.Capture },
+                        )
+                    }
                     Screen.Capture ->
                     CaptureScreen(
                         initialUrl = initialUrl,
@@ -151,6 +166,7 @@ class MainActivity : ComponentActivity() {
                         initialDiskCapGb = initialDiskCapGb,
                         onOpenVoices = { screen = Screen.Voices },
                         onOpenPeople = { screen = Screen.People },
+                        onOpenPlates = { screen = Screen.Plates },
                         onStart = { url, token, audioOnly -> requestStart(url, token, audioOnly) },
                         onAudioOnlyChange = { ao -> Thread { settings.setAudioOnlyBlocking(ao) }.start() },
                         onDiskCapChange = { gb ->
@@ -337,5 +353,5 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-/** The two top-level screens (no nav framework — a simple state toggle in [MainActivity]). */
-private enum class Screen { Capture, Voices, People }
+/** The top-level screens (no nav framework — a simple state toggle in [MainActivity]). */
+private enum class Screen { Capture, Voices, People, Plates }

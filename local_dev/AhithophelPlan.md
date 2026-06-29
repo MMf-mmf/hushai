@@ -193,8 +193,15 @@ I'm not sure where I got the number 20. Maybe it's from 20 video segments defini
 
 - [] under the known people and known voices, if someone was already identified, it should be in a drop-down so that it only displays the unknowns for us to select since overtime with the amount of known voices and known people grow, it is not important to have all of them in a drop-down as soon as we open up the tab only if we actually want to view them.
 
- - Test Test Test test the application end to end and report bugs and needed improvements
+- We must lean deeply into the face detection feature and license detection feature we need to make sure that whenever we identify a person or a car, we clean up the image zoom and do the necessary cropping to try to get the most clear image so that we can then process it correctly and categorize it correctly. We should follow the most sophisticated industry standards if necessary so that we get the best results compute is not a factor over here. We need the best results.
 
+ - Test Test Test test the application end to end and report bugs and needed improvements
+   we need to come up with a way to automate the testing as much a possible
+   so that the phone and computer are controled and clicked 
+   - it should take basic vid with the camera and play A known video at the same time on the computer where we know what is in the video and what the audio video supposed to look like so that we can then confirm that things were recorded correctly that the correct objects were detected, etc...
+   We'll have a set up where the phone is pointing at the computer and will take a video of the computer screen that pulls up the video at the exact same time that it's needed all of it should be automated and end so that a user does not need to click one button. It should all be automated 100%.
+
+- get images of a nice app so that we can update the mobile apps Ui based on it such as get loads of images from the nest mobile app 
  # Future plan 
  - have a agent scan social or integrate with 3rd party software to add a lable to the unlabeled peaple
 
@@ -204,7 +211,8 @@ I'm not sure where I got the number 20. Maybe it's from 20 video segments defini
 - [] if this is going to run on the local network it must set up some sort of encryption so that not anyone on the network can the application front end backend.
 as you can see we can connect cameras over the local wifi network so this needs to be further secured
 in addition we are talking about the admin panel should be perhaps locket to go given computers ip and not just any computer on the network...
-- [] instead of connecting to http://127.0.0.1:8070/ in the browser we need to be able to write a real name in the url that sill points to the same port only it looks nicer to a user
+- [x] instead of connecting to http://127.0.0.1:8070/ in the browser we need to be able to write a real name in the url that sill points to the same port only it looks nicer to a user
+  → Done: the viewer is reachable at **https://hushai.local/** (no port). `local_dev/setup_hostname.sh` sets the Mac's Bonjour name to `hushai` + a pf 443→8070 redirect; `run_stack.sh --lan` binds the LAN + allowlists this host; the TLS cert (gen_certs.sh) is already issued for `hushai.local`. See AGENTS.md "LAN security model" → "Friendly admin URL".
 - [] it must have a correct storage plan for long term storage for this we should go with the typical industry gold standard
 - we must be able to capture video from up to 30 cameras at once (we must do research on computer hardware needed to make this possible such as if i want it to all be sending the video feed with a cable 
 
@@ -216,3 +224,6 @@ in addition we are talking about the admin panel should be perhaps locket to go 
 
 
    
+
+
+PASSWORD: hushai-dev

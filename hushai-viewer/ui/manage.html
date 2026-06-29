@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hushai · Files</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='%232ee6d6'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body class="dash-body">
+    <header class="topbar">
+      <div class="brand"><span class="logo">◉</span> HUSHAI <span class="muted">files</span></div>
+      <a class="navlink" href="/" title="Back to the viewer">‹ Viewer</a>
+      <a class="navlink" href="/dashboard.html" title="System dashboard">▦ System</a>
+      <span class="spacer"></span>
+      <div class="clock dash-updated">
+        <span id="liveDot" class="dot"></span>
+        <span id="generatedAt" class="muted small">connecting…</span>
+      </div>
+      <button id="mgmtRefresh" class="ghost" title="Refresh">⟳</button>
+      <button id="btnLogout" class="ghost" title="Log out"
+        onclick="fetch('/logout',{method:'POST'}).finally(()=>location.href='/login')">⎋</button>
+    </header>
+
+    <main class="dash">
+      <div id="mgmtBanner" class="dash-banner loading">Loading devices…</div>
+
+      <!-- Storage summary tiles (populated by manage.js). -->
+      <div id="mgmtKpis" class="kpi-row"></div>
+
+      <section class="dash-section">
+        <div class="dash-head">
+          <h2>Devices &amp; footage</h2>
+          <span id="mgmtCount" class="count-chip"></span>
+        </div>
+        <p class="muted small mgmt-help">
+          Rename a device, set how long to keep its footage, and delete footage by date or the whole
+          device. Deletes are permanent — footage and its files are removed from disk.
+        </p>
+        <div id="mgmtList" class="mgmt-list"></div>
+      </section>
+    </main>
+
+    <script type="module" src="/js/manage/manage.js"></script>
+  </body>
+</html>

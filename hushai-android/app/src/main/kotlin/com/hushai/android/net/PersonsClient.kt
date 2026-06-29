@@ -26,7 +26,10 @@ class PersonsClient(
     data class Person(
         val id: String,
         val name: String?,
+        /** Raw per-frame face-template count (over-counts a single clip); internal weight, not UI. */
         val nSamples: Long,
+        /** Distinct appearances, detections clustered by time gap — what the UI shows as "sightings". */
+        val nSightings: Long,
         /** Up to 3 recent sighting times (unix nanos), most-recent first. */
         val sampleSightingsNanos: List<Long>,
     )
@@ -48,6 +51,8 @@ class PersonsClient(
                         id = o.getString("person_id"),
                         name = if (o.isNull("display_name")) null else o.optString("display_name"),
                         nSamples = o.optLong("n_samples"),
+                        // Fall back to n_samples if an older backend doesn't send n_sightings.
+                        nSightings = if (o.has("n_sightings")) o.optLong("n_sightings") else o.optLong("n_samples"),
                         sampleSightingsNanos = if (t == null) emptyList()
                         else (0 until t.length()).map { t.getLong(it) },
                     )

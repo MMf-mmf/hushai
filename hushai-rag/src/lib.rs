@@ -15,6 +15,7 @@ pub mod embed;
 pub mod humanize;
 pub mod llm;
 pub mod persons;
+pub mod plates;
 pub mod retrieve;
 pub mod routes;
 pub mod speakers;

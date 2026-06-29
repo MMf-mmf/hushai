@@ -29,6 +29,15 @@ sudo security add-trusted-cert -d -r trustRoot \
 > **If the host's LAN IP changes** (DHCP), re-run `./local_dev/gen_certs.sh`. It keeps the same
 > CA and only re-mints the leaf with the new IP — no client needs to re-trust anything.
 
+### Reaching the admin viewer — `https://hushai.local/`
+
+Cameras talk to the backend by raw LAN IP (above). **Admins** reach the viewer by a friendly,
+no-port name: run `./local_dev/setup_hostname.sh` once (sets this Mac's Bonjour name to `hushai` and
+adds a `pf` redirect 443→8070), then start the stack with `./local_dev/run_stack.sh --lan` (binds
+`0.0.0.0` + allowlists this host). The viewer is gated by an **IP allowlist + password** — add each
+admin computer's IP to `VIEWER_ADMIN_IP_ALLOWLIST` (re-run on DHCP change, same as the cert). See
+`hushai-viewer/README.md` → "Friendly URL".
+
 ---
 
 ## Step 1 — Mint the camera's token (the single build does it)

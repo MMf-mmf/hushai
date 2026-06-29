@@ -26,7 +26,7 @@ class PersonsClientTest {
     @Test fun parsesPersonList() {
         server.enqueue(
             MockResponse().setBody(
-                """[{"person_id":"abc-123","display_name":"Alice","n_samples":7,
+                """[{"person_id":"abc-123","display_name":"Alice","n_samples":7,"n_sightings":2,
                    "sample_sighting_unix_nanos":[3000,2000,1000]},
                    {"person_id":"def-456","display_name":null,"n_samples":2,
                    "sample_sighting_unix_nanos":[]}]""",
@@ -38,8 +38,10 @@ class PersonsClientTest {
         assertEquals("abc-123", list[0].id)
         assertEquals("Alice", list[0].name)
         assertEquals(7L, list[0].nSamples)
+        assertEquals(2L, list[0].nSightings) // distinct appearances, not the 7 raw templates
         assertEquals(listOf(3000L, 2000L, 1000L), list[0].sampleSightingsNanos)
         assertNull(list[1].name) // null display_name -> null, not "null"
+        assertEquals(2L, list[1].nSightings) // no n_sightings -> falls back to n_samples
         assertTrue(list[1].sampleSightingsNanos.isEmpty())
 
         assertEquals("/v1/persons", server.takeRequest().path)

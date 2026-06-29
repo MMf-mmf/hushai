@@ -2,6 +2,7 @@ package com.hushai.android.ui
 
 import android.graphics.BitmapFactory
 import androidx.compose.foundation.Image
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -59,6 +60,8 @@ fun PeopleScreen(client: PersonsClient, onBack: () -> Unit) {
     var persons by remember { mutableStateOf<List<PersonsClient.Person>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf(false) }
+    // Known (named) people collapse behind a closed disclosure so the unidentified faces lead.
+    var knownExpanded by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     suspend fun reload() {
@@ -139,15 +142,20 @@ fun PeopleScreen(client: PersonsClient, onBack: () -> Unit) {
                 val known = persons.filter { !it.name.isNullOrBlank() }
                 val unknown = persons.filter { it.name.isNullOrBlank() }
 
-                Text("Known people (${known.size})", style = MaterialTheme.typography.titleMedium)
                 if (known.isEmpty()) {
+                    Text("Known people (0)", style = MaterialTheme.typography.titleMedium)
                     Text(
                         "No faces identified yet — name one below to build your known-people list.",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant,
                     )
                 } else {
-                    known.forEach { card(it) }
+                    Text(
+                        "${if (knownExpanded) "▾" else "▸"} Known people (${known.size})",
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.clickable { knownExpanded = !knownExpanded },
+                    )
+                    if (knownExpanded) known.forEach { card(it) }
                 }
                 if (unknown.isNotEmpty()) {
                     Text("Unidentified faces (${unknown.size})", style = MaterialTheme.typography.titleMedium)
@@ -178,7 +186,7 @@ private fun PersonCard(
                     style = MaterialTheme.typography.titleMedium,
                 )
                 Text(
-                    "${person.nSamples} sighting(s)",
+                    "${person.nSightings} sighting(s)",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )

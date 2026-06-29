@@ -187,6 +187,86 @@ pub struct WorkerConfig {
     /// lane. Default false: objects are best-effort and never block face identity.
     pub object_required: bool,
 
+    // ---- Image cleanup / face restoration (the "zoom + clean up before we recognize" stage) ----
+    /// Which face detector to run (`scrfd` default — best small/distant recall — or `yunet`). When
+    /// the chosen model can't load, `build_vision_models` falls back to whichever IS provisioned.
+    pub face_detector_kind: crate::vision::enhance::DetectorKind,
+    /// SCRFD ONNX path (used when `face_detector_kind = scrfd`). Not committed; see fetch_scrfd.sh.
+    pub face_scrfd_model_path: String,
+    /// Embed both a crop and its horizontal mirror, average + renormalize (InsightFace TTA). A pure
+    /// accuracy win; default on.
+    pub face_embed_flip_tta: bool,
+    /// Context margin (fraction of bbox side) added around a face before cropping, so the restorer
+    /// has hairline/jaw context the tight alignment warp throws away.
+    pub face_crop_margin_frac: f32,
+    /// Blind-face-restoration model path (GFPGANv1.4 / CodeFormer ONNX). Empty/unloadable ⇒ the
+    /// restoration sub-lane self-disables (low-quality faces are dropped as before).
+    pub face_restore_model_path: String,
+    /// Which restorer the model is (`gfpgan` default | `codeformer`).
+    pub face_restore_kind: crate::vision::enhance::RestorerKind,
+    /// CodeFormer fidelity weight `w` (0=quality .. 1=fidelity); ignored by GFPGAN.
+    pub face_restore_codeformer_w: f32,
+    /// Restore (recover-then-embed) when a raw crop's sharpness is BELOW this. Clean faces above it
+    /// skip restoration (no embedding-space drift for already-good faces).
+    pub face_restore_max_sharpness: f32,
+    /// Restore when a raw crop's smaller side is BELOW this many pixels (small/distant face).
+    pub face_restore_min_px: i64,
+    /// Absolute floors below which even restoration can't help → hard drop (no row).
+    pub face_hard_min_px: i64,
+    pub face_hard_min_det_score: f32,
+    /// Super-resolution model path (Real-ESRGAN ONNX). Optional; upscales a tiny crop before restore.
+    pub face_upscale_model_path: String,
+    /// Upscale a crop whose smaller side is below this many pixels before restoring.
+    pub face_upscale_min_px: i64,
+    /// Max |yaw|/|pitch| (degrees, from the landmark pose proxy) for a face to be allowed to MINT a
+    /// new identity. A profile face minting a "new person" is a classic over-split bug.
+    pub face_mint_max_yaw_deg: f32,
+    pub face_mint_max_pitch_deg: f32,
+    /// When true, a restored (generatively-cleaned) face may mint a new identity + fold into the
+    /// centroid. Dev-stage default true; set false during a transition on a populated catalog.
+    pub face_restored_may_mint: bool,
+    /// Persist the cleaned best-shot crop to disk so the UI shows the restored thumbnail instead of
+    /// re-cropping raw frames. Written under `<blob_dir>/face_crops/`.
+    pub face_persist_crop: bool,
+    /// Tag the highest-quality face per segment as the best shot (drives the sample-face thumbnail).
+    pub face_best_shot_enabled: bool,
+    /// Blob root shared with the backend (its `BLOB_DIR`); face crops live under `<blob_dir>/face_crops`.
+    pub blob_dir: String,
+
+    // ---- License-plate recognition (ALPR) — runs after vehicle detection ----
+    /// Master switch for the plate lane (still self-disables if its models aren't provisioned).
+    pub plate_enabled: bool,
+    /// Plate-detector ONNX (YOLO bbox / 4-corner pose). Empty/unloadable ⇒ plate lane off.
+    pub plate_detect_model_path: String,
+    /// Plate-OCR ONNX (fast-plate-ocr CCT / PaddleOCR rec).
+    pub plate_ocr_model_path: String,
+    /// Ordered class→char map for the OCR head (sidecar JSON, an array of single-char strings).
+    pub plate_ocr_charset_path: String,
+    /// Square input side of the plate detector (letterboxed). Validate at provisioning.
+    pub plate_detect_input_size: usize,
+    /// Plate-detector confidence floor.
+    pub plate_min_det_score: f32,
+    /// Drop plates whose smaller side (original-frame px) is below this.
+    pub plate_min_px: f32,
+    /// Mean per-char OCR confidence floor to keep a read at all.
+    pub plate_min_ocr_conf: f32,
+    /// Higher OCR-confidence bar a read must clear to MINT a new catalog plate.
+    pub plate_mint_min_ocr_conf: f32,
+    /// Reject reads shorter than this many characters.
+    pub plate_min_len: usize,
+    /// Max edit distance for a fuzzy (OCR-noise) match to an existing plate.
+    pub plate_max_edit_distance: usize,
+    /// Trigram similarity floor for a fuzzy match candidate.
+    pub plate_fuzzy_min_similarity: f32,
+    /// Fractional expansion of the vehicle bbox before cropping the ROI we run plate-detect on.
+    pub plate_vehicle_roi_margin: f32,
+    /// Super-resolve a rectified plate whose smaller side is below this many pixels before OCR.
+    pub plate_sr_min_side_px: f32,
+    /// Also scan the whole frame for plates when no vehicle was detected (off by default).
+    pub plate_detect_whole_frame: bool,
+    /// When true, a missing/unloadable plate model disables the WHOLE vision subsystem loudly.
+    pub plate_required: bool,
+
     // --- Liveness heartbeat (read by the viewer's /api/dashboard) ---
     /// How often the worker upserts its `worker_heartbeat` row. The viewer treats a row whose
     /// `last_beat` is older than ~3× this as "down".
@@ -227,6 +307,27 @@ impl WorkerConfig {
             knn_ef_search: self.face_knn_ef_search,
             knn_statement_timeout_ms: self.face_knn_statement_timeout_ms,
             centroid_window: self.face_centroid_window,
+            restored_may_mint: self.face_restored_may_mint,
+        }
+    }
+
+    /// Quality gates handed to the plate read classifier (`plates::normalize::assess_quality`).
+    pub fn plate_gates(&self) -> crate::vision::plates::normalize::PlateGates {
+        crate::vision::plates::normalize::PlateGates {
+            min_det_score: self.plate_min_det_score,
+            min_ocr_conf: self.plate_min_ocr_conf,
+            mint_min_ocr_conf: self.plate_mint_min_ocr_conf,
+            min_px: self.plate_min_px,
+            min_len: self.plate_min_len,
+        }
+    }
+
+    /// Tuning bundle handed to `plates::plate_match::assign_plates`.
+    pub fn plate_match_cfg(&self) -> crate::vision::plates::plate_match::PlateMatchConfig {
+        crate::vision::plates::plate_match::PlateMatchConfig {
+            max_edit_distance: self.plate_max_edit_distance,
+            fuzzy_min_similarity: self.plate_fuzzy_min_similarity,
+            min_len: self.plate_min_len,
         }
     }
 
@@ -332,6 +433,44 @@ impl WorkerConfig {
             object_max_per_frame: parse("OBJECT_MAX_PER_FRAME", "20")?,
             object_min_box_px: parse("OBJECT_MIN_BOX_PX", "16.0")?,
             object_required: parse("OBJECT_REQUIRED", "false")?,
+
+            face_detector_kind: parse("FACE_DETECTOR_KIND", "scrfd")?,
+            face_scrfd_model_path: opt("FACE_SCRFD_MODEL_PATH", "./models/scrfd_10g_bnkps.onnx"),
+            face_embed_flip_tta: parse("FACE_EMBED_FLIP_TTA", "true")?,
+            face_crop_margin_frac: parse("FACE_CROP_MARGIN_FRAC", "0.35")?,
+            face_restore_model_path: opt("FACE_RESTORE_MODEL_PATH", "./models/gfpgan_v1.4.onnx"),
+            face_restore_kind: parse("FACE_RESTORE_KIND", "gfpgan")?,
+            face_restore_codeformer_w: parse("FACE_RESTORE_CODEFORMER_W", "0.6")?,
+            // Crops sharper than ~1.5× the reject gate are already clean → skip restoration.
+            face_restore_max_sharpness: parse("FACE_RESTORE_MAX_SHARPNESS", "45.0")?,
+            face_restore_min_px: parse("FACE_RESTORE_MIN_PX", "80")?,
+            face_hard_min_px: parse("FACE_HARD_MIN_PX", "16")?,
+            face_hard_min_det_score: parse("FACE_HARD_MIN_DET_SCORE", "0.3")?,
+            face_upscale_model_path: opt("FACE_UPSCALE_MODEL_PATH", "./models/realesrgan_x4plus.onnx"),
+            face_upscale_min_px: parse("FACE_UPSCALE_MIN_PX", "48")?,
+            face_mint_max_yaw_deg: parse("FACE_MINT_MAX_YAW_DEG", "35.0")?,
+            face_mint_max_pitch_deg: parse("FACE_MINT_MAX_PITCH_DEG", "30.0")?,
+            face_restored_may_mint: parse("FACE_RESTORED_MAY_MINT", "true")?,
+            face_persist_crop: parse("FACE_PERSIST_CROP", "true")?,
+            face_best_shot_enabled: parse("FACE_BEST_SHOT_ENABLED", "true")?,
+            blob_dir: opt("BLOB_DIR", "./blobs"),
+
+            plate_enabled: parse("PLATE_ENABLED", "true")?,
+            plate_detect_model_path: opt("PLATE_DETECT_MODEL_PATH", "./models/lp_detector.onnx"),
+            plate_ocr_model_path: opt("PLATE_OCR_MODEL_PATH", "./models/lp_ocr_cct.onnx"),
+            plate_ocr_charset_path: opt("PLATE_OCR_CHARSET_PATH", "./models/lp_ocr_charset.json"),
+            plate_detect_input_size: parse("PLATE_DETECT_INPUT_SIZE", "640")?,
+            plate_min_det_score: parse("PLATE_MIN_DET_SCORE", "0.35")?,
+            plate_min_px: parse("PLATE_MIN_PX", "16.0")?,
+            plate_min_ocr_conf: parse("PLATE_MIN_OCR_CONF", "0.55")?,
+            plate_mint_min_ocr_conf: parse("PLATE_MINT_MIN_OCR_CONF", "0.80")?,
+            plate_min_len: parse("PLATE_MIN_LEN", "4")?,
+            plate_max_edit_distance: parse("PLATE_MAX_EDIT_DISTANCE", "1")?,
+            plate_fuzzy_min_similarity: parse("PLATE_FUZZY_MIN_SIMILARITY", "0.7")?,
+            plate_vehicle_roi_margin: parse("PLATE_VEHICLE_ROI_MARGIN", "0.10")?,
+            plate_sr_min_side_px: parse("PLATE_SR_MIN_SIDE_PX", "64.0")?,
+            plate_detect_whole_frame: parse("PLATE_DETECT_WHOLE_FRAME", "false")?,
+            plate_required: parse("PLATE_REQUIRED", "false")?,
 
             heartbeat_interval: Duration::from_secs(parse("WORKER_HEARTBEAT_SECS", "10")?),
             worker_id: std::env::var("WORKER_ID").ok().filter(|s| !s.trim().is_empty()),

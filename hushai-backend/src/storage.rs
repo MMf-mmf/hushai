@@ -15,15 +15,22 @@
 //! a (GC-able) blob — never commit a row pointing at missing bytes.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use axum::extract::multipart::Field;
 use sha2::{Digest, Sha256};
+use sqlx::PgPool;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::error::IngestError;
 
 pub const STORAGE_BACKEND: &str = "file";
+
+/// Grace window for [`reclaim_blobs`]: never unlink a blob whose file was (re)created within this
+/// span. Comfortably longer than any ingest promote→row-commit gap, so a blob just written for an
+/// in-flight segment (whose row may not have committed yet) is never mistaken for an orphan.
+pub const RECLAIM_GRACE: Duration = Duration::from_secs(600);
 
 /// A temp blob on disk, removed on drop unless explicitly persisted (RAII guard
 /// ensures a failed/aborted upload never leaves a stray temp file).
@@ -189,6 +196,74 @@ pub fn ensure_capacity(root: &Path, watermark: u64) -> Result<(), IngestError> {
 
 fn io_err(e: std::io::Error) -> IngestError {
     IngestError::Internal(e.into())
+}
+
+/// Reclaim the content-addressed blob files for `shas` whose content is no longer referenced by
+/// ANY segment row. Returns the total bytes unlinked. Safe to call after a footage/device delete
+/// has COMMITTED: it re-checks each candidate against the live DB (so a blob still referenced by a
+/// kept segment — possible because storage is content-addressed and byte-identical segments share
+/// one file — is never removed), and skips files newer than `grace`.
+///
+/// Ordering contract (mirrors the write path's durability rule): callers DELETE the rows and
+/// COMMIT first, THEN call this. A crash in between only orphans a blob (reclaimed by a later
+/// pass), never dangles a row pointing at missing bytes. Best-effort: a failed unlink is logged
+/// and skipped, never surfaced as a request error.
+///
+/// NOTE on the residual race: a *different* `segment_id` re-promoting byte-identical content
+/// inside the grace window cannot occur with the current capture clients (distinct captures are
+/// never byte-identical; retransmits reuse the same `segment_id`, deduped by
+/// `ON CONFLICT (segment_id) DO NOTHING`, so a blob's ref-count only ever goes 1→0). Fully closing
+/// it would require `promote()` to hold a per-sha advisory lock across its row commit — a deferred
+/// hardening, unnecessary today.
+pub async fn reclaim_blobs(pool: &PgPool, root: &Path, shas: &[[u8; 32]], grace: Duration) -> u64 {
+    let mut freed: u64 = 0;
+    // Chunk so the re-check array + round-trips stay bounded on a whole-day delete (~43k segments).
+    for chunk in shas.chunks(1000) {
+        let candidates: Vec<Vec<u8>> = chunk.iter().map(|s| s.to_vec()).collect();
+        let unreferenced: Vec<Vec<u8>> = match sqlx::query_scalar(
+            "SELECT cand FROM unnest($1::bytea[]) AS cand \
+             WHERE NOT EXISTS (SELECT 1 FROM segments WHERE content_sha256 = cand)",
+        )
+        .bind(&candidates)
+        .fetch_all(pool)
+        .await
+        {
+            Ok(rows) => rows,
+            Err(e) => {
+                // Fail safe: never unlink a blob we couldn't confirm is unreferenced.
+                tracing::warn!(error = %e, "reclaim_blobs: reference re-check failed; skipping chunk");
+                continue;
+            }
+        };
+
+        for sha in unreferenced {
+            let sha_hex = hex::encode(&sha);
+            let path = shard_path(root, &sha_hex);
+            let meta = match tokio::fs::metadata(&path).await {
+                Ok(m) => m,
+                Err(_) => continue, // already gone
+            };
+            // Grace: protect a just-(re)created blob whose owning row may not have committed yet.
+            let too_new = meta
+                .modified()
+                .ok()
+                .and_then(|m| m.elapsed().ok())
+                .map(|age| age < grace)
+                .unwrap_or(false);
+            if too_new {
+                continue;
+            }
+            let len = meta.len();
+            match tokio::fs::remove_file(&path).await {
+                Ok(()) => freed += len,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    tracing::warn!(error = %e, blob = %sha_hex, "reclaim_blobs: unlink failed")
+                }
+            }
+        }
+    }
+    freed
 }
 
 #[cfg(test)]
