@@ -45,6 +45,14 @@ pub async fn run() -> anyhow::Result<()> {
     dotenvy::from_path("hushai-backend/.env").ok();
     init_tracing();
 
+    // Observability (roadmap B1).
+    hushai_backend::observe::record_build_info("viewer");
+    hushai_backend::observe::describe(
+        "hushai_viewer_proxy_total",
+        "counter",
+        "Requests reverse-proxied by the viewer, by upstream(backend|rag).",
+    );
+
     // Reuse the backend's DB Config + pool (path dependency), exactly like rag/worker.
     let backend_cfg = hushai_backend::config::Config::from_env()
         .context("loading shared backend config (DATABASE_URL/BLOB_DIR/DEVICE_TOKEN)")?;

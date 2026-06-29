@@ -459,3 +459,126 @@ function parseFrame(frame) {
   }
   return { event, data: payload };
 }
+
+// ---- events & alerts (proxied to hushai-backend at /v1/events* and /v1/alert-rules*) ----------
+// The proactive VSaaS layer: the materialized event stream, the in-app notification feed (with
+// acknowledge), and alert-rule CRUD. ns->ms at the boundary like the rest of this module. The proxy
+// injects the device bearer, so the browser calls these on the same origin with no token.
+
+function eventFromApi(e) {
+  return {
+    id: e.event_id,
+    deviceId: e.device_id ?? null,
+    type: e.event_type,
+    severity: e.severity,
+    subjectType: e.subject_type ?? null,
+    subjectId: e.subject_id ?? null,
+    subjectLabel: e.subject_label ?? null,
+    segmentId: e.segment_id ?? null,
+    startMs: nsToMs(e.start_unix_nanos),
+    endMs: nsToMs(e.end_unix_nanos),
+    score: e.score ?? null,
+    metadata: e.metadata ?? {},
+    createdMs: nsToMs(e.created_unix_nanos),
+  };
+}
+
+export async function getEvents({ deviceId, eventType, severity, sinceMs, limit } = {}) {
+  const p = new URLSearchParams();
+  if (deviceId) p.set("device_id", deviceId);
+  if (eventType) p.set("event_type", eventType);
+  if (severity) p.set("severity", severity);
+  if (sinceMs) p.set("since_unix_nanos", msToNsStr(sinceMs));
+  if (limit) p.set("limit", String(limit));
+  const rows = await getJson(`/v1/events?${p.toString()}`);
+  return rows.map(eventFromApi);
+}
+
+export async function getEventFeed({ status, limit } = {}) {
+  const p = new URLSearchParams();
+  if (status) p.set("status", status);
+  if (limit) p.set("limit", String(limit));
+  const rows = await getJson(`/v1/events/feed?${p.toString()}`);
+  return rows.map((d) => ({
+    deliveryId: d.delivery_id,
+    ruleId: d.rule_id ?? null,
+    eventId: d.event_id ?? null,
+    channel: d.channel,
+    status: d.status,
+    deviceId: d.device_id ?? null,
+    eventType: d.event_type ?? null,
+    severity: d.severity ?? null,
+    subjectLabel: d.subject_label ?? null,
+    createdMs: nsToMs(d.created_unix_nanos),
+    // The underlying event's footage moment (for the deep-link); null if the event was purged.
+    eventStartMs: d.event_start_unix_nanos != null ? nsToMs(d.event_start_unix_nanos) : null,
+    acknowledged: !!d.acknowledged,
+  }));
+}
+
+export async function ackDelivery(deliveryId) {
+  const res = await fetch(`/v1/events/feed/${encodeURIComponent(deliveryId)}/ack`, { method: "POST" });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
+  if (!res.ok) throw new Error(`ack -> ${res.status}`);
+  return res.json().catch(() => ({}));
+}
+
+// Alert rules are returned/sent in the backend's raw snake_case shape (the rule editor round-trips
+// the whole object on PATCH, so we don't remap fields the way the ns->ms readers above do).
+export async function getAlertRules() {
+  return getJson("/v1/alert-rules");
+}
+
+export async function createAlertRule(body) {
+  const res = await fetch("/v1/alert-rules", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
+  if (!res.ok) throw new Error(`create rule -> ${res.status} ${await res.text().catch(() => "")}`.trim());
+  return res.json();
+}
+
+export async function updateAlertRule(id, body) {
+  const res = await fetch(`/v1/alert-rules/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
+  if (!res.ok) throw new Error(`update rule -> ${res.status} ${await res.text().catch(() => "")}`.trim());
+  return res.json();
+}
+
+export async function deleteAlertRule(id) {
+  const res = await fetch(`/v1/alert-rules/${encodeURIComponent(id)}`, { method: "DELETE" });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
+  if (!res.ok) throw new Error(`delete rule -> ${res.status}`);
+  return res.json().catch(() => ({}));
+}
+
+// ---- watchlist ("of interest", proxied to hushai-backend /v1/watchlist) -------------------------
+// Mark a person/plate of interest → the backend auto-manages an alert rule so any sighting alerts.
+
+export async function getWatchlist() {
+  return getJson("/v1/watchlist");
+}
+
+export async function addWatch(subjectType, subjectId, reason = null) {
+  const res = await fetch("/v1/watchlist", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ subject_type: subjectType, subject_id: subjectId, reason }),
+  });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
+  if (!res.ok) throw new Error(`watch -> ${res.status}`);
+  return res.json();
+}
+
+export async function removeWatch(watchId) {
+  const res = await fetch(`/v1/watchlist/${encodeURIComponent(watchId)}`, { method: "DELETE" });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
+  if (!res.ok) throw new Error(`unwatch -> ${res.status}`);
+  return res.json().catch(() => ({}));
+}

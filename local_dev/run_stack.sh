@@ -17,6 +17,8 @@
 #   ./local_dev/run_stack.sh --add-camera NAME  # onboard a camera: mint+save a per-device token, print
 #                                               #   its config card, then exit (see docs/onboarding-a-camera.md)
 #   ./local_dev/run_stack.sh --pull             # `ollama pull` any missing models, then continue
+#   ./local_dev/run_stack.sh --test-db          # point the stack at hushai_test + the hushai-eval
+#                                               #   determinism profile (local_dev/eval.env) for regression runs
 #   ./local_dev/run_stack.sh --down             # stop a stack started earlier, then exit
 #   ./local_dev/run_stack.sh --with-android -- --audio-only --duration 60
 #                                               # everything after `--` is forwarded to run_hushai_app.sh
@@ -54,6 +56,7 @@ PULL_MODELS=0
 DOWN_ONLY=0
 TLS=0
 LAN=0
+TEST_DB=0
 ADD_CAMERA=""
 ANDROID_ARGS=()
 
@@ -65,6 +68,7 @@ while [[ $# -gt 0 ]]; do
     --pull)         PULL_MODELS=1; shift ;;
     --tls)          TLS=1; shift ;;
     --lan)          LAN=1; TLS=1; shift ;;
+    --test-db)      TEST_DB=1; shift ;;
     --add-camera)   ADD_CAMERA="${2:-}"; shift 2 || shift ;;
     --down)         DOWN_ONLY=1; shift ;;
     --)             shift; ANDROID_ARGS=("$@"); break ;;
@@ -307,11 +311,19 @@ else
   pg_isready -q -h localhost -p 5432 2>/dev/null || die "Postgres never became ready on :5432."
   log infra "Postgres up"
 fi
+# --test-db: source the hushai-eval determinism profile (hushai_test DB + locked-down worker knobs)
+# BEFORE launching. The `launch` subshells inherit these exports; services use dotenvy, which does
+# NOT override already-set env, so eval.env's DATABASE_URL=…/hushai_test wins over the dev .env.
+if [[ "$TEST_DB" -eq 1 ]]; then
+  [[ -f "$SCRIPT_DIR/eval.env" ]] || die "missing $SCRIPT_DIR/eval.env (the eval determinism profile)."
+  log boot "eval mode: sourcing eval.env (hushai_test DB + determinism lockdown)"
+  set -a; source "$SCRIPT_DIR/eval.env"; set +a
+fi
 # DB-exists hint (migrations auto-apply on startup, but the database must exist).
 if command -v psql >/dev/null 2>&1; then
-  DB_URL="$(grep -E '^DATABASE_URL=' "$REPO_ROOT/.env" 2>/dev/null | head -1 | cut -d= -f2- || true)"
+  DB_URL="${DATABASE_URL:-$(grep -E '^DATABASE_URL=' "$REPO_ROOT/.env" 2>/dev/null | head -1 | cut -d= -f2- || true)}"
   if [[ -n "$DB_URL" ]] && ! psql "$DB_URL" -tAc 'select 1' >/dev/null 2>&1; then
-    log warn "cannot connect to \$DATABASE_URL ($DB_URL). If the DB is missing: createdb hushai"
+    log warn "cannot connect to \$DATABASE_URL ($DB_URL). If missing: createdb $(basename "$DB_URL")"
   fi
 fi
 

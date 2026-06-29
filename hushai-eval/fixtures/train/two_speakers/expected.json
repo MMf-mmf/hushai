@@ -1,0 +1,38 @@
+{
+  "transcript": {
+    "full_text": "hello there. how are you doing today? it is a beautiful morning. honestly i am not doing well at all. everything feels terrible right now.",
+    "max_wer": 0.3,
+    "min_similarity": 0.7
+  },
+  "speakers": {
+    "distinct_count": 2,
+    "count_tolerance": 0,
+    "min_purity": 0.75,
+    "utterances": [
+      {
+        "label": "A",
+        "text_contains": "how are you",
+        "window_ns": [
+          0,
+          2910839000
+        ]
+      },
+      {
+        "label": "B",
+        "text_contains": "not doing well",
+        "window_ns": [
+          2910839000,
+          6873061000
+        ]
+      }
+    ]
+  },
+  "events": {
+    "expected": [
+      {
+        "event_type": "speech",
+        "min_count": 1
+      }
+    ]
+  }
+}

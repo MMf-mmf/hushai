@@ -80,6 +80,7 @@ pub async fn rag_query(
     Json(req): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, (StatusCode, String)> {
     check_auth(&headers, &st)?;
+    hushai_backend::observe::counter("hushai_rag_requests_total", &[("endpoint", "query")]);
 
     if req.query.trim().is_empty() {
         return Err((StatusCode::BAD_REQUEST, "query must not be empty".into()));

@@ -28,6 +28,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import requests
@@ -36,6 +37,17 @@ import segment_pb2 as pb
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parent
+
+# Fixed namespace for hushai-eval's DETERMINISTIC segment/session ids. Used only when
+# --segment-id-seed is given: the same (seed, seq) always maps to the same UUID, so a
+# regression run re-POSTs byte-identical ids and the eval harness can recompute / read
+# them to poll per-segment processing status. Never used on the normal (sidecar) path.
+EVAL_NS = uuid.UUID("6f1a7b2c-0000-7000-8000-000000000000")
+
+
+def seeded_uuid(seed: str, suffix: str) -> bytes:
+    """Deterministic 16-byte UUIDv5 from (seed, suffix). Any 16 bytes is a valid pg uuid."""
+    return uuid.uuid5(EVAL_NS, f"{seed}:{suffix}").bytes
 
 
 def uuid7_bytes() -> bytes:
@@ -146,6 +158,17 @@ def main() -> int:
     ap.add_argument("--work-dir", default=None, help="ffmpeg output dir (default: scratch per video)")
     ap.add_argument("--state-file", default=None, help="sidecar JSON for stable segment_ids")
     ap.add_argument("--limit", type=int, default=None, help="only send the first N segments")
+    ap.add_argument("--capture-start-ns", type=int, default=None,
+                    help="FIXED capture_start_unix_nanos for seq 0 (deterministic timestamps for "
+                         "hushai-eval). Subsequent segments are base + seq*duration_nanos. When set, "
+                         "monotonic_start_nanos is pinned to the same base. Default: live wall clock.")
+    ap.add_argument("--segment-id-seed", default=None,
+                    help="Derive segment_id + session_id deterministically from this seed "
+                         "(UUIDv5). Bypasses the sidecar entirely so a re-run POSTs byte-identical "
+                         "ids. Used by hushai-eval for reproducible regression runs.")
+    ap.add_argument("--emit-ids", default=None,
+                    help="Write a JSON {session_id, device_id, stream_id, segments:[{seq,segment_id}]} "
+                         "to this path so the harness can poll per-segment status.")
     ap.add_argument("--body-first", action="store_true", help="send the body part before the manifest")
     ap.add_argument("--bad-token", action="store_true", help="use an invalid token (expect 401)")
     ap.add_argument("--corrupt-body", action="store_true",
@@ -179,18 +202,25 @@ def main() -> int:
     if args.limit is not None:
         seg_paths = seg_paths[: args.limit]
 
-    state = load_sidecar(state_file, args.device)
-    if args.session:
-        state["session_id"] = args.session
-    session_id = bytes.fromhex(state["session_id"])
+    # Deterministic mode (hushai-eval): seed-derived session/segment ids, no sidecar.
+    deterministic = args.segment_id_seed is not None
+    if deterministic:
+        state = {"device_id": args.device, "session_id": None, "segment_ids": {}}
+        session_id = (bytes.fromhex(args.session) if args.session
+                      else seeded_uuid(args.segment_id_seed, "session"))
+    else:
+        state = load_sidecar(state_file, args.device)
+        if args.session:
+            state["session_id"] = args.session
+        session_id = bytes.fromhex(state["session_id"])
     stream_id = f"{args.device}-muxed"
 
     token = "totally-invalid-token" if args.bad_token else args.token
     headers = {"Authorization": f"Bearer {token}"}
 
     duration_ns = args.seg_seconds * 1_000_000_000
-    base_wall = time.time_ns()
-    base_mono = time.monotonic_ns()
+    base_wall = args.capture_start_ns if args.capture_start_ns is not None else time.time_ns()
+    base_mono = args.capture_start_ns if args.capture_start_ns is not None else time.monotonic_ns()
 
     print(f"[feed] device={args.device} session={state['session_id']} "
           f"segments={len(seg_paths)} url={args.url}")
@@ -200,11 +230,16 @@ def main() -> int:
     for seq, seg_path in enumerate(seg_paths):
         body = seg_path.read_bytes()
 
-        # Stable segment_id across re-runs (idempotency); minted once per (device, seq).
+        # Stable segment_id across re-runs (idempotency). Deterministic mode derives it from
+        # the seed; the sidecar path mints once per (device, seq) and persists it.
         key = str(seq)
-        if key not in state["segment_ids"]:
-            state["segment_ids"][key] = hexb(uuid7_bytes())
-        segment_id = bytes.fromhex(state["segment_ids"][key])
+        if deterministic:
+            segment_id = seeded_uuid(args.segment_id_seed, key)
+            state["segment_ids"][key] = hexb(segment_id)
+        else:
+            if key not in state["segment_ids"]:
+                state["segment_ids"][key] = hexb(uuid7_bytes())
+            segment_id = bytes.fromhex(state["segment_ids"][key])
 
         if args.conflict:
             # Same segment_id, DIFFERENT but self-consistent bytes -> server must 422.
@@ -251,9 +286,22 @@ def main() -> int:
         sha = hashlib.sha256(body).hexdigest()[:12]
         print(f"  seq={seq:>3} sha={sha} bytes={len(body):>7} -> {status}")
 
-    # Persist sidecar (unless we deliberately corrupted/altered the run).
-    if not (args.corrupt_body or args.conflict or args.bad_token):
+    # Persist sidecar (unless we deliberately corrupted/altered the run, or are deterministic).
+    if not (deterministic or args.corrupt_body or args.conflict or args.bad_token):
         save_sidecar(state_file, state)
+
+    # Emit the ids the harness needs to poll per-segment processing status.
+    if args.emit_ids:
+        Path(args.emit_ids).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.emit_ids).write_text(json.dumps({
+            "session_id": hexb(session_id),
+            "device_id": args.device,
+            "stream_id": stream_id,
+            "capture_start_unix_nanos": base_wall,
+            "duration_nanos": duration_ns,
+            "segments": [{"seq": int(k), "segment_id": v}
+                         for k, v in sorted(state["segment_ids"].items(), key=lambda kv: int(kv[0]))],
+        }, indent=2))
 
     print(f"\n[summary] {accepted}/{len(seg_paths)} segments accepted (200)")
     distinct = sorted({s for _, s in results})

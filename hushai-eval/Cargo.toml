@@ -1,0 +1,35 @@
+[package]
+name = "hushai-eval"
+version = "0.1.0"
+edition = "2024"
+description = "Hushai end-to-end regression harness: inject known clips into the live pipeline, wait for processing, score results against ground truth, and emit an improvement/regression verdict + exit code."
+
+[[bin]]
+name = "hushai-eval"
+path = "src/main.rs"
+
+[dependencies]
+# DB: runtime (unchecked) queries so no SQLX_OFFLINE / compile-time DB is needed.
+sqlx = { version = "0.9", features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "uuid",
+    "chrono",
+    "json",
+] }
+# HTTP: read APIs (/v1/speakers|persons|plates|events), RAG (/v1/rag/query), enroll PATCH.
+reqwest = { version = "0.12", features = ["json"] }
+
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+uuid = { version = "1", features = ["v5", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"          # config-hash + model-file / env-manifest fingerprints
+hex = "0.4"
+strsim = "0.11"        # token/char Levenshtein for WER, similarity, plate edit-distance
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

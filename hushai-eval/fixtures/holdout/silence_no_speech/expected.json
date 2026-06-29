@@ -1,0 +1,11 @@
+{
+  "transcript": {
+    "full_text": "",
+    "max_wer": 6.0,
+    "min_similarity": 0.0
+  },
+  "speakers": {
+    "distinct_count": 0,
+    "count_tolerance": 0
+  }
+}

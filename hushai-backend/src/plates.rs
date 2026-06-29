@@ -322,6 +322,9 @@ pub async fn merge_plate(
     .execute(&mut *tx)
     .await?;
 
+    // Keep any "of interest" watch alive across the merge (repoint/drop) before the loser disappears.
+    crate::watchlist::reconcile_merge(&mut tx, "plate", loser, into).await?;
+
     sqlx::query("DELETE FROM license_plates WHERE plate_id = $1")
         .bind(loser)
         .execute(&mut *tx)

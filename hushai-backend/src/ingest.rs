@@ -100,12 +100,35 @@ pub async fn post_segment(
         let outcome =
             db::persist_segment(&state.pool, &manifest, &blob_uri, STORAGE_BACKEND).await?;
 
+        let media = match manifest.media_type {
+            1 => "audio",
+            2 => "video",
+            3 => "muxed",
+            _ => "unknown",
+        };
+        // `source_kind` is UNVALIDATED client free text (contract §7); never use it raw as a metric
+        // label or a rogue/compromised device could mint unbounded series in the (never-evicting)
+        // registry. Bound it to a small known set; everything else collapses to "other".
+        let source = source_label(&manifest.source_kind);
         match outcome {
             Persisted::Inserted => {
+                crate::observe::counter(
+                    "hushai_segments_ingested_total",
+                    &[("source", source), ("media", media), ("result", "new")],
+                );
+                crate::observe::counter_by(
+                    "hushai_ingest_bytes_total",
+                    &[("source", source), ("media", media)],
+                    manifest.byte_len.max(0) as u64,
+                );
                 tracing::info!(%blob_uri, "segment durably accepted (new)");
                 Ok(StatusCode::OK)
             }
             Persisted::DuplicateSameBytes => {
+                crate::observe::counter(
+                    "hushai_segments_ingested_total",
+                    &[("source", source), ("media", media), ("result", "duplicate")],
+                );
                 tracing::info!("segment already present (idempotent retry)");
                 Ok(StatusCode::OK)
             }
@@ -117,4 +140,20 @@ pub async fn post_segment(
     }
     .instrument(span)
     .await
+}
+
+/// Collapse the unvalidated client `source_kind` to a bounded metric label (cardinality guard).
+/// Known first-party sources pass through; anything else → "other". (The DB keeps the raw value
+/// per device, so the breakdown isn't lost — only the metric label is bounded.)
+fn source_label(source_kind: &str) -> &'static str {
+    match source_kind {
+        "android_app" => "android_app",
+        "web_browser" => "web_browser",
+        "rtsp" => "rtsp",
+        "file_replay" => "file_replay",
+        // Synthetic traffic from the capacity/load-test harness (hushai-loadtest). A bounded label
+        // so a benchmark's ingest is distinguishable from real cameras in `hushai_segments_ingested_total`.
+        "loadtest_replica" => "loadtest_replica",
+        _ => "other",
+    }
 }

@@ -1,0 +1,28 @@
+[package]
+name = "hushai-loadtest"
+version = "0.1.0"
+edition = "2024"
+description = "Camera fan-out load-test harness: replays one clip as N synthetic cameras (identity-only, byte-identical), ramps 1..N, samples worker/backend metrics + macOS system load, and reports the per-camera cost + saturation point."
+
+[[bin]]
+name = "hushai-loadtest"
+path = "src/main.rs"
+
+[dependencies]
+# Reuse the compiled wire contract (`hushai.v1.SegmentManifest`) instead of duplicating the proto.
+hushai-backend = { path = "../hushai-backend" }
+
+tokio = { version = "1", features = ["full"] }
+# multipart POST to /v1/segments; json + rustls for scraping /metrics and /api/dashboard.
+reqwest = { version = "0.12", default-features = false, features = ["multipart", "rustls-tls", "json"] }
+prost = "0.14"                                            # encode SegmentManifest
+uuid = { version = "1", features = ["v7"] }              # mint session_id / segment_id
+sha2 = "0.10"                                            # content_sha256 (computed once per body)
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+csv = "1"                                                # timeseries + summary output
+chrono = { version = "0.4", features = ["clock"] }       # UTC run-dir timestamps

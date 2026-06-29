@@ -1,0 +1,10 @@
+{
+  "case_id": "two_speakers",
+  "config_hash": "b50665818cf29038",
+  "git_sha": "00c7542",
+  "metrics": {
+    "events.match": 1.0,
+    "transcript.similarity": 0.8947368421052632,
+    "transcript.wer": 0.12
+  }
+}

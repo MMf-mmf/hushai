@@ -47,6 +47,8 @@ pub fn init_tracing() {
 pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(hushai_backend::observe::metrics_handler))
         .route("/v1/rag/query", post(routes::rag_query))
         .route("/v1/rag/chat", post(chat::rag_chat))
         .route("/v1/rag/chat/sessions", get(chat::list_sessions))
@@ -60,11 +62,27 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
+/// Readiness (roadmap B5): DB reachable. 503 when not, so a load balancer / k8s can drain.
+async fn readyz(axum::extract::State(state): axum::extract::State<AppState>) -> axum::http::StatusCode {
+    match sqlx::query("SELECT 1").execute(&state.pool).await {
+        Ok(_) => axum::http::StatusCode::OK,
+        Err(_) => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+    }
+}
+
 /// Load config, connect, and serve until Ctrl-C / SIGTERM.
 pub async fn run() -> anyhow::Result<()> {
     dotenvy::dotenv().ok();
     dotenvy::from_path("hushai-backend/.env").ok();
     init_tracing();
+
+    // Observability (roadmap B1).
+    hushai_backend::observe::record_build_info("rag");
+    hushai_backend::observe::describe(
+        "hushai_rag_requests_total",
+        "counter",
+        "RAG requests by endpoint(query|chat).",
+    );
 
     let cfg = RagConfig::from_env()?;
 

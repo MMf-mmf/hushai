@@ -6,8 +6,12 @@
 //! segment writes zero sentences and is still marked `done`.
 
 use anyhow::Context;
+use hushai_backend::observe;
 use sqlx::{PgPool, Postgres, QueryBuilder};
 use uuid::Uuid;
+
+/// Histogram name for per-stage latency; lane is always "audio" in this module.
+const STAGE: &str = "hushai_worker_stage_seconds";
 
 use crate::asr::Transcriber;
 use crate::chunk::{self, Sentence};
@@ -34,13 +38,27 @@ pub async fn process_segment(
     cfg: &WorkerConfig,
     segment_id: Uuid,
 ) -> anyhow::Result<usize> {
-    let seg = media::load_segment(pool, segment_id).await?;
-    let pcm = media::extract_pcm(cfg, &seg).await?;
+    // Whole-pipeline wall-clock for `hushai_worker_segment_seconds` (recorded at the success path
+    // below). Stage timers (`hushai_worker_stage_seconds`) wrap each step so the load-test can
+    // attribute per-camera cost; their overhead is a single `Instant` read each (negligible).
+    let started = std::time::Instant::now();
+
+    let seg = {
+        let _t = observe::StageTimer::start(STAGE, &[("lane", "audio"), ("stage", "load_segment")]);
+        media::load_segment(pool, segment_id).await?
+    };
+    let pcm = {
+        let _t = observe::StageTimer::start(STAGE, &[("lane", "audio"), ("stage", "extract_pcm")]);
+        media::extract_pcm(cfg, &seg).await?
+    };
     // The speaker embedder runs VAD over the raw PCM (independent of whisper), so retain a
     // copy before `transcribe` moves `pcm`. One small clone per segment (~128 KB at 2s/16
     // kHz) keeps asr.rs + its tests untouched.
     let pcm_for_speaker = pcm.clone();
-    let utterances = transcriber.transcribe(pcm).await?;
+    let utterances = {
+        let _t = observe::StageTimer::start(STAGE, &[("lane", "audio"), ("stage", "transcribe")]);
+        transcriber.transcribe(pcm).await?
+    };
     let mut sentences = chunk::chunk_into_sentences(&utterances, seg.capture_start_unix_nanos);
 
     // Sentiment is a segment-level signal: classify the segment's transcript text once,
@@ -51,7 +69,14 @@ pub async fn process_segment(
         .map(|s| s.text.as_str())
         .collect::<Vec<_>>()
         .join(" ");
-    let sentiment = sentiment_clf.classify(&segment_text).await;
+    let sentiment = {
+        // Only time it when it actually runs, so a sentiment-disabled profile doesn't add a
+        // misleading near-zero bucket to the histogram.
+        let _t = cfg
+            .sentiment_enabled
+            .then(|| observe::StageTimer::start(STAGE, &[("lane", "audio"), ("stage", "sentiment")]));
+        sentiment_clf.classify(&segment_text).await
+    };
     for s in &mut sentences {
         s.sentiment = sentiment.clone();
     }
@@ -67,8 +92,11 @@ pub async fn process_segment(
         // (~2s) clip has enough speech for the VAD/quality gate to attribute it, instead of
         // rejecting every individual clip. Falls back to this segment alone when windowing
         // is disabled or there are no contiguous neighbors.
-        let (window_pcm, window_start_nanos) =
-            build_speaker_window(pool, cfg, &seg, pcm_for_speaker).await?;
+        let (window_pcm, window_start_nanos) = {
+            let _t = observe::StageTimer::start(STAGE, &[("lane", "audio"), ("stage", "speaker_window")]);
+            build_speaker_window(pool, cfg, &seg, pcm_for_speaker).await?
+        };
+        let _t = observe::StageTimer::start(STAGE, &[("lane", "audio"), ("stage", "speaker_embed")]);
         compute_speaker_embedding(
             voice_detector,
             speaker_embedder,
@@ -80,22 +108,70 @@ pub async fn process_segment(
     };
 
     let texts: Vec<String> = sentences.iter().map(|s| s.text.clone()).collect();
-    let embeddings = embedder.embed(texts).await?;
+    let embeddings = {
+        let _t = observe::StageTimer::start(STAGE, &[("lane", "audio"), ("stage", "embed")]);
+        embedder.embed(texts).await?
+    };
 
     let speaker_match_cfg = cfg.speaker_match_cfg();
-    write_transcript(
-        pool,
-        segment_id,
-        &seg.device_id,
-        &sentences,
-        &embeddings,
-        embedder.model_name(),
-        speaker,
-        &speaker_match_cfg,
-    )
-    .await?;
+    let speaker_id = {
+        let _t = observe::StageTimer::start(STAGE, &[("lane", "audio"), ("stage", "write_transcript")]);
+        write_transcript(
+            pool,
+            segment_id,
+            &seg.device_id,
+            &sentences,
+            &embeddings,
+            embedder.model_name(),
+            speaker,
+            &speaker_match_cfg,
+        )
+        .await?
+    };
+
+    // Proactive layer (roadmap A3): materialize a `speech` event + evaluate alert rules. Guarded so
+    // an event/alert failure can never fail the segment's core transcription.
+    if cfg.events.enabled {
+        let _t = observe::StageTimer::start(STAGE, &[("lane", "audio"), ("stage", "derive_events")]);
+        if let Err(e) = crate::events_producer::derive_audio_events(
+            pool,
+            &seg,
+            segment_id,
+            &sentences,
+            &sentiment,
+            speaker_id,
+            &cfg.events,
+        )
+        .await
+        {
+            tracing::warn!(%segment_id, error = %format!("{e:#}"), "audio event production failed; continuing");
+        }
+    }
+
+    // Success-path latency: total per-segment wall-clock, and capture->done lag (incl. queue wait),
+    // the "are we keeping up with realtime?" signal the load-test ramps against.
+    observe::observe_duration(
+        "hushai_worker_segment_seconds",
+        &[("lane", "audio")],
+        started.elapsed().as_secs_f64(),
+    );
+    record_capture_lag("audio", seg.capture_start_unix_nanos);
 
     Ok(sentences.len())
+}
+
+/// Record capture->done end-to-end latency (s) into `hushai_worker_capture_lag_seconds`.
+/// `capture_start_unix_nanos` is the device wall clock, so this folds in capture, upload, queue
+/// wait, and processing — exactly the realtime-lag the capacity test watches.
+pub(crate) fn record_capture_lag(lane: &'static str, capture_start_unix_nanos: i64) {
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(capture_start_unix_nanos);
+    let lag = (now_ns - capture_start_unix_nanos) as f64 / 1e9;
+    if lag.is_finite() && lag >= 0.0 {
+        observe::observe_duration("hushai_worker_capture_lag_seconds", &[("lane", lane)], lag);
+    }
 }
 
 /// Compute one segment-level speaker embedding behind the accuracy guards, or `None` to
@@ -264,6 +340,8 @@ async fn write_speaker_tombstone(
 /// table as the HNSW index; `speaker_id` is likewise denormalized (segment-level, the same
 /// value on every sentence). `sentences` and `embeddings` must be the same length and
 /// aligned by index. `speaker` is `None` for VAD-gated / multi-speaker / silent segments.
+/// Returns the resolved `speaker_id` (the value denormalized onto the sentences, `None` when the
+/// segment is silent / VAD-rejected / multi-speaker) so the caller can attribute a `speech` event.
 #[allow(clippy::too_many_arguments)]
 pub async fn write_transcript(
     pool: &PgPool,
@@ -274,7 +352,7 @@ pub async fn write_transcript(
     embed_model: &str,
     speaker: Option<SpeakerWrite>,
     speaker_match_cfg: &SpeakerMatchConfig,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<Uuid>> {
     anyhow::ensure!(
         sentences.len() == embeddings.len(),
         "sentence/embedding count mismatch: {} vs {}",
@@ -292,11 +370,10 @@ pub async fn write_transcript(
     // durable prior assignment from speaker_segments, which the DELETE below does not touch
     // but which is the idempotency source of truth. Takes the global advisory lock itself.
     // The resolved id is denormalized (as text) onto every sentence row.
-    let speaker_id_text: Option<String> = match &speaker {
+    let speaker_id: Option<Uuid> = match &speaker {
         Some(sp) => {
             speaker_match::assign_speaker(&mut tx, segment_id, device_id, sp, speaker_match_cfg)
                 .await?
-                .map(|id| id.to_string())
         }
         None => {
             // The speaker stage ran but produced no voiceprint (silent / VAD-rejected /
@@ -308,6 +385,8 @@ pub async fn write_transcript(
             None
         }
     };
+    // Denormalized as text on every sentence row (matches the text device_id / speaker_id columns).
+    let speaker_id_text: Option<String> = speaker_id.map(|id| id.to_string());
 
     sqlx::query("DELETE FROM transcript_sentences WHERE segment_id = $1")
         .bind(segment_id)
@@ -362,5 +441,5 @@ pub async fn write_transcript(
     .context("marking status done")?;
 
     tx.commit().await.context("commit transcript tx")?;
-    Ok(())
+    Ok(speaker_id)
 }

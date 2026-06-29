@@ -10,6 +10,16 @@
 #
 # - hushai-viewer: read-only browser NVR — stitches stored segments into a scrubbable
 #   HLS timeline. Also reuses hushai-backend as a library (Config + pool + storage helpers).
+#
+# - hushai-eval: end-to-end regression harness. Injects known clips into the LIVE pipeline,
+#   waits for processing to complete, scores results against ground truth, and emits an
+#   improvement/regression verdict + exit code. Standalone (sqlx + reqwest), no path dep on the
+#   services — it talks to them over their HTTP read APIs and the same Postgres.
+#
+# - hushai-loadtest: capacity/load-test harness. Replays ONE clip as N synthetic cameras
+#   (identity-only, byte-identical fan-out), ramps 1..N cumulatively, samples the worker/backend
+#   Prometheus metrics + macOS system load each step, and reports the per-camera cost + the
+#   saturation point. Reuses hushai-backend's proto (path dep); drives everything else over HTTP.
 [workspace]
 resolver = "2"
-members = ["hushai-backend", "hushai-worker", "hushai-rag", "hushai-viewer"]
+members = ["hushai-backend", "hushai-worker", "hushai-rag", "hushai-viewer", "hushai-eval", "hushai-loadtest"]

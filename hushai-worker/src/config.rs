@@ -4,6 +4,7 @@
 //! duplicate the schema-owning crate's knobs; this struct holds only what the
 //! transcription/embedding worker adds on top.
 
+use std::net::SocketAddr;
 use std::time::Duration;
 
 use anyhow::anyhow;
@@ -274,6 +275,17 @@ pub struct WorkerConfig {
     /// Stable id for this worker process's heartbeat row. Defaults to `<host>:<pid>` when unset;
     /// set explicitly (e.g. per host) when running multiple worker instances.
     pub worker_id: Option<String>,
+
+    // ---- Proactive events + alerts (roadmap A3 — the VSaaS layer) ----
+    /// Event producer + alert evaluator tunables (`EVENTS_*`). See `events_producer::EventsConfig`.
+    pub events: crate::events_producer::EventsConfig,
+
+    /// Notification delivery loop tunables (`ALERT_*`, roadmap A4). See `delivery::DeliveryConfig`.
+    pub delivery: crate::delivery::DeliveryConfig,
+
+    /// Address for the worker's Prometheus `/metrics` + `/healthz` server (roadmap B1/B5). The
+    /// worker has no other HTTP port. `WORKER_METRICS_ADDR`; empty disables it. Default :9100.
+    pub metrics_addr: Option<SocketAddr>,
 }
 
 impl WorkerConfig {
@@ -349,6 +361,16 @@ impl WorkerConfig {
 impl WorkerConfig {
     pub fn from_env() -> anyhow::Result<Self> {
         let ollama_base_url = opt("OLLAMA_BASE_URL", "http://localhost:11434");
+        // Validate the unknown-person severity against the canonical set NOW (it's free-text env);
+        // an invalid value would otherwise silently rank as 'info' in the evaluator and suppress
+        // unknown-person alerts that an operator scoped to min_severity='warning'.
+        let unknown_person_severity = opt("EVENTS_UNKNOWN_PERSON_SEVERITY", "warning");
+        if !hushai_backend::events::SEVERITIES.contains(&unknown_person_severity.as_str()) {
+            return Err(anyhow!(
+                "EVENTS_UNKNOWN_PERSON_SEVERITY={unknown_person_severity:?} is invalid; expected one of {:?}",
+                hushai_backend::events::SEVERITIES
+            ));
+        }
         Ok(Self {
             whisper_model_path: opt("WHISPER_MODEL_PATH", "./models/ggml-base.en.bin"),
             embed_ollama_base_url: opt("EMBED_OLLAMA_BASE_URL", &ollama_base_url),
@@ -474,6 +496,51 @@ impl WorkerConfig {
 
             heartbeat_interval: Duration::from_secs(parse("WORKER_HEARTBEAT_SECS", "10")?),
             worker_id: std::env::var("WORKER_ID").ok().filter(|s| !s.trim().is_empty()),
+
+            events: crate::events_producer::EventsConfig {
+                enabled: parse("EVENTS_ENABLED", "true")?,
+                alerts_enabled: parse("EVENTS_ALERTS_ENABLED", "true")?,
+                session_bucket_secs: parse("EVENTS_SESSION_BUCKET_SECS", "30")?,
+                object_min_score: parse("EVENTS_OBJECT_MIN_SCORE", "0.4")?,
+                object_suppress_person: parse("EVENTS_OBJECT_SUPPRESS_PERSON", "true")?,
+                plate_seen_min_conf: parse("EVENTS_PLATE_SEEN_MIN_CONF", "0.55")?,
+                negative_sentiment_warns: parse("EVENTS_NEGATIVE_SENTIMENT_WARNS", "true")?,
+                unknown_person_severity,
+            },
+
+            delivery: {
+                let timeout_ms: u64 = parse("ALERT_DELIVERY_TIMEOUT_MS", "8000")?;
+                crate::delivery::DeliveryConfig {
+                    enabled: parse("ALERT_DELIVERY_ENABLED", "true")?,
+                    poll_secs: parse("ALERT_DELIVERY_POLL_SECS", "10")?,
+                    batch: parse("ALERT_DELIVERY_BATCH", "20")?,
+                    max_attempts: parse("ALERT_DELIVERY_MAX_ATTEMPTS", "6")?,
+                    timeout_ms,
+                    // Lease must exceed the request timeout so an in-flight send isn't re-claimed
+                    // before it can finish; timeout + 30s buffer.
+                    lease_secs: (timeout_ms as f64) / 1000.0 + 30.0,
+                    backoff_base_secs: parse("ALERT_DELIVERY_BACKOFF_BASE_SECS", "30")?,
+                    backoff_max_secs: parse("ALERT_DELIVERY_BACKOFF_MAX_SECS", "3600")?,
+                    signing_secret: std::env::var("ALERT_WEBHOOK_SIGNING_SECRET")
+                        .ok()
+                        .filter(|s| !s.trim().is_empty()),
+                    // Local-first default: LAN webhook targets (Home Assistant, etc.) are allowed.
+                    allow_private: parse("ALERT_WEBHOOK_ALLOW_PRIVATE", "true")?,
+                }
+            },
+
+            metrics_addr: {
+                let s = opt("WORKER_METRICS_ADDR", "127.0.0.1:9100");
+                if s.trim().is_empty() {
+                    None
+                } else {
+                    Some(
+                        s.trim()
+                            .parse()
+                            .map_err(|e| anyhow!("WORKER_METRICS_ADDR={s:?} invalid: {e}"))?,
+                    )
+                }
+            },
         })
     }
 }

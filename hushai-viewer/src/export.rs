@@ -13,7 +13,9 @@
 use std::process::Stdio;
 
 use axum::body::Body;
-use axum::extract::{Path, Query, State};
+use std::net::SocketAddr;
+
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::header;
 use axum::response::Response;
 use serde::Deserialize;
@@ -35,6 +37,7 @@ pub struct ExportParams {
 
 pub async fn export_mp4(
     State(state): State<ViewerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
     Path(device_id): Path<String>,
     Query(p): Query<ExportParams>,
 ) -> ViewerResult<Response> {
@@ -44,6 +47,16 @@ pub async fn export_mp4(
         Some("video") => (Variant::Video, 2),
         _ => (Variant::Muxed, 3),
     };
+
+    // Audit the data-egress (roadmap B6): exporting footage off the system is compliance-relevant.
+    let actor = if state.cfg.auth_disabled { "local" } else { "admin" };
+    hushai_backend::audit::record(
+        &state.pool,
+        hushai_backend::audit::AuditEntry::event(actor, Some(peer.ip().to_string()), "footage.export")
+            .with_target("device", device_id.clone())
+            .with_detail(serde_json::json!({ "from": from, "to": to, "kind": variant.suffix() })),
+    )
+    .await;
 
     // The window's segments of this kind, already in stitch order.
     let rows = timeline::windowed_segments(&state.pool, &device_id, from, to).await?;

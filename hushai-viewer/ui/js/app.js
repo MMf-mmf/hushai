@@ -80,7 +80,13 @@ async function init() {
   lastDeviceSig = deviceSig(state.devices);
   populateDeviceSelect();
   const usable = state.devices.filter((d) => d.segmentCount > 0 && d.latestMs);
-  if (usable.length) {
+  // Deep-link from the Events feed: /?device=<id>&t=<ms> opens that camera at that instant.
+  const params = new URLSearchParams(location.search);
+  const linkDevice = params.get("device");
+  const linkMs = Number(params.get("t"));
+  if (linkDevice && isFinite(linkMs) && linkMs > 0 && state.devices.some((d) => d.id === linkDevice)) {
+    selectDevice(linkDevice, { seekMs: linkMs });
+  } else if (usable.length) {
     const def = usable.slice().sort((a, b) => b.segmentCount - a.segmentCount)[0];
     selectDevice(def.id);
   } else {

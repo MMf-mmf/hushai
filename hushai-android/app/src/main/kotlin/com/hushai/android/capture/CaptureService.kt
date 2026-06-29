@@ -73,6 +73,7 @@ class CaptureService : Service() {
     @Volatile private var audio: AudioEncoder? = null
     @Volatile private var micSource: MicSource? = null
     @Volatile private var assistant: VoiceAssistant? = null
+    @Volatile private var alertNotifier: AlertNotifier? = null
     @Volatile private var wakeLock: PowerManager.WakeLock? = null
     @Volatile private var uploadThread: Thread? = null
 
@@ -293,6 +294,10 @@ class CaptureService : Service() {
         // Bring up the shared delivery context (durable buffer + recovery + uploader +
         // connectivity + drain thread). Idempotent: a prior import may have started it.
         ensureDeliveryRunning(url, token, identity)
+
+        // Alert "push" (roadmap A7): poll the backend's alert feed + raise notifications while the
+        // always-on capture service runs. Self-contained; restarting capture re-targets it cleanly.
+        alertNotifier = AlertNotifier(this).also { it.start(url, token) }
 
         // Publish the live mode BEFORE flipping `running` so a concurrent redundant
         // start (which reads `running` then `activeAudioOnly`) sees a consistent pair.
@@ -658,6 +663,7 @@ class CaptureService : Service() {
     private fun stopCapture() {
         if (!running && camera == null) return
         HushaiLog.info("stopping capture — finalizing in-flight segments")
+        runCatching { alertNotifier?.stop() }; alertNotifier = null
         runCatching { camera?.stop() }; camera = null
         // Stop the mic FIRST so no more PCM is pushed, then it's safe to tear down
         // the consumers (encoder + assistant) without racing onPcm.

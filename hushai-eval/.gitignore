@@ -1,0 +1,3 @@
+# Scratch: emitted segment-id manifests + ffmpeg segment work dirs (regenerated each run).
+.work/
+# baselines/ IS committed — it's the reference metric vector per config-hash.

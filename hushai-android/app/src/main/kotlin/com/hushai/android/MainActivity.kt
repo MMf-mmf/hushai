@@ -25,12 +25,14 @@ import androidx.compose.ui.Modifier
 import androidx.core.content.ContextCompat
 import com.hushai.android.capture.CaptureService
 import com.hushai.android.config.Settings
+import com.hushai.android.net.EventsClient
 import com.hushai.android.net.Http
 import com.hushai.android.net.Reachability
 import com.hushai.android.net.PersonsClient
 import com.hushai.android.net.PlatesClient
 import com.hushai.android.net.SpeakersClient
 import com.hushai.android.ui.CaptureScreen
+import com.hushai.android.ui.EventsScreen
 import com.hushai.android.ui.PeopleScreen
 import com.hushai.android.ui.PlatesScreen
 import com.hushai.android.ui.VoicesScreen
@@ -154,6 +156,17 @@ class MainActivity : ComponentActivity() {
                             onBack = { screen = Screen.Capture },
                         )
                     }
+                    Screen.Events -> {
+                        BackHandler { screen = Screen.Capture }
+                        val eventsUrl = remember { settings.urlBlocking() }
+                        val eventsToken = remember { settings.tokenBlocking() }
+                        EventsScreen(
+                            client = remember(eventsUrl, eventsToken) {
+                                EventsClient(Http.upload, eventsUrl, eventsToken)
+                            },
+                            onBack = { screen = Screen.Capture },
+                        )
+                    }
                     Screen.Capture ->
                     CaptureScreen(
                         initialUrl = initialUrl,
@@ -167,6 +180,7 @@ class MainActivity : ComponentActivity() {
                         onOpenVoices = { screen = Screen.Voices },
                         onOpenPeople = { screen = Screen.People },
                         onOpenPlates = { screen = Screen.Plates },
+                        onOpenEvents = { screen = Screen.Events },
                         onStart = { url, token, audioOnly -> requestStart(url, token, audioOnly) },
                         onAudioOnlyChange = { ao -> Thread { settings.setAudioOnlyBlocking(ao) }.start() },
                         onDiskCapChange = { gb ->
@@ -354,4 +368,4 @@ class MainActivity : ComponentActivity() {
 }
 
 /** The top-level screens (no nav framework — a simple state toggle in [MainActivity]). */
-private enum class Screen { Capture, Voices, People, Plates }
+private enum class Screen { Capture, Voices, People, Plates, Events }

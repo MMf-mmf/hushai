@@ -3,7 +3,10 @@
 // ("when did I see plate ABC123"). The vehicle twin of the People modal. All calls go to
 // hushai-backend's /v1/plates* surface via the viewer proxy (which injects the device bearer).
 
-import { getPlates, searchPlates, samplePlateUrl, renamePlate, mergePlate } from "../api.js";
+import {
+  getPlates, searchPlates, samplePlateUrl, renamePlate, mergePlate,
+  getWatchlist, addWatch, removeWatch,
+} from "../api.js";
 import { nsToMs } from "../time.js";
 
 function note(text) {
@@ -110,6 +113,28 @@ function plateCard(p, others, ctx) {
   });
   actions.append(input, save);
 
+  // ⭐ Watch — "Plate of Interest": alert whenever this plate is seen (auto-managed alert rule).
+  const watchId = ctx.watched.get(p.plate_id);
+  const watchBtn = document.createElement("button");
+  watchBtn.type = "button";
+  watchBtn.className = watchId ? "watch-on" : "watch-off";
+  watchBtn.textContent = watchId ? "★ Watching" : "☆ Watch";
+  watchBtn.title = watchId
+    ? "Stop watching (remove from Plates of Interest)"
+    : "Watch — alert me whenever this plate is seen";
+  watchBtn.addEventListener("click", async () => {
+    watchBtn.disabled = true;
+    try {
+      if (watchId) await removeWatch(watchId);
+      else await addWatch("plate", p.plate_id);
+      await ctx.reload();
+    } catch {
+      watchBtn.disabled = false;
+      ctx.flash("Couldn't update the watchlist (Refresh and try again).");
+    }
+  });
+  actions.appendChild(watchBtn);
+
   if (others.length) {
     const merge = document.createElement("select");
     merge.title = "Merge this plate into…";
@@ -180,6 +205,7 @@ function boot() {
   const ctx = {
     query: "",
     reload: () => load(ctx.query),
+    watched: new Map(), // plate_id -> watch_id (refreshed each load)
     flash(msg) {
       const n = note(msg);
       body.prepend(n);
@@ -190,6 +216,15 @@ function boot() {
   async function load(query) {
     ctx.query = query || "";
     body.replaceChildren(note(ctx.query ? `Searching “${ctx.query}”…` : "Loading plates…"));
+    // Watchlist is best-effort: a failure must not block listing plates.
+    try {
+      const wl = await getWatchlist();
+      ctx.watched = new Map(
+        (wl || []).filter((w) => w.subject_type === "plate").map((w) => [w.subject_id, w.watch_id]),
+      );
+    } catch {
+      ctx.watched = new Map();
+    }
     let plates;
     try {
       plates = ctx.query ? await searchPlates(ctx.query) : await getPlates();

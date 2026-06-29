@@ -37,6 +37,10 @@ pub struct DashboardResponse {
     pub camera_summary: CameraSummary,
     pub queues: Queues,
     pub services: Vec<ServiceStatus>,
+    /// Live capacity/load-test status (hushai-loadtest writes `live.json`; pointed at via
+    /// `$VIEWER_LOADTEST_LIVE_JSON`). Absent when no run is active, so the existing UI is unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loadtest: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -164,7 +168,17 @@ pub async fn get_dashboard(State(state): State<ViewerState>) -> ViewerResult<Jso
         camera_summary,
         queues: Queues { transcription, vision },
         services,
+        loadtest: load_loadtest_status(),
     }))
+}
+
+/// Read the load-test harness's rolling `live.json` if `$VIEWER_LOADTEST_LIVE_JSON` points at a
+/// readable, parseable file. Tiny file (a few KB); best-effort — any failure yields `None` so the
+/// dashboard is unaffected when no benchmark is running.
+fn load_loadtest_status() -> Option<serde_json::Value> {
+    let path = std::env::var("VIEWER_LOADTEST_LIVE_JSON").ok()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
 }
 
 // ---------------------------------------------------------------------------

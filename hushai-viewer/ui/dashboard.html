@@ -14,6 +14,7 @@
     <header class="topbar">
       <div class="brand"><span class="logo">◉</span> HUSHAI <span class="muted">system</span></div>
       <a class="navlink" href="/" title="Back to the viewer">‹ Viewer</a>
+      <a class="navlink" href="/events.html" title="Alerts &amp; event feed">🔔 Events</a>
       <a class="navlink" href="/manage.html" title="Manage devices &amp; footage">🗄 Files</a>
       <span class="spacer"></span>
       <div class="clock dash-updated">
@@ -49,6 +50,17 @@
       <section class="dash-section">
         <div class="dash-head"><h2>Work queues</h2></div>
         <div id="queues" class="queue-grid"></div>
+      </section>
+
+      <!-- Capacity / load test (hidden unless hushai-loadtest is publishing live.json). -->
+      <section id="loadtestSection" class="dash-section" hidden>
+        <div class="dash-head">
+          <h2>Load test</h2>
+          <span id="loadtestStatus" class="count-chip"></span>
+        </div>
+        <div id="loadtestSummary" class="muted small"></div>
+        <canvas id="loadtestChart" width="900" height="320"
+                style="width:100%;max-width:920px;height:auto;margin-top:10px"></canvas>
       </section>
     </main>
 

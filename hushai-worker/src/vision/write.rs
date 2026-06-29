@@ -33,8 +33,23 @@ use super::plates::plate_match::{self, PlateWrite};
 use super::plates::{is_vehicle, rectify};
 use crate::config::WorkerConfig;
 use crate::media;
+use hushai_backend::observe;
 use sqlx::PgPool;
 use uuid::Uuid;
+
+/// Histogram name for per-stage latency; lane is always "vision" in this module.
+const STAGE: &str = "hushai_worker_stage_seconds";
+
+/// Record end-to-end per-segment wall-clock + capture->done lag for the vision lane. Called on every
+/// completion path so the load-test's per-camera cost includes decode+detect even when nothing is written.
+fn record_vision_latency(started: std::time::Instant, capture_start_unix_nanos: i64) {
+    observe::observe_duration(
+        "hushai_worker_segment_seconds",
+        &[("lane", "vision")],
+        started.elapsed().as_secs_f64(),
+    );
+    crate::process::record_capture_lag("vision", capture_start_unix_nanos);
+}
 
 /// The vision models, loaded once at startup and cloned (cheap `Arc`) into each worker task.
 /// Faces are required; the restoration sub-lane (super-res + face-restore) and the object lane
@@ -107,15 +122,16 @@ struct PlateCand {
 }
 
 /// One detected object ready to persist into `scene_objects` (region row, or the whole-frame
-/// open-vocab row with `object_label = '__frame__'` and NULL bbox/score).
-struct ObjectWrite {
-    object_label: String,
-    bbox: Option<[f32; 4]>,
-    det_score: Option<f32>,
-    frame_offset_nanos: i64,
-    start_unix_nanos: i64,
-    end_unix_nanos: i64,
-    embedding: Vec<f32>,
+/// open-vocab row with `object_label = '__frame__'` and NULL bbox/score). `pub` so the event
+/// producer (`crate::events_producer`) can read the just-written objects to emit `object_seen`.
+pub struct ObjectWrite {
+    pub object_label: String,
+    pub bbox: Option<[f32; 4]>,
+    pub det_score: Option<f32>,
+    pub frame_offset_nanos: i64,
+    pub start_unix_nanos: i64,
+    pub end_unix_nanos: i64,
+    pub embedding: Vec<f32>,
 }
 
 /// Process one VIDEO/MUXED segment through the face-identity pipeline. Returns the number of face
@@ -126,8 +142,14 @@ pub async fn process_vision_segment(
     cfg: &WorkerConfig,
     segment_id: Uuid,
 ) -> Result<usize> {
+    // Whole-pipeline wall-clock for `hushai_worker_segment_seconds`; stage timers below attribute
+    // per-camera cost (decode, detect, embed, write) for the capacity/load test.
+    let started = std::time::Instant::now();
     let seg = media::load_segment(pool, segment_id).await?;
-    let frames = frames::sample_frames(cfg, &seg, cfg.frames_per_segment).await?;
+    let frames = {
+        let _t = observe::StageTimer::start(STAGE, &[("lane", "vision"), ("stage", "sample_frames")]);
+        frames::sample_frames(cfg, &seg, cfg.frames_per_segment).await?
+    };
     if frames.is_empty() {
         return Ok(0); // no decodable video (e.g. audio-only blob) — clean no-op
     }
@@ -168,10 +190,28 @@ pub async fn process_vision_segment(
         let (faces_out, objs_out, plates_out) = tokio::task::spawn_blocking(
             move || -> Result<(Vec<FaceOutcome>, Vec<ObjectWrite>, Vec<PlateCand>)> {
                 // ---- faces (required lane), with the cleanup cascade ----
-                let faces = models.detector.detect(&img).context("face detect")?;
+                // Success-only timing for the fallible ONNX detect (a `?` failure shouldn't be
+                // booked as a fast stage).
+                let faces = {
+                    let __t = std::time::Instant::now();
+                    let r = models.detector.detect(&img).context("face detect")?;
+                    observe::observe_duration(
+                        STAGE,
+                        &[("lane", "vision"), ("stage", "face_detect")],
+                        __t.elapsed().as_secs_f64(),
+                    );
+                    r
+                };
+                let n_faces = faces.len();
+                // Accumulate per-face enhance+embed time and record ONCE per frame, so a frame with
+                // many faces doesn't take the registry lock once per face.
+                let mut enhance_secs = 0.0f64;
                 let mut fout = Vec::new();
                 for face in faces {
-                    match enhance_and_embed(&img, &face, &models, &params) {
+                    let __t = std::time::Instant::now();
+                    let res = enhance_and_embed(&img, &face, &models, &params);
+                    enhance_secs += __t.elapsed().as_secs_f64();
+                    match res {
                         Ok(Some(mut outcome)) => {
                             outcome.write.frame_offset_nanos = offset;
                             outcome.write.start_unix_nanos = abs;
@@ -184,13 +224,29 @@ pub async fn process_vision_segment(
                         }
                     }
                 }
+                if n_faces > 0 {
+                    observe::observe_duration(
+                        STAGE,
+                        &[("lane", "vision"), ("stage", "face_enhance_embed")],
+                        enhance_secs,
+                    );
+                }
 
                 // ---- RF-DETR runs ONCE and fans out to the object + plate lanes ----
                 let dets: Vec<DetectedObject> = match models.object_detector.as_ref() {
-                    Some(od) => od.detect(&img).unwrap_or_else(|e| {
-                        tracing::warn!(error = %e, "object detect failed; object/plate lanes skip this frame");
-                        Vec::new()
-                    }),
+                    Some(od) => {
+                        let __t = std::time::Instant::now();
+                        let r = od.detect(&img).unwrap_or_else(|e| {
+                            tracing::warn!(error = %e, "object detect failed; object/plate lanes skip this frame");
+                            Vec::new()
+                        });
+                        observe::observe_duration(
+                            STAGE,
+                            &[("lane", "vision"), ("stage", "object_detect")],
+                            __t.elapsed().as_secs_f64(),
+                        );
+                        r
+                    }
                     None => Vec::new(),
                 };
 
@@ -199,9 +255,14 @@ pub async fn process_vision_segment(
                 if let (Some(_od), Some(cl)) =
                     (models.object_detector.as_ref(), models.clip.as_ref())
                 {
+                    // Accumulate all CLIP embeds (per-region + whole-frame) and record once per frame.
+                    let mut clip_secs = 0.0f64;
                     for d in &dets {
                         let region = objects::crop_region(&img, &d.bbox);
-                        match cl.embed(&region) {
+                        let __t = std::time::Instant::now();
+                        let res = cl.embed(&region);
+                        clip_secs += __t.elapsed().as_secs_f64();
+                        match res {
                             Ok(emb) => oout.push(ObjectWrite {
                                 object_label: d.label.clone(),
                                 bbox: Some(d.bbox),
@@ -214,7 +275,10 @@ pub async fn process_vision_segment(
                             Err(e) => tracing::warn!(error = %e, "clip region embed failed; skipping object"),
                         }
                     }
-                    if let Ok(emb) = cl.embed(&img) {
+                    let __t = std::time::Instant::now();
+                    let frame_emb = cl.embed(&img);
+                    clip_secs += __t.elapsed().as_secs_f64();
+                    if let Ok(emb) = frame_emb {
                         oout.push(ObjectWrite {
                             object_label: "__frame__".to_string(),
                             bbox: None,
@@ -225,6 +289,11 @@ pub async fn process_vision_segment(
                             embedding: emb,
                         });
                     }
+                    observe::observe_duration(
+                        STAGE,
+                        &[("lane", "vision"), ("stage", "clip_embed")],
+                        clip_secs,
+                    );
                 }
 
                 // ---- plates (optional lane; NON-FATAL) — zoom into each vehicle, detect+read ----
@@ -232,8 +301,14 @@ pub async fn process_vision_segment(
                 if let (Some(pd), Some(po)) =
                     (models.plate_detector.as_ref(), models.plate_ocr.as_ref())
                 {
+                    let __t = std::time::Instant::now();
                     pout = process_plate_lane(
                         &img, &dets, pd, po, models.upscaler.as_deref(), &plate_params, offset, abs,
+                    );
+                    observe::observe_duration(
+                        STAGE,
+                        &[("lane", "vision"), ("stage", "plate")],
+                        __t.elapsed().as_secs_f64(),
                     );
                 }
                 Ok((fout, oout, pout))
@@ -291,40 +366,67 @@ pub async fn process_vision_segment(
 
     // Nothing to write and no object reconciliation needed — the common always-on no-op.
     if face_writes.is_empty() && !objects_ran && plate_writes.is_empty() {
+        record_vision_latency(started, seg.capture_start_unix_nanos);
         return Ok(0);
     }
 
     // One transaction: advisory-locked match-or-mint into persons/person_segments + the idempotent
     // scene_objects reconcile + plate match-or-mint, so a reprocess is a single atomic replacement.
-    let mut tx = pool.begin().await.context("begin vision write tx")?;
-    let assigned = if face_writes.is_empty() {
-        Vec::new()
-    } else {
-        face_match::assign_faces(
-            &mut tx,
+    let (assigned, plates_assigned) = {
+        let _t = observe::StageTimer::start(STAGE, &[("lane", "vision"), ("stage", "write_tx")]);
+        let mut tx = pool.begin().await.context("begin vision write tx")?;
+        let assigned = if face_writes.is_empty() {
+            Vec::new()
+        } else {
+            face_match::assign_faces(
+                &mut tx,
+                segment_id,
+                &seg.device_id,
+                &face_writes,
+                &cfg.face_match_cfg(),
+            )
+            .await?
+        };
+        if objects_ran {
+            insert_scene_objects(&mut tx, segment_id, &seg.device_id, &object_writes).await?;
+        }
+        let plates_assigned = if plate_writes.is_empty() {
+            Vec::new()
+        } else {
+            plate_match::assign_plates(
+                &mut tx,
+                segment_id,
+                &seg.device_id,
+                &plate_writes,
+                &cfg.plate_match_cfg(),
+            )
+            .await?
+        };
+        tx.commit().await.context("commit vision write tx")?;
+        (assigned, plates_assigned)
+    };
+
+    // Proactive layer (roadmap A3): materialize person/plate/object events + evaluate alert rules
+    // from the just-committed detections. Guarded so an event/alert failure can never fail vision
+    // processing (the segment still marks `done`). assigned/plates_assigned align to the *_writes.
+    if cfg.events.enabled {
+        let _t = observe::StageTimer::start(STAGE, &[("lane", "vision"), ("stage", "derive_events")]);
+        if let Err(e) = crate::events_producer::derive_vision_events(
+            pool,
+            &seg,
             segment_id,
-            &seg.device_id,
             &face_writes,
-            &cfg.face_match_cfg(),
-        )
-        .await?
-    };
-    if objects_ran {
-        insert_scene_objects(&mut tx, segment_id, &seg.device_id, &object_writes).await?;
-    }
-    let plates_assigned = if plate_writes.is_empty() {
-        Vec::new()
-    } else {
-        plate_match::assign_plates(
-            &mut tx,
-            segment_id,
-            &seg.device_id,
+            &assigned,
+            &object_writes,
             &plate_writes,
-            &cfg.plate_match_cfg(),
+            &plates_assigned,
+            &cfg.events,
         )
-        .await?
-    };
-    tx.commit().await.context("commit vision write tx")?;
+        .await
+        {
+            tracing::warn!(segment_id = %segment_id, error = %format!("{e:#}"), "vision event production failed; continuing");
+        }
+    }
 
     let attributed = assigned.iter().filter(|a| a.is_some()).count();
     let restored = face_writes.iter().filter(|f| f.restored).count();
@@ -339,6 +441,7 @@ pub async fn process_vision_segment(
         plates_attributed,
         "vision: wrote detections"
     );
+    record_vision_latency(started, seg.capture_start_unix_nanos);
     Ok(face_writes.len())
 }
 

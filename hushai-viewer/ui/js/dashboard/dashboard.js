@@ -222,6 +222,103 @@ function renderQueues(queues) {
   root.appendChild(queueCard("Vision (faces & objects)", queues?.vision));
 }
 
+// ---- load test (hushai-loadtest) ------------------------------------------
+
+// Shown only while a benchmark is publishing live.json (the `loadtest` field is otherwise absent).
+function renderLoadtest(lt) {
+  const section = $("loadtestSection");
+  if (!lt) {
+    if (section) section.hidden = true;
+    return;
+  }
+  section.hidden = false;
+  const sat = lt.saturation_n != null ? `${lt.saturation_n} cameras` : "—";
+  $("loadtestStatus").textContent = lt.running
+    ? `running · ${lt.current_cameras}/${lt.max_cameras} cams`
+    : "complete";
+  $("loadtestSummary").textContent =
+    `Profile: ${lt.profile} · saturation: ${sat}` + (lt.running ? " · ramping…" : "");
+  drawLoadtestChart($("loadtestChart"), lt);
+}
+
+// Dependency-free multi-line chart: camera-count (x) vs per-series-normalized signals (y),
+// with a dashed vertical marker at the saturation knee. Each series is scaled to its own max
+// (shown in the legend) so differing units share the plot.
+function drawLoadtestChart(canvas, lt) {
+  if (!canvas || !canvas.getContext) return;
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  ctx.clearRect(0, 0, W, H);
+  const pts = (lt.points || []).filter((p) => p && p.n != null);
+  if (!pts.length) return;
+
+  const pad = { l: 44, r: 12, t: 26, b: 28 };
+  const x0 = pad.l, x1 = W - pad.r, y0 = H - pad.b, y1 = pad.t;
+  const nMin = Math.min(...pts.map((p) => p.n));
+  const nMax = Math.max(lt.max_cameras || 0, ...pts.map((p) => p.n));
+  const xOf = (n) => x0 + (nMax === nMin ? 0 : (n - nMin) / (nMax - nMin)) * (x1 - x0);
+  const yOf = (v) => y0 - v * (y0 - y1); // v normalized 0..1
+
+  ctx.strokeStyle = "#3a3a3a";
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.moveTo(x0, y1); ctx.lineTo(x0, y0); ctx.lineTo(x1, y0);
+  ctx.stroke();
+  ctx.fillStyle = "#888";
+  ctx.font = "11px system-ui, sans-serif";
+  ctx.fillText(String(nMin), x0 - 3, y0 + 16);
+  ctx.fillText(String(nMax), x1 - 14, y0 + 16);
+  ctx.fillText("cameras", (x0 + x1) / 2 - 22, y0 + 16);
+
+  if (lt.saturation_n != null) {
+    const xs = xOf(lt.saturation_n);
+    ctx.strokeStyle = "#5fb56a";
+    ctx.setLineDash([5, 4]);
+    ctx.beginPath(); ctx.moveTo(xs, y1); ctx.lineTo(xs, y0); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = "#5fb56a";
+    ctx.fillText(`saturation N=${lt.saturation_n}`, Math.min(xs + 4, x1 - 92), y0 - 4);
+  }
+
+  const series = [
+    { k: "audio_oldest_pending_age_s", label: "lag s", color: "#e0563f" },
+    { k: "audio_queue_depth", label: "queue", color: "#d9a441" },
+    { k: "audio_throughput_seg_per_s", label: "tput", color: "#3f8ee0" },
+    { k: "worker_cpu_pct", label: "CPU%", color: "#5fb56a" },
+    { k: "gpu_active_pct", label: "GPU%", color: "#9b6fd4" },
+  ];
+  let legendX = x0 + 6;
+  for (const s of series) {
+    const vals = pts.map((p) => (p[s.k] == null ? null : Number(p[s.k])));
+    const max = Math.max(0, ...vals.filter((v) => v != null));
+    if (max <= 0) continue;
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let started = false;
+    pts.forEach((p, i) => {
+      const v = vals[i];
+      if (v == null) return;
+      const X = xOf(p.n), Y = yOf(v / max);
+      if (!started) { ctx.moveTo(X, Y); started = true; } else ctx.lineTo(X, Y);
+    });
+    ctx.stroke();
+    pts.forEach((p, i) => {
+      const v = vals[i];
+      if (v == null) return;
+      const X = xOf(p.n), Y = yOf(v / max);
+      ctx.fillStyle = p.keeping_up ? s.color : "#e0563f";
+      ctx.beginPath(); ctx.arc(X, Y, 2.5, 0, Math.PI * 2); ctx.fill();
+    });
+    const tag = `${s.label} (≤${max.toFixed(max < 10 ? 1 : 0)})`;
+    ctx.fillStyle = s.color;
+    ctx.fillRect(legendX, y1 - 12, 9, 9);
+    ctx.fillStyle = "#aaa";
+    ctx.fillText(tag, legendX + 12, y1 - 4);
+    legendX += 12 + ctx.measureText(tag).width + 16;
+  }
+}
+
 // ---- poll loop ------------------------------------------------------------
 
 async function refresh() {
@@ -237,6 +334,7 @@ async function refresh() {
     renderCameras(data.cameras || [], data.camera_summary);
     renderServices(data.services || []);
     renderQueues(data.queues || {});
+    renderLoadtest(data.loadtest || null);
   } catch (e) {
     $("liveDot").classList.remove("live");
     $("generatedAt").textContent = "disconnected";

@@ -24,10 +24,11 @@ and is compiled by both Rust (prost) and Kotlin (Square Wire).
 | `hushai-backend/` | Rust/Axum segment-ingest server (`POST /v1/segments`, `:8080`). Metadata in Postgres, media as content-addressed blobs under `{BLOB_DIR}/blobs/ab/cd/<sha256>`. Also the authenticated speaker catalog: `GET /v1/speakers`, `PATCH /v1/speakers/{id}` (name), `POST /v1/speakers/{id}/merge`, `POST /v1/speakers/recluster` (centroid) + `POST /v1/speakers/recluster-deep` (raw-embedding heal), `GET /v1/speakers/duplicates` (suggested duplicate groups), `POST /v1/speakers/merge-group` (one-tap group merge), `GET /v1/speakers/unattributed` + `POST /v1/speakers/unattributed/name` (cluster NULL-speaker audio into candidate voices and name one — mints + repoints), `GET /v1/speakers/{id}/sample-audio` + `GET /v1/speakers/unattributed/sample-audio?segment_id=` (segment-keyed clip so a still-unattributed candidate voice can be heard before naming) (`speakers.rs`, runtime sqlx — NOT the `.sqlx` macros). | ✅ built + verified |
 | `hushai-worker/` | Drains stored segments (NOTIFY-driven, poll backstop) → whisper.cpp ASR → `mxbai-embed-large` (1024-dim) embeddings → `transcript_sentences` (batched insert, `device_id` denormalized). Also derives per-segment **sentiment** (`sentiment.rs`, lexical via `llama3.2:3b`) and **speaker identity** (`speaker.rs`+`vad.rs`+`speaker_match.rs`: real Silero **VAD** strips static/silence → TitaNet 192-d embedding → **multi-vector k-NN** match-or-mint with **mint-guard hysteresis** + **self-healing centroid**, online global advisory-locked into `speakers`/`speaker_segments`; worker also runs a going-forward **auto-merge** of near-certain duplicate voices). The ASR path claims **AUDIO/MUXED** (`media_type IN (1,3)`); a separate **vision path** (`vision/`, see "Vision pipeline" below) claims **VIDEO/MUXED** (`media_type IN (2,3)`) → YuNet+ArcFace face identity into `persons`/`person_segments` (ONNX via `ort` load-dynamic). On startup it **self-heals** by re-queueing `done` audio segments that have no `speaker_segments` row yet (`SPEAKER_BACKFILL_ON_START`, default on), so a window where the speaker stage was down can't permanently strand a voice. It also writes a **liveness heartbeat** (`spawn_heartbeat`, one `worker_heartbeat` row per process every `WORKER_HEARTBEAT_SECS`=10, deleted on clean shutdown) since it has no HTTP port — the viewer's System dashboard reads it to tell "idle" from "dead". | ✅ built + verified |
 | `hushai-rag/` | Axum `:8090`. `POST /v1/rag/query`: pgvector NN over embeddings + a `qwen2.5:7b` answer via Rig (`RAG_LLM_MODEL`; upgraded from `llama3.2:3b`, which embellished the strict extractive attribution answers with sightings not in the sources — the worker's sentiment lane still uses `llama3.2:3b` independently), with optional **speaker attribution** (`filters.speaker_name`/`speaker_id` → text[] filter; `exhaustive:true` routes to non-semantic `list_by_speaker`; prompt prefixes each passage with the resolved speaker name **and a human-readable relative time** (e.g. "yesterday at 5:14 PM") and deliberately omits raw UUIDs/nanoseconds so the small model can't echo them as "ids"/"timestamps" — these display strings are computed once by `retrieve::enrich_for_display` via `humanize.rs` and ride along on each `Source` (`speaker_name`/`time_label`) for the prompt, the SSE/JSON citations, and persistence; an unnamed speaker renders as "someone we haven't identified yet" — `speakers.rs`/`humanize.rs`). `POST /v1/rag/chat`: **multi-turn, SSE token-streaming** grounded chat over recordings (`chat.rs`) — DB-backed conversations (`chat_sessions`/`chat_messages`, migration 0008; plain tables, NOT partitioned), retrieval re-anchored on the latest message + prior turns as LLM history, citations returned for video deep-linking; `GET /v1/rag/agents` + `GET /v1/rag/chat/sessions[/{id}/messages]`. **Agents** = a code registry (`agents.rs`): persona (the former hardcoded `llm.rs` preamble) + default retrieval scope, selected by `chat_sessions.agent_id` (text, no FK — agents live in code); adding one = appending a struct. Each agent has an `AgentKind`: `Grounded` (transcript retrieval), `Reflection`, `Objects` (open-vocab "when did I see a car" — CLIP-text NN over `scene_objects`, see "Vision pipeline"), or `People` (face attribution — `list_by_person`/`list_co_occurring_persons`/`list_recent_persons` over `person_segments`; routing in `routes::resolve_people_sources`, shared by the query + chat paths: explicit/mentioned name → that person's sightings; first-person "who was I with" (`is_co_occurrence_query`) → co-occurrence around the owner, declining with the owner-setup hint only when no owner is configured; **otherwise → the ROSTER of everyone seen, "who have you seen so far"** — a no-name question no longer needs an owner). **Unified auto-routing:** the web chat is now ONE box bound to a synthetic `auto` agent (`agents::AUTO_AGENT_ID`); per message the handler calls `llm::classify_agent` (a cheap qwen2.5:7b classification → `agents::parse_agent_label`, default `recordings`, with the last turn or two as context so clarification follow-ups route right) and dispatches to one of the 5 concrete kinds — no manual tab picker (rig has no tool-calling, so routing is a classification prompt). **Local time:** `ChatRequest`/`QueryRequest` carry `tz_offset_secs` (the browser's live UTC offset, sent by the viewer) which overrides `ANALYSIS_TZ_OFFSET_SECS` for all `humanize_time` rendering, so spoken times match the user's clock (the bug was UTC-only). **Camera clarification:** a deictic question ("who's in *this video*") with no camera scoped and >1 camera (`routes::is_deictic_video_query` + `camera_count`) returns the `CAMERA_CLARIFY` precomputed answer instead of silently answering across all cameras. The **`reflection`** agent (an introspective "how have my conversational skills/mood/social patterns been?" coach) does NOT do top-k retrieval — it runs `analytics::compute_digest` (`analytics.rs`): deterministic SQL rollups over ONE target speaker's whole history (talk-vs-listen balance, question rate, sentiment dist + weekly trend, top interlocutors, social rhythm — all by gap-grouping `start_unix_nanos` per device since there's no conversations table, and collapsing the segment-level sentiment/speaker denormalization), then the LLM only narrates the rendered digest (it computes NO numbers). Target-speaker precedence: request `speaker_id`/`speaker_name` → agent default → configured **owner** (`OWNER_SPEAKER_ID`/`OWNER_SPEAKER_NAME`; with neither set and no request filter it declines and asks you to name your voice). `/v1/rag/query` also takes an optional `agent_id` so the Android voice assistant can reach `reflection` (it routes introspective questions on-device via `ReflectionIntent`). Tune via `ANALYSIS_WINDOW_DAYS_DEFAULT`/`CONVERSATION_GAP_SECS`/`ANALYSIS_TZ_OFFSET_SECS`/`REFLECTION_LLM_MODEL` (a larger model is recommended for the digest→coaching synthesis). `POST /v1/tts`: local neural TTS (Kokoro-82M via the `sherpa-onnx` crate) of the answer → `audio/wav` for the Android client. Kokoro model is fetched (not committed) via `local_dev/fetch_tts_model.sh` → `models/kokoro-en-v0_19`; tune with `RAG_TTS_*` env. | ✅ built + **verified E2E in headless Chrome** |
-| `hushai-viewer/` | The **unified webapp** (`127.0.0.1:8070`): a scrubbable HLS NVR **+ a chat-over-recordings panel beside it**. Stitches stored ~2s segments into one timeline (lazy per-segment ffmpeg remux to MPEG-TS cached by content hash, windowed VOD playlists with `PROGRAM-DATE-TIME`+`DISCONTINUITY`, Android audio as an HLS alt-audio rendition), hls.js + canvas scrub-bar. Also **reverse-proxies `/v1/*`** (`proxy.rs`: one browser origin, no CORS, server-side bearer, body **streamed unbuffered** so chat SSE flows): most paths → **hushai-rag** (`RAG_BASE_URL`/`RAG_TOKEN`), but `/v1/speakers*` is dispatched by path → **hushai-backend** (`BACKEND_BASE_URL`/`BACKEND_TOKEN`, the latter defaulting to `DEVICE_TOKEN`) since the speaker-admin surface lives there. **Browser capture (the viewer is also a capture *source*):** a **● Capture** topbar modal (`ui/js/capture/*`) records the local camera+mic via `MediaRecorder` as ~2s **H.264/AAC fMP4** segments (rotate-a-fresh-recorder per cut → keyframe-aligned), hand-builds the `hushai.v1.SegmentManifest` protobuf in vanilla JS (`container="fmp4"`, `media_type=MUXED`, `codec_init_data`=fMP4 init), and POSTs multipart `{manifest,body}` to `/api/capture/segments` → `proxy.rs::forward_capture` forwards to backend `POST /v1/segments` (bearer injected, 16 MiB body) — so the web app streams in exactly like Android (`source_kind="web_browser"`, `device_id="web-<uuid>"`) and is processed by the same transcription+vision lanes. H.264/AAC is mandatory (the HLS remux only plays that); Chrome/Edge/Safari only (Firefox MediaRecorder is WebM-only). Serves the chat UI (`ui/js/chat/*` + `ui/js/store.js`) — ONE **unified auto-routed chat** (no agent tabs; `workspace.js` mounts a single `ChatPane` bound to the `auto` agent and sends `tz_offset_secs`; `agent-picker.js` is unused) with a **camera-scope dropdown** (`filters.device_id`) + **New chat** — and a **⚙ Voices** settings modal (`ui/js/settings/voices.js`: list/name/merge speakers + play sample audio — including a **Play** on still-unattributed candidate voices via `GET /v1/speakers/unattributed/sample-audio?segment_id=` — the web twin of the Android Voices screen) and a **👤 People** modal (`ui/js/settings/people.js`: list/name/merge faces, showing each `GET /v1/persons/{id}/sample-face` crop — the web twin of the Android People screen). Chat citations deep-link the timeline via `store.js` → `app.js` `seekToCitation` (`player.js` untouched; `timeline.js`/`app.js` were extended for the **AI processing-status ribbons**, see below). The scrub bar also carries two thin **AI-status ribbons** under the coverage track (audio + vision lanes) showing how far the pipeline has processed each stretch — backed by `GET /api/devices/{id}/processing` (`processing.rs`). Also serves a **System dashboard** (`▦ System` nav link → `ui/dashboard.html` + `ui/js/dashboard/dashboard.js`, a separate scrolling page): cameras (connected/idle/offline by `devices.last_seen` recency) + every background process — the 4 services (backend/rag/viewer `/healthz`, backend `/readyz` for degraded; worker via the `worker_heartbeat` row, migration 0010), Postgres (`SELECT 1` + pool gauges), Ollama (`/api/tags`, optional), disk free-space — plus the transcription/vision work-queue stats. One aggregating endpoint `GET /api/dashboard` (`hushai-viewer/src/dashboard.rs`) fans out the DB queries + HTTP probes server-side (browser can't reach the localhost siblings); the page polls it every 6s. Vanilla ES modules, **no build step**. Reuses `hushai-backend` as a lib. | ✅ built + **verified E2E in headless Chrome** |
+| `hushai-viewer/` | The **unified webapp** (`127.0.0.1:8070`): a scrubbable HLS NVR **+ a chat-over-recordings panel beside it**. Stitches stored ~2s segments into one timeline (lazy per-segment ffmpeg remux to MPEG-TS cached by content hash, windowed VOD playlists with `PROGRAM-DATE-TIME`+`DISCONTINUITY`, Android audio as an HLS alt-audio rendition), hls.js + canvas scrub-bar. Also **reverse-proxies `/v1/*`** (`proxy.rs`: one browser origin, no CORS, server-side bearer, body **streamed unbuffered** so chat SSE flows): most paths → **hushai-rag** (`RAG_BASE_URL`/`RAG_TOKEN`), but `/v1/speakers*` is dispatched by path → **hushai-backend** (`BACKEND_BASE_URL`/`BACKEND_TOKEN`, the latter defaulting to `DEVICE_TOKEN`) since the speaker-admin surface lives there. **Browser capture (the viewer is also a capture *source*):** a **● Capture** topbar modal (`ui/js/capture/*`) records the local camera+mic via `MediaRecorder` as ~2s **H.264/AAC fMP4** segments (rotate-a-fresh-recorder per cut → keyframe-aligned), hand-builds the `hushai.v1.SegmentManifest` protobuf in vanilla JS (`container="fmp4"`, `media_type=MUXED`, `codec_init_data`=fMP4 init), and POSTs multipart `{manifest,body}` to `/api/capture/segments` → `proxy.rs::forward_capture` forwards to backend `POST /v1/segments` (bearer injected, 16 MiB body) — so the web app streams in exactly like Android (`source_kind="web_browser"`, `device_id="web-<uuid>"`) and is processed by the same transcription+vision lanes. H.264/AAC is mandatory (the HLS remux only plays that); Chrome/Edge/Safari only (Firefox MediaRecorder is WebM-only). Serves the chat UI (`ui/js/chat/*` + `ui/js/store.js`) — ONE **unified auto-routed chat** (no agent tabs; `workspace.js` mounts a single `ChatPane` bound to the `auto` agent and sends `tz_offset_secs`; `agent-picker.js` is unused) with a **camera-scope dropdown** (`filters.device_id`) + **New chat** — and a **⚙ Voices** settings modal (`ui/js/settings/voices.js`: list/name/merge speakers + play sample audio — including a **Play** on still-unattributed candidate voices via `GET /v1/speakers/unattributed/sample-audio?segment_id=` — the web twin of the Android Voices screen) and a **👤 People** modal (`ui/js/settings/people.js`: list/name/merge faces, showing each `GET /v1/persons/{id}/sample-face` crop — the web twin of the Android People screen). Chat citations deep-link the timeline via `store.js` → `app.js` `seekToCitation` (`player.js` untouched; `timeline.js`/`app.js` were extended for the **AI processing-status ribbons**, see below). The scrub bar also carries two thin **AI-status ribbons** under the coverage track (audio + vision lanes) showing how far the pipeline has processed each stretch — backed by `GET /api/devices/{id}/processing` (`processing.rs`). Also serves a **System dashboard** (`▦ System` nav link → `ui/dashboard.html` + `ui/js/dashboard/dashboard.js`, a separate scrolling page): cameras (connected/idle/offline by `devices.last_seen` recency) + every background process — the 4 services (backend/rag/viewer `/healthz`, backend `/readyz` for degraded; worker via the `worker_heartbeat` row, migration 0010), Postgres (`SELECT 1` + pool gauges), Ollama (`/api/tags`, optional), disk free-space — plus the transcription/vision work-queue stats. One aggregating endpoint `GET /api/dashboard` (`hushai-viewer/src/dashboard.rs`) fans out the DB queries + HTTP probes server-side (browser can't reach the localhost siblings); the page polls it every 6s. The dashboard also has an optional **Load test** panel (`renderLoadtest` in `dashboard.js` + a `<canvas>`): `get_dashboard` includes a `loadtest` block read from `$VIEWER_LOADTEST_LIVE_JSON` (the `live.json` written by `hushai-loadtest`) when set, so the panel charts camera-count vs load with a marker at the saturation knee; absent when no run is active, so the existing UI is unaffected. Vanilla ES modules, **no build step**. Reuses `hushai-backend` as a lib. | ✅ built + **verified E2E in headless Chrome** |
 | `hushai-android/` | Native Android capture client (Kotlin). Camera2 + dual MediaCodec → ~2s segments → uploads; live preview, battery-saver, voice assistant, an **audio-only mode** (mic-only FGS, no camera), and a **Voices screen** (`ui/VoicesScreen.kt` + `net/SpeakersClient.kt`: list/name/merge speakers, play a sample-audio snippet, plus a **"Clean up voices"** section that surfaces backend-suggested duplicate groups and merges them in one tap / "Merge all"), and a **People screen** (`ui/PeopleScreen.kt` + `net/PersonsClient.kt`: the visual twin of Voices — list/name/merge faces, showing each face's sample-face crop via OkHttp + `BitmapFactory` + Compose `Image`, no image lib), and a **Plates screen** (`ui/PlatesScreen.kt` + `net/PlatesClient.kt`: the vehicle twin of People — list/search/name/merge license plates, showing each plate's `GET /v1/plates/{id}/sample-crop` crop the same OkHttp+`BitmapFactory` way; unnamed plates are labelled by their OCR `plate_text`). These are screen-state toggles in `MainActivity` (`Screen.{Capture,Voices,People,Plates}`), no nav framework. **First real client.** See its `README.md`. | ✅ built + **verified E2E on a physical Galaxy S8** |
+| `hushai-loadtest/` | **Capacity / load-test harness** (Rust bin; reuses `hushai-backend`'s proto, drives everything else over HTTP). Replays ONE clip as N **synthetic cameras** via **identity-only byte-identical fan-out** (reuse the encoded bytes; fresh `device_id`/`session_id`/`segment_id` per replica + per emit — the fastest possible duplication, so the generator never perturbs the measurement; `source_kind="loadtest_replica"`). Cameras emit at **wall-clock realtime cadence** (staggered, POST decoupled from the tick). The controller **ramps 1→N cumulatively** with a soak per step, scrapes the worker/backend `/metrics` + viewer `/api/dashboard` and samples macOS host load (`ps` always; `powermetrics` via `sudo -n` for GPU/ANE), declares the **saturation point** (largest N keeping up with realtime: flat `oldest_pending_age` slope + throughput ≥95% offered + bounded lag + no errors), names the bottleneck stage, and writes `loadtest-out/run-*/`{`report.md`,`summary_by_N.csv`,`timeseries.csv`,`run.json`,`live.json`}. Depends on the worker's per-stage latency histograms (`hushai_worker_stage_seconds{lane,stage}`, `*_segment_seconds`, `*_capture_lag_seconds` — added in `observe.rs`/`process.rs`/`vision/write.rs`). `--cleanup` deletes synthetic devices via `DELETE /v1/devices/{id}`. Profile sweep + worker-restart-per-profile: `local_dev/run_loadtest.sh`. See `docs/hardware-sizing-30-cameras.md`. | ✅ built (`cargo check` + unit tests) |
 | `contracts/` | The camera→backend contract (the boundary). | — |
-| `local_dev/` | Helper scripts: **`run_stack.sh` (ONE command to bring up the whole backend/AI/web stack — see "Run the full stack")**, `feed_segments.py` (replay a video as segments — reference client), `run_hushai_app.sh` (drive the Android app), `export_capture.sh` (reassemble uploaded segments into a playable file), `gen_certs.sh` (local CA + LAN TLS cert), `setup_hostname.sh` (one-time: Bonjour `hushai.local` + a `pf` 443→8070 redirect), **`serve.sh` (the ONE macOS command for `https://hushai.local/`: cert + CA-trust + setup_hostname + `run_stack --lan`, idempotent; `--check` reports status. Linux/Windows runbooks: `docs/friendly-url-{linux,windows}.md`)**. | — |
+| `local_dev/` | Helper scripts: **`run_stack.sh` (ONE command to bring up the whole backend/AI/web stack — see "Run the full stack")**, `feed_segments.py` (replay a video as segments — reference client), `run_hushai_app.sh` (drive the Android app), `export_capture.sh` (reassemble uploaded segments into a playable file), `gen_certs.sh` (local CA + LAN TLS cert), `run_loadtest.sh` (capacity benchmark driver — restarts the worker per config profile + runs `hushai-loadtest`; see `docs/hardware-sizing-30-cameras.md`), `setup_hostname.sh` (one-time: Bonjour `hushai.local` + a `pf` 443→8070 redirect), **`serve.sh` (the ONE macOS command for `https://hushai.local/`: cert + CA-trust + setup_hostname + `run_stack --lan`, idempotent; `--check` reports status. Linux/Windows runbooks: `docs/friendly-url-{linux,windows}.md`)**. | — |
 | `Issues/` | The tickets: `initial-backend.md`, `transcription-embedding-and-rag.md`, `initial-android-app.md`. | all done |
 
 ## Run the full stack locally
@@ -594,6 +595,231 @@ the camera dropdown + dashboard cards. Full reference: **[`docs/device-and-foota
   ⑤ the worker treats a segment vanishing mid-delete as a benign skip (`claim::segment_exists`).
 - **Tests:** `hushai-backend/tests/devices.rs` (cascade, FK-block fix, blob ref-count, day bucketing,
   retention idempotency). Verified end-to-end over HTTP incl. real blob reclamation from disk.
+
+## Events & alerts — the VSaaS proactive layer (2026-06-29, IN PROGRESS)
+
+The push toward industry-giant (Verkada/Rhombus/Eagle Eye) **feature parity**: turn the rich
+detections we already produce (faces/plates/objects/speech) into **events**, let operators define
+**alert rules**, and **notify**. Full plan + backlog: **[`docs/feature-parity-roadmap.md`](docs/feature-parity-roadmap.md)**
+(Pillar A = VSaaS events/alerts; Pillar B = cloud-native ops: metrics, tracing, Docker, object storage).
+
+**Built so far (A1/A2 — schema + API foundation, verified E2E over HTTP):**
+- **Migration `0014_events_and_alerts.sql`** — three tables:
+  - `events` — PLAIN (non-partitioned, unlike person_segments/scene_objects) because events are
+    *sessionized* (one row per continuous appearance, far fewer than raw detections) and a plain
+    table can carry a real `UNIQUE(dedup_key)` (partial, `WHERE dedup_key IS NOT NULL`) for
+    idempotent producers. event_type vocabulary + 'info'|'warning'|'critical' severity documented
+    in the migration header. `device_id` FK → devices; `segment_id` FK → segments `ON DELETE SET NULL`
+    (deep-link anchor survives footage purge).
+  - `alert_rules` — operator rules: `event_types[]`/`device_ids[]`/`subject_ids[]` (empty = any),
+    `min_severity`, local **time-of-day window** (`time_*_minutes`, wraps past midnight) +
+    `days_of_week[]` + `tz`, `cooldown_secs`, and a `channels` jsonb (`[{"type":"feed"},{"type":"webhook","url":…},{"type":"push"}]`).
+  - `alert_deliveries` — the notification **outbox + in-app feed** (denormalized event facets so the
+    feed renders without a join and survives event purge; `cooldown_key` for recency-based debounce).
+- **`hushai-backend/src/events.rs`** (runtime sqlx, `IngestError`, bearer-authed, house style):
+  - `GET /v1/events` (NULL-guarded facet/time filters, newest-first, limit≤500)
+  - `GET/POST /v1/alert-rules`, `PATCH/DELETE /v1/alert-rules/{id}` (PATCH = **full replace** of
+    editable fields — avoids the null-clear-vs-leave ambiguity; the editor saves the whole rule)
+  - `GET /v1/events/feed` (+ `POST /v1/events/feed/{id}/ack`) — the in-app feed, defaults to the
+    `feed` channel.
+  - `pub fn record_event(pool, &NewEvent)` — the **producer helper the worker will call** (roadmap
+    A3): INSERT…ON CONFLICT(dedup_key) DO UPDATE that **extends** an open event's end-time + best
+    score instead of duplicating (verified: same key→1 row, NULL keys never collide).
+  - Wired in `routes.rs` (merged like `devices`) and **proxied via the viewer** — `proxy.rs::is_backend_path`
+    now routes `/v1/events*` + `/v1/alert-rules*` to the backend.
+
+**Built so far (A3 — worker event producer + alert evaluator, compiled + verified via SQL E2E):**
+- **`hushai-worker/src/events_producer.rs`** — two post-commit hooks materialize sessionized events:
+  `derive_vision_events` (from `process_vision_segment` after its tx commits) and `derive_audio_events`
+  (from `process_segment` after `write_transcript`, which now returns the `Option<Uuid>` speaker_id).
+  Emitted event types (the ACTUAL vocabulary — a rule builder should offer THESE, not 0014's broader
+  comment list): **`known_person`** / **`unknown_person`** (split by `display_name IS NULL`, NOT a
+  mint flag — correct under reprocessing), **`plate_of_interest`** / **`plate_seen`**, **`object_seen`**
+  (excludes `__frame__` + optionally detector-`person`), **`speech`** (severity→`warning` on negative
+  sentiment). Coalesced **one event per distinct subject per `EVENTS_SESSION_BUCKET_SECS` bucket** via
+  the `dedup_key`; batched `display_name` lookups; name-lookup failures degrade to "unnamed" (never
+  drop a segment's other events). 9 `EVENTS_*` env knobs (`config.rs`; `EVENTS_UNKNOWN_PERSON_SEVERITY`
+  validated against the canonical severities at load).
+- **`hushai-worker/src/alerts.rs`** — `evaluate(pool, event_id)`: ONE statement matches the event
+  against enabled `alert_rules` (tz time-of-day window incl. **midnight-wrap**, day-of-week, severity
+  floor, device/subject/watchlist filters — all server-side; the worker has no chrono-tz), enforces
+  **cooldown** via a recency `NOT EXISTS` over `cooldown_key` (= `rule:subject`, folding `subject_label`
+  so distinct anonymous objects/plates don't suppress each other), and fans `channels` out one
+  delivery per channel. **`ON CONFLICT (rule_id,event_id,channel) DO NOTHING`** makes it idempotent +
+  race-safe (at-most-once per appearance; survives reprocess/backfill + concurrent audio workers).
+- **Migration `0015_alert_delivery_dedup.sql`** — `UNIQUE(rule_id,event_id,channel)` (backs the
+  ON CONFLICT) + `alert_deliveries.event_id` FK flipped to **ON DELETE SET NULL** so the feed/audit
+  trail survives an event purge (the denormalized columns' whole purpose).
+- Hooks are **guarded**: an event/alert failure logs + continues; segment processing never fails.
+- **Hardened from an adversarial review** (21 findings fixed): severity ESCALATES (worst-in-bucket
+  wins, so negative-sentiment speech isn't lost to first-write); `event_type`/`metadata` take the
+  latest sighting (a person named mid-bucket flips unknown→known); cooldown-key + idempotency above.
+
+**Built so far (A5 — viewer 🔔 Events page, built + verified E2E in headless Chrome + adversarially reviewed):**
+- **`hushai-viewer/ui/events.html`** + **`ui/js/events/events.js`** — a new static page (served at
+  `/events.html`, sibling of dashboard/manage; 🔔 Events navlink added to all pages). Three sections:
+  **Alerts** (the in-app feed = `feed`-channel `alert_deliveries`, with Acknowledge), **Event stream**
+  (filter by camera / type / **min-severity FLOOR** / newest-first; each row deep-links the timeline
+  via `/?device=&t=<ms>` — `app.js` init now honors that), and **Alert rules** (list + enable/disable +
+  delete + a create form that mirrors the backend's validation). All user text rendered via
+  `textContent` (XSS-safe); polling has render-sequence + in-flight + visibility-pause guards.
+- **`ui/js/api.js`** — `getEvents`/`getEventFeed`/`ackDelivery` + alert-rule CRUD wrappers (ns→ms at
+  the boundary; rules round-trip raw snake_case since PATCH = full replace).
+- **Backend tightening from the A5 review (in `events.rs`):** `GET /v1/events` `severity` filter is now
+  a **floor** (`>=`, matching the "Min severity" label, via `array_position` rank); `GET /v1/events/feed`
+  LEFT JOINs `events` to return `event_start_unix_nanos` so a feed deep-link lands on the **footage**
+  moment, not the alert-fire time; `AlertRuleInput::validate` now validates **channels** (known `type`
+  enum + webhook must be http(s)) — defense-in-depth before A4's sender exists.
+- Verified: a headless-Chrome drive (12 assertions: render, severity chips, deep-link href, XSS-safe
+  labels, feed + Acknowledge→0-unread, rule list, create-rule, type filter) + API checks of the
+  severity-floor and feed-event-time fixes.
+
+**Built so far (A4 — notification delivery loop, in `hushai-worker/src/delivery.rs`; verified by integration tests + adversarially reviewed):**
+- A background task (`spawn_delivery_loop`, spawned in `lib.rs::run` beside the heartbeat) drains the
+  `alert_deliveries` outbox for **`webhook`** rows (the `feed` channel is in-app; `push` awaits A7) and
+  POSTs them. **Crash-safe lease + backoff** (migration **0016** adds `next_attempt_at` + a partial
+  due-index): claim bumps `attempts` + leases the row under `FOR UPDATE SKIP LOCKED`; 2xx→`sent`;
+  transient fail→`next_attempt_at = now()+backoff` (capped exponential); past `max_attempts`→`failed`.
+- **Delivery is AT-LEAST-ONCE** (the POST and the `sent` write are separate) — every request carries a
+  stable idempotency key (`x-hushai-delivery` header + `delivery_id` in the body); consumers dedupe on it.
+  Payload is a documented `hushai.alert.v1` JSON; optional **HMAC-SHA256** signing via
+  `ALERT_WEBHOOK_SIGNING_SECRET` → `x-hushai-signature: sha256=<hex>`.
+- **SSRF posture (local-first):** webhooks to PRIVATE/LAN targets are ALLOWED by default
+  (`ALERT_WEBHOOK_ALLOW_PRIVATE=true` — Home Assistant/Node-RED on the LAN are the primary use case);
+  cloud-metadata IPs (`169.254.169.254` + `fd00:ec2::254`) are blocked ALWAYS; redirects are disabled
+  (no 30x→metadata bypass); the resolve is bounded + IPv4-mapped-IPv6 normalized; set
+  `ALERT_WEBHOOK_ALLOW_PRIVATE=false` to also block private/loopback/link-local/CGNAT for a cloud deploy.
+  (Residual resolve-then-connect TOCTOU accepted — rule creation is already viewer-auth-gated.)
+- Batch is delivered **concurrently** (bounded by `ALERT_DELIVERY_BATCH`) so one dead webhook can't
+  block peers. `ALERT_*` knobs in `config.rs`. New worker deps: `reqwest` (rustls), `hmac`, `sha2`, `hex`.
+- Tests: `hushai-worker/tests/delivery.rs` (real TCP HTTP sink): success→sent+POST-body, transient→
+  retry-backoff→failed, metadata-IP→blocked.
+
+**The VSaaS alerting pipeline is now end-to-end: detect → event (A1/A3) → rule match + cooldown (A2/A3)
+→ outbox (A3) → in-app feed + web Events UI (A5) → outbound webhook (A4).**
+
+**Not yet built (next loop iterations):** scrub-bar event markers on the timeline, A6 watchlists
+("of interest" → auto-rule), A7 Android push (the `push` channel transport). Then **Pillar B —
+cloud-native ops** (B1 Prometheus `/metrics`, B2 OTel, B3 Docker Compose for the whole stack, B4
+S3/MinIO blob backend, B5 health/readiness on every service, B6 audit log). NB the producer adds a few
+DB round-trips per segment on the always-on path — acceptable at ~2s cadence; revisit if profiling says so.
+
+## Observability — Prometheus metrics + health probes (2026-06-29, B1/B5; built + verified + reviewed)
+
+Cloud-native ops, step 1. **`hushai-backend/src/observe.rs`** is a tiny **dependency-free** Prometheus
+exporter shared by every service (no `metrics`/`prometheus` crate): a global `Mutex<Registry>` with
+`describe`/`counter`/`counter_by`/`gauge`/`render`, an axum `metrics_handler` for the HTTP services,
+and a **raw-tokio `spawn_metrics_server`** (`/metrics`+`/healthz`) for the **worker**, which has no
+axum router. Each binary has its own process-global registry (Prometheus scrapes each target).
+
+- **`/metrics` on all four:** backend/rag/viewer mount `observe::metrics_handler` (unauthenticated,
+  beside the health probes); the worker serves its own on `WORKER_METRICS_ADDR` (default
+  `127.0.0.1:9100`, empty disables). **`/healthz` on all four; `/readyz` (DB ping) on backend
+  (pre-existing) + rag + viewer.** The viewer's `/metrics`+`/readyz` sit OUTSIDE the IP-allowlist +
+  password gate (same posture as its `/healthz`) so a scraper needn't authenticate.
+- **Instrumented:** `hushai_segments_ingested_total{source,media,result}` + `hushai_ingest_bytes_total`
+  (backend); `hushai_worker_queue_depth{lane}`, `hushai_segments_processed_total{lane,result}`,
+  `hushai_events_produced_total{type}`, `hushai_alerts_fired_total`, `hushai_deliveries_total{result}`
+  (worker); `hushai_rag_requests_total{endpoint}` (rag); `hushai_viewer_proxy_total{upstream}` (viewer);
+  `hushai_build_info{service,version}` everywhere.
+- **Cardinality guard (load-bearing):** NEVER use device/client-controlled free text as a label — the
+  registry never evicts, so an unbounded label value is a memory/series-explosion vector. `source_kind`
+  is unvalidated client free text (contract §7), so `ingest.rs::source_label` collapses it to a known
+  allowlist (`android_app|web_browser|rtsp|other`). Apply the same rule to any new label.
+- The worker's raw HTTP parser reads until the request line's CRLF (bounded) — don't assume one read.
+
+## Audit log (2026-06-29, B6; built + verified + reviewed)
+
+Append-only **`audit_log`** (migrations `0017` + `0018`): who/what/when/where(ip)/outcome for admin
+actions. **Written at the GATEWAY** — `hushai-viewer/src/proxy.rs::forward` records every MUTATING
+(POST/PUT/PATCH/DELETE) request to a backend admin path (`is_backend_path`), with the real client IP
+(`ConnectInfo`) + the upstream status; plus `auth.login`/`auth.login_failed`/`auth.logout` (viewer
+`auth.rs`) and `footage.export` (viewer `export.rs`). The backend owns the schema + the read API
+(`GET /v1/audit`, bearer-authed, proxied like the other `/v1/*` admin surfaces).
+
+- **`hushai-backend/src/audit.rs`**: `AuditEntry` + `record` (inline-awaited everywhere but wrapped in
+  a 3s timeout, so it's durable when the DB is healthy yet can never hang/fail the audited action) +
+  `classify(method, path)` → semantic `(action, target_type, target_id)`. `classify` is
+  **POSITION-AWARE** (device id at seg[2], sub-action at seg[3]) so a device literally named `footage`
+  isn't logged as a footage purge; collection-level literals (`recluster`, `merge-group`,
+  `unattributed`, `feed`, …) aren't mistaken for ids. Unit-tested (20 path cases).
+- **DB-enforced immutability:** migration `0018` adds a `BEFORE UPDATE` trigger that RAISEs — existing
+  entries can't be silently rewritten (INSERT only; DELETE left open for future retention purge).
+- **Known gap (documented):** only actions THROUGH the viewer are gateway-audited; a direct call to the
+  backend port (device token) bypasses it. The `audit::record` helper is ready for backend-side hooks.
+- **Actor** is coarse (`admin`, or `local` when auth is disabled) under the single-password model —
+  per-user actors arrive with RBAC (roadmap C3).
+
+## Watchlists — "People/Plates of Interest" (2026-06-29, A6; built + verified + reviewed)
+
+Flag a person/plate "of interest" → alert on any sighting. **Reuses the alert engine**: each
+`watchlist` entry (migration `0019`) owns a managed `alert_rules` row (subject_type + subject_ids=[id],
+min_severity='info', feed channel, 30-min cooldown), so the A3 evaluator fires on a subject match —
+no worker change. `hushai-backend/src/watchlist.rs`: `GET/POST/PATCH/DELETE /v1/watchlist` (bearer,
+viewer-proxied); a ☆/★ **Watch toggle** sits beside rename/merge on the People (`settings/people.js`)
+and Plates (`settings/plates.js`) modals (`ctx.watched` maps subject_id→watch_id per load).
+
+- **Add is idempotent + SELF-HEALING:** re-watching a subject whose managed rule was deleted out from
+  under it re-mints the rule; a disabled watch is re-enabled. `update_watch` likewise re-mints if the
+  rule is gone (so enable/disable is never a silent no-op).
+- **Survives merges (load-bearing):** `watchlist.reconcile_merge` is called inside
+  `persons::merge_person` / `plates::merge_plate` BEFORE the loser id is deleted — it repoints the
+  watch + the managed rule's `subject_ids` to the survivor (or drops the loser's if the survivor is
+  already watched, respecting `watchlist_subject_idx`). Without this a merge would silently kill the
+  watch (the matcher re-keys all future sightings to the survivor id).
+
+## Android alert push + Events screen (2026-06-29, A7; built + on-device verified + reviewed)
+
+The mobile end of the alerting story (Verkada-style push to your phone), **FCM-free / local-first**.
+- **`hushai-android/.../capture/AlertNotifier.kt`** — a daemon poll loop (hosted by the always-on
+  `CaptureService`, started in `startCapture`, stopped in `stopCapture`) that hits the backend's
+  `/v1/events/feed` over the same connection the uploader uses (LAN / USB `adb reverse`, zero egress)
+  and raises a high-importance `hushai_alerts` system notification per new alert. **Dedupe is a
+  PERSISTED server-time `created_unix_nanos` high-water mark in SharedPreferences** — NOT an in-memory
+  "seen" set — because feed deliveries stay `pending` until acked (nothing auto-advances them). This
+  is load-bearing: a fresh notifier is built on every capture start, so without the persisted
+  watermark an alert that fired while capture was stopped would be swallowed on the re-prime. First
+  run primes to the current max (no history blast); restarts notify anything newer than the watermark.
+  Notifications use the delivery_id as the TAG (collision-free) + a constant id.
+- **`net/EventsClient.kt`** (feed list + ack; uses the short-timeout `Http.probe` for the bg poll) +
+  **`ui/EventsScreen.kt`** (the mobile twin of the web Events feed: view + acknowledge, 10s poll,
+  optimistic-ack, a banner when notifications are OS-disabled) + `Screen.Events` nav in `MainActivity`
+  / an "Alerts" card in `CaptureScreen`. Unit-tested (`EventsClientTest`).
+- **Caveat (documented):** the notifier only runs WHILE CAPTURING (the always-on appliance assumption);
+  the app authenticates to the feed with the device token (any provisioned device can read the feed —
+  fine in the single-owner LAN model). Verify on device with `run_hushai_app.sh` + a seeded feed alert
+  → `adb shell dumpsys notification`.
+
+**The VSaaS pillar (A1–A7) is now COMPLETE: detect → event → rule + watchlist → in-app feed + web
+Events UI + outbound webhook + Android push.**
+
+## End-to-end regression harness — `hushai-eval` (2026-06-29, Tier 1 built + verified)
+
+`hushai-eval` injects **known** clips into the **live** pipeline, waits for processing to complete,
+queries results, scores them against ground truth, and emits an **improvement/regression/unchanged**
+verdict + exit code (0 pass · 1 regression/floor-breach · 2 inconclusive). It's the deterministic
+file-injection tier (the regression backbone + agent inner-loop); a physical camera-at-screen
+"realism" tier is planned to reuse the same fixtures + scorers. Full docs: `hushai-eval/README.md`.
+
+- **Run:** `cargo run -p hushai-eval -- run --tier {fast|full} [--fixtures train|holdout|all]
+  [--update-baseline] [--json]`. Requires the stack pointed at the **`hushai_test`** DB with the
+  determinism profile `local_dev/eval.env` (`./local_dev/run_stack.sh --test-db`). The harness
+  REFUSES to run against a non-`*_test` DB (it TRUNCATEs result/catalog tables every run).
+- **Injection** is the existing `local_dev/feed_segments.py`, extended with `--capture-start-ns`
+  (fixed timestamps) and `--segment-id-seed` (deterministic ids, no sidecar) + `--emit-ids`.
+- **Fixtures:** `hushai-eval/fixtures/{train,holdout}/<case>/{media.*,meta.json,expected.json}`.
+  Media is gitignored; regenerate with `./local_dev/build_fixtures.sh` (macOS `say` TTS + ffmpeg →
+  construction-known ground truth). Ground truth + `baselines/<config-hash>/` ARE committed.
+- **Trust invariants** (don't weaken): isolated/reset DB, determinism-locked worker, fixture-pinned
+  timestamps, a `config_hash` over models+knobs that keys baselines, quiescent completion detection,
+  assignment-invariant scoring, and a sealed `holdout/` split with counter-fixtures.
+- **⚠ Speaker-lane finding the harness surfaced:** the speaker lane currently mints **0 speakers** on
+  every available clip (TTS *and* real `IMG_7256.mp4`): ~0.31s post-VAD speech, all `marginal`, while
+  Whisper transcribes the same audio fine. This is consistent with the uncalibrated `VAD_*`/mint-gate
+  fast-follow below (gates tuned for noisy captures under-trigger on clean audio). Diarization scoring
+  is staged OFF `two_speakers.modalities` until investigated — **do not loosen mint gates to mask it.**
+- **Pending:** object/ALPR fixtures need the RF-DETR/CLIP/plate weights provisioned (`OBJECT_REQUIRED`/
+  `PLATE_REQUIRED` then flip to `true` in `eval.env`); face fixtures need source stills.
 
 ## Fast-follows (not yet done)
 

@@ -68,12 +68,22 @@ pub fn router(state: ViewerState) -> Router {
     ));
 
     Router::new()
-        // Liveness probe: outside both gates so external monitors + the dashboard's own
-        // server-side probes work without being in the allowlist (returns only "ok").
+        // Liveness/readiness/metrics: outside both gates so external monitors + Prometheus + the
+        // dashboard's own server-side probes work without being in the allowlist (roadmap B1/B5).
         .route("/healthz", get(|| async { "ok" }))
+        .route("/readyz", get(readyz))
+        .route("/metrics", get(hushai_backend::observe::metrics_handler))
         .merge(protected)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// Readiness (roadmap B5): the DB the viewer reads is reachable.
+async fn readyz(State(state): State<crate::state::ViewerState>) -> axum::http::StatusCode {
+    match sqlx::query("SELECT 1").execute(&state.pool).await {
+        Ok(_) => axum::http::StatusCode::OK,
+        Err(_) => axum::http::StatusCode::SERVICE_UNAVAILABLE,
+    }
 }
 
 #[derive(Debug, Deserialize)]

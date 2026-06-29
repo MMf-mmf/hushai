@@ -68,6 +68,7 @@ pub async fn rag_chat(
     Json(req): Json<ChatRequest>,
 ) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
     check_auth(&headers, &st)?;
+    hushai_backend::observe::counter("hushai_rag_requests_total", &[("endpoint", "chat")]);
 
     let message = req.message.trim().to_string();
     if message.is_empty() {

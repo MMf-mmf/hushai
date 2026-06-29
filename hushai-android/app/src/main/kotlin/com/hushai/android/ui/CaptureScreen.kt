@@ -76,6 +76,7 @@ fun CaptureScreen(
     onOpenVoices: () -> Unit,
     onOpenPeople: () -> Unit,
     onOpenPlates: () -> Unit,
+    onOpenEvents: () -> Unit,
     onStart: (url: String, token: String, audioOnly: Boolean) -> Unit,
     onAudioOnlyChange: (Boolean) -> Unit,
     onDiskCapChange: (gb: Float) -> Unit,
@@ -265,6 +266,21 @@ fun CaptureScreen(
             Spacer(Modifier.height(12.dp))
             OutlinedButton(onClick = onOpenPlates, modifier = Modifier.fillMaxWidth()) {
                 Text("Open Plates")
+            }
+        }
+
+        // Alerts: the in-app feed of matched alert rules / watchlist hits (also pushed as system
+        // notifications by the background poller while capturing).
+        SectionCard {
+            Text("Alerts", style = MaterialTheme.typography.titleMedium)
+            Text(
+                "People/plates of interest and other matched rules — view and acknowledge alerts.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Spacer(Modifier.height(12.dp))
+            OutlinedButton(onClick = onOpenEvents, modifier = Modifier.fillMaxWidth()) {
+                Text("Open Alerts")
             }
         }
 

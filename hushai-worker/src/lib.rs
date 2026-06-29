@@ -9,11 +9,14 @@
 //! Modules are public so integration tests can exercise the claim/lease + atomic
 //! write logic directly against a live DB.
 
+pub mod alerts;
 pub mod asr;
 pub mod chunk;
 pub mod claim;
 pub mod config;
+pub mod delivery;
 pub mod embed;
+pub mod events_producer;
 pub mod media;
 pub mod process;
 pub mod sentiment;
@@ -188,6 +191,27 @@ pub async fn run() -> anyhow::Result<()> {
     // every cfg.heartbeat_interval. The viewer's /api/dashboard reads it (idle != dead). One row
     // per process (not per loop), keyed by cfg.worker_id (default "<host>:<pid>").
     spawn_heartbeat(pool.clone(), cfg.clone(), shutdown.clone());
+
+    // Notification delivery (roadmap A4): drain the alert_deliveries outbox → outbound webhook POSTs
+    // (retry + backoff). Independent of the segment-processing loops; no-op when disabled.
+    delivery::spawn_delivery_loop(pool.clone(), cfg.delivery.clone(), shutdown.clone());
+
+    // Observability (roadmap B1/B5): the worker has no axum router, so it gets a tiny raw-tokio
+    // /metrics + /healthz server. Describe its metrics so the scrape is self-documenting.
+    if let Some(addr) = cfg.metrics_addr {
+        use hushai_backend::observe;
+        observe::record_build_info("worker");
+        observe::describe("hushai_worker_queue_depth", "gauge", "Pending+processing segments, by lane (audio|vision).");
+        observe::describe("hushai_segments_processed_total", "counter", "Segments processed by a lane, by lane + result(ok|error).");
+        observe::describe("hushai_events_produced_total", "counter", "Event emit operations by event_type (incl. session re-extension UPSERTs, so >= distinct events).");
+        observe::describe("hushai_alerts_fired_total", "counter", "Alert deliveries created by the rule evaluator (sum across rules x channels).");
+        observe::describe("hushai_deliveries_total", "counter", "Webhook delivery outcomes: sent|failed are TERMINAL; retry counts scheduled (non-terminal) retries.");
+        // Load-test / capacity instrumentation: per-stage and end-to-end latency histograms.
+        observe::describe("hushai_worker_stage_seconds", "histogram", "Per-stage processing latency (s), by lane(audio|vision) + stage.");
+        observe::describe("hushai_worker_segment_seconds", "histogram", "End-to-end per-segment processing wall-clock (s), by lane.");
+        observe::describe("hushai_worker_capture_lag_seconds", "histogram", "Capture-to-done latency (s), incl. queue wait, by lane — the realtime-keep-up signal.");
+        observe::spawn_metrics_server(addr, shutdown.clone());
+    }
 
     let mut handles = Vec::with_capacity(cfg.worker_concurrency);
     for worker_id in 0..cfg.worker_concurrency.max(1) {
@@ -443,6 +467,7 @@ async fn vision_worker_loop(
                     .await
                 {
                     Ok(n) => {
+                        hushai_backend::observe::counter("hushai_segments_processed_total", &[("lane", "vision"), ("result", "ok")]);
                         if let Err(e) = claim::mark_vision_done(&pool, segment_id).await {
                             tracing::warn!(%segment_id, error = %e, "marking vision done failed");
                         }
@@ -454,6 +479,7 @@ async fn vision_worker_loop(
                             // is cascade-gone. Benign skip, not a failure.
                             tracing::debug!(%segment_id, "vision segment vanished mid-flight; skipping");
                         } else {
+                            hushai_backend::observe::counter("hushai_segments_processed_total", &[("lane", "vision"), ("result", "error")]);
                             let msg = format!("{e:#}");
                             tracing::warn!(%segment_id, error = %msg, "vision processing failed");
                             let _ = claim::mark_vision_error(&pool, segment_id, &msg).await;
@@ -531,6 +557,21 @@ fn spawn_heartbeat(pool: PgPool, cfg: Arc<WorkerConfig>, shutdown: Arc<AtomicBoo
             .fetch_one(&pool)
             .await
             .ok();
+
+            // Per-lane backlog gauges for Prometheus (roadmap B1) — only when the metrics server is on.
+            // Literal SQL per lane (sqlx 0.9 requires &'static str — no format!).
+            if cfg.metrics_addr.is_some() {
+                let lanes: [(&str, &str); 2] = [
+                    ("audio", "SELECT count(*) FROM segment_transcription_status WHERE status IN ('pending','processing')"),
+                    ("vision", "SELECT count(*) FROM segment_vision_status WHERE status IN ('pending','processing')"),
+                ];
+                for (lane, sql) in lanes {
+                    let depth: Option<i64> = sqlx::query_scalar(sql).fetch_one(&pool).await.ok();
+                    if let Some(d) = depth {
+                        hushai_backend::observe::gauge("hushai_worker_queue_depth", &[("lane", lane)], d);
+                    }
+                }
+            }
 
             let res = sqlx::query(
                 r#"
@@ -630,6 +671,7 @@ async fn worker_loop(
                 .await
                 {
                     Ok(n) => {
+                        hushai_backend::observe::counter("hushai_segments_processed_total", &[("lane", "audio"), ("result", "ok")]);
                         tracing::info!(%segment_id, sentences = n, worker_id, "processed segment");
                     }
                     Err(e) => {
@@ -638,6 +680,7 @@ async fn worker_loop(
                             // is cascade-gone, so there's nothing to mark; not a failure.
                             tracing::debug!(%segment_id, worker_id, "segment vanished mid-flight; skipping");
                         } else {
+                            hushai_backend::observe::counter("hushai_segments_processed_total", &[("lane", "audio"), ("result", "error")]);
                             tracing::error!(%segment_id, worker_id, error = format!("{e:#}"), "segment failed");
                             if let Err(e2) =
                                 claim::mark_error(&pool, segment_id, &format!("{e:#}")).await

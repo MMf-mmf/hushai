@@ -235,6 +235,10 @@ pub async fn merge_person(
     .execute(&mut *tx)
     .await?;
 
+    // Keep any "of interest" watch alive across the merge: repoint (or drop) the loser's watch +
+    // managed rule to the survivor before the loser id disappears (else the watch silently dies).
+    crate::watchlist::reconcile_merge(&mut tx, "person", loser, into).await?;
+
     sqlx::query("DELETE FROM persons WHERE person_id = $1")
         .bind(loser)
         .execute(&mut *tx)

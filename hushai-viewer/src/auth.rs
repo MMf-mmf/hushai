@@ -121,16 +121,29 @@ pub async fn login_page(State(st): State<ViewerState>) -> Response {
 }
 
 /// `POST /login` — verify the password, set the session cookie, redirect to `/`.
-pub async fn login_submit(State(st): State<ViewerState>, Form(form): Form<LoginForm>) -> Response {
+pub async fn login_submit(
+    State(st): State<ViewerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Form(form): Form<LoginForm>,
+) -> Response {
     if st.cfg.auth_disabled {
         return Redirect::to("/").into_response();
     }
+    let ip = Some(peer.ip().to_string());
     let ok = st
         .cfg
         .admin_password_hash
         .as_deref()
         .map(|hash| verify_password(&form.password, hash))
         .unwrap_or(false);
+    // Audit both outcomes (roadmap B6): a failed login matters for brute-force detection.
+    let action = if ok { "auth.login" } else { "auth.login_failed" };
+    let status = if ok { 200 } else { 401 };
+    hushai_backend::audit::record(
+        &st.pool,
+        hushai_backend::audit::AuditEntry::event("admin", ip, action).with_status(status),
+    )
+    .await;
     if ok {
         let value = make_session_value(&st.cfg);
         let cookie = set_cookie_header(&st.cfg, &value, st.cfg.session_ttl_secs);
@@ -141,7 +154,17 @@ pub async fn login_submit(State(st): State<ViewerState>, Form(form): Form<LoginF
 }
 
 /// `POST /logout` — clear the cookie and bounce to `/login`.
-pub async fn logout(State(st): State<ViewerState>) -> Response {
+pub async fn logout(
+    State(st): State<ViewerState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Response {
+    let actor = if st.cfg.auth_disabled { "local" } else { "admin" };
+    hushai_backend::audit::record(
+        &st.pool,
+        hushai_backend::audit::AuditEntry::event(actor, Some(peer.ip().to_string()), "auth.logout")
+            .with_status(200),
+    )
+    .await;
     let cookie = set_cookie_header(&st.cfg, "", 0);
     redirect_with_cookie("/login", &cookie)
 }

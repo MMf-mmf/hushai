@@ -3,7 +3,10 @@
 // the Android "People" screen and the visual sibling of the Voices modal. All calls go to
 // hushai-backend's /v1/persons* surface via the viewer proxy (which injects the device bearer).
 
-import { getPersons, sampleFaceUrl, renamePerson, mergePerson } from "../api.js";
+import {
+  getPersons, sampleFaceUrl, renamePerson, mergePerson,
+  getWatchlist, addWatch, removeWatch,
+} from "../api.js";
 import { nsToMs } from "../time.js";
 
 function note(text) {
@@ -109,6 +112,29 @@ function personCard(p, others, ctx) {
   });
   actions.append(input, save);
 
+  // ⭐ Watch — "Person of Interest": alert whenever this person is seen. Toggles the backend
+  // watchlist (which auto-manages a scoped alert rule). `ctx.watched` maps person_id → watch_id.
+  const watchId = ctx.watched.get(p.person_id);
+  const watchBtn = document.createElement("button");
+  watchBtn.type = "button";
+  watchBtn.className = watchId ? "watch-on" : "watch-off";
+  watchBtn.textContent = watchId ? "★ Watching" : "☆ Watch";
+  watchBtn.title = watchId
+    ? "Stop watching (remove from People of Interest)"
+    : "Watch — alert me whenever this person is seen";
+  watchBtn.addEventListener("click", async () => {
+    watchBtn.disabled = true;
+    try {
+      if (watchId) await removeWatch(watchId);
+      else await addWatch("person", p.person_id);
+      await ctx.reload();
+    } catch {
+      watchBtn.disabled = false;
+      ctx.flash("Couldn't update the watchlist (Refresh and try again).");
+    }
+  });
+  actions.appendChild(watchBtn);
+
   // "Merge into" — fold this face into another person (same human, split across ids).
   if (others.length) {
     const merge = document.createElement("select");
@@ -183,6 +209,7 @@ function boot() {
 
   const ctx = {
     reload: () => load(),
+    watched: new Map(), // person_id -> watch_id (refreshed each load)
     flash(msg) {
       const n = note(msg);
       body.prepend(n);
@@ -192,6 +219,15 @@ function boot() {
 
   async function load() {
     body.replaceChildren(note("Loading people…"));
+    // Watchlist is best-effort: a failure here must not block listing people.
+    try {
+      const wl = await getWatchlist();
+      ctx.watched = new Map(
+        (wl || []).filter((w) => w.subject_type === "person").map((w) => [w.subject_id, w.watch_id]),
+      );
+    } catch {
+      ctx.watched = new Map();
+    }
     let persons;
     try {
       persons = await getPersons();

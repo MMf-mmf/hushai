@@ -215,6 +215,12 @@ in addition we are talking about the admin panel should be perhaps locket to go 
   → Done: the viewer is reachable at **https://hushai.local/** (no port). `local_dev/setup_hostname.sh` sets the Mac's Bonjour name to `hushai` + a pf 443→8070 redirect; `run_stack.sh --lan` binds the LAN + allowlists this host; the TLS cert (gen_certs.sh) is already issued for `hushai.local`. See AGENTS.md "LAN security model" → "Friendly admin URL".
 - [] it must have a correct storage plan for long term storage for this we should go with the typical industry gold standard
 - we must be able to capture video from up to 30 cameras at once (we must do research on computer hardware needed to make this possible such as if i want it to all be sending the video feed with a cable 
+An idea to test a multiple camera set up would be as follow
+
+When in test mode
+We have an adapter that reads the incoming camera data from its normal source and then duplicates it X amount of times and perhaps just to distinguish it slightly changes a tiny bit of the coloring of the image whatever we do do whether it’s adding a number to the frame or changing the coloring a drop it must not change the performance at all. It must be something really really very quick.
+
+From there, we can then test the performance of what happens when we add two cameras, three cameras and all the way up to however many cameras we want to test we can then test it slowly to see how the performance is affected by every camera that we add and give us an exact performance breakdown on how our system load performs with X amount of cameras on a given computer/hardware
 
 
 # A must for the developers 

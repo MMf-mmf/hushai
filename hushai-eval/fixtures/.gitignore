@@ -1,0 +1,11 @@
+# Fixture MEDIA is gitignored (large + may be privacy-sensitive); regenerate with
+# `./local_dev/build_fixtures.sh`. The ground truth (meta.json / expected.json) IS committed.
+*.mp4
+*.wav
+*.aiff
+*.m4a
+*.mov
+*.png
+*.jpg
+*.jpeg
+refs/

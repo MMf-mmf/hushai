@@ -6,12 +6,15 @@
 //! write path (`storage`), the idempotency transaction (`db`), and the source-agnostic
 //! invariant (§7) — the backend NEVER branches on `source_kind`.
 
+pub mod audit;
 pub mod auth;
 pub mod config;
 pub mod db;
 pub mod devices;
 pub mod error;
+pub mod events;
 pub mod ingest;
+pub mod observe;
 pub mod persons;
 pub mod plates;
 pub mod proto;
@@ -20,6 +23,7 @@ pub mod speakers;
 pub mod state;
 pub mod storage;
 pub mod tls;
+pub mod watchlist;
 
 use std::path::Path;
 use std::sync::Arc;
@@ -83,6 +87,19 @@ pub async fn run() -> anyhow::Result<()> {
     let bind_addr = config.bind_addr;
     let tls = config.tls.clone();
     let state = build_state(config).await?;
+
+    // Observability (roadmap B1): self-describe the ingest metrics so `/metrics` is documented.
+    observe::record_build_info("backend");
+    observe::describe(
+        "hushai_segments_ingested_total",
+        "counter",
+        "Segments accepted at /v1/segments, by source/media/result(new|duplicate).",
+    );
+    observe::describe(
+        "hushai_ingest_bytes_total",
+        "counter",
+        "Bytes of NEW segment media durably stored, by source/media.",
+    );
 
     // Per-device retention: a background task that purges footage past each device's keep-last-N-days
     // policy (once at startup, then on an interval). Idempotent, so it's safe regardless of restarts.

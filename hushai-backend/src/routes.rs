@@ -13,15 +13,18 @@ use axum::routing::{delete, get, patch, post, put};
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
+use crate::audit;
 use crate::auth;
 use crate::db;
 use crate::devices;
+use crate::events;
 use crate::ingest;
 use crate::persons;
 use crate::plates;
 use crate::speakers;
 use crate::state::AppState;
 use crate::storage;
+use crate::watchlist;
 
 pub fn router(state: AppState) -> Router {
     let max_body = state.config.max_body_bytes;
@@ -123,14 +126,65 @@ pub fn router(state: AppState) -> Router {
             auth::require_bearer,
         ));
 
+    // Events / alerts surface (roadmap Pillar A): the materialized event feed, the in-app
+    // notification feed + ack, and alert-rule CRUD. Bearer-authed, proxied via the viewer like
+    // devices/speakers. Literal `/feed*` routes precede nothing ambiguous; rule `/{id}` is last.
+    let events = Router::new()
+        .route("/v1/events", get(events::list_events))
+        .route("/v1/events/feed", get(events::list_feed))
+        .route(
+            "/v1/events/feed/{delivery_id}/ack",
+            post(events::ack_delivery),
+        )
+        .route(
+            "/v1/alert-rules",
+            get(events::list_rules).post(events::create_rule),
+        )
+        .route(
+            "/v1/alert-rules/{rule_id}",
+            patch(events::update_rule).delete(events::delete_rule),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_bearer,
+        ));
+
+    // Audit-log read surface (roadmap B6) — bearer-authed, proxied via the viewer like the others.
+    let audit = Router::new()
+        .route("/v1/audit", get(audit::list_audit))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_bearer,
+        ));
+
+    // Watchlist ("of interest") surface (roadmap A6) — bearer-authed, proxied via the viewer.
+    let watchlist = Router::new()
+        .route(
+            "/v1/watchlist",
+            get(watchlist::list_watchlist).post(watchlist::add_watch),
+        )
+        .route(
+            "/v1/watchlist/{watch_id}",
+            patch(watchlist::update_watch).delete(watchlist::remove_watch),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_bearer,
+        ));
+
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
+        // Prometheus scrape target (unauthenticated, like the health probes — roadmap B1).
+        .route("/metrics", get(crate::observe::metrics_handler))
         .merge(ingest)
         .merge(speakers)
         .merge(persons)
         .merge(plates)
         .merge(devices)
+        .merge(events)
+        .merge(audit)
+        .merge(watchlist)
         .layer(TraceLayer::new_for_http())
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,

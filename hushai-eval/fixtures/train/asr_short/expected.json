@@ -1,0 +1,7 @@
+{
+  "transcript": {
+    "full_text": "the quick brown fox jumps over the lazy dog. pack my box with five dozen liquor jugs.",
+    "max_wer": 0.3,
+    "min_similarity": 0.7
+  }
+}

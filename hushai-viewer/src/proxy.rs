@@ -30,13 +30,40 @@ const MAX_CAPTURE_BODY: usize = 16 * 1024 * 1024;
 
 /// Forward any method on `/v1/*` to the right upstream (rag or backend), streaming back.
 pub async fn forward(State(state): State<ViewerState>, req: Request) -> Response {
-    match forward_inner(state, req).await {
+    // Capture audit facets before the request is consumed. We audit only MUTATING requests to the
+    // ADMIN surfaces (backend paths) — not high-volume rag chat/query or ingest — at the gateway.
+    let method = req.method().as_str().to_string();
+    let path = req.uri().path().to_string();
+    let audit_worthy =
+        hushai_backend::audit::is_mutating(&method) && is_backend_path(&path);
+    let client_ip = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|ci| ci.0.ip().to_string());
+    let actor = if state.cfg.auth_disabled { "local" } else { "admin" };
+    let pool = state.pool.clone();
+
+    let resp = match forward_inner(state, req).await {
         Ok(resp) => resp,
         Err(msg) => {
             tracing::warn!(error = %msg, "proxy failed");
             (StatusCode::BAD_GATEWAY, msg).into_response()
         }
+    };
+
+    // Gateway audit (roadmap B6): record the action + its outcome (incl. a BAD_GATEWAY failure).
+    // Awaited inline (durable, no fire-and-forget loss) but bounded by record()'s internal timeout.
+    if audit_worthy {
+        let entry = hushai_backend::audit::AuditEntry::proxied(
+            actor,
+            client_ip,
+            &method,
+            &path,
+            resp.status().as_u16(),
+        );
+        hushai_backend::audit::record(&pool, entry).await;
     }
+    resp
 }
 
 /// Forward a browser capture upload (`POST /api/capture/segments`) to hushai-backend's
@@ -103,9 +130,10 @@ async fn forward_capture_inner(state: ViewerState, req: Request) -> Result<Respo
         .map_err(|e| format!("building proxied capture response: {e}"))
 }
 
-/// `/v1/speakers*`, `/v1/persons*`, `/v1/plates*`, and `/v1/devices*` are hushai-backend's
-/// catalog-/device-admin surfaces (voices, faces, license plates, and device management + footage
-/// deletion); everything else is hushai-rag.
+/// `/v1/speakers*`, `/v1/persons*`, `/v1/plates*`, `/v1/devices*`, `/v1/events*`, and
+/// `/v1/alert-rules*` are hushai-backend's catalog-/device-admin surfaces (voices, faces, license
+/// plates, device management + footage deletion, and the events/alerts feed + rules); everything
+/// else is hushai-rag.
 fn is_backend_path(path: &str) -> bool {
     path == "/v1/speakers"
         || path.starts_with("/v1/speakers/")
@@ -115,12 +143,25 @@ fn is_backend_path(path: &str) -> bool {
         || path.starts_with("/v1/plates/")
         || path == "/v1/devices"
         || path.starts_with("/v1/devices/")
+        || path == "/v1/events"
+        || path.starts_with("/v1/events/")
+        || path == "/v1/alert-rules"
+        || path.starts_with("/v1/alert-rules/")
+        || path == "/v1/audit"
+        || path.starts_with("/v1/audit/")
+        || path == "/v1/watchlist"
+        || path.starts_with("/v1/watchlist/")
 }
 
 async fn forward_inner(state: ViewerState, req: Request) -> Result<Response, String> {
     let method = req.method().clone();
     // Pick the upstream (base URL + bearer) by path before consuming the request.
-    let (base_url, token) = if is_backend_path(req.uri().path()) {
+    let to_backend = is_backend_path(req.uri().path());
+    hushai_backend::observe::counter(
+        "hushai_viewer_proxy_total",
+        &[("upstream", if to_backend { "backend" } else { "rag" })],
+    );
+    let (base_url, token) = if to_backend {
         (&state.cfg.backend_base_url, state.cfg.backend_token.as_ref())
     } else {
         (&state.cfg.rag_base_url, state.cfg.rag_token.as_ref())
