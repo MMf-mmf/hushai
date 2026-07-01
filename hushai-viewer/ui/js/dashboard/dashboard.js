@@ -66,6 +66,27 @@ function fmtClock(rfc3339) {
   }
 }
 
+// First 8 chars of a segment uuid — enough to correlate with logs / the processing view.
+function shortId(id) {
+  return id ? `${id.slice(0, 8)}…` : "—";
+}
+
+function truncate(s, n) {
+  s = String(s || "");
+  return s.length > n ? `${s.slice(0, n - 1)}…` : s;
+}
+
+// The single most-recent error across both queues (smallest age), or null. Drives the KPI
+// subtitle so the headline says *what* broke, not just how many.
+function freshestError(queues) {
+  const all = [
+    ...((queues?.transcription?.recent_errors) || []),
+    ...((queues?.vision?.recent_errors) || []),
+  ];
+  if (!all.length) return null;
+  return all.reduce((best, e) => (e.age_secs < best.age_secs ? e : best));
+}
+
 // ---- KPI tiles ------------------------------------------------------------
 
 function kpi(label, valueHtml, sub, klass) {
@@ -102,9 +123,14 @@ function renderKpis(data) {
   const backlog = (q.transcription?.pending || 0) + (q.transcription?.processing || 0) +
     (q.vision?.pending || 0) + (q.vision?.processing || 0);
   const errs = (q.transcription?.error || 0) + (q.vision?.error || 0);
+  // Say what the error was, not just how many: lead with the freshest message, then id + age.
+  let errSub = errs > 0 ? `${errs} error${errs === 1 ? "" : "s"}` : "items waiting / in-flight";
+  if (errs > 0) {
+    const fe = freshestError(q);
+    if (fe) errSub = `${truncate(fe.last_error, 48)} · ${shortId(fe.segment_id)} · ${agoSecs(fe.age_secs)}`;
+  }
   root.appendChild(
-    kpi("Queue backlog", `${backlog.toLocaleString()}`,
-      errs > 0 ? `${errs} error${errs === 1 ? "" : "s"}` : "items waiting / in-flight",
+    kpi("Queue backlog", `${backlog.toLocaleString()}`, errSub,
       errs > 0 ? "degraded" : backlog > 0 ? "degraded" : "up"),
   );
 
@@ -196,6 +222,24 @@ function qstat(label, value, klass) {
   ]);
 }
 
+// An expandable list of the recent error rows (segment id · message · age · ×attempts). Native
+// <details> so it needs no extra JS; collapsed by default to keep the card compact. Returns null
+// (skipped by el's child filter) when the queue has no errors.
+function errorList(recent) {
+  if (!recent || !recent.length) return null;
+  const rows = recent.map((e) =>
+    el("li", { class: "qerr" }, [
+      el("span", { class: "qerr-id mono small", title: e.segment_id, text: shortId(e.segment_id) }),
+      el("span", { class: "qerr-msg", title: e.last_error, text: e.last_error || "(no message)" }),
+      el("span", { class: "qerr-meta muted small", text: `${agoSecs(e.age_secs)} · ×${e.attempts}` }),
+    ]),
+  );
+  return el("details", { class: "qerrors" }, [
+    el("summary", { class: "small" }, [`recent errors (${recent.length})`]),
+    el("ul", { class: "qerr-list" }, rows),
+  ]);
+}
+
 function queueCard(title, q) {
   q = q || {};
   return el("div", { class: "card queue" }, [
@@ -212,6 +256,7 @@ function queueCard(title, q) {
     el("div", { class: "muted small" }, [
       `oldest pending ${q.pending ? agoSecs(q.oldest_pending_age_secs) : "—"} · last activity ${agoSecs(q.max_updated_age_secs)}`,
     ]),
+    errorList(q.recent_errors),
   ]);
 }
 

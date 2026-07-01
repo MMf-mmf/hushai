@@ -14,6 +14,7 @@ pub mod devices;
 pub mod error;
 pub mod events;
 pub mod ingest;
+pub mod logging;
 pub mod observe;
 pub mod persons;
 pub mod plates;
@@ -30,18 +31,15 @@ use std::sync::Arc;
 
 use anyhow::Context;
 use tokio::sync::Semaphore;
-use tracing_subscriber::EnvFilter;
 
 use crate::auth::TokenStore;
 use crate::config::Config;
 use crate::state::AppState;
 
-/// Initialise tracing once, honouring `RUST_LOG`, defaulting to a sensible filter.
+/// Initialise tracing once, honouring `RUST_LOG` / `LOG_FORMAT` / `LOG_DIR`. Delegates to the
+/// shared [`logging`] module so every service formats, files, and panic-captures identically.
 pub fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,hushai_backend=debug"));
-    // `try_init` so repeated calls (e.g. in tests) don't panic.
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    logging::init("hushai-backend", "info,hushai_backend=debug");
 }
 
 /// Build a fully-wired [`AppState`] from config: connect the pool, run migrations,
@@ -86,6 +84,17 @@ pub async fn run() -> anyhow::Result<()> {
     let config = Config::from_env()?;
     let bind_addr = config.bind_addr;
     let tls = config.tls.clone();
+    // Redacted startup banner: enough to debug a misconfigured deploy, with no secrets
+    // (DEVICE_TOKEN / DATABASE_URL credentials are deliberately omitted).
+    tracing::info!(
+        service = "hushai-backend",
+        version = env!("CARGO_PKG_VERSION"),
+        %bind_addr,
+        tls = tls.is_some(),
+        blob_dir = %config.blob_dir.display(),
+        logging = %logging::summary(),
+        "starting"
+    );
     let state = build_state(config).await?;
 
     // Observability (roadmap B1): self-describe the ingest metrics so `/metrics` is documented.

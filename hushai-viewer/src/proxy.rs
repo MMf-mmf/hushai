@@ -47,7 +47,9 @@ pub async fn forward(State(state): State<ViewerState>, req: Request) -> Response
         Ok(resp) => resp,
         Err(msg) => {
             tracing::warn!(error = %msg, "proxy failed");
-            (StatusCode::BAD_GATEWAY, msg).into_response()
+            // Static body — the detail (internal upstream URL + reqwest chain) is in the warn! above;
+            // don't leak host:port/infra errors to the client. Matches error.rs's static-5xx pattern.
+            (StatusCode::BAD_GATEWAY, "upstream unavailable").into_response()
         }
     };
 
@@ -77,7 +79,9 @@ pub async fn forward_capture(State(state): State<ViewerState>, req: Request) -> 
         Ok(resp) => resp,
         Err(msg) => {
             tracing::warn!(error = %msg, "capture proxy failed");
-            (StatusCode::BAD_GATEWAY, msg).into_response()
+            // Static body — the detail (internal upstream URL + reqwest chain) is in the warn! above;
+            // don't leak host:port/infra errors to the client. Matches error.rs's static-5xx pattern.
+            (StatusCode::BAD_GATEWAY, "upstream unavailable").into_response()
         }
     }
 }

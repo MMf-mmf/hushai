@@ -185,7 +185,13 @@ pub fn router(state: AppState) -> Router {
         .merge(events)
         .merge(audit)
         .merge(watchlist)
-        .layer(TraceLayer::new_for_http())
+        // One structured access line per request, carrying a generated `request_id` that every
+        // handler log inherits (see crate::logging) — so a request is traceable end-to-end.
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(crate::logging::make_http_span)
+                .on_response(crate::logging::on_http_response),
+        )
         .layer(TimeoutLayer::with_status_code(
             StatusCode::REQUEST_TIMEOUT,
             request_timeout,

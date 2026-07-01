@@ -22,6 +22,11 @@ pub struct PlateOcr {
     h: usize,
     w: usize,
     nchw: bool,
+    /// Decode head: `true` = CTC/CRNN (collapse consecutive duplicates), `false` = fixed-length
+    /// per-slot softmax (fast-plate-ocr CCT — a real double letter like "BB1234" MUST survive, so we
+    /// do NOT collapse). Auto-default is fixed-length (the primary model); set `PLATE_OCR_CTC=true`
+    /// for a CRNN/PaddleOCR recognizer.
+    ctc: bool,
 }
 
 impl PlateOcr {
@@ -65,7 +70,15 @@ impl PlateOcr {
             h: h.max(8),
             w: w.max(8),
             nchw,
+            ctc: false,
         }
+    }
+
+    /// Select the decode head: `true` = CTC duplicate-collapse (CRNN/PaddleOCR), `false` = fixed-length
+    /// per-slot (fast-plate-ocr CCT). Default is fixed-length.
+    pub fn with_ctc(mut self, ctc: bool) -> Self {
+        self.ctc = ctc;
+        self
     }
 
     /// Read a (rectified, enhanced) plate image. CPU-bound; call inside `spawn_blocking`.
@@ -136,40 +149,7 @@ impl PlateOcr {
             }
         };
 
-        let mut text = String::new();
-        let mut confs: Vec<f32> = Vec::new();
-        let mut prev: Option<usize> = None;
-        for s in 0..steps {
-            // softmax over classes for this timestep
-            let mut max = f32::NEG_INFINITY;
-            let mut argmax = 0usize;
-            for cls in 0..classes {
-                let v = at(s, cls);
-                if v > max {
-                    max = v;
-                    argmax = cls;
-                }
-            }
-            // CTC collapse: skip blank + consecutive duplicates.
-            if Some(argmax) == blank {
-                prev = None;
-                continue;
-            }
-            if prev == Some(argmax) {
-                continue;
-            }
-            prev = Some(argmax);
-            if let Some(&ch) = self.charset.get(argmax) {
-                // softmax prob for confidence
-                let mut denom = 0.0f32;
-                for cls in 0..classes {
-                    denom += (at(s, cls) - max).exp();
-                }
-                let prob = if denom > 0.0 { 1.0 / denom } else { 0.0 };
-                text.push(ch);
-                confs.push(prob);
-            }
-        }
+        let (text, confs) = greedy_decode(&at, steps, classes, blank, &self.charset, self.ctc);
         let norm = super::normalize::normalize(&text);
         // Re-pair confidences with the kept (alphanumeric) characters.
         let kept_confs: Vec<f32> = if confs.len() == norm.chars().count() {
@@ -185,5 +165,90 @@ impl PlateOcr {
             ]
         };
         Ok(PlateRead::new(norm, kept_confs))
+    }
+}
+
+/// Greedy decode of a recognizer's `[steps, classes]` logits into a raw string + per-char softmax
+/// confidences. `at(step, cls)` returns the logit; `blank=Some(i)` skips index `i` (CTC blank / the
+/// fixed-length pad slot). `ctc=true` collapses consecutive duplicate classes (CRNN/PaddleOCR);
+/// `ctc=false` keeps them — a fixed-length per-slot head (fast-plate-ocr CCT) must preserve real
+/// double letters like "BB1234". Pure + side-effect-free so the load-bearing decode is unit-tested.
+fn greedy_decode(
+    at: &impl Fn(usize, usize) -> f32,
+    steps: usize,
+    classes: usize,
+    blank: Option<usize>,
+    charset: &[char],
+    ctc: bool,
+) -> (String, Vec<f32>) {
+    let mut text = String::new();
+    let mut confs: Vec<f32> = Vec::new();
+    let mut prev: Option<usize> = None;
+    for s in 0..steps {
+        let mut max = f32::NEG_INFINITY;
+        let mut argmax = 0usize;
+        for cls in 0..classes {
+            let v = at(s, cls);
+            if v > max {
+                max = v;
+                argmax = cls;
+            }
+        }
+        if Some(argmax) == blank {
+            prev = None;
+            continue;
+        }
+        if ctc && prev == Some(argmax) {
+            continue; // CTC duplicate-collapse — ONLY for CTC heads
+        }
+        prev = Some(argmax);
+        if let Some(&ch) = charset.get(argmax) {
+            let mut denom = 0.0f32;
+            for cls in 0..classes {
+                denom += (at(s, cls) - max).exp();
+            }
+            let prob = if denom > 0.0 { 1.0 / denom } else { 0.0 };
+            text.push(ch);
+            confs.push(prob);
+        }
+    }
+    (text, confs)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::greedy_decode;
+
+    // Build a [steps,classes] (class-last) one-hot logit grid from a slot→class sequence.
+    fn grid(seq: &[usize], classes: usize) -> impl Fn(usize, usize) -> f32 + '_ {
+        move |s: usize, c: usize| if seq[s] == c { 10.0 } else { 0.0 }
+    }
+
+    #[test]
+    fn fixed_length_preserves_double_letters() {
+        // charset 0..=9 then A..Z (36); model class 36 = pad/blank. "BB1234" then 3 pad slots.
+        let charset: Vec<char> = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars().collect();
+        let b = |ch: char| charset.iter().position(|&c| c == ch).unwrap();
+        let seq = vec![b('B'), b('B'), b('1'), b('2'), b('3'), b('4'), 36, 36, 36];
+        let at = grid(&seq, 37);
+        let (text, confs) = greedy_decode(&at, 9, 37, Some(36), &charset, false);
+        assert_eq!(text, "BB1234", "fixed-length head must keep the double B");
+        assert_eq!(confs.len(), 6);
+    }
+
+    #[test]
+    fn ctc_collapses_runs_but_blank_separates() {
+        let charset: Vec<char> = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ".chars().collect();
+        let b = |ch: char| charset.iter().position(|&c| c == ch).unwrap();
+        // CTC stream: A A <blank> A 1 -> "AA1" (blank separates the two A-runs).
+        let seq = vec![b('A'), b('A'), 36, b('A'), b('1')];
+        let at = grid(&seq, 37);
+        let (text, _) = greedy_decode(&at, 5, 37, Some(36), &charset, true);
+        assert_eq!(text, "AA1");
+        // Without the separating blank, the run collapses to one A.
+        let seq2 = vec![b('A'), b('A'), b('A'), b('1'), 36];
+        let at2 = grid(&seq2, 37);
+        let (text2, _) = greedy_decode(&at2, 5, 37, Some(36), &charset, true);
+        assert_eq!(text2, "A1");
     }
 }

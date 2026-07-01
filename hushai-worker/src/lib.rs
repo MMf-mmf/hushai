@@ -17,6 +17,7 @@ pub mod config;
 pub mod delivery;
 pub mod embed;
 pub mod events_producer;
+pub mod governor;
 pub mod media;
 pub mod process;
 pub mod sentiment;
@@ -33,19 +34,18 @@ use anyhow::Context;
 use sqlx::PgPool;
 use sqlx::postgres::PgListener;
 use tokio::sync::Notify;
-use tracing_subscriber::EnvFilter;
 
 use crate::asr::Transcriber;
 use crate::config::WorkerConfig;
 use crate::embed::Embedder;
+use crate::governor::Governor;
 use crate::sentiment::SentimentClassifier;
 use crate::speaker::{SpeakerEmbedder, VoiceDetector};
 use crate::vision::write::VisionModels;
 
+/// Honours `RUST_LOG` / `LOG_FORMAT` / `LOG_DIR` via the shared [`hushai_backend::logging`] module.
 pub fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,hushai_worker=debug"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    hushai_backend::logging::init("hushai-worker", "info,hushai_worker=debug");
 }
 
 /// Load config, connect, migrate, and run worker tasks until Ctrl-C / SIGTERM.
@@ -107,7 +107,27 @@ pub async fn run() -> anyhow::Result<()> {
         "hushai-worker starting"
     );
 
-    let transcriber = Transcriber::new(&cfg.whisper_model_path)?;
+    // CPU thread budget: with N audio + V vision loops each running inference, "all cores per call"
+    // oversubscribes the box. We size whisper n_threads and ORT intra-op threads to
+    // cores/(audio+vision) so the loops fill the CPU instead of thrashing it. Log it once — it's
+    // the first thing to check when reading a loadtest run.
+    tracing::info!(
+        cores = WorkerConfig::cores(),
+        audio_loops = cfg.worker_concurrency,
+        vision_loops = cfg.vision_concurrency,
+        asr_threads = cfg.asr_n_threads(),
+        ort_intra_threads = cfg.ort_intra_op_threads(),
+        "concurrency budget"
+    );
+
+    let transcriber = Transcriber::new(&cfg.whisper_model_path, cfg.asr_n_threads())?.with_quality(
+        crate::asr::DecodeQuality {
+            no_speech_thold: cfg.whisper_no_speech_thold,
+            logprob_thold: cfg.whisper_logprob_thold,
+            entropy_thold: cfg.whisper_entropy_thold,
+            suppress_nst: cfg.whisper_suppress_nst,
+        },
+    );
     let embedder = Embedder::new(&cfg.embed_ollama_base_url, &cfg.embed_model)?;
     let sentiment_clf = SentimentClassifier::new(
         &cfg.llm_ollama_base_url,
@@ -187,6 +207,13 @@ pub async fn run() -> anyhow::Result<()> {
 
     let cfg = Arc::new(cfg);
 
+    // Device load governor: a monitor task publishes a Normal/Elevated/Saturated level the worker
+    // loops read each iteration to pace themselves (pause the expensive vision lane + inter-segment
+    // cooldown) under load, so the box is never thrashed. Nothing is dropped — deferral only delays;
+    // the durable queue drains oldest-first once load clears. Disabled ⇒ legacy always-claim behavior.
+    let governor = Arc::new(Governor::new(cfg.governor.clone()));
+    governor::spawn_load_monitor(pool.clone(), governor.clone(), shutdown.clone());
+
     // Liveness heartbeat: the worker has no HTTP port, so it self-reports into `worker_heartbeat`
     // every cfg.heartbeat_interval. The viewer's /api/dashboard reads it (idle != dead). One row
     // per process (not per loop), keyed by cfg.worker_id (default "<host>:<pid>").
@@ -203,6 +230,8 @@ pub async fn run() -> anyhow::Result<()> {
         observe::record_build_info("worker");
         observe::describe("hushai_worker_queue_depth", "gauge", "Pending+processing segments, by lane (audio|vision).");
         observe::describe("hushai_segments_processed_total", "counter", "Segments processed by a lane, by lane + result(ok|error).");
+        observe::describe("hushai_audio_segments_skipped_silent_total", "counter", "Audio segments skipped before whisper because no speech was detected, by reason(rms|vad).");
+        observe::describe("hushai_worker_segments_skipped_static_total", "counter", "Vision segments skipped because the scene was unchanged vs the camera's last analyzed frame, by lane(vision).");
         observe::describe("hushai_events_produced_total", "counter", "Event emit operations by event_type (incl. session re-extension UPSERTs, so >= distinct events).");
         observe::describe("hushai_alerts_fired_total", "counter", "Alert deliveries created by the rule evaluator (sum across rules x channels).");
         observe::describe("hushai_deliveries_total", "counter", "Webhook delivery outcomes: sent|failed are TERMINAL; retry counts scheduled (non-terminal) retries.");
@@ -210,6 +239,8 @@ pub async fn run() -> anyhow::Result<()> {
         observe::describe("hushai_worker_stage_seconds", "histogram", "Per-stage processing latency (s), by lane(audio|vision) + stage.");
         observe::describe("hushai_worker_segment_seconds", "histogram", "End-to-end per-segment processing wall-clock (s), by lane.");
         observe::describe("hushai_worker_capture_lag_seconds", "histogram", "Capture-to-done latency (s), incl. queue wait, by lane — the realtime-keep-up signal.");
+        observe::describe("hushai_worker_load_level", "gauge", "Device load governor level: 0=Normal, 1=Elevated, 2=Saturated.");
+        observe::describe("hushai_worker_throttle_total", "counter", "Times a lane paused/cooled to protect the device, by lane + reason(vision_paused|audio_paused|cooldown).");
         observe::spawn_metrics_server(addr, shutdown.clone());
     }
 
@@ -226,18 +257,27 @@ pub async fn run() -> anyhow::Result<()> {
             cfg.clone(),
             shutdown.clone(),
             wake.clone(),
+            governor.clone(),
         )));
     }
-    // Vision worker (VIDEO/MUXED → face identity). One loop: vision inference is CPU-heavy and the
-    // global person advisory lock serializes minting anyway; bump if profiling warrants.
+    // Vision workers (VIDEO/MUXED → face/object/plate identity). Fan out `VISION_CONCURRENCY`
+    // loops over the SKIP-LOCKED vision queue, mirroring the audio fan-out above. `VisionModels`
+    // is a cheap `Arc` clone (ORT `Session` is `Send+Sync` and `Run` is thread-safe), so all loops
+    // share ONE set of models with no duplication; each segment is still processed start-to-finish
+    // on a single loop, so intra-segment frame ordering (plate clustering) is preserved. The global
+    // person advisory lock still serializes minting across loops — by design (cross-device identity).
+    // Vision loops are identity-less: the "worker 0 only" auto-merge lives solely in the audio loop.
     if let Some(models) = vision_models {
-        handles.push(tokio::spawn(vision_worker_loop(
-            pool.clone(),
-            models,
-            cfg.clone(),
-            shutdown.clone(),
-            wake.clone(),
-        )));
+        for _ in 0..cfg.vision_concurrency.max(1) {
+            handles.push(tokio::spawn(vision_worker_loop(
+                pool.clone(),
+                models.clone(),
+                cfg.clone(),
+                shutdown.clone(),
+                wake.clone(),
+                governor.clone(),
+            )));
+        }
     }
 
     for h in handles {
@@ -260,15 +300,16 @@ fn build_face_detector(
         model,
     };
     let coreml = cfg.vision_coreml;
+    let intra = cfg.ort_intra_op_threads();
     let scrfd = || -> anyhow::Result<Arc<dyn FaceDetect>> {
         Ok(Arc::new(ScrfdDetector::new(
-            model::load_session(&cfg.face_scrfd_model_path, coreml)?,
+            model::load_session_with_threads(&cfg.face_scrfd_model_path, coreml, intra)?,
             cfg.face_min_det_score,
         )))
     };
     let yunet = || -> anyhow::Result<Arc<dyn FaceDetect>> {
         Ok(Arc::new(FaceDetector::new(
-            model::load_session(&cfg.face_detect_model_path, coreml)?,
+            model::load_session_with_threads(&cfg.face_detect_model_path, coreml, intra)?,
             cfg.face_min_det_score,
         )))
     };
@@ -308,16 +349,23 @@ fn build_vision_models(cfg: &WorkerConfig) -> anyhow::Result<VisionModels> {
         plates::{detect::PlateDetector, ocr::PlateOcr},
     };
     model::init_ort(&cfg.ort_dylib_path);
+    // Per-session ORT intra-op thread budget (see WorkerConfig::ort_intra_op_threads): keeps N
+    // parallel vision loops from each spawning an all-core thread pool. CoreML nodes are unaffected.
+    let intra = cfg.ort_intra_op_threads();
     let detector = build_face_detector(cfg)?;
     let embedder = FaceEmbedder::new(
-        model::load_session(&cfg.face_embed_model_path, cfg.vision_coreml)
+        model::load_session_with_threads(&cfg.face_embed_model_path, cfg.vision_coreml, intra)
             .context("loading face-embed model (FACE_EMBED_MODEL_PATH)")?,
     )
     .with_flip_tta(cfg.face_embed_flip_tta);
 
     // Optional image-cleanup sub-lane (blind-face-restore + super-res). Each self-disables on a
     // missing/unloadable model; low-quality faces are then dropped as before (the face lane runs).
-    let restorer = match model::load_session(&cfg.face_restore_model_path, cfg.vision_coreml) {
+    let restorer = match model::load_session_with_threads(
+        &cfg.face_restore_model_path,
+        cfg.vision_coreml,
+        intra,
+    ) {
         Ok(s) => {
             tracing::info!(
                 model = %cfg.face_restore_model_path,
@@ -335,7 +383,11 @@ fn build_vision_models(cfg: &WorkerConfig) -> anyhow::Result<VisionModels> {
             None
         }
     };
-    let upscaler = match model::load_session(&cfg.face_upscale_model_path, cfg.vision_coreml) {
+    let upscaler = match model::load_session_with_threads(
+        &cfg.face_upscale_model_path,
+        cfg.vision_coreml,
+        intra,
+    ) {
         Ok(s) => {
             tracing::info!(model = %cfg.face_upscale_model_path, "face super-resolution enabled (Real-ESRGAN)");
             Some(Arc::new(Upscaler::new(s)))
@@ -347,25 +399,38 @@ fn build_vision_models(cfg: &WorkerConfig) -> anyhow::Result<VisionModels> {
     // failure disables objects with a warning but keeps the (required) face lane running, so an
     // operator who hasn't provisioned RF-DETR/CLIP still gets person identity.
     let (object_detector, clip) = match (
-        model::load_session(&cfg.object_det_model_path, cfg.vision_coreml),
-        model::load_session(&cfg.clip_image_model_path, cfg.vision_coreml),
+        model::load_session_with_threads(&cfg.object_det_model_path, cfg.vision_coreml, intra),
+        model::load_session_with_threads(&cfg.clip_image_model_path, cfg.vision_coreml, intra),
     ) {
         (Ok(od), Ok(cl)) => {
+            let mut detector = ObjectDetector::new(
+                od,
+                cfg.object_det_input_size,
+                cfg.object_min_det_score,
+                cfg.object_max_per_frame,
+                cfg.object_min_box_px,
+            )
+            .with_nms_iou(cfg.object_nms_iou);
+            // Apply the authoritative column→label map (RF-DETR's COCO 91-slot layout). The built-in
+            // map is already correct; this honors a custom export's classes file when present.
+            match crate::vision::objects::load_class_map(std::path::Path::new(&cfg.object_classes_path)) {
+                Ok(names) => detector = detector.with_class_names(names),
+                Err(e) => tracing::warn!(
+                    path = %cfg.object_classes_path,
+                    error = %e,
+                    "object class map not loaded; using built-in COCO-91 map"
+                ),
+            }
             tracing::info!(
                 object_det = %cfg.object_det_model_path,
                 clip = %cfg.clip_image_model_path,
+                classes = detector.named_class_count(),
                 max_per_frame = cfg.object_max_per_frame,
                 min_box_px = cfg.object_min_box_px,
-                "vision object lane enabled (open-vocab objects) — validate the decode against the real export (see AGENTS.md vision)"
+                "vision object lane enabled (open-vocab objects, COCO-91 class map)"
             );
             (
-                Some(Arc::new(ObjectDetector::new(
-                    od,
-                    cfg.object_det_input_size,
-                    cfg.object_min_det_score,
-                    cfg.object_max_per_frame,
-                    cfg.object_min_box_px,
-                ))),
+                Some(Arc::new(detector)),
                 Some(Arc::new(ClipEmbedder::new(cl))),
             )
         }
@@ -392,7 +457,12 @@ fn build_vision_models(cfg: &WorkerConfig) -> anyhow::Result<VisionModels> {
     let (plate_detector, plate_ocr) = if !cfg.plate_enabled {
         (None, None)
     } else {
-        let det = model::load_session(&cfg.plate_detect_model_path, cfg.vision_coreml).map(|s| {
+        let det = model::load_session_with_threads(
+            &cfg.plate_detect_model_path,
+            cfg.vision_coreml,
+            intra,
+        )
+        .map(|s| {
             Arc::new(PlateDetector::new(
                 s,
                 cfg.plate_detect_input_size,
@@ -400,8 +470,8 @@ fn build_vision_models(cfg: &WorkerConfig) -> anyhow::Result<VisionModels> {
             ))
         });
         let ocr = load_plate_charset(&cfg.plate_ocr_charset_path).and_then(|charset| {
-            model::load_session(&cfg.plate_ocr_model_path, cfg.vision_coreml)
-                .map(|s| Arc::new(PlateOcr::new(s, charset)))
+            model::load_session_with_threads(&cfg.plate_ocr_model_path, cfg.vision_coreml, intra)
+                .map(|s| Arc::new(PlateOcr::new(s, charset).with_ctc(cfg.plate_ocr_ctc)))
         });
         match (det, ocr) {
             (Ok(d), Ok(o)) => {
@@ -437,6 +507,9 @@ fn build_vision_models(cfg: &WorkerConfig) -> anyhow::Result<VisionModels> {
         clip,
         plate_detector,
         plate_ocr,
+        // One per-camera fingerprint map for the whole process, shared by every vision loop via
+        // the cheap `Arc` clone in `run()`'s fan-out.
+        motion_cache: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     })
 }
 
@@ -459,8 +532,20 @@ async fn vision_worker_loop(
     cfg: Arc<WorkerConfig>,
     shutdown: Arc<AtomicBool>,
     wake: Arc<Notify>,
+    governor: Arc<Governor>,
 ) {
     while !shutdown.load(Ordering::SeqCst) {
+        // Load governor: under saturation, pause the expensive vision lane entirely so audio keeps
+        // up and the box recovers. Pending vision rows just wait (never dropped) and drain
+        // oldest-first once load clears — the organic quiet-time drain.
+        if governor.vision_should_pause() {
+            hushai_backend::observe::counter("hushai_worker_throttle_total", &[("lane", "vision"), ("reason", "vision_paused")]);
+            tokio::select! {
+                _ = wake.notified() => {}
+                _ = tokio::time::sleep(cfg.poll_interval) => {}
+            }
+            continue;
+        }
         match claim::claim_one_vision(&pool, cfg.max_attempts, cfg.lease_timeout_secs).await {
             Ok(Some(segment_id)) => {
                 match crate::vision::write::process_vision_segment(&pool, &models, &cfg, segment_id)
@@ -485,6 +570,13 @@ async fn vision_worker_loop(
                             let _ = claim::mark_vision_error(&pool, segment_id, &msg).await;
                         }
                     }
+                }
+                // Governor cooldown: pace the lane between segments at Elevated so the box keeps
+                // headroom (no-op at Normal / when disabled; vision is fully paused at Saturated above).
+                let cd = governor.cooldown();
+                if !cd.is_zero() {
+                    hushai_backend::observe::counter("hushai_worker_throttle_total", &[("lane", "vision"), ("reason", "cooldown")]);
+                    tokio::time::sleep(cd).await;
                 }
             }
             Ok(None) => {
@@ -651,11 +743,22 @@ async fn worker_loop(
     cfg: Arc<WorkerConfig>,
     shutdown: Arc<AtomicBool>,
     wake: Arc<Notify>,
+    governor: Arc<Governor>,
 ) {
     // Only worker 0 runs the going-forward auto-merge, so it's never run concurrently and
     // needs no shared state. Initialized to now() so the first pass waits one interval.
     let mut last_autoheal = std::time::Instant::now();
     while !shutdown.load(Ordering::SeqCst) {
+        // Load governor: by default audio is the lane we keep running (vision pauses first), so this
+        // only fires when the operator inverted the priority (LOAD_PAUSE_VISION_FIRST=false).
+        if governor.audio_should_pause() {
+            hushai_backend::observe::counter("hushai_worker_throttle_total", &[("lane", "audio"), ("reason", "audio_paused")]);
+            tokio::select! {
+                _ = wake.notified() => {}
+                _ = tokio::time::sleep(cfg.poll_interval) => {}
+            }
+            continue;
+        }
         match claim::claim_one(&pool, cfg.max_attempts, cfg.lease_timeout_secs).await {
             Ok(Some(segment_id)) => {
                 match process::process_segment(
@@ -689,6 +792,13 @@ async fn worker_loop(
                             }
                         }
                     }
+                }
+                // Governor cooldown: pace the audio lane between segments under load so the box
+                // keeps headroom (no-op at Normal / when disabled).
+                let cd = governor.cooldown();
+                if !cd.is_zero() {
+                    hushai_backend::observe::counter("hushai_worker_throttle_total", &[("lane", "audio"), ("reason", "cooldown")]);
+                    tokio::time::sleep(cd).await;
                 }
             }
             Ok(None) => {

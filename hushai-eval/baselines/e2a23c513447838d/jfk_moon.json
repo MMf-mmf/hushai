@@ -1,0 +1,12 @@
+{
+  "case_id": "jfk_moon",
+  "config_hash": "e2a23c513447838d",
+  "git_sha": "fa190ff",
+  "metrics": {
+    "events.match": 1.0,
+    "speakers.count_error": 0.0,
+    "speakers.distinct_count": 1.0,
+    "transcript.similarity": 0.8823529411764706,
+    "transcript.wer": 0.22727272727272727
+  }
+}

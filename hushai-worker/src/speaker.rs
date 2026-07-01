@@ -170,25 +170,41 @@ impl VoiceDetector {
             )
             .map_err(|e| anyhow::anyhow!("constructing VAD: {e}"))?;
 
-            vad.accept_waveform(samples);
-            vad.flush(); // force the trailing partial segment out (offline / whole-buffer use)
-
+            // Silero VAD MUST be fed in window_size (512) frames, draining completed speech
+            // segments as we go. Feeding the whole buffer in one accept_waveform call makes
+            // sherpa emit only a single tiny segment (~0.31s) regardless of input — verified by
+            // the `vad_probe_real_speech` diagnostic (whole-buffer=0.31s vs chunked=4.41s on a
+            // 14s clip). Chunk-feed + drain, then feed the tail, flush, and drain again.
+            const WINDOW: usize = 512; // matches SileroVadConfig.window_size
             let mut speech: Vec<f32> = Vec::new();
             let mut start_sample = 0usize;
             let mut end_sample = 0usize;
             let mut first = true;
-            while !vad.is_empty() {
-                let seg = vad.front();
-                vad.pop();
-                let s = seg.start.max(0) as usize;
-                let e = s + seg.samples.len();
-                if first {
-                    start_sample = s;
-                    first = false;
+            let mut drain = |vad: &mut SileroVad, speech: &mut Vec<f32>| {
+                while !vad.is_empty() {
+                    let seg = vad.front();
+                    vad.pop();
+                    let s = seg.start.max(0) as usize;
+                    let e = s + seg.samples.len();
+                    if first {
+                        start_sample = s;
+                        first = false;
+                    }
+                    end_sample = e;
+                    speech.extend_from_slice(&seg.samples);
                 }
-                end_sample = e;
-                speech.extend_from_slice(&seg.samples);
+            };
+            let mut i = 0usize;
+            while i + WINDOW <= samples.len() {
+                vad.accept_waveform(samples[i..i + WINDOW].to_vec());
+                drain(&mut vad, &mut speech);
+                i += WINDOW;
             }
+            if i < samples.len() {
+                vad.accept_waveform(samples[i..].to_vec()); // feed the sub-window tail
+            }
+            vad.flush(); // finalize any in-progress trailing speech segment
+            drain(&mut vad, &mut speech);
 
             // Speech energy (numerator) and noise-floor energy (denominator) for SNR. The
             // kept speech samples are a subset of the buffer, so noise sum-of-squares is the
@@ -264,6 +280,47 @@ mod tests {
             emb.iter().all(|x| x.is_finite()),
             "embedding has non-finite values"
         );
+    }
+
+    /// Diagnostic: compare whole-buffer vs chunked-512 VAD feeding on REAL speech PCM.
+    /// Gated on VAD_PROBE_PCM (path to 16k mono f32le) + VAD_MODEL_PATH. Run with --nocapture.
+    #[tokio::test]
+    async fn vad_probe_real_speech() {
+        let (Ok(pcmpath), Ok(model)) = (std::env::var("VAD_PROBE_PCM"), std::env::var("VAD_MODEL_PATH")) else {
+            eprintln!("skip vad_probe_real_speech: set VAD_PROBE_PCM + VAD_MODEL_PATH");
+            return;
+        };
+        let bytes = std::fs::read(&pcmpath).expect("read pcm");
+        let pcm: Vec<f32> = bytes.chunks_exact(4).map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]])).collect();
+        eprintln!("PCM: {} samples ({:.2}s)", pcm.len(), pcm.len() as f32 / 16000.0);
+        let bufsecs = (pcm.len() as f32 / 16000.0 + 1.0).max(2.0);
+        let cfg = || SileroVadConfig {
+            model: model.clone(), min_silence_duration: 0.3, min_speech_duration: 0.25,
+            max_speech_duration: 20.0, threshold: 0.5, sample_rate: 16000, window_size: 512,
+            provider: None, num_threads: Some(1), debug: false,
+        };
+        // (A) whole buffer + flush (what detect() does today)
+        {
+            let mut vad = SileroVad::new(cfg(), bufsecs).unwrap();
+            vad.accept_waveform(pcm.clone());
+            vad.flush();
+            let (mut n, mut tot) = (0usize, 0usize);
+            while !vad.is_empty() { let s = vad.front(); vad.pop(); n += 1; tot += s.samples.len(); }
+            eprintln!("(A) whole-buffer + flush : segments={n} speech={:.2}s", tot as f32 / 16000.0);
+        }
+        // (B) chunked 512 + drain + flush (canonical sherpa usage)
+        {
+            let mut vad = SileroVad::new(cfg(), bufsecs).unwrap();
+            let (w, mut i, mut n, mut tot) = (512usize, 0usize, 0usize, 0usize);
+            while i + w <= pcm.len() {
+                vad.accept_waveform(pcm[i..i + w].to_vec());
+                while !vad.is_empty() { let s = vad.front(); vad.pop(); n += 1; tot += s.samples.len(); }
+                i += w;
+            }
+            vad.flush();
+            while !vad.is_empty() { let s = vad.front(); vad.pop(); n += 1; tot += s.samples.len(); }
+            eprintln!("(B) chunked-512 + flush  : segments={n} speech={:.2}s", tot as f32 / 16000.0);
+        }
     }
 
     /// VAD smoke test: the Silero model loads and a silence-padded buffer yields less kept

@@ -42,12 +42,21 @@ Every ~2 s segment is analyzed by `hushai-worker`. Per segment the pipeline does
 - **Audio lane** (`WORKER_CONCURRENCY` parallel tasks, default 2): ffmpeg decode → **Whisper ASR**
   (the dominant cost, ~2.5–5× real-time per 2 s clip on a CPU build) → sentiment (Ollama) → speaker
   VAD + TitaNet embedding → text embedding → DB write.
-- **Vision lane** (1 task): ffmpeg frame decode → face detect (SCRFD/YuNet) + ArcFace embed
-  (+ optional GFPGAN/Real-ESRGAN restore) → RF-DETR objects + CLIP → plate detect + OCR → DB write.
+- **Vision lane** (`VISION_CONCURRENCY` parallel tasks, default 2): ffmpeg frame decode → face detect
+  (SCRFD/YuNet) + ArcFace embed (+ optional GFPGAN/Real-ESRGAN restore) → RF-DETR objects + CLIP →
+  plate detect + OCR → DB write.
 
-Because Whisper alone runs several× real-time and the audio lane defaults to **2** workers, the system
-**saturates well below 30 cameras at stock settings** — the offered rate (30 cams × one 2 s segment / 2 s
-= 15 segments/s) far exceeds what 2 Whisper workers drain. This is the number the benchmark measures.
+Both lanes fan out over a SKIP-LOCKED queue, so raising `WORKER_CONCURRENCY` / `VISION_CONCURRENCY`
+parallelizes immediately (and a 2nd worker host against the same DB scales out for free). The catch:
+each Whisper/ORT call otherwise grabs **all** cores, so N parallel loops oversubscribe the box. The
+worker sizes a **per-call thread budget** (`ASR_THREADS` / `ORT_INTRA_THREADS`, `0`=auto =
+`cores / (audio+vision loops)`) so fan-out is a real win — logged at startup as "concurrency budget".
+
+Because Whisper alone runs several× real-time, the system still **saturates below 30 cameras at stock
+settings** — the offered rate (30 cams × one 2 s segment / 2 s = 15 segments/s) far exceeds what a
+handful of CPU Whisper workers drain. Fan-out + the thread budget move the knee up by a real multiple
+(from "2 oversubscribed loops" to "≈cores genuinely-parallel right-sized loops"), but 30 cameras on
+one box needs a GPU/Metal Whisper build (§3). This is the number the benchmark measures.
 
 Industry reference points for *decode + light AI* (your pipeline is heavier, so expect lower density):
 
@@ -69,6 +78,9 @@ The right tier and box count come from the **measured per-camera cost** (§3), n
 ---
 
 ## 3. Measure it: the `hushai-loadtest` harness
+
+> **Full operational guide:** [`hushai-loadtest/README.md`](../hushai-loadtest/README.md) — prerequisites,
+> profiles, tuning knobs, output interpretation, troubleshooting, and cleanup. This section is the summary.
 
 `hushai-loadtest` (workspace crate) replays one clip as **N synthetic cameras** (identity-only,
 byte-identical fan-out — the fastest possible duplication, so the generator never perturbs the
@@ -96,7 +108,8 @@ cargo run -p hushai-loadtest -- --video IMG_7256.mp4 --max-cameras 30 --profile 
 
 # 3) attribute per-subsystem cost across profiles
 ./local_dev/run_loadtest.sh audio-only audio-sentiment audio-vision everything
-./local_dev/run_loadtest.sh conc1 conc2 conc4 conc6     # how saturation scales with WORKER_CONCURRENCY
+./local_dev/run_loadtest.sh conc1 conc2 conc4 conc6        # audio-lane: saturation vs WORKER_CONCURRENCY
+./local_dev/run_loadtest.sh visconc1 visconc2 visconc4     # vision-lane: saturation vs VISION_CONCURRENCY
 
 # 4) clean up synthetic devices when done
 cargo run -p hushai-loadtest -- --cleanup
@@ -117,9 +130,23 @@ In the **keeping-up (linear) regime**, the harness reports per-camera cost; proj
   (e.g. one 2 s segment taking 6 s of ASR ⇒ ~`30 × 6/2 = 90` parallel audio slots — clearly a job for a
   GPU-accelerated Whisper build, not 90 CPU cores). The `conc*` profiles measure how saturation N rises
   with `WORKER_CONCURRENCY` so you can find the knee.
+  with `WORKER_CONCURRENCY` (`visconc*` does the same for `VISION_CONCURRENCY`) so you can find the knee.
 - If the **vision** lane saturates first while CPU has headroom → the deployment needs GPU/ANE
   acceleration. If **audio** (CPU Whisper) saturates first → more cores or a GPU Whisper build.
 - If ffmpeg **decode** shows up as a dominant stage → offload it (NVDEC / VideoToolbox).
+
+**Don't let a shared resource cap the fan-out.** When you raise the concurrencies, size these to match
+or the dominant stage will silently shift off Whisper onto a queue you didn't tune:
+- **DB pool:** `DB_MAX_CONNECTIONS` (default 16) ≥ `WORKER_CONCURRENCY + VISION_CONCURRENCY + ~3`
+  (heartbeat/listener/delivery) + backend + rag headroom. Near core-many loops, ~32 (and match
+  Postgres `max_connections`). Undersizing blocks on acquire (a `db_acquire_timeout` tuning signal),
+  never corrupts.
+- **Ollama:** set `OLLAMA_NUM_PARALLEL` ≥ `max(WORKER_CONCURRENCY, 4)` so the now-parallel embed +
+  sentiment requests don't serialize server-side; under load split `EMBED_OLLAMA_BASE_URL` and
+  `LLM_OLLAMA_BASE_URL` onto separate instances. If the report's dominant stage flips from `transcribe`
+  to `embed`/`sentiment`, this is the gate that's binding.
+- **CPU thread budget:** leave `ASR_THREADS`/`ORT_INTRA_THREADS` at `0` (auto) unless profiling shows
+  loops sitting idle on I/O — then pin them. The startup "concurrency budget" log shows the derived values.
 
 ---
 
@@ -154,4 +181,23 @@ Continuous recording dominates disk sizing; analytics metadata is negligible by 
 - Video-analytics benchmarking methodology (throughput/latency/dropped-frame metrics): video-analytics
   inference-pipeline benchmarking literature.
 
-_Last updated 2026-06-29. Replace the per-tier density rows with your own `hushai-loadtest` numbers once measured._
+## 6. Measured baseline (fill in per machine)
+
+First run — **Apple M3 Pro (12 cores), default config** (`WORKER_CONCURRENCY=2`, `VISION_CONCURRENCY=2`,
+derived per-call thread budget = `cores/(audio+vision loops)` ≈ 3 threads each), full audio + face
+pipeline on **CPU Whisper**:
+
+| Metric | Value |
+|---|---|
+| Saturation (real-time) | **1 camera** (fails at 2; backlog runs away beyond) |
+| Bottleneck stage | `audio/transcribe` (~1.4–3.4 s per 2 s segment) |
+| Per-camera cost | ≈ **2 CPU cores** |
+| 30-camera projection | ≈ 60 cores ⇒ **needs GPU/Metal Whisper and/or tuned concurrency, not CPU** |
+
+The audio (CPU Whisper) lane saturates first, so the lever for 30 cameras is a **GPU/Metal-accelerated
+Whisper** build, then re-measuring the `WORKER_CONCURRENCY`/`VISION_CONCURRENCY` thread-budget tradeoff
+with the `conc*`/`visconc*` sweeps.
+
+---
+
+_Last updated 2026-06-29. Re-run `hushai-loadtest` per target machine and update §6 + the §2 tier rows._

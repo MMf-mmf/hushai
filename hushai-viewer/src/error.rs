@@ -35,7 +35,14 @@ impl IntoResponse for ViewerError {
         if let ViewerError::Internal(e) = &self {
             tracing::error!(error = %e, "viewer internal error");
         }
-        (status, Json(json!({ "error": self.to_string() }))).into_response()
+        // Don't leak the anyhow/sqlx chain (SQL text, table names, BLOB paths) to clients:
+        // 5xx bodies are static (the detail is logged above). 4xx variants are
+        // client-actionable, so their message is safe to surface.
+        let body = match &self {
+            ViewerError::Internal(_) => "internal error".to_string(),
+            other => other.to_string(),
+        };
+        (status, Json(json!({ "error": body }))).into_response()
     }
 }
 

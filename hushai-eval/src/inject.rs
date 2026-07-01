@@ -60,6 +60,9 @@ pub fn inject(
     if !media.is_file() {
         bail!("media file not found: {}", media.display());
     }
+    // feed_segments.py runs with cwd=local_dev and resolves --video relative to THAT, so pass an
+    // absolute path (the harness's cwd may differ from the script's).
+    let media = media.canonicalize().unwrap_or_else(|_| media.to_path_buf());
     let ids_path = ctx.scratch.join(format!("{label}-ids.json"));
     let work_dir = ctx.scratch.join(format!("{label}-segments"));
     let url = format!("{}/v1/segments", ctx.backend_url.trim_end_matches('/'));

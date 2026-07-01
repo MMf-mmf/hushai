@@ -233,7 +233,7 @@ pub async fn compute_digest(
         "SELECT MIN(start_unix_nanos) AS first_n, MAX(start_unix_nanos) AS last_n, \
                 COUNT(*)::bigint AS utterances, \
                 COUNT(DISTINCT segment_id)::bigint AS segments, \
-                COUNT(DISTINCT (start_unix_nanos / 86400000000000))::bigint AS active_days, \
+                COUNT(DISTINCT ((start_unix_nanos + $4) / 86400000000000))::bigint AS active_days, \
                 COALESCE(SUM(GREATEST(end_unix_nanos - start_unix_nanos, 0)), 0)::bigint AS speaking_nanos, \
                 COALESCE(AVG(char_length(text)), 0)::float8 AS avg_chars, \
                 COALESCE(AVG(GREATEST(end_unix_nanos - start_unix_nanos, 0)), 0)::float8 AS avg_dur, \
@@ -244,6 +244,9 @@ pub async fn compute_digest(
     .bind(&target)
     .bind(after)
     .bind(before)
+    // $4: tz offset (ns) so active_days buckets by LOCAL civil day, matching bucket() used by every
+    // other rollup — otherwise the decline gate (active_days < 3) disagrees near UTC midnight.
+    .bind(cfg.tz_offset_secs * 1_000_000_000)
     .fetch_one(&mut *tx)
     .await?;
 

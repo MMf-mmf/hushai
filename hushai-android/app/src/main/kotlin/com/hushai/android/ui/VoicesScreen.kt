@@ -399,17 +399,28 @@ private fun DuplicateGroupCard(
 private fun playSample(ctx: Context, client: SpeakersClient, id: String, scope: CoroutineScope) {
     scope.launch(Dispatchers.IO) {
         val file = client.downloadSample(id, ctx.cacheDir) ?: return@launch
+        var mp: MediaPlayer? = null
         try {
-            MediaPlayer().apply {
+            mp = MediaPlayer().apply {
                 setDataSource(file.path)
                 setOnCompletionListener {
                     it.release()
                     file.delete()
                 }
+                // prepareAsync() reports decode/codec/IO failures asynchronously via this
+                // callback, NOT the catch below — without it onCompletion never fires and both
+                // the native MediaPlayer (globally hard-capped) and the cached sample leak.
+                setOnErrorListener { player, _, _ ->
+                    player.release()
+                    file.delete()
+                    true
+                }
                 setOnPreparedListener { it.start() }
                 prepareAsync()
             }
         } catch (e: Exception) {
+            // Synchronous throw (e.g. setDataSource): release the player we may have built.
+            mp?.release()
             file.delete()
         }
     }

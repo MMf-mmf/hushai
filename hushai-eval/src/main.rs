@@ -2,7 +2,9 @@
 //! (0 pass/improved, 1 regression/floor-breach, 2 inconclusive/infra).
 
 use clap::{Parser, Subcommand};
+use hushai_eval::probe::ProbeOpts;
 use hushai_eval::RunOpts;
+use std::path::PathBuf;
 
 #[derive(Parser)]
 #[command(name = "hushai-eval", about = "Hushai end-to-end regression harness")]
@@ -33,6 +35,19 @@ enum Cmd {
         /// Emit the full SuiteResult as JSON instead of the human report.
         #[arg(long)]
         json: bool,
+    },
+    /// Run ONE clip through the live pipeline, print what it heard, and write a draft fixture
+    /// for human review (the labeling loop). Accepts any audio (wav/mp3/m4a/…) or a muxed mp4.
+    Probe {
+        /// Path to the audio (or muxed) clip.
+        #[arg(long)]
+        audio: PathBuf,
+        /// Case name (defaults to the file stem).
+        #[arg(long)]
+        case: Option<String>,
+        /// Also exercise + show the vision lane (needs vision weights + worker vision enabled).
+        #[arg(long)]
+        vision: bool,
     },
 }
 
@@ -66,6 +81,18 @@ async fn main() {
                 }
                 Err(e) => {
                     eprintln!("hushai-eval error: {e:#}");
+                    2
+                }
+            }
+        }
+        Cmd::Probe { audio, case, vision } => {
+            let case = case.unwrap_or_else(|| {
+                audio.file_stem().and_then(|s| s.to_str()).unwrap_or("probe").to_string()
+            });
+            match hushai_eval::probe::probe(ProbeOpts { audio, case, vision }).await {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("hushai-eval probe error: {e:#}");
                     2
                 }
             }

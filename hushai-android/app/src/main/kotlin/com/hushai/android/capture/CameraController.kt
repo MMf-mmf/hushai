@@ -35,16 +35,24 @@ class CameraController(
     private val encoderSurface: Surface,
 ) {
     private val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
-    private var device: CameraDevice? = null
-    private var session: CameraCaptureSession? = null
-    private var previewSurface: Surface? = null
+    // @Volatile: written on [handler] (open/(re)configure) but ALSO read+closed by stop() on the
+    // caller's (lifecycle) thread; without it stop() can read a stale device==null and skip
+    // device.close(), leaking the held CameraDevice.
+    @Volatile private var device: CameraDevice? = null
+    @Volatile private var session: CameraCaptureSession? = null
+    @Volatile private var previewSurface: Surface? = null
     // Bumped on every (re)configure. A session's async onConfigured only "wins" if
     // its generation is still current; a stale callback (e.g. the encoder-only
     // session whose config raced with an encoder+preview reconfigure) closes itself
     // and bows out. Without this the active session could end up without the preview
     // target (black preview) or hit "session has been closed" on setRepeatingRequest.
-    // All of these are touched only on [handler], so no synchronization is needed.
+    // Touched only on [handler] (unlike device/session, which stop() also touches).
     private var configGeneration = 0
+    // Set true by [stop]; gates the handler-side (re)configure paths so a teardown
+    // that races a queued setPreviewSurface/onOpened post can't drive a (re)configure
+    // onto a camera we've already closed. @Volatile because stop() flips it from the
+    // caller's thread while the posts read it on [handler].
+    @Volatile private var closed = false
     private val thread = HandlerThread("hushai-camera").apply { start() }
     private val handler = Handler(thread.looper)
 
@@ -52,6 +60,9 @@ class CameraController(
     fun start() {
         manager.openCamera(cameraId, object : CameraDevice.StateCallback() {
             override fun onOpened(camera: CameraDevice) {
+                // A stop() that landed while the open was in flight already tore us
+                // down — don't adopt (or leak) this now-orphaned camera.
+                if (closed) { runCatching { camera.close() }; return }
                 device = camera
                 createSession(camera)
             }
@@ -78,6 +89,7 @@ class CameraController(
      */
     fun setPreviewSurface(surface: Surface?) {
         handler.post {
+            if (closed) return@post
             if (previewSurface === surface) return@post
             previewSurface = surface
             device?.let { createSession(it) }
@@ -90,6 +102,8 @@ class CameraController(
         // untouched (owned by the encoder, not the session) so the stream resumes.
         runCatching { session?.close() }
         session = null
+        // Torn down (stop() ran) — never touch the now-closed camera.
+        if (closed) return
 
         // Capture the exact target set this session is built with, and reuse it
         // verbatim when building the request — never re-read previewSurface, which
@@ -100,35 +114,48 @@ class CameraController(
         }
         val generation = ++configGeneration
 
-        camera.createCaptureSession(
-            targets,
-            object : CameraCaptureSession.StateCallback() {
-                override fun onConfigured(configured: CameraCaptureSession) {
-                    if (generation != configGeneration) {
-                        // A newer reconfigure superseded this one — discard it.
-                        runCatching { configured.close() }
-                        return
+        // A teardown can still slip in between the `closed` check above and this
+        // call (stop() runs on the caller thread), closing the device mid-flight and
+        // making createCaptureSession throw "CameraDevice was already closed". Swallow
+        // it — a closed camera needs no session — so the camera thread never crashes
+        // the whole app (was: uncaught IllegalStateException → process death on Stop).
+        runCatching {
+            camera.createCaptureSession(
+                targets,
+                object : CameraCaptureSession.StateCallback() {
+                    override fun onConfigured(configured: CameraCaptureSession) {
+                        if (closed || generation != configGeneration) {
+                            // Torn down, or a newer reconfigure superseded this one — discard it.
+                            runCatching { configured.close() }
+                            return
+                        }
+                        session = configured
+                        // createCaptureRequest/setRepeatingRequest can also throw if the
+                        // camera closed after onConfigured — keep them inside runCatching.
+                        runCatching {
+                            val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
+                                targets.forEach { addTarget(it) }
+                                set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
+                            }
+                            configured.setRepeatingRequest(request.build(), null, handler)
+                        }.onFailure { HushaiLog.error("setRepeatingRequest failed", it) }
                     }
-                    session = configured
-                    val request = camera.createCaptureRequest(CameraDevice.TEMPLATE_RECORD).apply {
-                        targets.forEach { addTarget(it) }
-                        set(CaptureRequest.CONTROL_MODE, CaptureRequest.CONTROL_MODE_AUTO)
-                    }
-                    runCatching {
-                        configured.setRepeatingRequest(request.build(), null, handler)
-                    }.onFailure { HushaiLog.error("setRepeatingRequest failed", it) }
-                }
 
-                override fun onConfigureFailed(failed: CameraCaptureSession) {
-                    if (generation != configGeneration) return
-                    HushaiLog.error("camera session configure failed (targets=${targets.size})")
-                }
-            },
-            handler,
-        )
+                    override fun onConfigureFailed(failed: CameraCaptureSession) {
+                        if (generation != configGeneration) return
+                        HushaiLog.error("camera session configure failed (targets=${targets.size})")
+                    }
+                },
+                handler,
+            )
+        }.onFailure { HushaiLog.warn("createCaptureSession skipped (camera closing): ${it.message}") }
     }
 
     fun stop() {
+        // Flip the gate BEFORE closing so any handler-queued (re)configure that
+        // hasn't started yet sees `closed` and bails instead of configuring a
+        // camera we're about to close.
+        closed = true
         runCatching { session?.close() }
         runCatching { device?.close() }
         session = null
@@ -137,7 +164,15 @@ class CameraController(
         thread.quitSafely()
     }
 
-    data class Selection(val cameraId: String, val size: Size)
+    data class Selection(
+        val cameraId: String,
+        val size: Size,
+        // Clockwise mount angle of the sensor vs the device's natural orientation, and whether the
+        // camera is front-facing — the two inputs (with the device's physical orientation) that
+        // OrientationTracker needs to make the recording upright.
+        val sensorOrientation: Int,
+        val facingFront: Boolean,
+    )
 
     companion object {
         private val TARGET = Size(1280, 720)
@@ -157,10 +192,13 @@ class CameraController(
                     .get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_BACK
             } ?: ids.first()
 
-            val map = manager.getCameraCharacteristics(back)
-                .get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val chars = manager.getCameraCharacteristics(back)
+            val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             val size = chooseSize(map) ?: TARGET
-            return Selection(back, size)
+            val sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 0
+            val facingFront =
+                chars.get(CameraCharacteristics.LENS_FACING) == CameraCharacteristics.LENS_FACING_FRONT
+            return Selection(back, size, sensorOrientation, facingFront)
         }
 
         private fun chooseSize(map: StreamConfigurationMap?): Size? {

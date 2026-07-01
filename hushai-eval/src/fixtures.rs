@@ -51,6 +51,26 @@ pub struct Meta {
 }
 
 impl Meta {
+    /// Build an in-memory Meta for the `probe` flow (no meta.json on disk yet).
+    pub fn synthetic(device_id: &str, case_id: &str, media_kind: &str, base_ns: i64, modalities: Vec<String>) -> Self {
+        Meta {
+            case_id: case_id.into(),
+            description: "probe".into(),
+            device_id: device_id.into(),
+            media_file: "media.mp4".into(),
+            media_kind: media_kind.into(),
+            seg_seconds: 2,
+            limit: None,
+            base_capture_unix_nanos: base_ns,
+            segment_id_seed: Some(case_id.into()),
+            modalities,
+            tier: "full".into(),
+            config: serde_json::Map::new(),
+            enroll: vec![],
+            poll: PollSpec::default(),
+        }
+    }
+
     pub fn seed(&self) -> String {
         self.segment_id_seed.clone().unwrap_or_else(|| self.case_id.clone())
     }

@@ -25,19 +25,39 @@ pub fn init_ort(dylib_path: &str) {
     });
 }
 
-/// Load an ONNX model into a `Session`. Registers CoreML (best-effort, Apple Silicon) ahead of
-/// CPU when `coreml` is set; ort silently falls back to CPU for nodes CoreML can't take.
+/// Load an ONNX model into a `Session` with ORT's default threading (all physical cores intra-op).
+/// Registers CoreML (best-effort, Apple Silicon) ahead of CPU when `coreml` is set; ort silently
+/// falls back to CPU for nodes CoreML can't take. Used by tests and simple callers; the worker uses
+/// [`load_session_with_threads`] to apply its CPU thread budget.
 pub fn load_session(model_path: &str, coreml: bool) -> Result<Session> {
+    load_session_with_threads(model_path, coreml, 0)
+}
+
+/// Like [`load_session`] but caps ORT intra-op threads to `intra_threads` (`0` = ORT default, i.e.
+/// all cores). The worker passes a per-session budget (`WorkerConfig::ort_intra_op_threads`) so N
+/// parallel vision loops don't each spin up an all-core thread pool and oversubscribe the CPU.
+/// CoreML-offloaded nodes are unaffected by this cap (it governs only CPU-fallback ops).
+pub fn load_session_with_threads(
+    model_path: &str,
+    coreml: bool,
+    intra_threads: usize,
+) -> Result<Session> {
     let mut eps = Vec::new();
     if coreml {
         eps.push(CoreMLExecutionProvider::default().build());
     }
     eps.push(CPUExecutionProvider::default().build());
 
-    Session::builder()
+    let mut builder = Session::builder()
         .context("ort session builder")?
         .with_execution_providers(eps)
-        .context("registering execution providers")?
+        .context("registering execution providers")?;
+    if intra_threads > 0 {
+        builder = builder
+            .with_intra_threads(intra_threads)
+            .context("setting ORT intra-op thread count")?;
+    }
+    builder
         .commit_from_file(model_path)
         .with_context(|| format!("loading ONNX model {model_path}"))
 }

@@ -120,6 +120,49 @@ feeds the backend. Dev token: `dev-secret-token`. `OLLAMA_BASE_URL` is the share
 every Ollama call; set `EMBED_OLLAMA_BASE_URL` (worker + rag query embedding) and/or
 `LLM_OLLAMA_BASE_URL` (rag answer generation) to route them at separate instances under load.
 
+## Worker parallelism & scaling (read before touching `lib.rs` spawn / `asr.rs` / `vision/model.rs`)
+
+> **Full technical reference:** `docs/worker-parallelism-and-scaling.md` — the verified thread-safety
+> facts, the CPU thread-budget math, the config-knob table, how to tune/verify with the loadtest, and
+> the deferred stage-pipeline + path to 30 cameras. The summary below is the orientation; that doc is
+> the detail.
+
+The worker drains TWO independent SKIP-LOCKED queues in parallel; both fan out:
+- **Audio:** `WORKER_CONCURRENCY` (default 2) `worker_loop`s. Whisper is genuinely parallel —
+  `Transcriber` shares one `Arc<WhisperContext>` (`Send+Sync`) and calls `create_state()` per call
+  on `spawn_blocking`; there is **no** ASR mutex. The TitaNet speaker embedder *is* `Arc<Mutex<…>>`
+  (sherpa needs `&mut self`) but it's light and per-segment.
+- **Vision:** `VISION_CONCURRENCY` (default 2) `vision_worker_loop`s sharing ONE `Arc`-cloned
+  `VisionModels` — `ort::Session` is `Send+Sync` and `Run` is thread-safe, so no model duplication
+  and no added mutex. Each *segment* is processed start-to-finish on one loop, so intra-segment frame
+  ordering (plate clustering) is preserved; fan-out is across segments.
+- **CPU thread budget (the load-bearing tuning fact):** every whisper / ORT call would otherwise
+  request ALL cores, so N parallel loops oversubscribe the box and net far less than N×. `run()`
+  derives `asr_n_threads()` / `ort_intra_op_threads()` = `clamp(cores / (audio+vision loops), 1, cores)`
+  and threads them into `Transcriber::new` and `model::load_session_with_threads` (CoreML nodes are
+  unaffected). Override with `ASR_THREADS` / `ORT_INTRA_THREADS` (`0` = auto); the chosen budget is
+  logged once at startup ("concurrency budget"). `load_session` (no threads) is kept for tests.
+- **Invariants:** the speaker + face match/mint `pg_advisory_xact_lock`s stay GLOBAL (cross-device
+  identity) — never shard per device. The "worker 0 only" speaker auto-merge lives solely in the
+  audio `worker_loop`; vision loops are identity-less. `claim_one*` SKIP LOCKED makes this safe across
+  loops AND across worker **processes/hosts** — running a 2nd worker against the same DB scales out
+  for free.
+- **Downstream gates when you raise concurrency:** lift `DB_MAX_CONNECTIONS` (default 16; the worker
+  needs ≈ audio+vision+3 plus backend/rag headroom) and set Ollama `OLLAMA_NUM_PARALLEL` ≥
+  `max(WORKER_CONCURRENCY,4)` (and/or split `EMBED_OLLAMA_BASE_URL`/`LLM_OLLAMA_BASE_URL`) or
+  embeddings/sentiment become the next serial choke. **CPU Whisper remains the ceiling** — ~30 cameras
+  needs a GPU/Metal whisper build and/or a 2nd worker host (see `docs/hardware-sizing-30-cameras.md`).
+  Find the knee with `./local_dev/run_loadtest.sh conc1 conc2 conc4 conc6` (audio) /
+  `visconc1 visconc2 visconc4` (vision).
+
+## Worker efficiency: skip-silent / skip-static / load governor (read before touching `process.rs` / `vision/write.rs` / `lib.rs` loops)
+
+Three measures cut wasted compute and keep the device from ever being driven into overload. All default ON with conservative, **uncalibrated** thresholds + a kill switch each (`hushai-worker/.env.example`); the durable queue still guarantees nothing is ever dropped.
+
+- **Skip-silent (audio)** — `process::process_segment`, right after `extract_pcm`, before `transcribe`. Two stages, cheapest first: a free `vad::rms` floor (`AUDIO_SILENCE_RMS_FLOOR`) short-circuits dead air, else the already-loaded Silero VAD's `speech_secs` vs `AUDIO_SILENCE_MIN_SPEECH_SECS` makes the call. A silent segment is written via the normal `write_transcript(empty, speaker=None)` — so it gets the reject **tombstone** that stops `reconcile_missing_speaker_segments` re-queueing it — then `Ok(0)`. **Fails OPEN** (VAD error ⇒ normal ASR). Pure decision is `vad::silence_verdict` (unit-tested, no model). Counter: `hushai_audio_segments_skipped_silent_total{reason=rms|vad}`. Does NOT affect speaker windowing (neighbors are read by sequence, blobs/status intact).
+- **Skip-static (vision)** — `vision::write::process_vision_segment`, after `sample_frames`/`frames.is_empty()`, before the model loop. Cross-segment motion via `vision/motion.rs`: a 32×32 mean-subtracted-MSE grayscale fingerprint per camera (`VISION_MOTION_FP_SIDE`), cached **in-memory** on `VisionModels.motion_cache` (`Arc<Mutex<HashMap<device_id, Fingerprint>>>`, one map/process, lossy-on-restart by design). `distance <= VISION_MOTION_THRESHOLD` ⇒ skip ALL face/object/plate inference, write **nothing**, `Ok(0)`; cache is updated on both branches (drift re-baselines, PTZ self-corrects). Skip writes nothing on purpose — presence continuity comes from the 30s event sessionization, NOT carry-forward (which would fabricate detections + pollute the k-NN match substrate). Counter: `hushai_worker_segments_skipped_static_total{lane=vision}`. **Set `VISION_MOTION_SKIP_ENABLED=false` for any full reprocess/calibration run** (the per-camera baseline is meaningless replaying old segments out of order).
+- **Load governor** — new `governor.rs` (`Governor` = `AtomicU8` level + accessors; `spawn_load_monitor` task). Samples the audio backlog-lag TREND (OLS slope of oldest-pending age) + optionally the OS 1-min load average (`libc::getloadavg`, `cfg(unix)`, normalized by cores) and publishes Normal/Elevated/Saturated with hysteresis (`LOAD_*` knobs). The worker loops read it each iteration: at **Saturated** the EXPENSIVE vision lane pauses entirely (skip claim, idle) so audio keeps up and the box recovers; at **Elevated** an inter-segment cooldown paces the still-running lane. Strict-oldest-first ordering is UNCHANGED — the governor only paces, never reorders or drops; deferred work drains organically when load clears. Metrics: gauge `hushai_worker_load_level`, counter `hushai_worker_throttle_total{lane,reason}`. Migration `0020_queue_claim_indexes.sql` adds the missing `segments(capture_start_unix_nanos)` + partial claimable indexes so the always-on oldest-first claim stays cheap at scale (perf only, no behavior change).
+
 ## Build/run gotchas (non-obvious)
 
 - **Android toolchain** is installed no-sudo in non-standard spots: `JAVA_HOME=/opt/homebrew/opt/openjdk@17`,
@@ -349,7 +392,8 @@ persons minted, all observations attributed; worker unit tests green; ort/sherpa
   `ensure_vision_status_rows` / `mark_vision_{done,error}` (`claim.rs`), so a vision failure and an
   ASR failure retry independently. Backend ingest (`db.rs`) queues vision status for VIDEO/MUXED
   (runtime query, no `.sqlx`); `lib.rs` builds the models resiliently (missing model/dylib →
-  vision self-disables, audio continues) and runs a `vision_worker_loop`.
+  vision self-disables, audio continues) and runs **`VISION_CONCURRENCY` (default 2) `vision_worker_loop`s**
+  (see "Worker parallelism" below) over the SKIP-LOCKED vision queue.
 - **ORT runtime — the load-bearing gotcha (`AGENTS.md` "vision ONNX runtime"):** `ort`
   `=2.0.0-rc.9` with `default-features=false, features=["load-dynamic","ndarray","coreml"]`.
   sherpa-rs statically bundles ONNX Runtime **1.17.1**; `ort-sys` rc.9 targets **1.20.0**, so `ort`
@@ -371,7 +415,10 @@ persons minted, all observations attributed; worker unit tests green; ort/sherpa
   **optional + non-fatal**: it activates only when both `OBJECT_DET_MODEL_PATH` (RF-DETR) and
   `CLIP_IMAGE_MODEL_PATH` (CLIP) load; else it self-disables (or hard-fails the vision subsystem when
   `OBJECT_REQUIRED=true`) and faces still run. Tuning knobs: `OBJECT_MIN_DET_SCORE`,
-  `OBJECT_DET_INPUT_SIZE` (384), `OBJECT_MAX_PER_FRAME` (20), `OBJECT_MIN_BOX_PX` (16).
+  `OBJECT_DET_INPUT_SIZE` (384), `OBJECT_MAX_PER_FRAME` (20), `OBJECT_MIN_BOX_PX` (16),
+  `OBJECT_NMS_IOU` (0.5 — **class-aware** NMS added 2026-06-30; RF-DETR's 300-query head emits duplicate
+  boxes per object, so the lane now ends with `geom::nms_by` per label like the face/plate lanes).
+  `FRAMES_PER_SEGMENT` default raised **2→3** (recall; the motion-gate still skips static segments).
   - **Provision + VALIDATE the decode (operator step — models are gitignored):** run
     `local_dev/export_rf_detr.py` (→ `models/rf-detr-nano.onnx` + `rf-detr-classes.json`),
     `local_dev/export_clip.py` (→ image+text towers from ONE OpenCLIP ViT-B/32 checkpoint),
@@ -383,10 +430,15 @@ persons minted, all observations attributed; worker unit tests green; ort/sherpa
     COCO labels, in-frame boxes, unit-norm embeds) → the decisive cross-modal gate
     `CLIP_TEST_IMAGE=car.jpg cargo test -p hushai-rag --test clip_text clip_text_matches_image_cross_modal`
     (`cos(car_img,'a car') > cos(car_img,'a dog')` — proves both towers share one space + the tokenizer).
-    ⚠️ The `objects.rs` decode is defensive (boxes by output order, cxcywh, sigmoid logits, **COCO-80**
-    labels). RF-DETR may use a **90/91-slot** COCO layout — if `detect_objects_from_real_video` shows
-    `class_<i>` labels or off-frame boxes, fix `coco_label()`/the class offset against
-    `models/rf-detr-classes.json` before trusting labels. Per-frame detect/embed failures are logged + skipped.
+    ✅ **Class decode FIXED + verified (2026-06-30).** The real export is `dets[1,300,4]` + `labels[1,300,91]`
+    (C=**91**): the class-logit COLUMN INDEX *is* the COCO category id (col 1=person, 2=bicycle, 37=sports
+    ball, 82=refrigerator; col 0 + the historical gaps are background). The old decode mapped that column
+    through a **dense COCO-80** table, so every detection was mislabeled (a person → "bicycle", verified both
+    via direct injection *and* live phone-at-screen capture). `objects.rs` now maps via the canonical
+    **COCO-91** layout (`coco91_class_names()`), skips background/gap columns (never emits `class_<i>`), and
+    loads the authoritative `models/rf-detr-classes.json` when present (`OBJECT_CLASSES_PATH`,
+    `with_class_names`). Guarded by `coco91_column_map_is_correct` (unit) + the inject/probe loop. Boxes are
+    cxcywh, normalized→letterbox-rescaled to original-frame px. Per-frame detect/embed failures logged + skipped.
   - **RAG query side (`hushai-rag`):** a CLIP **text** tower (`clip_text.rs`, same load-dynamic ORT
     coexistence as the worker) embeds the query phrase; `retrieve::nearest_objects` NN-searches
     `scene_objects`' OWN HNSW (the OpenCLIP space — **never** `person_segments`/ArcFace), and
@@ -467,6 +519,10 @@ shared core in `hushai-worker/src/vision/`:
   **SCRFD** (`detect_scrfd.rs`, `scrfd_10g_bnkps.onnx`) is the **default** (`FACE_DETECTOR_KIND=scrfd`,
   best small/distant recall, same 5-pt landmark contract); **YuNet** stays as the fallback —
   `build_face_detector` loads the configured one and falls back to whichever IS provisioned.
+  **Provisioned + verified (2026-06-30):** `fetch_scrfd.sh` pulled `det_10g.onnx` → `scrfd_10g_bnkps.onnx`;
+  the worker now logs `face detector: SCRFD`. This FIXED the live phone-at-screen small-face miss — a
+  screen-displayed face that YuNet captured as **0** detections SCRFD reads as **3** (live loopback PASS),
+  while still detecting the easy large face on direct injection.
 - **Face cleanup cascade** (`write.rs::enhance_and_embed`): already-clean (Mint) faces embed the raw
   aligned crop (legacy ArcFace space preserved); a not-clean-but-recoverable face is margin-cropped →
   super-resolved (if tiny) → **blind-face-restored** → aligned on the restored pixels → re-assessed →
@@ -490,6 +546,16 @@ shared core in `hushai-worker/src/vision/`:
   Migration **`0013_license_plates.sql`**: `license_plates` catalog (pg_trgm + fuzzystrmatch, unique
   `plate_text_norm`) + monthly-partitioned `plate_detections`. `ensure_plate_detection_partitions` is
   called at worker startup.
+  - **Provisioning state (2026-06-30):** OCR is **provisioned + decode-validated**. `export_plate_ocr.py`
+    (adapted to fast-plate-ocr ≥2.x: `LicensePlateRecognizer` + `inference.hub.download_model`) writes
+    `models/lp_ocr_cct.onnx` (NHWC `[1,64,128,3]` → `[1,9,37]`) + `lp_ocr_charset.json` (36 chars, pad `_`
+    omitted so class 36 = the blank/pad). The fast-plate-ocr CCT head is **fixed-length** (9 slots), NOT
+    CTC — `ocr.rs` now has a `PLATE_OCR_CTC` knob (**default false**) that disables duplicate-collapse so
+    real double letters ("BB1234") survive; CRNN/PaddleOCR sets it true. Decode is `greedy_decode` (pure +
+    unit-tested). **Remaining blocker: the plate DETECTOR.** It needs an operator-authorized model
+    (`PLATE_DETECTOR_ONNX_URL` → `fetch_plate_detector.sh`, or a `yolo export`'d YOLOv8/11 LP `.pt`);
+    auto-loading a 3rd-party `.pt` is blocked (pickle RCE) and is a licensing call. Validate any detector
+    with `cargo test -p hushai-worker --test vision_pipeline inspect_plate_model_io_shapes` (now exists).
 - **Surfaces:** backend `plates.rs` (`GET /v1/plates`, `/v1/plates/search?q=`, `PATCH`, `merge`,
   `sample-crop`); RAG **Plates agent** (`AgentKind::Plates`, `resolve_plate*` + `list_by_plate`) answers
   *"when did I see plate ABC123"*; viewer **🚗 Plates** modal (`ui/js/settings/plates.js` + proxy
@@ -728,6 +794,38 @@ axum router. Each binary has its own process-global registry (Prometheus scrapes
   allowlist (`android_app|web_browser|rtsp|other`). Apply the same rule to any new label.
 - The worker's raw HTTP parser reads until the request line's CRLF (bounded) — don't assume one read.
 
+## Logging — centralized, production-grade (B2-ish; built + verified)
+
+All four binaries init tracing through **one** shared module, **`hushai-backend/src/logging.rs`**
+(worker/rag/viewer reach it via the path dep). Each crate's `init_tracing()` is a one-liner that
+calls `logging::init("<service>", "<default RUST_LOG filter>")`. Do NOT re-introduce per-crate
+`tracing_subscriber::fmt()` — extend the shared module instead.
+
+- **Env knobs (read by `logging::init`, documented in `hushai-backend/.env.example`):**
+  - `RUST_LOG` — unchanged `EnvFilter` semantics; per-crate default preserved as the fallback.
+  - `LOG_FORMAT` — `text` (default, human) or `json` (one object/line for Loki/ELK/CloudWatch).
+  - `LOG_DIR` — when set, ALSO writes a **daily-rotated** `<LOG_DIR>/<service>.log` via
+    `tracing-appender` non-blocking (stdout kept too). The `WorkerGuard` is parked in a module
+    `OnceLock` so the background writer lives for the whole process. New backend deps: the
+    `tracing-subscriber` `json` feature + `tracing-appender`.
+- **HTTP request correlation:** backend/rag/viewer wrap their `TraceLayer` with
+  `logging::make_http_span` + `logging::on_http_response` — one INFO access line per request with a
+  generated `request_id` that every handler log inside the request inherits. (The old bare
+  `TraceLayer::new_for_http()` logged nothing at the `info` default.)
+- **Worker pipeline:** `process_segment` (audio) and `process_vision_segment` (vision) are
+  `#[tracing::instrument(skip_all, fields(segment_id, lane))]`, and each fallible stage is
+  `.context("<stage>")`-tagged so the top-level "segment failed" error names the failing stage.
+- **Panic capture:** `logging::init` installs a panic hook routing panics through `tracing::error!`
+  (message + location + backtrace). Set `RUST_BACKTRACE=1` for a populated backtrace.
+
+## Dashboard error detail
+
+`/api/dashboard` (`hushai-viewer/src/dashboard.rs`) returns, per queue, a `recent_errors[]`
+(`{segment_id,last_error,attempts,age_secs}`, newest-first, capped at `RECENT_ERRORS_LIMIT`) in
+addition to the `error` count — so `dashboard.html` shows *what* failed (freshest message in the
+"Queue backlog" KPI subtitle + an expandable list under each queue card), not just a count. The
+detail query only runs when `error > 0`. (The deeper per-segment view stays in `processing.rs`.)
+
 ## Audit log (2026-06-29, B6; built + verified + reviewed)
 
 Append-only **`audit_log`** (migrations `0017` + `0018`): who/what/when/where(ip)/outcome for admin
@@ -799,7 +897,9 @@ Events UI + outbound webhook + Android push.**
 queries results, scores them against ground truth, and emits an **improvement/regression/unchanged**
 verdict + exit code (0 pass · 1 regression/floor-breach · 2 inconclusive). It's the deterministic
 file-injection tier (the regression backbone + agent inner-loop); a physical camera-at-screen
-"realism" tier is planned to reuse the same fixtures + scorers. Full docs: `hushai-eval/README.md`.
+"realism" tier is planned to reuse the same fixtures + scorers.
+**Agent playbook (read this to USE the loop): `hushai-eval/RECURSIVE_TESTING.md`** — bring-up, the
+validate-a-change inner loop, the labeling flow, trust invariants, and gotchas. Quick reference: `hushai-eval/README.md`.
 
 - **Run:** `cargo run -p hushai-eval -- run --tier {fast|full} [--fixtures train|holdout|all]
   [--update-baseline] [--json]`. Requires the stack pointed at the **`hushai_test`** DB with the
@@ -808,18 +908,40 @@ file-injection tier (the regression backbone + agent inner-loop); a physical cam
 - **Injection** is the existing `local_dev/feed_segments.py`, extended with `--capture-start-ns`
   (fixed timestamps) and `--segment-id-seed` (deterministic ids, no sidecar) + `--emit-ids`.
 - **Fixtures:** `hushai-eval/fixtures/{train,holdout}/<case>/{media.*,meta.json,expected.json}`.
-  Media is gitignored; regenerate with `./local_dev/build_fixtures.sh` (macOS `say` TTS + ffmpeg →
-  construction-known ground truth). Ground truth + `baselines/<config-hash>/` ARE committed.
+  Media is gitignored, regenerated by `./local_dev/build_fixtures.sh` (synthetic `say` TTS) +
+  `./local_dev/fetch_eval_clips.sh` (real public-domain JFK/FDR/Armstrong clips). Ground truth +
+  `baselines/<config-hash>/` ARE committed. `cargo run -p hushai-eval -- probe --audio <clip>` runs
+  one clip through the live pipeline and writes a draft fixture pre-filled from the output, for
+  human correction (the human-verified-ground-truth labeling loop).
 - **Trust invariants** (don't weaken): isolated/reset DB, determinism-locked worker, fixture-pinned
   timestamps, a `config_hash` over models+knobs that keys baselines, quiescent completion detection,
   assignment-invariant scoring, and a sealed `holdout/` split with counter-fixtures.
-- **⚠ Speaker-lane finding the harness surfaced:** the speaker lane currently mints **0 speakers** on
-  every available clip (TTS *and* real `IMG_7256.mp4`): ~0.31s post-VAD speech, all `marginal`, while
-  Whisper transcribes the same audio fine. This is consistent with the uncalibrated `VAD_*`/mint-gate
-  fast-follow below (gates tuned for noisy captures under-trigger on clean audio). Diarization scoring
-  is staged OFF `two_speakers.modalities` until investigated — **do not loosen mint gates to mask it.**
-- **Pending:** object/ALPR fixtures need the RF-DETR/CLIP/plate weights provisioned (`OBJECT_REQUIRED`/
-  `PLATE_REQUIRED` then flip to `true` in `eval.env`); face fixtures need source stills.
+- **✅ Speaker-lane bug — found AND fixed via this harness (first recursive-testing win, 2026-06-29).**
+  The harness surfaced 0 speakers minted on every clip (constant ~0.31s post-VAD speech). Root cause:
+  `speaker.rs::detect()` fed the whole buffer to sherpa Silero VAD in one `accept_waveform` call,
+  which emits a single ~0.31s segment regardless of input. Fix: feed 512-sample windows + drain in a
+  loop (`vad_probe_real_speech` diagnostic: 0.31s→4.41s on a 14s clip). JFK now mints 1 voice;
+  `jfk_moon`/`silence_no_speech` gate it. Remaining: `two_speakers` still MERGES 2 voices→1 (short
+  TTS turns + speaker-window crossing the boundary) — diarization staged off its modalities; the
+  `distinct_count:2` target is documented in its `expected.json`. Don't loosen thresholds to mask it.
+- **Vision provisioning (2026-06-30):** `./local_dev/provision_vision.sh` (isolated venv) exports
+  RF-DETR + CLIP → worker **object lane + face lane both enabled**. Fixed `export_rf_detr.py` (drop the
+  rejected `simplify=` kwarg) + `export_clip.py` (`torch.backends.mha.set_fastpath_enabled(False)` so the
+  `aten::_native_multi_head_attention` op exports). **Plates still deferred:** OCR pkg API moved + no
+  default detector URL — set `PLATE_DETECTOR_ONNX_URL` to enable ALPR.
+- **Physical camera-at-screen tier (Tier 2, 2026-06-30):** `local_dev/physical_loopback.py` — plays a
+  clip/image FULLSCREEN (ffplay) while the USB Galaxy phone (app `com.hushai.android`, drive via the
+  `run_hushai_app.sh` adb pattern; `--ez audio_only false` forces video) captures it through the LIVE
+  pipeline, then scores TOLERANTLY (`--expect-objects/--expect-text/--expect-face`, presence/recall →
+  PASS/DEGRADED/FAIL). Proven live: ASR (mic), objects (`refrigerator`), faces (portrait→1 face), events.
+- **Speaker-on-physical-audio (2026-06-30, investigated; do NOT blind-tune):** real room audio mints 0
+  speakers because segments are `AttachOnly` — instrumentation (`process.rs:294` logs
+  speech_secs/voiced_frac/snr_db/quality for every segment) shows BOTH gates fail: voiced_frac ~0.37–0.40
+  (<0.5, deflated by the speaker-window aggregating non-speech neighbors) AND snr_db ~2.0–2.7 (<3.0).
+  An adversarial workflow verified that lowering these would make a TV/laptop playing dialogue mint a
+  SPURIOUS speaker (screen audio isn't separable from a real proximate person by these metrics). Safe
+  calibration needs a LABELED real-capture set (person vs TV vs music vs HVAC) and/or computing
+  voiced_frac on the current segment not the window. Silence stays safe (rejected pre-SNR on speech<0.3s).
 
 ## Fast-follows (not yet done)
 

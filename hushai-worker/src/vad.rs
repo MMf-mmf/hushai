@@ -82,6 +82,49 @@ pub fn rms(samples: &[f32]) -> f32 {
     (sum_sq / samples.len() as f64).sqrt() as f32
 }
 
+/// Why the pre-ASR skip-silent gate classified a segment as having no transcribable speech.
+/// Carried as a metric label so an operator can see how much skipping is the free RMS
+/// short-circuit vs the VAD-confirmed case (and retune the RMS floor accordingly).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SilenceReason {
+    /// RMS amplitude at/under the floor — dead air; classified WITHOUT running the VAD model.
+    Rms,
+    /// The VAD ran and found less than the minimum speech duration (energy but no speech).
+    Vad,
+}
+
+impl SilenceReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SilenceReason::Rms => "rms",
+            SilenceReason::Vad => "vad",
+        }
+    }
+}
+
+/// Pure decision for the pre-ASR skip-silent gate (so it unit-tests with no model, like
+/// [`assess_quality`]). Two stages, cheapest first:
+///   1. An RMS at/under `floor` is dead air → `Some(Rms)` (caller skips the VAD entirely).
+///   2. Otherwise, once the VAD has run, a `speech_secs` under `min_speech_secs` → `Some(Vad)`.
+///
+/// `speech_secs` is `None` before the VAD has run: pass `None` to evaluate only the cheap RMS
+/// stage (returns `None` meaning "energy present — run the VAD next"), then call again with
+/// `Some(secs)`. Returns `None` when the segment should be transcribed normally.
+pub fn silence_verdict(
+    rms_level: f32,
+    speech_secs: Option<f64>,
+    floor: f32,
+    min_speech_secs: f64,
+) -> Option<SilenceReason> {
+    if rms_level <= floor {
+        return Some(SilenceReason::Rms);
+    }
+    match speech_secs {
+        Some(s) if s < min_speech_secs => Some(SilenceReason::Vad),
+        _ => None,
+    }
+}
+
 /// The output of one VAD pass over a segment's PCM: the speech-only audio to embed plus
 /// the signals [`assess_quality`] turns into a [`SpeakerQuality`]. All sample indices are
 /// into the ORIGINAL 16 kHz buffer that was fed to the detector.
@@ -267,5 +310,26 @@ mod tests {
     fn rms_basic() {
         assert_eq!(rms(&[]), 0.0);
         assert!((rms(&[0.5, -0.5, 0.5, -0.5]) - 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn silence_verdict_rms_floor_short_circuits_without_vad() {
+        // At/under the floor => dead air, decided on RMS alone (speech_secs is irrelevant).
+        assert_eq!(silence_verdict(0.001, None, 0.005, 0.2), Some(SilenceReason::Rms));
+        assert_eq!(silence_verdict(0.005, None, 0.005, 0.2), Some(SilenceReason::Rms));
+        // Even with speech_secs known, the RMS floor wins (it's the cheapest, hardest signal).
+        assert_eq!(silence_verdict(0.001, Some(5.0), 0.005, 0.2), Some(SilenceReason::Rms));
+    }
+
+    #[test]
+    fn silence_verdict_above_floor_defers_to_vad() {
+        // Energy present but VAD not yet run => proceed to the VAD stage.
+        assert_eq!(silence_verdict(0.1, None, 0.005, 0.2), None);
+        // VAD found too little speech => skip with reason Vad.
+        assert_eq!(silence_verdict(0.1, Some(0.05), 0.005, 0.2), Some(SilenceReason::Vad));
+        // VAD found enough speech => transcribe normally.
+        assert_eq!(silence_verdict(0.1, Some(0.5), 0.005, 0.2), None);
+        // Boundary: exactly the threshold is NOT below it => transcribe.
+        assert_eq!(silence_verdict(0.1, Some(0.2), 0.005, 0.2), None);
     }
 }

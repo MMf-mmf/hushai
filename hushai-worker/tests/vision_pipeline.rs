@@ -281,6 +281,57 @@ fn inspect_object_model_io_shapes() {
     }
 }
 
+/// Inspect the PLATE detector + OCR ONNX I/O (sibling of inspect_object_model_io_shapes). Run FIRST
+/// after provisioning so the operator can confirm the defensive decode contracts in
+/// plates/detect.rs + plates/ocr.rs against the REAL export:
+///   * detector: largest output squeezes to 2-D [C,N]/[N,C] with C>=5 (4 box + 1 conf), and >=13 for
+///     a 4-corner pose model (5 + 4*(x,y) [+vis]).
+///   * OCR: 4-D input with a channel axis of 1 (gray) or 3 (RGB); output squeezes to 2-D [T,C]/[C,T]
+///     where the class axis == charset len (±1 for a CTC blank).
+///   cargo test -p hushai-worker --test vision_pipeline inspect_plate_model_io_shapes -- --nocapture
+#[test]
+fn inspect_plate_model_io_shapes() {
+    let dy = dylib();
+    if !dy.exists() {
+        eprintln!("SKIP: dylib missing");
+        return;
+    }
+    model::init_ort(dy.to_str().unwrap());
+    for (name, rel) in [
+        ("plate-detector", "models/lp_detector.onnx"),
+        ("plate-ocr", "models/lp_ocr_cct.onnx"),
+    ] {
+        let p = repo_root().join(rel);
+        if !p.exists() {
+            eprintln!(
+                "SKIP {name}: {} missing (set PLATE_DETECTOR_ONNX_URL + run local_dev/provision_vision.sh / export_plate_ocr.py)",
+                p.display()
+            );
+            continue;
+        }
+        let s = model::load_session(p.to_str().unwrap(), false).expect("load");
+        eprintln!("== {name} ({rel}) ==");
+        for i in &s.inputs {
+            eprintln!("  IN  {} : {:?}", i.name, i.input_type.tensor_dimensions());
+        }
+        for o in &s.outputs {
+            eprintln!("  OUT {} : {:?}", o.name, o.output_type.tensor_dimensions());
+        }
+    }
+    // Also surface the provisioned charset length so [T,C] vs [C,T] is unambiguous at provisioning.
+    let cs = repo_root().join("models/lp_ocr_charset.json");
+    if cs.exists() {
+        if let Ok(raw) = std::fs::read_to_string(&cs) {
+            let n = serde_json::from_str::<serde_json::Value>(&raw)
+                .ok()
+                .and_then(|v| v.as_array().map(|a| a.len()).or_else(|| v.as_object().map(|o| o.len())));
+            eprintln!("== charset (models/lp_ocr_charset.json): {n:?} entries ==");
+        }
+    } else {
+        eprintln!("SKIP charset: models/lp_ocr_charset.json missing");
+    }
+}
+
 /// Decode validation for the object lane: run RF-DETR + the CLIP image tower over a clip that
 /// RELIABLY contains a COCO object (synthesize one with `local_dev/make_object_clip.sh`). Asserts at
 /// least one detection with a REAL COCO label (not `class_<i>` — which would mean the class indexing

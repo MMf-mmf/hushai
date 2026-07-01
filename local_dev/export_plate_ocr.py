@@ -61,41 +61,44 @@ def main() -> int:
         return 0
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
+    # fast-plate-ocr >=2.x moved the API: ONNXPlateRecognizer -> LicensePlateRecognizer, and the ONNX +
+    # a YAML config (carrying the alphabet + pad char) are fetched via inference.hub.download_model.
     try:
-        from fast_plate_ocr import ONNXPlateRecognizer
+        from fast_plate_ocr import LicensePlateRecognizer
+        from fast_plate_ocr.inference import hub
     except ImportError:
-        die("Missing fast-plate-ocr. Install: pip install fast-plate-ocr")
+        die("Missing fast-plate-ocr. Install: pip install 'fast-plate-ocr[onnx]'")
 
-    # fast-plate-ocr downloads the ONNX + a config (which carries the alphabet) to a local cache.
     print(f"Resolving fast-plate-ocr hub model '{args.hub_model}' …")
-    rec = ONNXPlateRecognizer(args.hub_model)
-
-    # Locate the cached .onnx + its config; APIs differ across versions, so probe defensively.
-    onnx_path = None
-    alphabet = None
-    for attr in ("model_path", "_model_path", "onnx_model_path"):
-        p = getattr(rec, attr, None)
-        if p and Path(p).exists():
-            onnx_path = Path(p)
-            break
-    cfg = getattr(rec, "config", None) or getattr(rec, "_config", None)
-    if cfg is not None:
-        alphabet = cfg.get("alphabet") if isinstance(cfg, dict) else getattr(cfg, "alphabet", None)
-
-    if onnx_path is None:
-        die("Could not locate the cached ONNX from fast-plate-ocr; inspect the installed version's API "
-            "(the recognizer object should expose the model path + config alphabet) and adapt this script.")
+    try:
+        # Constructing the recognizer downloads + caches the model; reuse the cache for the onnx path.
+        rec = LicensePlateRecognizer(args.hub_model, device="cpu")
+        onnx_path, _cfg_path = hub.download_model(model_name=args.hub_model)
+    except Exception as e:  # noqa: BLE001
+        die(f"Could not resolve '{args.hub_model}': {e}\n"
+            "  If this is an SSL cert error on a framework Python, retry with:\n"
+            "    SSL_CERT_FILE=$(python -c 'import certifi; print(certifi.where())') "
+            "python local_dev/export_plate_ocr.py")
     shutil.copyfile(onnx_path, out)
 
-    if alphabet:
-        # Each class is one char; the alphabet string's order IS the class order.
-        charset = list(alphabet)
-        charset_out.write_text(json.dumps(charset, ensure_ascii=False))
-        print(f"Wrote charset ({len(charset)} classes) -> {charset_out}")
-    else:
-        die("Exported the ONNX but could not read the alphabet — write models/lp_ocr_charset.json by "
-            "hand (a JSON array of single-char strings in class-index order) before running the worker.")
+    # Ordered class->char map. The recognizer's alphabet places the pad char (config.pad_char) at the
+    # LAST class index. ocr.rs treats class index == len(charset) as the blank/pad, so we OMIT the pad
+    # char here (charset length = real classes; model classes = len+1). This is the load-bearing
+    # alignment from finding 6: charset[i] MUST equal the model's class i for the non-pad classes.
+    alphabet = getattr(rec.config, "alphabet", None)
+    pad = getattr(rec.config, "pad_char", None)
+    if not alphabet:
+        die("Exported the ONNX but could not read the alphabet from rec.config — write "
+            "models/lp_ocr_charset.json by hand (JSON array of 1-char strings in class order).")
+    charset = [c for c in alphabet if c != pad] if pad else list(alphabet)
+    charset_out.write_text(json.dumps(charset, ensure_ascii=False))
+    print(f"Wrote charset ({len(charset)} classes; pad {pad!r} at model index "
+          f"{alphabet.index(pad) if pad and pad in alphabet else 'n/a'} omitted) -> {charset_out}")
 
+    # fast-plate-ocr CCT is a FIXED-LENGTH per-slot head (max_plate_slots), NOT CTC — the worker's
+    # default PLATE_OCR_CTC=false matches it (a CRNN/PaddleOCR recognizer would need PLATE_OCR_CTC=true).
+    slots = getattr(rec.config, "max_plate_slots", None)
+    print(f"Model head: fixed-length, max_plate_slots={slots} → keep PLATE_OCR_CTC=false (default).")
     print(f"Wrote {out}. sha256: {sha256(out)}")
     print("Validate: cargo test -p hushai-worker --test vision_pipeline inspect_plate_model_io_shapes -- --nocapture")
     return 0

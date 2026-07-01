@@ -54,6 +54,10 @@ pub struct ViewerConfig {
     pub ffmpeg_bin: String,
     /// Max concurrent ffmpeg processes (separate budget from the ingest backend).
     pub ffmpeg_concurrency: usize,
+    /// Max concurrent footage EXPORTS. Each holds one permit for its whole (long) stream and
+    /// internally drives per-segment remuxes on `ffmpeg_concurrency`, so it needs its own small
+    /// budget — otherwise N exports fork N unbounded ffmpegs and starve the remux pool.
+    pub export_concurrency: usize,
     /// Default timeline/playlist window when the client omits `from`/`to`.
     pub default_window_nanos: i64,
     /// Hard cap on a *playable* (HLS) window so a single playlist can never blow up.
@@ -148,6 +152,7 @@ impl ViewerConfig {
                 .unwrap_or(default_cache),
             ffmpeg_bin: opt("FFMPEG_BIN", "ffmpeg"),
             ffmpeg_concurrency: parse("VIEWER_FFMPEG_CONCURRENCY", &default_cpus.to_string())?,
+            export_concurrency: parse("VIEWER_EXPORT_CONCURRENCY", "2")?,
             default_window_nanos: parse("VIEWER_DEFAULT_WINDOW_NANOS", &HOUR_NANOS.to_string())?,
             // 6h cap: comfortably covers a day's worth of intermittent capture as a single
             // playlist on localhost, while still bounding worst-case playlist size.

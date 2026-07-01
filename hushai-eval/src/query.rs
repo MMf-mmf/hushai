@@ -67,7 +67,9 @@ pub async fn observe(
     let mut o = Observed { window: (lo, hi), ..Default::default() };
 
     if has("transcript") || has("speakers") || has("sentiment") {
-        let rows: Vec<(String, i64, i64, Option<String>, Option<Uuid>)> = sqlx::query_as(
+        // NB: transcript_sentences.speaker_id is TEXT (a stringified UUID), not a uuid column —
+        // read it as String and parse to Uuid to match the speakers catalog (which IS uuid).
+        let rows: Vec<(String, i64, i64, Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT text, start_unix_nanos, end_unix_nanos, sentiment, speaker_id
              FROM transcript_sentences
              WHERE device_id = $1 AND start_unix_nanos >= $2 AND start_unix_nanos < $3
@@ -80,12 +82,12 @@ pub async fn observe(
         .await?;
         o.sentences = rows
             .into_iter()
-            .map(|(text, start_ns, end_ns, sentiment, speaker_id)| Sentence {
+            .map(|(text, start_ns, end_ns, sentiment, spk)| Sentence {
                 text,
                 start_ns,
                 end_ns,
                 sentiment,
-                speaker_id,
+                speaker_id: spk.and_then(|s| Uuid::parse_str(&s).ok()),
             })
             .collect();
 

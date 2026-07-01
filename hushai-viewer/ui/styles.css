@@ -1205,6 +1205,47 @@ details.voice-section > summary::marker {
   letter-spacing: 0.4px;
 }
 
+/* Expandable "what failed" list under a queue card (recent_errors). Collapsed by default. */
+.qerrors {
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+.qerrors > summary {
+  cursor: pointer;
+  color: var(--bad);
+  user-select: none;
+}
+.qerrors > summary:hover {
+  color: var(--text);
+}
+.qerr-list {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.qerr {
+  display: flex;
+  gap: 10px;
+  align-items: baseline;
+}
+.qerr-id {
+  flex: 0 0 auto;
+  color: var(--muted);
+}
+.qerr-msg {
+  flex: 1 1 auto;
+  color: var(--bad);
+  /* Long worker errors wrap rather than overflow the card. */
+  overflow-wrap: anywhere;
+}
+.qerr-meta {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
 /* Narrow screens: collapse the services grid to a stacked card-ish layout. */
 @media (max-width: 720px) {
   .srow {

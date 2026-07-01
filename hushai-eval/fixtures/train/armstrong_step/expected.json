@@ -1,0 +1,15 @@
+{
+  "transcript": {
+    "full_text": "I'm going to step off the LM now. That's one small step for man, one giant leap for mankind.",
+    "max_wer": 0.8,
+    "min_similarity": 0.3
+  },
+  "events": {
+    "expected": [
+      {
+        "event_type": "speech",
+        "min_count": 1
+      }
+    ]
+  }
+}

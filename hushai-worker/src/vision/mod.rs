@@ -20,6 +20,7 @@ pub mod face_match;
 pub mod frames;
 pub mod geom;
 pub mod model;
+pub mod motion;
 pub mod objects;
 pub mod plates;
 pub mod write;

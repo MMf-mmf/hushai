@@ -77,6 +77,9 @@ WHERE
         WHERE d.cooldown_key =
               e.rule_id::text || ':' || COALESCE(e.subject_id::text, e.subject_label, e.subject_type, 'any')
           AND d.created_at > now() - make_interval(secs => e.cooldown_secs)
+          -- A terminal-failed delivery (bad webhook, SSRF block — no retry) must NOT count as a
+          -- recent firing, else one broken target suppresses every later alert for the whole cooldown.
+          AND d.status <> 'failed'
     )
 -- At-most-once per (rule, event, channel): makes the evaluator IDEMPOTENT (a reprocess/backfill that
 -- re-UPSERTs the same event_id and re-evaluates is a no-op) AND closes the check-then-insert race

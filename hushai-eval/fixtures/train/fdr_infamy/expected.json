@@ -1,0 +1,15 @@
+{
+  "transcript": {
+    "full_text": "Yesterday, December 7th, 1941, a date which will live in infamy, the United States of America",
+    "max_wer": 0.7,
+    "min_similarity": 0.4
+  },
+  "events": {
+    "expected": [
+      {
+        "event_type": "speech",
+        "min_count": 1
+      }
+    ]
+  }
+}

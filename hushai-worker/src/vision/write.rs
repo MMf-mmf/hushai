@@ -25,6 +25,7 @@ use super::face_embed::{self, FaceEmbedder, FaceGates, FaceQuality};
 use super::face_match::{self, FaceWrite};
 use super::frames;
 use super::geom;
+use super::motion::{self, Fingerprint};
 use super::objects::{self, ClipEmbedder, DetectedObject, ObjectDetector};
 use super::plates::detect::{PlateBox, PlateDetector};
 use super::plates::normalize::{self as plate_norm, PlateGates, PlateQuality, PlateRead};
@@ -70,6 +71,11 @@ pub struct VisionModels {
     pub plate_detector: Option<Arc<PlateDetector>>,
     /// License-plate OCR.
     pub plate_ocr: Option<Arc<PlateOcr>>,
+    /// Per-camera last-analyzed-frame fingerprint for the cross-segment skip-static gate. In-memory
+    /// (one map per worker PROCESS, shared across vision loops via the `Arc` clone); lossy on
+    /// restart, which costs at most one non-skip per camera — fine for a pure compute heuristic.
+    /// Locked only to read+replace a fingerprint (no `.await` held under the lock).
+    pub motion_cache: Arc<std::sync::Mutex<std::collections::HashMap<String, Fingerprint>>>,
 }
 
 /// CLIP image-embedding model tag stored on every `scene_objects` row (the open-vocab space).
@@ -136,6 +142,13 @@ pub struct ObjectWrite {
 
 /// Process one VIDEO/MUXED segment through the face-identity pipeline. Returns the number of face
 /// observations written. Idempotent (see `face_match::assign_faces`).
+/// Instrumented so every per-frame warning (face cleanup, plate OCR, object detect) and the
+/// top-level failure carry `segment_id`/`lane`; fallible stages are `.context`-tagged so the
+/// vision worker loop's error log names the stage that failed.
+#[tracing::instrument(
+    skip_all,
+    fields(segment_id = %segment_id, lane = "vision"),
+)]
 pub async fn process_vision_segment(
     pool: &PgPool,
     models: &VisionModels,
@@ -145,13 +158,60 @@ pub async fn process_vision_segment(
     // Whole-pipeline wall-clock for `hushai_worker_segment_seconds`; stage timers below attribute
     // per-camera cost (decode, detect, embed, write) for the capacity/load test.
     let started = std::time::Instant::now();
-    let seg = media::load_segment(pool, segment_id).await?;
+    let seg = media::load_segment(pool, segment_id).await.context("load_segment")?;
     let frames = {
         let _t = observe::StageTimer::start(STAGE, &[("lane", "vision"), ("stage", "sample_frames")]);
-        frames::sample_frames(cfg, &seg, cfg.frames_per_segment).await?
+        frames::sample_frames(cfg, &seg, cfg.frames_per_segment).await.context("sample_frames")?
     };
     if frames.is_empty() {
         return Ok(0); // no decodable video (e.g. audio-only blob) — clean no-op
+    }
+
+    // Skip-static gate: compare this segment's representative frame against the last frame we
+    // analyzed for the SAME camera. A near-identical scene (an empty hallway) skips ALL vision
+    // inference — the dominant waste on static cameras. Skipping writes NOTHING: presence
+    // continuity is preserved by event sessionization (a person seen before/after a static gap
+    // coalesces into one event), NOT by fabricating detections that were never inferred (which
+    // would also pollute the k-NN identity-matching substrate). The vision loop still marks the
+    // segment `done` on this `Ok(0)`. The per-camera fingerprint is updated on BOTH branches so a
+    // slow brightness drift re-baselines incrementally and a camera move self-corrects next time.
+    if cfg.vision_motion_skip_enabled {
+        let _t = observe::StageTimer::start(STAGE, &[("lane", "vision"), ("stage", "motion_gate")]);
+        // Most recent pixels in the segment; taken before the by-value loop below consumes `frames`.
+        if let Some(cur) = frames
+            .last()
+            .map(|f| motion::fingerprint(&f.image, cfg.vision_motion_fp_side))
+        {
+            // Lock only to read the prior fingerprint and store the new one — no `.await` under it.
+            let prior = {
+                let mut cache = models
+                    .motion_cache
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let prior = cache.get(&seg.device_id).cloned();
+                cache.insert(seg.device_id.clone(), cur.clone());
+                prior
+            };
+            if let Some(prev) = prior {
+                let dist = motion::distance(&prev, &cur);
+                if dist <= cfg.vision_motion_threshold {
+                    observe::counter(
+                        "hushai_worker_segments_skipped_static_total",
+                        &[("lane", "vision")],
+                    );
+                    tracing::debug!(
+                        %segment_id,
+                        device_id = %seg.device_id,
+                        distance = dist,
+                        threshold = cfg.vision_motion_threshold,
+                        "vision: skipped static segment (no inference)"
+                    );
+                    record_vision_latency(started, seg.capture_start_unix_nanos);
+                    return Ok(0);
+                }
+            }
+            // First segment for this camera (no prior) or motion present: fall through and process.
+        }
     }
 
     let params = FaceEnhanceParams {
@@ -622,12 +682,16 @@ async fn persist_face_crops(blob_dir: &str, segment_id: Uuid, outcomes: &mut [Fa
         tracing::warn!(error = %e, "could not create face_crops dir; skipping crop persistence");
         return;
     }
+    // Per-call UUID so two concurrent decodes of the SAME segment (lease re-claim, speaker
+    // look-back) can't last-writer-wins each other's crop file while each tx stores a crop_uri
+    // pointing at it. Mirrors the frames.rs/media.rs staging-path fix.
+    let run = Uuid::now_v7();
     // Encode (CPU-bound) off the async runtime; collect (index, path) for the ones that succeed.
     let jobs: Vec<(usize, std::path::PathBuf, RgbImage)> = outcomes
         .iter()
         .enumerate()
         .map(|(i, o)| {
-            let path = dir.join(format!("{segment_id}_{i}.jpg"));
+            let path = dir.join(format!("{segment_id}_{run}_{i}.jpg"));
             (i, path, thumbnail(&o.cleaned_crop, 256))
         })
         .collect();
@@ -820,10 +884,13 @@ async fn persist_plate_crops(
         tracing::warn!(error = %e, "could not create plate_crops dir; skipping crop persistence");
         return;
     }
+    // Per-call UUID (see persist_face_crops) so concurrent same-segment decodes don't clobber
+    // each other's crop file while each row references it.
+    let run = Uuid::now_v7();
     let jobs: Vec<(usize, std::path::PathBuf, RgbImage)> = pairs
         .iter()
         .enumerate()
-        .map(|(i, (_, crop))| (i, dir.join(format!("{segment_id}_{i}.jpg")), crop.clone()))
+        .map(|(i, (_, crop))| (i, dir.join(format!("{segment_id}_{run}_{i}.jpg")), crop.clone()))
         .collect();
     let written = tokio::task::spawn_blocking(move || {
         let mut ok: Vec<(usize, String)> = Vec::new();

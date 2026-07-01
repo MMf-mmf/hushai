@@ -86,7 +86,27 @@ pub struct QueueStats {
     pub done_recent: i64,
     pub oldest_pending_age_secs: i64,
     pub max_updated_age_secs: i64,
+    /// The most recent error rows (newest first, capped) so the dashboard can show *what* failed,
+    /// not just how many. Empty when `error == 0`. Additive field — older UIs ignore it.
+    #[serde(default)]
+    pub recent_errors: Vec<QueueError>,
 }
+
+/// One failed segment's error detail, surfaced from `segment_*_status.last_error`.
+#[derive(Debug, Serialize, Default, Clone)]
+pub struct QueueError {
+    pub segment_id: String,
+    /// The worker's recorded failure message (truncated to 2000 chars at write time).
+    pub last_error: String,
+    /// How many times the worker retried before this error (capped by `MAX_ATTEMPTS`).
+    pub attempts: i64,
+    /// Seconds since the row was last updated (i.e. since this error was recorded).
+    pub age_secs: i64,
+}
+
+/// How many recent error rows the dashboard surfaces per queue. Small: it's a "what's wrong right
+/// now" peek, not a full error log (the per-device processing view drills deeper).
+const RECENT_ERRORS_LIMIT: i64 = 5;
 
 /// A uniform status row the frontend renders identically for every service/dependency.
 #[derive(Debug, Serialize)]
@@ -291,6 +311,13 @@ async fn queue_stats(pool: &PgPool, table: &str) -> ViewerResult<QueueStats> {
     .fetch_one(pool)
     .await?;
 
+    // Only pay for the detail query when there's something to show.
+    let recent_errors = if row.2 > 0 {
+        recent_errors(pool, table).await?
+    } else {
+        Vec::new()
+    };
+
     Ok(QueueStats {
         pending: row.0,
         processing: row.1,
@@ -298,7 +325,37 @@ async fn queue_stats(pool: &PgPool, table: &str) -> ViewerResult<QueueStats> {
         done_recent: row.3,
         oldest_pending_age_secs: row.4,
         max_updated_age_secs: row.5,
+        recent_errors,
     })
+}
+
+/// The most recently-failed rows for a queue, newest first. `table` is the same compile-time
+/// constant as `queue_stats` (never user input), so `AssertSqlSafe` over the formatted SQL holds.
+async fn recent_errors(pool: &PgPool, table: &str) -> ViewerResult<Vec<QueueError>> {
+    let rows: Vec<(String, Option<String>, i32, i64)> = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+        r#"
+        SELECT segment_id::text,
+               last_error,
+               attempts,
+               COALESCE(EXTRACT(EPOCH FROM now() - updated_at), 0)::bigint AS age_secs
+        FROM {table}
+        WHERE status = 'error'
+        ORDER BY updated_at DESC
+        LIMIT {RECENT_ERRORS_LIMIT}
+        "#
+    )))
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|(segment_id, last_error, attempts, age_secs)| QueueError {
+            segment_id,
+            last_error: last_error.unwrap_or_else(|| "(no message recorded)".to_string()),
+            attempts: attempts as i64,
+            age_secs,
+        })
+        .collect())
 }
 
 // ---------------------------------------------------------------------------
@@ -511,5 +568,84 @@ fn human_bytes(n: u64) -> String {
         format!("{n} B")
     } else {
         format!("{v:.1} {}", UNITS[i])
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::postgres::PgPoolOptions;
+    use uuid::Uuid;
+
+    // Live-DB test, gated on DATABASE_URL like the worker/backend integration tests — skips cleanly
+    // when unset so `cargo test` is green without a database.
+    async fn pool() -> Option<PgPool> {
+        let url = std::env::var("DATABASE_URL").ok()?;
+        PgPoolOptions::new().max_connections(4).connect(&url).await.ok()
+    }
+
+    /// Minimal device/session/stream/segment so the FK on `segment_transcription_status` holds.
+    async fn insert_fixture_segment(pool: &PgPool, device_id: &str) -> Uuid {
+        let session_id = Uuid::now_v7();
+        let segment_id = Uuid::now_v7();
+        sqlx::query("INSERT INTO devices (device_id, source_kind) VALUES ($1,'test') ON CONFLICT (device_id) DO NOTHING")
+            .bind(device_id).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO sessions (session_id, device_id) VALUES ($1,$2)")
+            .bind(session_id).bind(device_id).execute(pool).await.unwrap();
+        sqlx::query("INSERT INTO streams (session_id, stream_id, device_id, media_type, codec, container) VALUES ($1,'s0',$2,3,'h264+aac','fmp4')")
+            .bind(session_id).bind(device_id).execute(pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO segments (segment_id, device_id, stream_id, session_id, sequence, media_type, codec, container, \
+                capture_start_unix_nanos, monotonic_start_nanos, duration_nanos, content_sha256, byte_len, blob_uri, storage_backend) \
+             VALUES ($1,$2,'s0',$3,0,3,'h264+aac','fmp4',1,0,2000000000,$4,100,$5,'file')",
+        )
+        .bind(segment_id).bind(device_id).bind(session_id).bind(vec![0u8; 32])
+        .bind(format!("file:///nonexistent/{segment_id}"))
+        .execute(pool).await.unwrap();
+        segment_id
+    }
+
+    async fn cleanup(pool: &PgPool, device_id: &str) {
+        for sql in [
+            "DELETE FROM segment_transcription_status WHERE segment_id IN (SELECT segment_id FROM segments WHERE device_id=$1)",
+            "DELETE FROM segments WHERE device_id=$1",
+            "DELETE FROM streams WHERE device_id=$1",
+            "DELETE FROM sessions WHERE device_id=$1",
+            "DELETE FROM devices WHERE device_id=$1",
+        ] {
+            let _ = sqlx::query(sql).bind(device_id).execute(pool).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn queue_stats_surfaces_recent_error_detail() {
+        let Some(pool) = pool().await else {
+            eprintln!("skipping queue_stats_surfaces_recent_error_detail: DATABASE_URL unset");
+            return;
+        };
+        let device = format!("test-dash-err-{}", Uuid::now_v7());
+        let seg = insert_fixture_segment(&pool, &device).await;
+
+        // Record a freshly-failed status row (updated_at = now(), so it sorts to the front of the
+        // newest-first recent_errors query).
+        sqlx::query(
+            "INSERT INTO segment_transcription_status (segment_id, status, attempts, last_error, updated_at) \
+             VALUES ($1,'error',5,'whisper OOM', now())",
+        )
+        .bind(seg).execute(&pool).await.unwrap();
+
+        let stats = queue_stats(&pool, "segment_transcription_status").await.unwrap();
+
+        assert!(stats.error >= 1, "error count should include our seeded row");
+        let mine = stats
+            .recent_errors
+            .iter()
+            .find(|e| e.segment_id == seg.to_string())
+            .expect("our seeded error should be among the most-recent errors");
+        assert_eq!(mine.last_error, "whisper OOM");
+        assert_eq!(mine.attempts, 5);
+        assert!(mine.age_secs >= 0);
+
+        cleanup(&pool, &device).await;
     }
 }

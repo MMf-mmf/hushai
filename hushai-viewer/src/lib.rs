@@ -28,15 +28,13 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use tokio::sync::Semaphore;
-use tracing_subscriber::EnvFilter;
 
 use crate::config::ViewerConfig;
 use crate::state::ViewerState;
 
+/// Honours `RUST_LOG` / `LOG_FORMAT` / `LOG_DIR` via the shared [`hushai_backend::logging`] module.
 pub fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,hushai_viewer=debug,tower_http=info"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    hushai_backend::logging::init("hushai-viewer", "info,hushai_viewer=debug,tower_http=info");
 }
 
 /// Load config, connect, ensure the cache dir, and serve until Ctrl-C / SIGTERM.
@@ -75,6 +73,7 @@ pub async fn run() -> anyhow::Result<()> {
     let display_host = cfg.display_host.clone(); // captured before `cfg` moves into ViewerState
     let tls = cfg.tls.clone();
     let ffmpeg_sem = Arc::new(Semaphore::new(cfg.ffmpeg_concurrency.max(1)));
+    let export_sem = Arc::new(Semaphore::new(cfg.export_concurrency.max(1)));
     // HTTP client for the `/v1/*` reverse-proxy + dashboard probes. When the sibling
     // backend/rag serve TLS behind a private LAN CA, trust that CA so the loopback
     // proxy/probe calls verify instead of failing the handshake.
@@ -91,12 +90,15 @@ pub async fn run() -> anyhow::Result<()> {
     };
 
     tracing::info!(
+        service = "hushai-viewer",
+        version = env!("CARGO_PKG_VERSION"),
         %bind_addr,
         ffmpeg = %cfg.ffmpeg_bin,
         ffmpeg_concurrency = cfg.ffmpeg_concurrency,
         cache_dir = %cfg.cache_dir.display(),
         ui_dir = %cfg.ui_dir.display(),
         rag_base_url = %cfg.rag_base_url,
+        logging = %hushai_backend::logging::summary(),
         "hushai-viewer starting"
     );
 
@@ -105,6 +107,7 @@ pub async fn run() -> anyhow::Result<()> {
         cfg: Arc::new(cfg),
         http,
         ffmpeg_sem,
+        export_sem,
         inflight: Arc::new(Mutex::new(HashMap::new())),
     };
 

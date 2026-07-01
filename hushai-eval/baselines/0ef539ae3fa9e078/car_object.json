@@ -1,0 +1,8 @@
+{
+  "case_id": "car_object",
+  "config_hash": "0ef539ae3fa9e078",
+  "git_sha": "fa190ff",
+  "metrics": {
+    "objects.label_f1": 1.0
+  }
+}

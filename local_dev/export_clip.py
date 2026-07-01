@@ -122,6 +122,14 @@ def main() -> None:
         def forward(self, text):
             return self.m.encode_text(text)
 
+    # open_clip's MultiheadAttention fast path emits aten::_native_multi_head_attention, which the
+    # legacy torchscript ONNX exporter can't lower. Disable the fast path so it traces via the
+    # standard (exportable) attention path. (Newer torch only; ignored if the API is absent.)
+    try:
+        torch.backends.mha.set_fastpath_enabled(False)
+    except Exception:
+        pass
+
     with torch.no_grad():
         # --- image tower ---
         img_dummy = torch.randn(1, 3, CLIP_SIZE, CLIP_SIZE, dtype=torch.float32)

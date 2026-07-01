@@ -1,18 +1,18 @@
 //! Open-vocabulary object lane (Phase B): RF-DETR region boxes + OpenCLIP image embeddings.
 //!
-//! ⚠️ OPERATOR-PROVISIONED + DECODE-VALIDATED-AT-PROVISIONING. Unlike the face models (YuNet/ArcFace,
-//! whose exact ONNX I/O is proven in `tests/vision_pipeline.rs`), the RF-DETR and CLIP ONNX exports
-//! are NOT committed. This decoder targets the standard DETR-family export contract and is
-//! deliberately defensive:
+//! OPERATOR-PROVISIONED (RF-DETR + CLIP ONNX are gitignored). DECODE VALIDATED against the real
+//! export (2026-06-30): RF-DETR-Nano emits `dets[1,300,4]` (boxes) + `labels[1,300,91]` (class logits).
 //!   * outputs are read by ORDER (first = boxes `[1,N,4]`, second = class logits `[1,N,C]`) since
 //!     export tensor NAMES vary (dets/labels, pred_boxes/pred_logits, boxes/scores).
 //!   * boxes are assumed cxcywh; NORMALIZED [0,1] when the max coord looks normalized, else treated
-//!     as model-input pixels and rescaled. Logits are sigmoid-activated (RF-DETR), argmax → COCO label.
-//! VALIDATE this decode against the real export at provisioning (the tooling now exists — see AGENTS.md
-//! "vision"): `local_dev/export_rf_detr.py` + `export_clip.py`, then
-//! `cargo test -p hushai-worker --test vision_pipeline inspect_object_model_io_shapes` and
-//! `detect_objects_from_real_video`. ⚠️ `coco_label` is dense COCO-80; RF-DETR may use a 90/91-slot
-//! layout — if the test shows `class_<i>` labels, fix the class map against `models/rf-detr-classes.json`.
+//!     as model-input pixels and rescaled.
+//!   * logits are sigmoid-activated (RF-DETR focal head). **The class-logit COLUMN INDEX is the COCO
+//!     category id** (the 91-slot layout: col 1=person, 2=bicycle, 82=refrigerator; col 0 + the gaps
+//!     are background). We arg-max over NAMED columns only and map via [`coco91_class_names`] (or the
+//!     authoritative `models/rf-detr-classes.json` via [`ObjectDetector::with_class_names`]). A prior
+//!     dense-COCO-80 map mislabeled every detection (person→"bicycle"); see `coco91_column_map_is_correct`.
+//! Re-validate after a re-export: `cargo test -p hushai-worker --test vision_pipeline
+//! inspect_object_model_io_shapes` + `detect_objects_from_real_video`.
 //! Any failure here is NON-FATAL: the object lane self-disables / skips, and the face lane still runs.
 //!
 //! Coordinate contract (load-bearing for the viewer overlay): boxes are returned in ORIGINAL-frame
@@ -22,6 +22,7 @@ use anyhow::{Context, Result};
 use image::RgbImage;
 use ndarray::Array4;
 use ort::session::Session;
+use std::path::Path;
 
 /// CLIP ViT-B/32 image-tower input side and normalization (the standard OpenAI CLIP preprocessing).
 const CLIP_SIZE: usize = 224;
@@ -47,7 +48,20 @@ pub struct ObjectDetector {
     max_per_frame: usize,
     /// Drop boxes whose smaller side is below this many original-frame pixels.
     min_box_px: f32,
+    /// Class-aware NMS IoU threshold. RF-DETR's 300-query focal head emits several near-duplicate
+    /// boxes per real object (no Hungarian suppression at inference); like every other vision
+    /// detector lane (YuNet/SCRFD/plates) we greedily suppress heavy SAME-LABEL overlap. Tuned via
+    /// `OBJECT_NMS_IOU`; class-aware so an overlapping person+bicycle both survive.
+    nms_iou: f32,
+    /// Class-logit COLUMN INDEX → label. Length == the model's C. `None` slots are the COCO
+    /// background/unused columns (id 0 + the historical gaps) and are never emitted. Defaults to the
+    /// canonical COCO-91 layout; override with the authoritative `models/rf-detr-classes.json` via
+    /// [`with_class_names`]. (See the module header — this map IS the load-bearing decode point.)
+    class_names: Vec<Option<String>>,
 }
+
+/// Default class-aware NMS IoU for the object lane (conservative — only heavy overlap is merged).
+pub const DEFAULT_OBJECT_NMS_IOU: f32 = 0.5;
 
 impl ObjectDetector {
     pub fn new(
@@ -63,7 +77,29 @@ impl ObjectDetector {
             score_threshold,
             max_per_frame,
             min_box_px: min_box_px.max(0.0),
+            nms_iou: DEFAULT_OBJECT_NMS_IOU,
+            class_names: coco91_class_names(),
         }
+    }
+
+    /// Override the class-aware NMS IoU threshold (`OBJECT_NMS_IOU`). Values outside (0,1] disable NMS.
+    pub fn with_nms_iou(mut self, iou: f32) -> Self {
+        self.nms_iou = iou;
+        self
+    }
+
+    /// Override the column→label map with the authoritative one the exporter wrote
+    /// (`models/rf-detr-classes.json`). Keeps the built-in COCO-91 map if `names` is empty.
+    pub fn with_class_names(mut self, names: Vec<Option<String>>) -> Self {
+        if names.iter().any(|n| n.is_some()) {
+            self.class_names = names;
+        }
+        self
+    }
+
+    /// Number of named (emittable) classes — for startup logging / sanity.
+    pub fn named_class_count(&self) -> usize {
+        self.class_names.iter().filter(|n| n.is_some()).count()
     }
 
     /// Detect objects in an RGB frame. CPU-bound ONNX work — call inside `spawn_blocking`.
@@ -134,17 +170,23 @@ impl ObjectDetector {
 
         let mut out: Vec<DetectedObject> = Vec::new();
         for q in 0..nq {
-            // best class for this query (sigmoid logits; RF-DETR uses focal/sigmoid heads)
-            let mut best_c = 0usize;
+            // Best class for this query (sigmoid logits; RF-DETR uses focal/sigmoid heads). The
+            // column index IS the COCO category id, so we only consider columns that map to a real
+            // class — skipping the background (id 0) and the historical gap columns rather than
+            // arg-maxing over them and emitting a `class_<i>` / mislabeled detection.
+            let mut best_c = usize::MAX;
             let mut best_s = 0.0f32;
             for c in 0..ncls {
+                if c >= self.class_names.len() || self.class_names[c].is_none() {
+                    continue;
+                }
                 let s = sigmoid(lg[q * ncls + c]);
                 if s > best_s {
                     best_s = s;
                     best_c = c;
                 }
             }
-            if best_s < self.score_threshold {
+            if best_c == usize::MAX || best_s < self.score_threshold {
                 continue;
             }
             let b = &bx[q * 4..q * 4 + 4]; // cxcywh
@@ -169,9 +211,30 @@ impl ObjectDetector {
             }
             out.push(DetectedObject {
                 bbox: [x.max(0.0), y.max(0.0), w, h],
-                label: coco_label(best_c),
+                // Some by construction: the argmax loop only considers named columns.
+                label: self.class_names[best_c].clone().unwrap_or_else(|| format!("class_{best_c}")),
                 score: best_s,
             });
+        }
+        // Class-aware NMS: RF-DETR's 300-query head emits several near-duplicate boxes per object;
+        // suppress heavy SAME-LABEL overlap (so an overlapping person+bicycle both survive) before
+        // we embed/persist. Skipped when nms_iou is out of (0,1]. Determinism: group order is sorted
+        // by label (BTreeMap) and the final pass re-sorts by score, so output is stable under the
+        // CPU EP. Mirrors detect.rs / detect_scrfd.rs / plates/detect.rs which all end with nms_by.
+        if self.nms_iou > 0.0 && self.nms_iou <= 1.0 && out.len() > 1 {
+            let mut by_label: std::collections::BTreeMap<String, Vec<DetectedObject>> =
+                std::collections::BTreeMap::new();
+            for d in out.drain(..) {
+                by_label.entry(d.label.clone()).or_default().push(d);
+            }
+            for (_label, group) in by_label {
+                out.extend(crate::vision::geom::nms_by(
+                    group,
+                    self.nms_iou,
+                    |d| d.bbox,
+                    |d| d.score,
+                ));
+            }
         }
         // Keep the highest-confidence detections first, then cap per frame to bound scene_objects.
         out.sort_by(|a, b| {
@@ -252,93 +315,56 @@ fn sigmoid(x: f32) -> f32 {
     1.0 / (1.0 + (-x).exp())
 }
 
-/// COCO-80 class names (the order RF-DETR/Ultralytics export). Out-of-range → `class_<i>`.
-fn coco_label(i: usize) -> String {
-    const COCO: [&str; 80] = [
-        "person",
-        "bicycle",
-        "car",
-        "motorcycle",
-        "airplane",
-        "bus",
-        "train",
-        "truck",
-        "boat",
-        "traffic light",
-        "fire hydrant",
-        "stop sign",
-        "parking meter",
-        "bench",
-        "bird",
-        "cat",
-        "dog",
-        "horse",
-        "sheep",
-        "cow",
-        "elephant",
-        "bear",
-        "zebra",
-        "giraffe",
-        "backpack",
-        "umbrella",
-        "handbag",
-        "tie",
-        "suitcase",
-        "frisbee",
-        "skis",
-        "snowboard",
-        "sports ball",
-        "kite",
-        "baseball bat",
-        "baseball glove",
-        "skateboard",
-        "surfboard",
-        "tennis racket",
-        "bottle",
-        "wine glass",
-        "cup",
-        "fork",
-        "knife",
-        "spoon",
-        "bowl",
-        "banana",
-        "apple",
-        "sandwich",
-        "orange",
-        "broccoli",
-        "carrot",
-        "hot dog",
-        "pizza",
-        "donut",
-        "cake",
-        "chair",
-        "couch",
-        "potted plant",
-        "bed",
-        "dining table",
-        "toilet",
-        "tv",
-        "laptop",
-        "mouse",
-        "remote",
-        "keyboard",
-        "cell phone",
-        "microwave",
-        "oven",
-        "toaster",
-        "sink",
-        "refrigerator",
-        "book",
-        "clock",
-        "vase",
-        "scissors",
-        "teddy bear",
-        "hair drier",
-        "toothbrush",
+/// The canonical COCO "91-slot" column→label map RF-DETR/DETR emit: the class-logit COLUMN INDEX is
+/// the COCO category id (1..=90, with the historical gaps at 12/26/29/30/45/66/68/69/71/83; column 0
+/// is background). Returns a vec indexed by column; `None` = background/gap (never emitted). This is
+/// byte-for-byte the map `local_dev/export_rf_detr.py` writes to `models/rf-detr-classes.json`.
+fn coco91_class_names() -> Vec<Option<String>> {
+    const COCO91: [(usize, &str); 80] = [
+        (1, "person"), (2, "bicycle"), (3, "car"), (4, "motorcycle"), (5, "airplane"), (6, "bus"),
+        (7, "train"), (8, "truck"), (9, "boat"), (10, "traffic light"), (11, "fire hydrant"),
+        (13, "stop sign"), (14, "parking meter"), (15, "bench"), (16, "bird"), (17, "cat"),
+        (18, "dog"), (19, "horse"), (20, "sheep"), (21, "cow"), (22, "elephant"), (23, "bear"),
+        (24, "zebra"), (25, "giraffe"), (27, "backpack"), (28, "umbrella"), (31, "handbag"),
+        (32, "tie"), (33, "suitcase"), (34, "frisbee"), (35, "skis"), (36, "snowboard"),
+        (37, "sports ball"), (38, "kite"), (39, "baseball bat"), (40, "baseball glove"),
+        (41, "skateboard"), (42, "surfboard"), (43, "tennis racket"), (44, "bottle"),
+        (46, "wine glass"), (47, "cup"), (48, "fork"), (49, "knife"), (50, "spoon"), (51, "bowl"),
+        (52, "banana"), (53, "apple"), (54, "sandwich"), (55, "orange"), (56, "broccoli"),
+        (57, "carrot"), (58, "hot dog"), (59, "pizza"), (60, "donut"), (61, "cake"), (62, "chair"),
+        (63, "couch"), (64, "potted plant"), (65, "bed"), (67, "dining table"), (70, "toilet"),
+        (72, "tv"), (73, "laptop"), (74, "mouse"), (75, "remote"), (76, "keyboard"),
+        (77, "cell phone"), (78, "microwave"), (79, "oven"), (80, "toaster"), (81, "sink"),
+        (82, "refrigerator"), (84, "book"), (85, "clock"), (86, "vase"), (87, "scissors"),
+        (88, "teddy bear"), (89, "hair drier"), (90, "toothbrush"),
     ];
-    COCO.get(i)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| format!("class_{i}"))
+    let mut v = vec![None; 91];
+    for (id, name) in COCO91 {
+        v[id] = Some(name.to_string());
+    }
+    v
+}
+
+/// Load `{ "index": "name" }` (e.g. `models/rf-detr-classes.json`, written by export_rf_detr.py)
+/// into a column-indexed vec where the COCO category id keys the slot. Missing/gap ids stay `None`.
+pub fn load_class_map(path: &Path) -> Result<Vec<Option<String>>> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("reading class map {}", path.display()))?;
+    let map: std::collections::BTreeMap<String, String> = serde_json::from_str(&raw)
+        .with_context(|| format!("parsing class map {} as {{\"id\":\"name\"}}", path.display()))?;
+    let max_id = map.keys().filter_map(|k| k.parse::<usize>().ok()).max().unwrap_or(0);
+    let mut v = vec![None; max_id + 1];
+    for (k, name) in map {
+        if let Ok(id) = k.parse::<usize>() {
+            v[id] = Some(name);
+        }
+    }
+    anyhow::ensure!(
+        v.iter().any(|x| x.is_some()),
+        "class map {} contained no numeric-id entries",
+        path.display()
+    );
+    Ok(v)
 }
 
 #[cfg(test)]
@@ -346,11 +372,38 @@ mod tests {
     use super::*;
 
     #[test]
-    fn coco_labels_and_fallback() {
-        assert_eq!(coco_label(0), "person");
-        assert_eq!(coco_label(63), "laptop");
-        assert_eq!(coco_label(56), "chair");
-        assert_eq!(coco_label(999), "class_999");
+    fn coco91_column_map_is_correct() {
+        // Column index == COCO category id (NOT dense COCO-80). This is the bug that made a person
+        // (column 1) decode as "bicycle": dense-80[1] == bicycle, but coco-91[1] == person.
+        let m = coco91_class_names();
+        assert_eq!(m.len(), 91);
+        assert_eq!(m[1].as_deref(), Some("person"));
+        assert_eq!(m[2].as_deref(), Some("bicycle"));
+        assert_eq!(m[3].as_deref(), Some("car"));
+        assert_eq!(m[37].as_deref(), Some("sports ball"));
+        assert_eq!(m[62].as_deref(), Some("chair"));
+        assert_eq!(m[73].as_deref(), Some("laptop"));
+        assert_eq!(m[82].as_deref(), Some("refrigerator"));
+        assert_eq!(m[90].as_deref(), Some("toothbrush"));
+        // Background + historical gap columns are None (never emitted).
+        assert_eq!(m[0], None);
+        assert_eq!(m[12], None);
+        assert_eq!(m[26], None);
+        assert_eq!(m[83], None);
+        assert_eq!(m.iter().filter(|x| x.is_some()).count(), 80);
+    }
+
+    #[test]
+    fn load_class_map_parses_id_keyed_json() {
+        let dir = std::env::temp_dir().join(format!("hushai_classmap_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("classes.json");
+        std::fs::write(&p, r#"{"1":"person","2":"bicycle","82":"refrigerator"}"#).unwrap();
+        let m = load_class_map(&p).unwrap();
+        assert_eq!(m[1].as_deref(), Some("person"));
+        assert_eq!(m[82].as_deref(), Some("refrigerator"));
+        assert_eq!(m[3], None);
+        let _ = std::fs::remove_file(&p);
     }
 
     #[test]

@@ -641,7 +641,11 @@ function hideStatus() {
 }
 function showError(msg) {
   const el = $("status");
-  el.innerHTML = `<div>${msg}</div>`;
+  // textContent (not innerHTML) so an error string carrying server/user-derived text — a device id
+  // or an echoed query in a 4xx message — can't inject HTML/script into the admin console.
+  const div = document.createElement("div");
+  div.textContent = msg;
+  el.replaceChildren(div);
   el.style.display = "flex";
 }
 function toast(msg) {

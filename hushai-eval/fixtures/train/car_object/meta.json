@@ -1,0 +1,17 @@
+{
+  "case_id": "car_object",
+  "description": "PD Wikimedia car photo (Peugeot iOn) ken-burns'd to a 6s muxed clip; recipe in fetch_eval_clips.sh. Regression guard for the RF-DETR object-class decode: a COCO-80 mislabel would turn 'car' into 'motorcycle' (F1=0). Object lane only.",
+  "device_id": "eval-car-object",
+  "media_file": "media.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "objects"
+  ],
+  "tier": "full",
+  "poll": {
+    "timeout_secs": 180,
+    "interval_secs": 2
+  }
+}

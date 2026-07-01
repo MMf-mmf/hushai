@@ -30,18 +30,33 @@ pub async fn resolve_name(pool: &PgPool, name: &str) -> anyhow::Result<Vec<Uuid>
 /// ("when did I see Bob" with no explicit filter). Case-insensitive; only names of length >= 2 so a
 /// 1-char name can't match everything. Returns the union of matching ids (empty if none mentioned).
 pub async fn resolve_names_in_text(pool: &PgPool, query: &str) -> anyhow::Result<Vec<Uuid>> {
+    // Word-boundary match (not substring): a name matches only when ALL of its words appear as whole
+    // words in the query. A raw `position(name in query)` substring match wrongly attributed e.g.
+    // "Cal" to "calendar" or "Ed" to "edited", routing the answer to that person's full sightings.
     let rows = sqlx::query(
-        "SELECT person_id FROM persons \
-         WHERE display_name IS NOT NULL AND char_length(display_name) >= 2 \
-           AND position(lower(display_name) in lower($1)) > 0",
+        "SELECT person_id, display_name FROM persons \
+         WHERE display_name IS NOT NULL AND char_length(display_name) >= 2",
     )
-    .bind(query)
     .fetch_all(pool)
     .await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| r.get::<Uuid, _>("person_id"))
-        .collect())
+    let q = query.to_lowercase();
+    let q_words: std::collections::HashSet<&str> = q
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut ids = Vec::new();
+    for r in rows {
+        let name: String = r.get("display_name");
+        let name_l = name.to_lowercase();
+        let name_words: Vec<&str> = name_l
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !name_words.is_empty() && name_words.iter().all(|w| q_words.contains(w)) {
+            ids.push(r.get::<Uuid, _>("person_id"));
+        }
+    }
+    Ok(ids)
 }
 
 /// Map person-id strings to display names for prompt attribution. Batched single query; only named

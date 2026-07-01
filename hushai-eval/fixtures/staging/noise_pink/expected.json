@@ -1,0 +1,16 @@
+{
+  "_draft_note": "Pre-filled from the pipeline's OWN output. CORRECT anything wrong, then promote.",
+  "events": {
+    "expected": []
+  },
+  "speakers": {
+    "count_tolerance": 0,
+    "distinct_count": 0,
+    "min_purity": 0.75
+  },
+  "transcript": {
+    "full_text": "",
+    "max_wer": 0.2,
+    "min_similarity": 0.8
+  }
+}

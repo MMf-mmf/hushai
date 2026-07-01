@@ -490,7 +490,10 @@ pub async fn rag_chat(
             yield Ok(sse_event("token", &json!({ "delta": answer })));
             match insert_message(&pool, session_id, "assistant", &answer, Some(&sources), &agent_id_stream).await {
                 Ok(message_id) => yield Ok(sse_event("done", &json!({ "message_id": message_id }))),
-                Err(e) => yield Ok(sse_event("error", &json!({ "message": format!("failed to persist answer: {e:#}") }))),
+                Err(e) => {
+                    tracing::error!(error = format!("{e:#}"), "failed to persist rag chat answer (precomputed)");
+                    yield Ok(sse_event("error", &json!({ "message": "failed to save the answer" })));
+                }
             }
         } else {
             // Both branches return different concrete stream types; box to one type.
@@ -524,7 +527,9 @@ pub async fn rag_chat(
                             }
                             Err(e) => {
                                 errored = true;
-                                yield Ok(sse_event("error", &json!({ "message": format!("{e:#}") })));
+                                // Log the chain server-side; don't stream sqlx/path/URL internals to the client.
+                                tracing::error!(error = format!("{e:#}"), "rag chat token stream failed");
+                                yield Ok(sse_event("error", &json!({ "message": "the assistant hit an internal error" })));
                                 break;
                             }
                         }
@@ -544,16 +549,18 @@ pub async fn rag_chat(
                                 yield Ok(sse_event("done", &json!({ "message_id": message_id })));
                             }
                             Err(e) => {
+                                tracing::error!(error = format!("{e:#}"), "failed to persist rag chat answer");
                                 yield Ok(sse_event(
                                     "error",
-                                    &json!({ "message": format!("failed to persist answer: {e:#}") }),
+                                    &json!({ "message": "failed to save the answer" }),
                                 ));
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    yield Ok(sse_event("error", &json!({ "message": format!("{e:#}") })));
+                    tracing::error!(error = format!("{e:#}"), "rag chat stream setup failed");
+                    yield Ok(sse_event("error", &json!({ "message": "the assistant hit an internal error" })));
                 }
             }
         }

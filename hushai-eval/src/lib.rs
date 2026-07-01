@@ -12,6 +12,7 @@ pub mod fixtures;
 pub mod inject;
 pub mod manifest;
 pub mod poll;
+pub mod probe;
 pub mod query;
 pub mod report;
 pub mod reset;

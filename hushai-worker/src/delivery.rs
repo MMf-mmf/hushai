@@ -218,11 +218,38 @@ async fn deliver_one(
     }
     let req = req.body(body_bytes);
 
-    match req.send().await {
-        Ok(resp) if resp.status().is_success() => mark_sent(pool, c.delivery_id).await,
-        Ok(resp) => decide_retry(pool, cfg, c, &format!("http status {}", resp.status())).await,
+    // Host (not full URL) for logs: enough to identify the endpoint without leaking query/token
+    // material a target might carry in its path.
+    let host = req
+        .try_clone()
+        .and_then(|r| r.build().ok())
+        .and_then(|r| r.url().host_str().map(str::to_string))
+        .unwrap_or_else(|| "?".to_string());
+    let sent_at = std::time::Instant::now();
+    let result = req.send().await;
+    let latency_ms = sent_at.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(resp) if resp.status().is_success() => {
+            tracing::debug!(
+                delivery_id = %c.delivery_id, host, status = resp.status().as_u16(),
+                attempt = c.attempts, latency_ms, "alert delivery: sent"
+            );
+            mark_sent(pool, c.delivery_id).await
+        }
+        Ok(resp) => {
+            tracing::warn!(
+                delivery_id = %c.delivery_id, host, status = resp.status().as_u16(),
+                attempt = c.attempts, latency_ms, "alert delivery: non-2xx response"
+            );
+            decide_retry(pool, cfg, c, &format!("http status {}", resp.status())).await
+        }
         Err(e) => {
             let kind = if e.is_timeout() { "timeout" } else { "send error" };
+            tracing::warn!(
+                delivery_id = %c.delivery_id, host, attempt = c.attempts, latency_ms,
+                error = %e, "alert delivery: {kind}"
+            );
             decide_retry(pool, cfg, c, &format!("{kind}: {e}")).await
         }
     }
@@ -236,6 +263,12 @@ async fn decide_retry(
     err: &str,
 ) -> Result<(), sqlx::Error> {
     if c.attempts >= cfg.max_attempts {
+        // Permanent give-up: previously only bumped a counter. A developer asking "why didn't my
+        // webhook fire?" needs this at warn, with the rule/event that produced it.
+        tracing::warn!(
+            delivery_id = %c.delivery_id, rule_id = ?c.rule_id, event_id = ?c.event_id,
+            attempts = c.attempts, %err, "alert delivery: gave up (max attempts) — marking failed"
+        );
         mark_failed(
             pool,
             c.delivery_id,

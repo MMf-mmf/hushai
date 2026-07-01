@@ -8,6 +8,9 @@ description = "Hushai RAG service: single-turn grounded Q&A over transcribed seg
 # Reuse the ingest backend's Config + DB pool (path dep).
 hushai-backend = { path = "../hushai-backend" }
 
+# Constant-time bearer-token comparison (matches the backend's auth hardening).
+subtle = "2"
+
 # Rig: local embeddings + completion via the Ollama provider.
 rig = "0.37"
 
@@ -53,7 +56,8 @@ tokio = { version = "1", features = ["full"] }
 async-stream = "0.3"
 futures-util = "0.3"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Logging is initialised centrally by `hushai_backend::logging` (subscriber + JSON/file + panic hook);
+# this crate only emits via `tracing` macros, so it needs no direct `tracing-subscriber` dep.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"

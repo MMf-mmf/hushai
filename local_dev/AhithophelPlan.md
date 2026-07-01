@@ -229,7 +229,15 @@ From there, we can then test the performance of what happens when we add two cam
    and before actualy doing any update we must varify everting works end to end...
 
 
-   
 
+
+- [] We need a way to start parallel processing all this incoming data or else it will take to long to get thought it all as of now it seems to be processing the audio segments one at a time
+and and i'm not sure about the Vision (faces & objects) but its most probably similar
+Paralyzing is a very important part of the application and to make it scale, so if we need to change some of the underlying infrastructure then that's what we have to do
+
+When we have 2
+errors in the dashboard.html it should also way what the error was in addition we should expand the logging of the application as would a production ready, security camera system have so that I developer can bug it if necessary.
+
+- [] is a service is down there should be a button in the UI to restart it...
 
 PASSWORD: hushai-dev

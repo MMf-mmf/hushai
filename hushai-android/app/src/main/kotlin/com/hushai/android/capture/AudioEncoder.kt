@@ -56,7 +56,14 @@ class AudioEncoder(
             setInteger(MediaFormat.KEY_BIT_RATE, bitRate)
             setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, MAX_INPUT_SIZE)
         }
-        codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        // Release the native MediaCodec if configure() throws (device-specific rejection), else it
+        // leaks against the global codec pool on every START_STICKY restart attempt.
+        try {
+            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+        } catch (e: Exception) {
+            runCatching { codec.release() }
+            throw e
+        }
     }
 
     fun start() {
@@ -122,7 +129,11 @@ class AudioEncoder(
                 }
                 index >= 0 -> {
                     val buffer = codec.getOutputBuffer(index)
-                    if (buffer != null) handleEncoded(buffer, info)
+                    // Guard handleEncoded (opens a SegmentMuxer, which can throw): a throw would
+                    // otherwise propagate out and silently stop audio encoding. Log + drop; the
+                    // releaseOutputBuffer below still runs.
+                    if (buffer != null) runCatching { handleEncoded(buffer, info) }
+                        .onFailure { HushaiLog.error("audio handleEncoded failed; dropping sample", it) }
                     codec.releaseOutputBuffer(index, false)
                 }
                 else -> return // INFO_TRY_AGAIN_LATER

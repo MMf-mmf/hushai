@@ -50,7 +50,10 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Observability
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# `json` powers the production (machine-parseable) log format toggled by LOG_FORMAT=json.
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+# Non-blocking, daily-rotated on-disk log files (the durable audit trail), enabled by LOG_DIR.
+tracing-appender = "0.2"
 
 # Errors
 thiserror = "2"

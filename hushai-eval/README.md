@@ -6,9 +6,13 @@ unchanged** verdict + an exit code. This is the inner loop an agent (or a human)
 *make a change → run the suite → read the verdict → iterate until the target metric improves with no
 regressions.*
 
-It is the **deterministic / file-injection** tier (Tier 1) — the regression backbone. A future
-physical "camera-at-screen" realism tier (Tier 2) reuses the same fixtures + scorers; see the plan
-at `~/.claude/plans/getting-recursive-testing-in-resilient-micali.md`.
+It is the **deterministic / file-injection** tier (Tier 1) — the regression backbone. The physical
+"camera-at-screen" realism tier (Tier 2) is **built** too (`local_dev/physical_loopback.py`) and
+reuses the same fixtures + scorers.
+
+> **Agents: read `hushai-eval/RECURSIVE_TESTING.md`** — the full playbook (bring-up, the
+> validate-a-change loop, the labeling flow, trust invariants, troubleshooting). This README is the
+> quick reference.
 
 ## The contract (what the agent loop consumes)
 
@@ -98,13 +102,31 @@ modalities to score), `expected.json` (ground truth; every modality key optional
 ns offsets from `base_capture_unix_nanos`), and optional `refs/` enrollment assets. Regenerate media
 with `./local_dev/build_fixtures.sh`.
 
-Current corpus (auto-generated, construction-known ground truth):
+Current corpus — synthetic (macOS `say`, `build_fixtures.sh`) + real public-domain clips
+(`fetch_eval_clips.sh`); all ground truth human-verified:
 
 | case | split | scores | notes |
 |------|-------|--------|-------|
 | `asr_short` | train (fast) | transcript | single TTS voice; WER ≈ 0.06 |
-| `two_speakers` | train (full) | transcript, events | two voices; multi-utterance ASR + speech events |
+| `two_speakers` | train (full) | transcript, events | 2 TTS voices; diarization staged (currently merges to 1 voice — next target) |
+| `jfk_moon` | train (full) | transcript, **speakers**, events | real JFK speech; WER 0.23; **speaker gate: mints exactly 1 voice** |
+| `fdr_infamy` | train (full) | transcript, events | real 1941 archival audio; WER 0.56 (degraded-audio baseline) |
+| `armstrong_step` | train (full) | transcript, events | real Moon-radio audio; WER 0.43 (noisy baseline) |
 | `silence_no_speech` | holdout (full) | transcript, speakers | counter-fixture: must mint **0** speakers |
+
+## The labeling loop (`probe`)
+
+Turn any clip into a human-verified fixture:
+
+```
+cargo run -p hushai-eval -- probe --audio path/to/clip.wav [--case NAME] [--vision]
+```
+
+It resets the test DB, injects the clip, processes it, prints everything the pipeline heard
+(transcript + sentiment + speakers + events), and writes a DRAFT `fixtures/staging/<case>/` with
+`expected.json` PRE-FILLED from the pipeline's own output. You review the printout, correct the
+ground truth, then promote it to `fixtures/train/` and `--update-baseline`. Real fixtures' media is
+re-fetchable via `local_dev/fetch_eval_clips.sh`.
 
 ## Current coverage & known findings
 
@@ -114,12 +136,17 @@ Current corpus (auto-generated, construction-known ground truth):
   (allow-set accuracy), persons/faces (count + named), objects (label-set F1), plates (normalized
   string + read recall + named). They score as soon as a fixture lists the modality and the lane is
   enabled with weights present.
-- **⚠ Speaker-lane finding:** on this machine the speaker lane currently mints **0 speakers** on
-  every available clip — TTS **and** real audio (`IMG_7256.mp4`): ~0.31s post-VAD speech, all
-  `quality='marginal'`, while Whisper (its own VAD) transcribes the same audio fine. This is a real
-  characteristic the harness surfaced; **do not** loosen the mint gates to mask it. Diarization
-  scoring is staged off `two_speakers.modalities` until it's investigated. To re-enable, add
-  `"speakers"` back to that fixture's `modalities`.
+- **✅ Speaker-lane bug — found AND fixed by this harness (the first recursive-testing win).** The
+  harness surfaced that the speaker lane minted **0 speakers** on every clip (TTS *and* real audio:
+  a constant ~0.31s post-VAD speech). Root cause: `hushai-worker/src/speaker.rs::detect()` fed the
+  whole buffer to sherpa's Silero VAD in one `accept_waveform` call, which emits a single ~0.31s
+  segment regardless of input. Fix: feed 512-sample windows in a loop, draining segments (verified
+  by the `vad_probe_real_speech` diagnostic: 0.31s → 4.41s on a 14s clip). Now JFK mints 1 voice;
+  `jfk_moon` + `silence_no_speech` gate it.
+- **Remaining diarization gap (next target):** `two_speakers` still merges its 2 distinct voices into
+  1 (short 2s-turn TTS + the speaker-window aggregation crossing the turn boundary). Diarization is
+  staged off `two_speakers.modalities`; the target (`distinct_count: 2`) is documented in its
+  `expected.json`. Enable it once the merge is fixed — **do not** loosen mint/match thresholds to mask it.
 - **Pending (needs weights / your help):** object detection + ALPR fixtures require the RF-DETR /
   CLIP / plate-detector / plate-OCR weights (Phase 0 provisioning). Face fixtures need source
   stills. The physical camera tier needs a rig.

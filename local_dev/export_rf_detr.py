@@ -119,7 +119,11 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as td:
         print("Exporting to ONNX…")
         # rfdetr writes <output_dir>/inference_model.onnx (name varies by version); glob for it.
-        model.export(output_dir=td, opset_version=args.opset, simplify=True)
+        # Newer rfdetr.export() dropped the `simplify` kwarg — fall back without it.
+        try:
+            model.export(output_dir=td, opset_version=args.opset, simplify=True)
+        except TypeError:
+            model.export(output_dir=td, opset_version=args.opset)
         produced = sorted(Path(td).glob("*.onnx"))
         if not produced:
             die(f"rfdetr.export produced no .onnx in {td}")

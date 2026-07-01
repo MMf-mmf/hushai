@@ -71,7 +71,12 @@ profile_env() {
     conc2)  echo "VISION_ENABLED=true"; echo "SENTIMENT_ENABLED=true"; echo "PLATE_ENABLED=true"; echo "WORKER_CONCURRENCY=2" ;;
     conc4)  echo "VISION_ENABLED=true"; echo "SENTIMENT_ENABLED=true"; echo "PLATE_ENABLED=true"; echo "WORKER_CONCURRENCY=4" ;;
     conc6)  echo "VISION_ENABLED=true"; echo "SENTIMENT_ENABLED=true"; echo "PLATE_ENABLED=true"; echo "WORKER_CONCURRENCY=6" ;;
-    *) die "unknown profile '$1' (try: audio-only audio-sentiment audio-vision everything conc1 conc2 conc4 conc6)" ;;
+    # vision-lane fan-out: hold the audio lane fixed and sweep VISION_CONCURRENCY (the new knob) so
+    # the report attributes the vision saturation knee. Run against a VIDEO/MUXED corpus (--video).
+    visconc1) echo "VISION_ENABLED=true"; echo "SENTIMENT_ENABLED=true"; echo "PLATE_ENABLED=true"; echo "WORKER_CONCURRENCY=2"; echo "VISION_CONCURRENCY=1" ;;
+    visconc2) echo "VISION_ENABLED=true"; echo "SENTIMENT_ENABLED=true"; echo "PLATE_ENABLED=true"; echo "WORKER_CONCURRENCY=2"; echo "VISION_CONCURRENCY=2" ;;
+    visconc4) echo "VISION_ENABLED=true"; echo "SENTIMENT_ENABLED=true"; echo "PLATE_ENABLED=true"; echo "WORKER_CONCURRENCY=2"; echo "VISION_CONCURRENCY=4" ;;
+    *) die "unknown profile '$1' (try: audio-only audio-sentiment audio-vision everything conc1 conc2 conc4 conc6 visconc1 visconc2 visconc4)" ;;
   esac
 }
 

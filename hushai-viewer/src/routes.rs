@@ -74,7 +74,12 @@ pub fn router(state: ViewerState) -> Router {
         .route("/readyz", get(readyz))
         .route("/metrics", get(hushai_backend::observe::metrics_handler))
         .merge(protected)
-        .layer(TraceLayer::new_for_http())
+        // Structured per-request access log with a correlatable `request_id` (see crate::logging).
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(hushai_backend::logging::make_http_span)
+                .on_response(hushai_backend::logging::on_http_response),
+        )
         .with_state(state)
 }
 
@@ -94,8 +99,19 @@ pub struct WindowParams {
 
 /// Clamp a *playable* window so a single playlist can't blow up. Unbounded windows
 /// (no `to`) are left alone — the UI always supplies a bounded window.
-fn clamp_window(from: i64, to: i64, max: i64) -> (i64, i64) {
-    if to != i64::MAX && to > from && to.saturating_sub(from) > max {
+pub(crate) fn clamp_window(from: i64, to: i64, max: i64) -> (i64, i64) {
+    // Resolve an unbounded upper bound (`to` omitted → i64::MAX) to "now" first, so the
+    // max-window cap ALSO applies to the default unbounded request — otherwise the clamp
+    // was a no-op for exactly the request it exists to bound (whole-history scan).
+    let to = if to == i64::MAX {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(i64::MAX)
+    } else {
+        to
+    };
+    if to > from && to.saturating_sub(from) > max {
         (to - max, to)
     } else {
         (from, to)
@@ -121,6 +137,9 @@ async fn get_timeline(
 ) -> ViewerResult<Json<timeline::TimelineResponse>> {
     let from = p.from.unwrap_or(0);
     let to = p.to.unwrap_or(i64::MAX);
+    // Same 6h clamp the detections/processing/playlist routes use, so an unbounded
+    // timeline request can't load a device's entire history into one JSON body.
+    let (from, to) = clamp_window(from, to, state.cfg.max_window_nanos);
     let rows = timeline::windowed_segments(&state.pool, &device_id, from, to).await?;
     Ok(Json(timeline::build_timeline(&device_id, from, to, &rows)))
 }

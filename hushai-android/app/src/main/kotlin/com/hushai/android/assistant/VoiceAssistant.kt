@@ -49,9 +49,10 @@ class VoiceAssistant(
     private val queue = ArrayBlockingQueue<ByteArray>(QUEUE_CAPACITY)
     @Volatile private var running = false
     @Volatile private var phase = AssistantPhase.LISTENING
-    private var worker: Thread? = null
+    // @Volatile: created on hushai-va-init, read/torn-down by stop() on hushai-lifecycle.
+    @Volatile private var worker: Thread? = null
 
-    private var recognizer: Recognizer? = null
+    @Volatile private var recognizer: Recognizer? = null
     private val audioPlayer = AudioPlayer()
     private val speakExecutor: ExecutorService =
         Executors.newSingleThreadExecutor { r -> Thread(r, "hushai-va-speak") }
@@ -81,7 +82,8 @@ class VoiceAssistant(
         } catch (e: Exception) {
             HushaiLog.error("vosk model load failed", e)
             running = false // else onPcm keeps enqueuing into a queue no worker drains
-            publish { it.copy(phase = AssistantPhase.OFF, note = "voice models failed to load") }
+            // enabled=false so the UI Switch reflects the dead assistant (not stuck ON).
+            publish { it.copy(enabled = false, phase = AssistantPhase.OFF, note = "voice models failed to load") }
             return
         }
         if (!running) return
@@ -90,9 +92,12 @@ class VoiceAssistant(
         } catch (e: Exception) {
             HushaiLog.error("recognizer init failed", e)
             running = false
-            publish { it.copy(phase = AssistantPhase.OFF, note = "recognizer init failed") }
+            publish { it.copy(enabled = false, phase = AssistantPhase.OFF, note = "recognizer init failed") }
             return
         }
+        // A stop() can land during the slow Vosk/Recognizer init above; if so, close the native
+        // Recognizer here instead of leaking it (stop() already ran and saw recognizer==null).
+        if (!running) { runCatching { rec.close() }; return }
         recognizer = rec
         publish { it.copy(ready = true) }
         worker = Thread({ loop() }, "hushai-va").apply { start() }

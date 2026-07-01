@@ -13,6 +13,11 @@ use anyhow::anyhow;
 pub struct WorkerConfig {
     /// Path to the whisper.cpp GGML model file (local ASR).
     pub whisper_model_path: String,
+    /// Whisper anti-hallucination decode-quality params (see `asr::DecodeQuality`).
+    pub whisper_no_speech_thold: f32,
+    pub whisper_logprob_thold: f32,
+    pub whisper_entropy_thold: f32,
+    pub whisper_suppress_nst: bool,
     /// Base URL of the Ollama server the worker sends embedding requests to.
     /// From `EMBED_OLLAMA_BASE_URL`, falling back to `OLLAMA_BASE_URL`. Keeping this
     /// separate from the RAG answer-LLM endpoint lets always-on embedding load be
@@ -20,8 +25,21 @@ pub struct WorkerConfig {
     pub embed_ollama_base_url: String,
     /// Embedding model name (must produce 1024-dim vectors to match the schema).
     pub embed_model: String,
-    /// Number of concurrent per-segment pipelines.
+    /// Number of concurrent per-segment AUDIO pipelines (whisper/embed/speaker lane).
     pub worker_concurrency: usize,
+    /// Number of concurrent VIDEO/MUXED VISION pipelines (face/object/plate lane). The single
+    /// shared `VisionModels` (Arc-based ORT sessions; `Session` is `Send+Sync` and `Run` is
+    /// thread-safe) is cloned per loop, so this is pure segment-level fan-out over the
+    /// SKIP-LOCKED vision queue — no model duplication. Each segment is still processed
+    /// start-to-finish on one loop, so intra-segment frame ordering (plate clustering) holds.
+    pub vision_concurrency: usize,
+    /// Per-call whisper thread override (`ASR_THREADS`). `0`/unset ⇒ the derived CPU budget
+    /// `clamp(cores / (worker_concurrency + vision_concurrency), 1, cores)`, so N parallel
+    /// transcriptions don't each request all cores and oversubscribe the box. See `asr_n_threads`.
+    pub asr_threads: usize,
+    /// Per-session ORT intra-op thread override (`ORT_INTRA_THREADS`). `0`/unset ⇒ the same
+    /// derived budget. CoreML-offloaded nodes are unaffected; this caps only CPU-fallback ops.
+    pub ort_intra_threads: usize,
     /// How long to wait between polls when the queue is drained (keep-up mode).
     pub poll_interval: Duration,
     /// Max attempts before a segment is left in `error` and no longer retried.
@@ -66,6 +84,19 @@ pub struct WorkerConfig {
     pub vad_min_silence_secs: f32,
     /// Minimum speech (s) for a Silero segment to be emitted (drops isolated blips).
     pub vad_min_speech_secs: f32,
+
+    // --- Skip-silent gate — don't pay for whisper on a segment with no speech ---
+    /// Master switch for the pre-ASR skip-silent gate. On (default) skips whisper + sentiment +
+    /// speaker work on segments with no speech (writing an empty transcript + reject tombstone,
+    /// still marked `done`). Set false to fully restore legacy "always transcribe" behavior.
+    pub audio_silence_skip_enabled: bool,
+    /// Stage-1 free floor: a segment whose RMS amplitude is at/under this is dead air and is
+    /// skipped WITHOUT running the VAD model (~-46 dBFS at 0.005). Uncalibrated starting guess.
+    pub audio_silence_rms_floor: f32,
+    /// Stage-2 threshold: after the VAD runs, less than this many seconds of detected speech ⇒
+    /// skip. Kept BELOW `speaker_min_speech_secs` (0.3) so we only skip on essentially-no-speech;
+    /// a short-but-real utterance is still transcribed (the speaker stage may reject it later).
+    pub audio_silence_min_speech_secs: f64,
 
     // --- Mint quality gates — a NEW identity may only be born from clean audio ---
     /// MINT gate: minimum cleaned speech (s) to be allowed to mint a NEW identity (must be
@@ -156,9 +187,30 @@ pub struct WorkerConfig {
     pub face_detect_model_path: String,
     pub face_embed_model_path: String,
     pub object_det_model_path: String,
+    /// Authoritative column→label map for the object detector (RF-DETR's COCO 91-slot layout). The
+    /// worker falls back to its built-in COCO-91 map if this file is absent/unreadable.
+    pub object_classes_path: String,
+    /// Class-aware NMS IoU for the object lane (RF-DETR duplicate-box suppression). Default 0.5.
+    pub object_nms_iou: f32,
     pub clip_image_model_path: String,
     /// How many frames to sample per ~2s segment for detection/embedding.
     pub frames_per_segment: usize,
+
+    // --- Skip-static gate — don't re-run vision on an unchanged scene ---
+    /// Master switch for the cross-segment motion gate. On (default) skips ALL vision inference on
+    /// a segment whose representative frame is near-identical to the same camera's last analyzed
+    /// frame (writing nothing, still marked `done`). Set false to fully restore legacy behavior —
+    /// also do this for a full reprocess/calibration run (the in-memory baseline isn't meaningful
+    /// when replaying old segments out of order). Mirrors `speaker_reprocess_rejects_on_start`'s
+    /// "on for one run" convention.
+    pub vision_motion_skip_enabled: bool,
+    /// Mean-subtracted MSE distance (0..~65025) at/under which a segment is "static" and skipped.
+    /// Conservative default skips only near-identical frames. UNCALIBRATED starting guess —
+    /// calibrate per deployment against real footage (see plan "How to Test").
+    pub vision_motion_threshold: f32,
+    /// Fingerprint tile side (NxN grayscale). Larger = more sensitive + slightly more cost; 32 is
+    /// the recommended sweet spot (~1 KB/camera).
+    pub vision_motion_fp_side: usize,
     /// Face match-or-mint tunables (cosine DISTANCE; mirror the SPEAKER_* set). UNCALIBRATED
     /// starting guesses — calibrate on a real face fixture (see plan "How to Test").
     pub face_match_threshold: f32,
@@ -241,6 +293,8 @@ pub struct WorkerConfig {
     pub plate_detect_model_path: String,
     /// Plate-OCR ONNX (fast-plate-ocr CCT / PaddleOCR rec).
     pub plate_ocr_model_path: String,
+    /// OCR decode head: false = fixed-length per-slot (fast-plate-ocr CCT, default), true = CTC (CRNN).
+    pub plate_ocr_ctc: bool,
     /// Ordered class→char map for the OCR head (sidecar JSON, an array of single-char strings).
     pub plate_ocr_charset_path: String,
     /// Square input side of the plate detector (letterboxed). Validate at provisioning.
@@ -283,12 +337,50 @@ pub struct WorkerConfig {
     /// Notification delivery loop tunables (`ALERT_*`, roadmap A4). See `delivery::DeliveryConfig`.
     pub delivery: crate::delivery::DeliveryConfig,
 
+    /// Device load governor tunables (`LOAD_*`). Paces processing so the box is never overloaded;
+    /// disabled ⇒ legacy always-claim behavior. See `governor::GovernorConfig`.
+    pub governor: crate::governor::GovernorConfig,
+
     /// Address for the worker's Prometheus `/metrics` + `/healthz` server (roadmap B1/B5). The
     /// worker has no other HTTP port. `WORKER_METRICS_ADDR`; empty disables it. Default :9100.
     pub metrics_addr: Option<SocketAddr>,
 }
 
 impl WorkerConfig {
+    /// Logical-core count with a safe fallback — the basis of the inference thread budget.
+    pub fn cores() -> usize {
+        std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+    }
+
+    /// Total inference loops sharing the CPU (audio + vision), at least 1. Denominator of the
+    /// per-call thread budget so M audio + V vision loops don't each grab all cores.
+    pub fn total_inference_loops(&self) -> usize {
+        (self.worker_concurrency + self.vision_concurrency).max(1)
+    }
+
+    /// Per-call whisper `n_threads`. `ASR_THREADS` overrides; `0`/unset ⇒ the derived budget
+    /// `clamp(cores / total_inference_loops, 1, cores)`.
+    pub fn asr_n_threads(&self) -> i32 {
+        let c = Self::cores();
+        let derived = (c / self.total_inference_loops()).clamp(1, c);
+        let n = if self.asr_threads == 0 { derived } else { self.asr_threads };
+        n.clamp(1, c) as i32
+    }
+
+    /// Per-session ORT intra-op thread count (same budget). `ORT_INTRA_THREADS` overrides;
+    /// `0`/unset ⇒ derived. `0` is never returned (the core fallback guarantees ≥ 1).
+    pub fn ort_intra_op_threads(&self) -> usize {
+        let c = Self::cores();
+        let derived = (c / self.total_inference_loops()).clamp(1, c);
+        if self.ort_intra_threads == 0 {
+            derived
+        } else {
+            self.ort_intra_threads.clamp(1, c)
+        }
+    }
+
     /// Mint-quality gates for the input-quality classifier (see `vad::assess_quality`).
     pub fn mint_gates(&self) -> crate::vad::MintGates {
         crate::vad::MintGates {
@@ -373,9 +465,16 @@ impl WorkerConfig {
         }
         Ok(Self {
             whisper_model_path: opt("WHISPER_MODEL_PATH", "./models/ggml-base.en.bin"),
+            whisper_no_speech_thold: parse("WHISPER_NO_SPEECH_THOLD", "0.6")?,
+            whisper_logprob_thold: parse("WHISPER_LOGPROB_THOLD", "-1.0")?,
+            whisper_entropy_thold: parse("WHISPER_ENTROPY_THOLD", "2.4")?,
+            whisper_suppress_nst: parse("WHISPER_SUPPRESS_NST", "false")?,
             embed_ollama_base_url: opt("EMBED_OLLAMA_BASE_URL", &ollama_base_url),
             embed_model: opt("EMBED_MODEL", "mxbai-embed-large"),
             worker_concurrency: parse("WORKER_CONCURRENCY", "2")?,
+            vision_concurrency: parse("VISION_CONCURRENCY", "2")?,
+            asr_threads: parse("ASR_THREADS", "0")?,
+            ort_intra_threads: parse("ORT_INTRA_THREADS", "0")?,
             poll_interval: Duration::from_secs(parse("POLL_INTERVAL_SECS", "5")?),
             max_attempts: parse("MAX_ATTEMPTS", "5")?,
             lease_timeout_secs: parse("LEASE_TIMEOUT_SECS", "300")?,
@@ -395,6 +494,9 @@ impl WorkerConfig {
             vad_threshold: parse("VAD_THRESHOLD", "0.5")?,
             vad_min_silence_secs: parse("VAD_MIN_SILENCE_SECS", "0.3")?,
             vad_min_speech_secs: parse("VAD_MIN_SPEECH_SECS", "0.25")?,
+            audio_silence_skip_enabled: parse("AUDIO_SILENCE_SKIP_ENABLED", "true")?,
+            audio_silence_rms_floor: parse("AUDIO_SILENCE_RMS_FLOOR", "0.005")?,
+            audio_silence_min_speech_secs: parse("AUDIO_SILENCE_MIN_SPEECH_SECS", "0.2")?,
             speaker_mint_min_speech_secs: parse("SPEAKER_MINT_MIN_SPEECH_SECS", "1.2")?,
             // Lowered from 10.0: real phone/room audio is noisier than clean-room `say` voices.
             // The voiced-fraction gate still keeps mostly-silence windows out of minting, so this
@@ -437,8 +539,13 @@ impl WorkerConfig {
             ),
             face_embed_model_path: opt("FACE_EMBED_MODEL_PATH", "./models/w600k_r50.onnx"),
             object_det_model_path: opt("OBJECT_DET_MODEL_PATH", "./models/rf-detr-nano.onnx"),
+            object_classes_path: opt("OBJECT_CLASSES_PATH", "./models/rf-detr-classes.json"),
+            object_nms_iou: parse("OBJECT_NMS_IOU", "0.5")?,
             clip_image_model_path: opt("CLIP_IMAGE_MODEL_PATH", "./models/clip_vit_b32_image.onnx"),
-            frames_per_segment: parse("FRAMES_PER_SEGMENT", "2")?,
+            frames_per_segment: parse("FRAMES_PER_SEGMENT", "3")?,
+            vision_motion_skip_enabled: parse("VISION_MOTION_SKIP_ENABLED", "true")?,
+            vision_motion_threshold: parse("VISION_MOTION_THRESHOLD", "8.0")?,
+            vision_motion_fp_side: parse("VISION_MOTION_FP_SIDE", "32")?,
             face_match_threshold: parse("FACE_MATCH_THRESHOLD", "0.5")?,
             face_mint_distance_floor: parse("FACE_MINT_DISTANCE_FLOOR", "0.72")?,
             face_knn_k: parse("FACE_KNN_K", "15")?,
@@ -480,6 +587,7 @@ impl WorkerConfig {
             plate_enabled: parse("PLATE_ENABLED", "true")?,
             plate_detect_model_path: opt("PLATE_DETECT_MODEL_PATH", "./models/lp_detector.onnx"),
             plate_ocr_model_path: opt("PLATE_OCR_MODEL_PATH", "./models/lp_ocr_cct.onnx"),
+            plate_ocr_ctc: parse("PLATE_OCR_CTC", "false")?,
             plate_ocr_charset_path: opt("PLATE_OCR_CHARSET_PATH", "./models/lp_ocr_charset.json"),
             plate_detect_input_size: parse("PLATE_DETECT_INPUT_SIZE", "640")?,
             plate_min_det_score: parse("PLATE_MIN_DET_SCORE", "0.35")?,
@@ -527,6 +635,23 @@ impl WorkerConfig {
                     // Local-first default: LAN webhook targets (Home Assistant, etc.) are allowed.
                     allow_private: parse("ALERT_WEBHOOK_ALLOW_PRIVATE", "true")?,
                 }
+            },
+
+            governor: crate::governor::GovernorConfig {
+                enabled: parse("LOAD_GOVERNOR_ENABLED", "true")?,
+                sample: Duration::from_secs(parse("LOAD_SAMPLE_SECS", "5")?),
+                slope_elevated: parse("LOAD_SLOPE_ELEVATED", "0.05")?,
+                slope_saturated: parse("LOAD_SLOPE_SATURATED", "0.10")?,
+                use_cpu: parse("LOAD_GOVERNOR_USE_CPU", "true")?,
+                cpu_elevated: parse("LOAD_CPU_ELEVATED", "0.80")?,
+                cpu_saturated: parse("LOAD_CPU_SATURATED", "0.95")?,
+                recover_samples: parse("LOAD_RECOVER_SAMPLES", "3")?,
+                pause_vision_first: parse("LOAD_PAUSE_VISION_FIRST", "true")?,
+                cooldown_elevated: Duration::from_millis(parse("BACKLOG_COOLDOWN_MS", "0")?),
+                cooldown_saturated: Duration::from_millis(parse(
+                    "BACKLOG_SATURATED_COOLDOWN_MS",
+                    "250",
+                )?),
             },
 
             metrics_addr: {

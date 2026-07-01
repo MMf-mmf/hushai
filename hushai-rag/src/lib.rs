@@ -28,7 +28,6 @@ use anyhow::Context;
 use axum::Router;
 use axum::routing::{get, post};
 use tower_http::trace::TraceLayer;
-use tracing_subscriber::EnvFilter;
 
 use crate::clip_text::ClipTextEmbedder;
 use crate::config::RagConfig;
@@ -37,10 +36,9 @@ use crate::llm::Llm;
 use crate::state::AppState;
 use crate::tts::Tts;
 
+/// Honours `RUST_LOG` / `LOG_FORMAT` / `LOG_DIR` via the shared [`hushai_backend::logging`] module.
 pub fn init_tracing() {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,hushai_rag=debug"));
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+    hushai_backend::logging::init("hushai-rag", "info,hushai_rag=debug");
 }
 
 /// Build the router for a given state (kept separate so tests can mount it too).
@@ -58,7 +56,12 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/rag/agents", get(chat::list_agents))
         .route("/v1/tts", post(routes::tts_synthesize))
-        .layer(TraceLayer::new_for_http())
+        // Structured per-request access log with a correlatable `request_id` (see crate::logging).
+        .layer(
+            TraceLayer::new_for_http()
+                .make_span_with(hushai_backend::logging::make_http_span)
+                .on_response(hushai_backend::logging::on_http_response),
+        )
         .with_state(state)
 }
 
@@ -103,10 +106,34 @@ pub async fn run() -> anyhow::Result<()> {
     let llm = Arc::new(Llm::new(&cfg.llm_ollama_base_url, &cfg.rag_llm_model)?);
     let bind_addr = cfg.bind_addr;
     let tls = cfg.tls.clone();
+    // Redacted startup banner (no RAG_TOKEN / DB credentials).
+    tracing::info!(
+        service = "hushai-rag",
+        version = env!("CARGO_PKG_VERSION"),
+        %bind_addr,
+        tls = tls.is_some(),
+        llm_model = %cfg.rag_llm_model,
+        embed_model = %cfg.embed_model,
+        logging = %hushai_backend::logging::summary(),
+        "starting"
+    );
     if cfg.rag_token.is_none() {
+        // Fail closed: an unauthenticated rag on a non-loopback bind is a world-open surveillance
+        // archive (transcripts, who-with-whom, plates, reflection digest) — one POST from any LAN
+        // host reads everything. Allow only loopback, or an explicit opt-in for trusted networks.
+        let insecure_ok = std::env::var("RAG_ALLOW_INSECURE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if !bind_addr.ip().is_loopback() && !insecure_ok {
+            anyhow::bail!(
+                "refusing to start: RAG_TOKEN is unset while binding a non-loopback address \
+                 ({bind_addr}) — the rag archive would be UNAUTHENTICATED and world-open on the \
+                 LAN. Set RAG_TOKEN, bind 127.0.0.1, or set RAG_ALLOW_INSECURE=true to override."
+            );
+        }
         tracing::warn!(
-            "RAG_TOKEN is unset — the rag service is UNAUTHENTICATED. Set RAG_TOKEN so \
-             it isn't world-open on the LAN (the viewer proxy + Android assistant present it)."
+            "RAG_TOKEN is unset — the rag service is UNAUTHENTICATED (allowed: loopback or \
+             RAG_ALLOW_INSECURE). Set RAG_TOKEN so it isn't world-open on the LAN."
         );
     }
 

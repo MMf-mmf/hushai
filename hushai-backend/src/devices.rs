@@ -573,10 +573,12 @@ fn aggregate_deleted(rows: Vec<(Vec<u8>, i64)>) -> (i64, i64, Vec<[u8; 32]>) {
 }
 
 /// Reclaim the (now-unreferenced) blobs in the background so the HTTP response returns promptly.
-/// Zero grace is safe here: the candidate set is exactly the just-committed-deleted segments' shas,
-/// and `reclaim_blobs` re-checks each against the live DB, so a blob still shared by a kept segment
-/// is preserved. (The grace window only matters for a future full-tree sweep vs in-flight ingest of
-/// genuinely new content — out of scope here.)
+/// Uses `storage::RECLAIM_GRACE` (not zero): `reclaim_blobs` re-checks each sha against the live DB,
+/// but a concurrent ingest of byte-identical content can have promoted (written) the shared blob
+/// while its owning row is not yet committed — a delete's reclaim would then see the sha as
+/// unreferenced and unlink bytes the about-to-commit row points at. The grace window skips blobs
+/// younger than it, closing that promote-then-commit race. (Distinct segment_ids CAN share bytes:
+/// the loadtest harness + re-import mint fresh ids over a shared corpus body.)
 fn spawn_reclaim(st: &AppState, shas: Vec<[u8; 32]>) {
     if shas.is_empty() {
         return;
@@ -585,7 +587,7 @@ fn spawn_reclaim(st: &AppState, shas: Vec<[u8; 32]>) {
     let root = st.blob_root.clone();
     tokio::spawn(async move {
         let n = shas.len();
-        let freed = storage::reclaim_blobs(&pool, &root, &shas, Duration::ZERO).await;
+        let freed = storage::reclaim_blobs(&pool, &root, &shas, storage::RECLAIM_GRACE).await;
         tracing::info!(candidate_blobs = n, freed_bytes = freed, "blob reclamation complete");
     });
 }

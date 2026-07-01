@@ -16,6 +16,10 @@ pub struct ViewerState {
     pub http: reqwest::Client,
     /// Bounds total concurrent ffmpeg remuxes (a fast scrub must not fork-bomb).
     pub ffmpeg_sem: Arc<Semaphore>,
+    /// Bounds concurrent footage EXPORTS, SEPARATELY from `ffmpeg_sem`: an export holds one permit
+    /// for its whole long-lived stream AND internally calls remux (which takes `ffmpeg_sem`), so
+    /// sharing one semaphore would let an export deadlock its own per-segment remuxes.
+    pub export_sem: Arc<Semaphore>,
     /// Per-cache-key single-flight locks so concurrent requests for the same segment
     /// remux it once. Keyed by `<sha>.<variant>`; entries are short-lived.
     pub inflight: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,

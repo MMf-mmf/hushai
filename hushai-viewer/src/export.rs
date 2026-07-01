@@ -43,6 +43,9 @@ pub async fn export_mp4(
 ) -> ViewerResult<Response> {
     let from = p.from.unwrap_or(0);
     let to = p.to.unwrap_or(i64::MAX);
+    // Clamp like the playlist/detections/processing routes so one export can't remux a
+    // device's entire history (an ffmpeg-per-segment storm) — bounds worst-case CPU/IO.
+    let (from, to) = crate::routes::clamp_window(from, to, state.cfg.max_window_nanos);
     let (variant, media_type) = match p.kind.as_deref() {
         Some("video") => (Variant::Video, 2),
         _ => (Variant::Muxed, 3),
@@ -70,6 +73,15 @@ pub async fn export_mp4(
             variant.suffix()
         )));
     }
+
+    // Cap concurrent exports on a DEDICATED permit (not ffmpeg_sem, which the per-segment remux
+    // feeder below needs — sharing would deadlock at low concurrency). Fail fast with 503 rather
+    // than queue a long-lived export; the permit is held by the reaper until ffmpeg exits.
+    let export_permit = state
+        .export_sem
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| ViewerError::Busy)?;
 
     let mut child = tokio::process::Command::new(&state.cfg.ffmpeg_bin)
         .args([
@@ -116,6 +128,7 @@ pub async fn export_mp4(
     // Reaper: own the Child so it's reaped once the stream ends; `kill_on_drop` tears ffmpeg down if
     // the client disconnects (stdout reader dropped → ffmpeg SIGPIPEs → exits).
     tokio::spawn(async move {
+        let _permit = export_permit; // released when ffmpeg exits (stream done / client disconnect)
         let _ = child.wait().await;
     });
 

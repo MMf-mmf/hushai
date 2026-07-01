@@ -1,0 +1,14 @@
+{
+  "objects": {
+    "windows": [
+      {
+        "start_ns": 0,
+        "end_ns": 6000000000,
+        "labels": [
+          "car"
+        ]
+      }
+    ],
+    "min_label_f1": 0.5
+  }
+}

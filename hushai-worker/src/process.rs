@@ -28,6 +28,15 @@ use crate::vad::{self, SpeakerQuality};
 const NANOS_PER_SAMPLE: i64 = 1_000_000_000 / vad::SAMPLE_RATE as i64;
 
 /// Run the full pipeline for one claimed segment. Returns the number of sentences written.
+///
+/// Instrumented so every log emitted during processing — including the best-effort warnings deeper
+/// in the call tree (VAD/quality/sentiment/event production) — carries `segment_id` and `lane`,
+/// making one segment's path filterable in production logs. Each fallible stage is `.context`-tagged
+/// so the top-level "segment failed" error names the stage that failed.
+#[tracing::instrument(
+    skip_all,
+    fields(segment_id = %segment_id, lane = "audio"),
+)]
 pub async fn process_segment(
     pool: &PgPool,
     transcriber: &Transcriber,
@@ -45,19 +54,102 @@ pub async fn process_segment(
 
     let seg = {
         let _t = observe::StageTimer::start(STAGE, &[("lane", "audio"), ("stage", "load_segment")]);
-        media::load_segment(pool, segment_id).await?
+        media::load_segment(pool, segment_id).await.context("load_segment")?
     };
     let pcm = {
         let _t = observe::StageTimer::start(STAGE, &[("lane", "audio"), ("stage", "extract_pcm")]);
-        media::extract_pcm(cfg, &seg).await?
+        media::extract_pcm(cfg, &seg).await.context("extract_pcm")?
     };
     // The speaker embedder runs VAD over the raw PCM (independent of whisper), so retain a
     // copy before `transcribe` moves `pcm`. One small clone per segment (~128 KB at 2s/16
     // kHz) keeps asr.rs + its tests untouched.
     let pcm_for_speaker = pcm.clone();
+
+    // Skip-silent gate: whisper is the dominant per-segment cost, so a segment with no speech
+    // should never reach it. Two stages, cheapest first — a free RMS floor short-circuits dead
+    // air without the VAD model, else the Silero VAD (already loaded for speaker work) makes the
+    // definitive call. Fails OPEN: a VAD error falls through to normal ASR so a transient model
+    // fault never silently drops real audio. Skipping leaves the segment's blob + status rows
+    // intact, so it does NOT remove it from a later segment's speaker window
+    // (`build_speaker_window` reads neighbor PCM by sequence, not by transcript) — don't "fix" that.
+    if cfg.audio_silence_skip_enabled {
+        let level = vad::rms(&pcm_for_speaker);
+        let verdict = match vad::silence_verdict(
+            level,
+            None,
+            cfg.audio_silence_rms_floor,
+            cfg.audio_silence_min_speech_secs,
+        ) {
+            // Dead air on RMS alone — no need to run the VAD model.
+            Some(reason) => Some((reason, None)),
+            // Energy present: let the VAD make the definitive speech/no-speech call.
+            None => {
+                let _t = observe::StageTimer::start(
+                    STAGE,
+                    &[("lane", "audio"), ("stage", "silence_gate")],
+                );
+                match voice_detector.detect(&pcm_for_speaker).await {
+                    Ok(vr) => vad::silence_verdict(
+                        level,
+                        Some(vr.speech_secs),
+                        cfg.audio_silence_rms_floor,
+                        cfg.audio_silence_min_speech_secs,
+                    )
+                    .map(|reason| (reason, Some(vr.speech_secs))),
+                    Err(e) => {
+                        tracing::warn!(error = %e, "silence gate: VAD failed; proceeding with ASR");
+                        None
+                    }
+                }
+            }
+        };
+        if let Some((reason, speech_secs)) = verdict {
+            // No transcribable speech. Write an empty transcript through the normal path: it
+            // deletes any prior sentences AND writes the `quality='reject'` speaker tombstone
+            // that stops `reconcile_missing_speaker_segments` from re-queueing this segment on
+            // every restart, then marks status `done`. Skips whisper/sentiment/speaker/embed.
+            {
+                let _t = observe::StageTimer::start(
+                    STAGE,
+                    &[("lane", "audio"), ("stage", "write_transcript")],
+                );
+                write_transcript(
+                    pool,
+                    segment_id,
+                    &seg.device_id,
+                    &[],
+                    &[],
+                    embedder.model_name(),
+                    None,
+                    &cfg.speaker_match_cfg(),
+                )
+                .await
+                .context("write_transcript (silent)")?;
+            }
+            observe::counter(
+                "hushai_audio_segments_skipped_silent_total",
+                &[("reason", reason.as_str())],
+            );
+            tracing::debug!(
+                %segment_id,
+                rms = level,
+                speech_secs = ?speech_secs,
+                reason = reason.as_str(),
+                "skipped silent segment (no ASR)"
+            );
+            observe::observe_duration(
+                "hushai_worker_segment_seconds",
+                &[("lane", "audio")],
+                started.elapsed().as_secs_f64(),
+            );
+            record_capture_lag("audio", seg.capture_start_unix_nanos);
+            return Ok(0);
+        }
+    }
+
     let utterances = {
         let _t = observe::StageTimer::start(STAGE, &[("lane", "audio"), ("stage", "transcribe")]);
-        transcriber.transcribe(pcm).await?
+        transcriber.transcribe(pcm).await.context("transcribe")?
     };
     let mut sentences = chunk::chunk_into_sentences(&utterances, seg.capture_start_unix_nanos);
 
@@ -94,7 +186,7 @@ pub async fn process_segment(
         // is disabled or there are no contiguous neighbors.
         let (window_pcm, window_start_nanos) = {
             let _t = observe::StageTimer::start(STAGE, &[("lane", "audio"), ("stage", "speaker_window")]);
-            build_speaker_window(pool, cfg, &seg, pcm_for_speaker).await?
+            build_speaker_window(pool, cfg, &seg, pcm_for_speaker).await.context("speaker_window")?
         };
         let _t = observe::StageTimer::start(STAGE, &[("lane", "audio"), ("stage", "speaker_embed")]);
         compute_speaker_embedding(
@@ -110,7 +202,7 @@ pub async fn process_segment(
     let texts: Vec<String> = sentences.iter().map(|s| s.text.clone()).collect();
     let embeddings = {
         let _t = observe::StageTimer::start(STAGE, &[("lane", "audio"), ("stage", "embed")]);
-        embedder.embed(texts).await?
+        embedder.embed(texts).await.context("embed")?
     };
 
     let speaker_match_cfg = cfg.speaker_match_cfg();
@@ -126,7 +218,8 @@ pub async fn process_segment(
             speaker,
             &speaker_match_cfg,
         )
-        .await?
+        .await
+        .context("write_transcript")?
     };
 
     // Proactive layer (roadmap A3): materialize a `speech` event + evaluate alert rules. Guarded so
@@ -198,6 +291,17 @@ async fn compute_speaker_embedding(
 
     // Quality gate on POST-VAD speech. Reject (too little/too noisy) => NULL, skip embedding.
     let q = vad::assess_quality(&vr, total_secs, &cfg.mint_gates());
+    // Surface the quality signals for EVERY segment (not just Reject) so the mint gate that BINDS
+    // (speech_secs vs snr_db vs voiced_frac) is observable and calibratable from real captures
+    // rather than inferred. Zero behavior change. (added for hushai-eval speaker calibration)
+    tracing::info!(
+        speech_secs = q.speech_secs,
+        voiced_frac = q.voiced_frac,
+        snr_db = q.snr_db,
+        total_secs,
+        quality = ?q.quality,
+        "speaker: quality assessed"
+    );
     if q.quality == SpeakerQuality::Reject {
         tracing::debug!(
             secs = q.speech_secs,

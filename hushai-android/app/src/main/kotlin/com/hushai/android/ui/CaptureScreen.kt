@@ -34,6 +34,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -538,6 +539,9 @@ private fun AssistantCard(
 ) {
     var enabled by remember { mutableStateOf(initialEnabled) }
     var wakeWord by remember { mutableStateOf(initialWakeWord) }
+    // Follow the authoritative assistant state: when the bus flips enabled OFF (e.g. the
+    // Vosk model / recognizer failed to init), the Switch must reflect that, not stay ON.
+    LaunchedEffect(status.enabled) { enabled = status.enabled }
 
     SectionCard {
         Row(verticalAlignment = Alignment.CenterVertically) {

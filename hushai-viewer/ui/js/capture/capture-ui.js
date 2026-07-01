@@ -116,6 +116,13 @@ function boot() {
     render();
   }
   function close() {
+    // Dismissing the modal (X / backdrop / Escape) must NOT leave the camera+mic live and the
+    // recorder+uploader running invisibly with no UI to stop them. Do the same graceful stop as the
+    // Stop button: flush the final segment, release the stream (via the recorder's onStopped), and
+    // let the uploader drain the backlog. stop() early-returns when not recording, so this is safe
+    // for a plain dismiss too.
+    controller.stop();
+    preview.srcObject = null;
     modal.hidden = true;
   }
 

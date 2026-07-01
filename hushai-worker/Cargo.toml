@@ -51,7 +51,8 @@ pgvector = { version = "0.4.2", features = ["sqlx"] }
 
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+# Logging is initialised centrally by `hushai_backend::logging` (subscriber + JSON/file + panic hook);
+# this crate only emits via `tracing` macros, so it needs no direct `tracing-subscriber` dep.
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
@@ -67,6 +68,10 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 hmac = "0.12"
 sha2 = "0.10"
 hex = "0.4"
+
+# OS 1-minute load average (getloadavg) for the device load governor. Already in the lockfile
+# transitively, so this adds no new resolved crate; usage is gated to `cfg(unix)`.
+libc = "0.2"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full"] }

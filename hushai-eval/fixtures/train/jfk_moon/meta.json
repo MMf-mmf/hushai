@@ -1,0 +1,19 @@
+{
+  "case_id": "jfk_moon",
+  "description": "JFK Rice University 'we have vowed' passage (~334s), public domain; real human speech, human-verified transcript | speakers gate: VAD fix mints exactly 1 voice",
+  "device_id": "eval-jfk-moon",
+  "media_file": "media.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "transcript",
+    "speakers",
+    "events"
+  ],
+  "tier": "full",
+  "poll": {
+    "timeout_secs": 180,
+    "interval_secs": 2
+  }
+}

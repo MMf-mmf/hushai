@@ -1,0 +1,9 @@
+{
+  "case_id": "asr_short",
+  "config_hash": "bda4ec6d0a4946ce",
+  "git_sha": "fa190ff",
+  "metrics": {
+    "transcript.similarity": 0.9540229885057472,
+    "transcript.wer": 0.058823529411764705
+  }
+}

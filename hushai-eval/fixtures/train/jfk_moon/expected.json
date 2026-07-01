@@ -1,0 +1,19 @@
+{
+  "transcript": {
+    "full_text": "For the eyes of the world now look into space, to the moon and to the planets beyond, and we have vowed",
+    "max_wer": 0.35,
+    "min_similarity": 0.65
+  },
+  "events": {
+    "expected": [
+      {
+        "event_type": "speech",
+        "min_count": 1
+      }
+    ]
+  },
+  "speakers": {
+    "distinct_count": 1,
+    "count_tolerance": 0
+  }
+}

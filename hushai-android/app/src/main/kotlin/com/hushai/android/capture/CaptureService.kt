@@ -70,6 +70,7 @@ class CaptureService : Service() {
     @Volatile private var uploader: Uploader? = null
     @Volatile private var camera: CameraController? = null
     @Volatile private var video: VideoEncoder? = null
+    @Volatile private var orientationTracker: OrientationTracker? = null
     @Volatile private var audio: AudioEncoder? = null
     @Volatile private var micSource: MicSource? = null
     @Volatile private var assistant: VoiceAssistant? = null
@@ -142,20 +143,30 @@ class CaptureService : Service() {
     /** Toggle the assistant live: attach/detach it as a second mic sink while capturing.
      *  Build/teardown run off the main thread (DataStore reads, model load, thread join). */
     private fun setAssistantEnabled(enabled: Boolean) {
-        if (enabled) {
-            val mic = micSource
-            if (assistant == null && mic != null && running) {
-                thread(name = "hushai-va-enable") {
+        // Run on the lifecycle executor so build/start/stop serialize with
+        // reconcile()/stopCapture() (which also mutate `assistant` there). Done off the
+        // main thread anyway (DataStore reads, model load, thread join). Without this
+        // serialization a stopCapture() that reads `assistant` just before this thread
+        // assigned it would tear nothing down, leaking a live VoiceAssistant (worker
+        // thread + loaded Vosk/speaker models + speak executor) for the process lifetime.
+        lifecycle.submit {
+            if (enabled) {
+                val mic = micSource
+                if (assistant == null && mic != null && running) {
                     val a = buildAssistant()
+                    // A stop landed while we were building — don't start an orphan.
+                    if (!running || micSource == null) { runCatching { a.stop() }; return@submit }
                     assistant = a
                     a.start()        // start (running=true) BEFORE the mic can call onPcm on it
                     mic.addSink(a)
+                    AssistantBus.update { it.copy(enabled = true) }
                 }
+            } else {
+                val a = assistant
+                assistant = null
+                if (a != null) { runCatching { micSource?.removeSink(a) }; runCatching { a.stop() } }
+                AssistantBus.update { it.copy(enabled = false) }
             }
-        } else {
-            val a = assistant
-            assistant = null
-            if (a != null) thread(name = "hushai-va-disable") { micSource?.removeSink(a); a.stop() }
         }
     }
 
@@ -314,57 +325,81 @@ class CaptureService : Service() {
             HushaiLog.info("preflight ${health.detail} url=$url")
         }
 
-        // Encoders write scratch bodies here; offer() renames them to durable names.
-        val segmentDir = File(File(noBackupFilesDir, "segments"), "incoming").apply { mkdirs() }
+        // Build the live pipeline (encoders, mic, camera). Any of these can throw on
+        // device-specific MediaCodec/AudioRecord/Camera2 init; the lifecycle submit() that
+        // called us never .get()s its Future, so a throw here would be silently swallowed
+        // — leaving running=true with a half-built pipeline that advertises "capturing"
+        // while producing nothing. On failure, tear down what we built and clear running.
+        try {
+            // Encoders write scratch bodies here; offer() renames them to durable names.
+            val segmentDir = File(File(noBackupFilesDir, "segments"), "incoming").apply { mkdirs() }
 
-        // Audio-only skips the entire video pipeline: no camera is opened and no
-        // H.264 encoder runs, so only the cam0-audio stream is produced. This is
-        // why we never select a camera here — saving storage, bandwidth, battery.
-        val selection = if (audioOnly) null else CameraController.select(this)
-        if (!audioOnly && selection == null) {
-            HushaiLog.error("no camera available")
-            StatusBus.update { it.copy(lastError = "no camera") }
-            return
-        }
-
-        if (selection != null) {
-            video = VideoEncoder(
-                segmentDir, selection.size, VIDEO_BITRATE, FRAME_RATE, SEGMENT_DURATION_US, videoSeq, ::onSegment,
-            ).also { it.start() }
-        }
-
-        // One mic, fanned out: the AAC segment encoder always, plus the voice
-        // assistant when enabled. Both consume the same 16 kHz mono PCM.
-        val audioEnc = AudioEncoder(
-            segmentDir, AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BITRATE, SEGMENT_DURATION_US, audioSeq, ::onSegment,
-        ).also { it.start() }
-        audio = audioEnc
-        val sinks = mutableListOf<PcmSink>(audioEnc)
-        if (settings.assistantEnabledBlocking()) {
-            val a = buildAssistant()
-            assistant = a
-            sinks.add(a)
-            a.start()
-            AssistantBus.update { it.copy(enabled = true) }
-        }
-        micSource = MicSource(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, sinks).also { it.start() }
-
-        if (selection != null) {
-            camera = CameraController(this, selection.cameraId, video!!.inputSurface).also {
-                it.start()
-                // If the Activity is already in the foreground and handed us a preview
-                // surface before capture began, wire it in now (idempotent).
-                previewSurface?.let { s -> it.setPreviewSurface(s) }
+            // Audio-only skips the entire video pipeline: no camera is opened and no
+            // H.264 encoder runs, so only the cam0-audio stream is produced. This is
+            // why we never select a camera here — saving storage, bandwidth, battery.
+            val selection = if (audioOnly) null else CameraController.select(this)
+            if (!audioOnly && selection == null) {
+                throw IllegalStateException("no camera available")
             }
-        }
 
-        val summary = if (audioOnly) "audio only" else "capturing ${selection!!.size.width}x${selection.size.height}"
-        captureSummary = summary
-        CaptureNotification.update(this, summary)
-        HushaiLog.info(
-            "capture started device=$deviceId audioOnly=$audioOnly " +
-                (selection?.let { "video ${it.size}" } ?: "(no video)"),
-        )
+            if (selection != null) {
+                // Make every recorded segment UPRIGHT regardless of how the phone is held/mounted:
+                // the tracker reads the physical orientation (accelerometer, works screen-off) and the
+                // encoder stamps each segment's MP4 rotation matrix (worker ffmpeg + browser autorotate).
+                val tracker = OrientationTracker(this, selection.sensorOrientation, selection.facingFront)
+                    .also { it.enable() }
+                orientationTracker = tracker
+                video = VideoEncoder(
+                    segmentDir, selection.size, VIDEO_BITRATE, FRAME_RATE, SEGMENT_DURATION_US, videoSeq, ::onSegment,
+                    rotationProvider = { tracker.orientationHint() },
+                ).also { it.start() }
+            }
+
+            // One mic, fanned out: the AAC segment encoder always, plus the voice
+            // assistant when enabled. Both consume the same 16 kHz mono PCM.
+            val audioEnc = AudioEncoder(
+                segmentDir, AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, AUDIO_BITRATE, SEGMENT_DURATION_US, audioSeq, ::onSegment,
+            ).also { it.start() }
+            audio = audioEnc
+            val sinks = mutableListOf<PcmSink>(audioEnc)
+            if (settings.assistantEnabledBlocking()) {
+                val a = buildAssistant()
+                assistant = a
+                sinks.add(a)
+                a.start()
+                AssistantBus.update { it.copy(enabled = true) }
+            }
+            micSource = MicSource(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, sinks).also { it.start() }
+
+            if (selection != null) {
+                camera = CameraController(this, selection.cameraId, video!!.inputSurface).also {
+                    it.start()
+                    // If the Activity is already in the foreground and handed us a preview
+                    // surface before capture began, wire it in now (idempotent).
+                    previewSurface?.let { s -> it.setPreviewSurface(s) }
+                }
+            }
+
+            val summary = if (audioOnly) "audio only" else "capturing ${selection!!.size.width}x${selection.size.height}"
+            captureSummary = summary
+            CaptureNotification.update(this, summary)
+            HushaiLog.info(
+                "capture started device=$deviceId audioOnly=$audioOnly " +
+                    (selection?.let { "video ${it.size}" } ?: "(no video)"),
+            )
+        } catch (e: Exception) {
+            HushaiLog.error("startCapture failed — tearing down partial pipeline", e)
+            runCatching { camera?.stop() }; camera = null
+            runCatching { micSource?.stop() }; micSource = null
+            runCatching { video?.stop() }; video = null
+            runCatching { orientationTracker?.disable() }; orientationTracker = null
+            runCatching { audio?.stop() }; audio = null
+            runCatching { assistant?.stop() }; assistant = null
+            running = false
+            AssistantBus.update { it.copy(enabled = false) }
+            StatusBus.update { it.copy(running = false, lastError = e.message ?: "capture failed to start") }
+            maybeStopDelivery()
+        }
     }
 
     /**
@@ -669,6 +704,7 @@ class CaptureService : Service() {
         // the consumers (encoder + assistant) without racing onPcm.
         runCatching { micSource?.stop() }; micSource = null
         runCatching { video?.stop() }; video = null
+        runCatching { orientationTracker?.disable() }; orientationTracker = null
         runCatching { audio?.stop() }; audio = null
         runCatching { assistant?.stop() }; assistant = null
         running = false

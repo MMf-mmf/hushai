@@ -29,9 +29,13 @@ class SegmentMuxer(
     // byte-identical to the original behavior). A non-null clock (manual import) maps
     // the segment's first-sample PTS onto the file's ORIGINAL capture time.
     private val clock: SegmentClock? = null,
+    // Clockwise degrees (0/90/180/270) to rotate the video so it displays UPRIGHT regardless of how
+    // the phone is held/mounted. Written to the MP4 rotation matrix (setOrientationHint); the worker's
+    // ffmpeg autorotates on it and browsers honor it. 0 = no hint (default; audio + imports pass 0).
+    private val orientationHintDegrees: Int = 0,
 ) {
     private val muxer = MediaMuxer(file.absolutePath, MediaMuxer.OutputFormat.MUXER_OUTPUT_MPEG_4)
-    private val trackIndex = muxer.addTrack(format)
+    private val trackIndex: Int
     private var started = false
     private var firstPtsUs = -1L
     private var lastPtsUs = 0L
@@ -42,7 +46,25 @@ class SegmentMuxer(
     private val captureWallNanos = System.currentTimeMillis() * 1_000_000L
     private val monotonicNanos = SystemClock.elapsedRealtimeNanos()
 
+    init {
+        // MediaMuxer() above opened the output file's fd; if addTrack rejects the format the
+        // constructor throws and the caller's field stays null, so teardown can't reach this
+        // muxer — release it (+ delete the partial file) before rethrowing to avoid an fd leak.
+        try {
+            trackIndex = muxer.addTrack(format)
+        } catch (e: Exception) {
+            runCatching { muxer.release() }
+            runCatching { file.delete() }
+            throw e
+        }
+    }
+
     fun start() {
+        // Must be set before start(). Stamps the MP4 rotation matrix so downstream (ffmpeg
+        // autorotate, browser <video>) renders upright. Only meaningful for video; 0 = leave default.
+        if (orientationHintDegrees != 0) {
+            runCatching { muxer.setOrientationHint(orientationHintDegrees) }
+        }
         muxer.start()
         started = true
     }

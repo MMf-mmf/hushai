@@ -50,15 +50,21 @@ pub async fn sample_frames(
     }
     fragment.extend_from_slice(&media);
 
+    // Per-call UUID so two concurrent decodes of the SAME segment never share staging
+    // paths. A long segment can be re-claimed (lease timeout) while still in-flight; keying
+    // temp paths by segment_id alone let loop B's remove_dir_all/TempPath::drop wipe loop A's
+    // frames mid-read → ffmpeg "No such file" + spurious vision errors. Mirrors media.rs:185.
+    let run = uuid::Uuid::now_v7();
+
     // ffmpeg needs a seekable input for mp4, so stage the fragment on disk.
-    let tmp_in = std::env::temp_dir().join(format!("hushai-vis-in-{}.mp4", seg.segment_id));
+    let tmp_in = std::env::temp_dir().join(format!("hushai-vis-in-{}-{}.mp4", seg.segment_id, run));
     tokio::fs::write(&tmp_in, &fragment)
         .await
         .context("staging temp media for ffmpeg")?;
     let _c1 = TempPath(tmp_in.clone());
 
     // Emit frames as PNG into a temp dir; the `image` crate then yields dims + RGB directly.
-    let out_dir = std::env::temp_dir().join(format!("hushai-vis-frames-{}", seg.segment_id));
+    let out_dir = std::env::temp_dir().join(format!("hushai-vis-frames-{}-{}", seg.segment_id, run));
     let _ = tokio::fs::remove_dir_all(&out_dir).await; // clear any stale run
     tokio::fs::create_dir_all(&out_dir)
         .await

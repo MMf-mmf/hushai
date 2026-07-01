@@ -30,6 +30,9 @@ class VideoEncoder(
     private val segmentDurationUs: Long,
     private val sequencer: AtomicLong,
     private val onSegment: (Segment) -> Unit,
+    // Returns the current upright-rotation hint (0/90/180/270) for the NEXT segment, sampled at each
+    // ~2s boundary so rotating the phone mid-capture self-corrects. Default 0 = no rotation.
+    private val rotationProvider: () -> Int = { 0 },
 ) {
     private val codec = MediaCodec.createEncoderByType(MIME)
     val inputSurface: Surface
@@ -54,8 +57,17 @@ class VideoEncoder(
             // samples. Hardware realtime encoders honor this; a no-op on older APIs.
             setInteger(MediaFormat.KEY_LATENCY, 1)
         }
-        codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
-        inputSurface = codec.createInputSurface()
+        // configure()/createInputSurface() can throw on a device-specific config rejection
+        // (size comes from CameraController.select(), not a trusted constant). Release the native
+        // MediaCodec before rethrowing, else it leaks against the global codec pool on every
+        // START_STICKY restart attempt.
+        try {
+            codec.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            inputSurface = codec.createInputSurface()
+        } catch (e: Exception) {
+            runCatching { codec.release() }
+            throw e
+        }
     }
 
     fun start() {
@@ -89,7 +101,11 @@ class VideoEncoder(
                 }
                 index >= 0 -> {
                     val buffer = codec.getOutputBuffer(index)
-                    if (buffer != null) handleEncoded(buffer, info)
+                    // Guard handleEncoded (opens a SegmentMuxer, which can throw on a muxer/format
+                    // reject): a throw would otherwise kill this drain thread and silently stop
+                    // encoding. Log + drop the sample; releaseOutputBuffer still runs below.
+                    if (buffer != null) runCatching { handleEncoded(buffer, info) }
+                        .onFailure { HushaiLog.error("video handleEncoded failed; dropping sample", it) }
                     codec.releaseOutputBuffer(index, false)
                 }
                 // INFO_TRY_AGAIN_LATER: nothing ready; loop.
@@ -127,7 +143,13 @@ class VideoEncoder(
 
     private fun openSegment(format: MediaFormat, startPtsUs: Long) {
         val file = File(segmentDir, "video-${fileCounter++}.mp4")
-        val muxer = SegmentMuxer(file, STREAM_ID, MediaType.VIDEO.value, "h264", format, csd)
+        // Sample the device orientation now so this segment records upright for the phone's CURRENT
+        // pose (a mid-capture rotation self-corrects on the next segment).
+        val rotation = runCatching { rotationProvider() }.getOrDefault(0)
+        val muxer = SegmentMuxer(
+            file, STREAM_ID, MediaType.VIDEO.value, "h264", format, csd,
+            orientationHintDegrees = rotation,
+        )
         muxer.start()
         current = muxer
         segmentStartPtsUs = startPtsUs

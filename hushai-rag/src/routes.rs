@@ -7,6 +7,7 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
+use subtle::ConstantTimeEq;
 
 use sqlx::PgPool;
 
@@ -266,10 +267,15 @@ async fn objects_query(
         speaker_id: None,
     };
 
-    // Exhaustive: list every sighting of the exact COCO class (no recall cliff). Otherwise the
-    // open-vocab semantic path (CLIP text NN over scene_objects, including the whole-frame rows).
-    let mut sources = if req.exhaustive.unwrap_or(false) {
-        let label = normalize_object_label(&req.query);
+    // Exhaustive: list every sighting of the EXACT COCO class (no recall cliff) — but only when the
+    // query resolves to a real COCO label. A non-COCO phrase ("a spaceship", "people walking") falls
+    // through to the open-vocab semantic path instead of silently returning nothing.
+    let exhaustive_label = if req.exhaustive.unwrap_or(false) {
+        normalize_object_label(&req.query)
+    } else {
+        None
+    };
+    let mut sources = if let Some(label) = exhaustive_label {
         retrieve::list_by_object_class(
             &st.pool,
             &[label],
@@ -281,6 +287,8 @@ async fn objects_query(
         .await
         .map_err(internal)?
     } else {
+        // Open-vocab semantic path (CLIP text NN over scene_objects, incl. the whole-frame rows) —
+        // also the FALLBACK when an exhaustive query names a non-COCO class.
         let q = req.query.clone();
         // CLIP text embedding is CPU-bound ONNX work — off the async runtime.
         let embedding = tokio::task::spawn_blocking(move || clip.embed_text(&q))
@@ -316,25 +324,80 @@ async fn objects_query(
     Ok(Json(QueryResponse { answer, sources }))
 }
 
-/// Reduce a natural phrase to a bare object class for the exact-class exhaustive path: lowercase,
-/// strip trailing punctuation + a leading article, and naively singularize ("cars" -> "car").
-fn normalize_object_label(query: &str) -> String {
+/// The 80 COCO class names the object detector writes to `scene_objects` (the values of
+/// hushai-worker's `coco91_class_names`). Used to resolve an exhaustive query to a REAL label.
+fn coco_labels() -> &'static std::collections::HashSet<&'static str> {
+    static S: std::sync::OnceLock<std::collections::HashSet<&'static str>> =
+        std::sync::OnceLock::new();
+    S.get_or_init(|| {
+        [
+            "person", "bicycle", "car", "motorcycle", "airplane", "bus", "train", "truck", "boat",
+            "traffic light", "fire hydrant", "stop sign", "parking meter", "bench", "bird", "cat",
+            "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "backpack",
+            "umbrella", "handbag", "tie", "suitcase", "frisbee", "skis", "snowboard", "sports ball",
+            "kite", "baseball bat", "baseball glove", "skateboard", "surfboard", "tennis racket",
+            "bottle", "wine glass", "cup", "fork", "knife", "spoon", "bowl", "banana", "apple",
+            "sandwich", "orange", "broccoli", "carrot", "hot dog", "pizza", "donut", "cake", "chair",
+            "couch", "potted plant", "bed", "dining table", "toilet", "tv", "laptop", "mouse",
+            "remote", "keyboard", "cell phone", "microwave", "oven", "toaster", "sink",
+            "refrigerator", "book", "clock", "vase", "scissors", "teddy bear", "hair drier",
+            "toothbrush",
+        ]
+        .into_iter()
+        .collect()
+    })
+}
+
+/// Common plurals/synonyms that don't fall out of naive singularization → exact COCO label.
+fn object_alias(s: &str) -> Option<&'static str> {
+    Some(match s {
+        "people" | "persons" | "human" | "humans" | "man" | "woman" | "men" | "women" | "guy"
+        | "guys" | "somebody" | "someone" => "person",
+        "buses" => "bus",
+        "knives" => "knife",
+        "wine glasses" | "wineglass" | "wineglasses" => "wine glass",
+        "television" | "televisions" | "tvs" | "tv set" => "tv",
+        "phone" | "phones" | "cellphone" | "cellphones" | "cell phones" | "mobile phone"
+        | "smartphone" | "smartphones" => "cell phone",
+        "sofa" | "sofas" | "couches" => "couch",
+        "laptops" => "laptop",
+        "plants" | "potted plants" => "potted plant",
+        _ => return None,
+    })
+}
+
+/// Resolve a natural phrase to a bare COCO class for the exact-class exhaustive path, or `None` if it
+/// isn't a COCO class (so the caller falls back to the semantic path instead of returning nothing).
+/// Fixes the old naive single-'s' strip that mangled compound/irregular labels (people→peopl,
+/// buses→buse, scissors→scissor) and silently emptied the exhaustive answer.
+fn normalize_object_label(query: &str) -> Option<String> {
     let lower = query
         .trim()
         .trim_end_matches(['?', '.', '!', ','])
         .to_lowercase();
-    let lower = lower.trim();
-    let stripped = lower
-        .strip_prefix("a ")
-        .or_else(|| lower.strip_prefix("an "))
-        .or_else(|| lower.strip_prefix("the "))
-        .unwrap_or(lower)
-        .trim();
-    if stripped.len() > 1 && stripped.ends_with('s') {
-        stripped[..stripped.len() - 1].to_string()
-    } else {
-        stripped.to_string()
+    let s = {
+        let l = lower.trim();
+        l.strip_prefix("a ")
+            .or_else(|| l.strip_prefix("an "))
+            .or_else(|| l.strip_prefix("the "))
+            .unwrap_or(l)
+            .trim()
+    };
+    // Exact COCO label (covers singulars that end in 's' like "scissors"/"skis").
+    if coco_labels().contains(s) {
+        return Some(s.to_string());
     }
+    // Known irregular plural / synonym.
+    if let Some(l) = object_alias(s) {
+        return Some(l.to_string());
+    }
+    // Regular plural → singular, but ONLY if it lands on a real label ("cars"→"car", "dogs"→"dog").
+    for cand in [s.strip_suffix("es"), s.strip_suffix('s')].into_iter().flatten() {
+        if coco_labels().contains(cand) {
+            return Some(cand.to_string());
+        }
+    }
+    None
 }
 
 /// Shown when "who was I with" can't resolve the owner (no request person, no configured owner).
@@ -801,7 +864,17 @@ pub(crate) fn check_auth(headers: &HeaderMap, st: &AppState) -> Result<(), (Stat
             .get(AUTHORIZATION)
             .and_then(|h| h.to_str().ok())
             .and_then(|v| v.strip_prefix("Bearer "));
-        if presented != Some(expected.as_str()) {
+        // Constant-time compare so the static RAG_TOKEN isn't recoverable byte-by-byte via
+        // a timing side channel — matches the backend's `subtle`-based auth (auth.rs:69).
+        // The length check isn't itself secret; ct_eq is constant-time for equal lengths.
+        let ok = match presented {
+            Some(tok) => {
+                tok.len() == expected.len()
+                    && bool::from(tok.as_bytes().ct_eq(expected.as_bytes()))
+            }
+            None => false,
+        };
+        if !ok {
             return Err((
                 StatusCode::UNAUTHORIZED,
                 "missing or invalid bearer token".into(),
@@ -812,13 +885,39 @@ pub(crate) fn check_auth(headers: &HeaderMap, st: &AppState) -> Result<(), (Stat
 }
 
 pub(crate) fn internal(e: anyhow::Error) -> (StatusCode, String) {
+    // Log the full chain server-side, but return a static body — `{e:#}` leaks sqlx
+    // table/column names, SQL fragments, Ollama URLs and filesystem paths to any caller.
     tracing::error!(error = format!("{e:#}"), "rag request failed");
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}"))
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal error".to_string(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_co_occurrence_query, is_deictic_video_query};
+    use super::{is_co_occurrence_query, is_deictic_video_query, normalize_object_label};
+
+    #[test]
+    fn object_label_resolves_plurals_and_irregulars() {
+        let n = |q: &str| normalize_object_label(q);
+        // regular plurals + articles + punctuation
+        assert_eq!(n("cars").as_deref(), Some("car"));
+        assert_eq!(n("a dog").as_deref(), Some("dog"));
+        assert_eq!(n("the laptops?").as_deref(), Some("laptop"));
+        // irregular plurals / compounds the OLD naive single-'s' strip mangled
+        assert_eq!(n("people").as_deref(), Some("person"));
+        assert_eq!(n("buses").as_deref(), Some("bus"));
+        assert_eq!(n("knives").as_deref(), Some("knife"));
+        assert_eq!(n("wine glasses").as_deref(), Some("wine glass"));
+        assert_eq!(n("phones").as_deref(), Some("cell phone"));
+        // singular labels that END in 's' must NOT be truncated
+        assert_eq!(n("scissors").as_deref(), Some("scissors"));
+        assert_eq!(n("skis").as_deref(), Some("skis"));
+        // non-COCO phrases return None → caller falls back to the semantic path (not empty results)
+        assert_eq!(n("a spaceship"), None);
+        assert_eq!(n("people walking around"), None);
+    }
 
     #[test]
     fn deictic_video_questions_are_detected() {
