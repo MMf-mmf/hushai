@@ -54,6 +54,11 @@ pub struct ChatRequest {
     pub filters: Option<QueryFilters>,
     #[serde(default)]
     pub top_k: Option<i64>,
+    /// When true AND a speaker filter resolves, route retrieval down the exhaustive
+    /// non-semantic path (everything that speaker said in scope, no vector ranking) —
+    /// the same routing `/v1/rag/query` already has. The UI's "Thorough" toggle.
+    #[serde(default)]
+    pub exhaustive: Option<bool>,
     /// Caller's UTC offset in seconds (e.g. -14400 for EDT) for rendering "today/yesterday at
     /// h:MM PM". The browser sends its live offset so spoken times match the user's local clock;
     /// absent (e.g. non-browser callers) falls back to `ANALYSIS_TZ_OFFSET_SECS`.
@@ -353,21 +358,40 @@ pub async fn rag_chat(
                 .or(agent.default_top_k)
                 .unwrap_or(st.cfg.top_k_default)
                 .clamp(1, 50);
-            // Retrieve on the latest message (identical to /query's semantic branch).
-            let embedding = st.embedder.embed_one(&message).await.map_err(internal)?;
-            let tuning = Tuning {
-                ef_search: st.cfg.hnsw_ef_search,
-                statement_timeout_ms: st.cfg.query_timeout_ms,
-            };
-            let filters = Filters {
-                device_id,
-                after_unix_nanos: after,
-                before_unix_nanos: before,
-                speaker_id,
-            };
-            let mut s = retrieve::nearest(&st.pool, &embedding, top_k, &tuning, &filters)
+            // Route: exhaustive attribution ("everything Bob said") vs topical semantic
+            // search — mirrors /v1/rag/query. Exhaustive only when explicitly requested
+            // AND a speaker filter resolved; it skips the query embedding entirely.
+            let want_exhaustive = req.exhaustive.unwrap_or(false)
+                && speaker_id.as_ref().is_some_and(|v| !v.is_empty());
+            let mut s = if want_exhaustive {
+                retrieve::list_by_speaker(
+                    &st.pool,
+                    speaker_id.as_deref().unwrap_or_default(),
+                    device_id.as_deref(),
+                    after,
+                    before,
+                    top_k.max(50),
+                )
                 .await
-                .map_err(internal)?;
+                .map_err(internal)?
+            } else {
+                // Retrieve on the latest message (identical to /query's semantic branch).
+                let embedding = st.embedder.embed_one(&message).await.map_err(internal)?;
+                let tuning = Tuning {
+                    ef_search: st.cfg.hnsw_ef_search,
+                    statement_timeout_ms: st.cfg.query_timeout_ms,
+                };
+                let filters = Filters {
+                    device_id,
+                    after_unix_nanos: after,
+                    before_unix_nanos: before,
+                    speaker_id,
+                };
+                retrieve::nearest(&st.pool, &embedding, top_k, &tuning, &filters)
+                    .await
+                    .map_err(internal)?
+            };
+            // Exhaustive rows carry distance 0.0, so they survive this unchanged.
             s.retain(|x| x.distance <= st.cfg.distance_threshold);
             let ids: Vec<String> = s.iter().filter_map(|x| x.speaker_id.clone()).collect();
             names = crate::speakers::name_map(&st.pool, &ids)
