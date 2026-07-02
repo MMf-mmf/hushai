@@ -201,6 +201,21 @@ impl Llm {
             .map_err(|e| anyhow!("LLM objects prompt failed: {e}"))
     }
 
+    /// Produce a grounded answer for an EVENTS question ("what happened yesterday" / "any alerts")
+    /// from the pre-fetched event timeline. Single-shot, no history, events persona. Sources carry a
+    /// plain-language description in `text` and a humanized `time_label`; no speaker attribution.
+    pub async fn answer_events(&self, question: &str, sources: &[Source]) -> anyhow::Result<String> {
+        let agent = self
+            .tune(self.client.agent(&self.model))
+            .preamble(crate::agents::events_preamble())
+            .build();
+        let prompt = build_events_prompt(question, sources);
+        agent
+            .prompt(prompt)
+            .await
+            .map_err(|e| anyhow!("LLM events prompt failed: {e}"))
+    }
+
     /// Produce a grounded answer for a PERSON question ("when did I see Bob" / "who was I with")
     /// from face sightings. Single-shot, people persona. Sources carry the resolved person name in
     /// `speaker_name` + a humanized `time_label` (set by `enrich_for_display`), so the shared
@@ -360,6 +375,27 @@ pub fn build_objects_prompt(question: &str, sources: &[Source]) -> String {
         }
     }
     format!("Object sightings:\n{ctx}\nQuestion: {question}")
+}
+
+/// Assemble the numbered EVENT-timeline block + question. Each line is a flagged event and its
+/// plain-language time; identity/timestamps are pre-humanized so the model never sees raw values.
+pub fn build_events_prompt(question: &str, sources: &[Source]) -> String {
+    if sources.is_empty() {
+        return format!(
+            "Events: (none found)\n\nQuestion: {question}\n\n\
+             Nothing notable was recorded for that time, so say so plainly."
+        );
+    }
+    let mut ctx = String::new();
+    for (i, s) in sources.iter().enumerate() {
+        let what = s.text.trim();
+        if s.time_label.is_empty() {
+            ctx.push_str(&format!("[{}] ({})\n", i + 1, what));
+        } else {
+            ctx.push_str(&format!("[{}] ({}, {})\n", i + 1, what, s.time_label));
+        }
+    }
+    format!("Events:\n{ctx}\nQuestion: {question}")
 }
 
 /// Assemble the reflection prompt: the pre-rendered analytics digest (from

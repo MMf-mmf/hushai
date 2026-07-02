@@ -570,6 +570,56 @@ pub async fn rag_chat(
             }
             sources = s;
         }
+        AgentKind::Events => {
+            // Timeline of flagged events ("what happened / any alerts"). Optionally narrowed to a lane
+            // (person/object/plate/speech) or to alerts, parsed from the message. Count-intent → a
+            // DETERMINISTIC count; otherwise the LLM narrates the pre-fetched list (grounded).
+            let device_id = qf.device_id.or_else(|| df.device_id.clone());
+            let after = qf.after_unix_nanos.or(df.after_unix_nanos);
+            let before = qf.before_unix_nanos.or(df.before_unix_nanos);
+            let limit = req.top_k.or(agent.default_top_k).unwrap_or(50).clamp(1, 200);
+            let ml = message.to_lowercase();
+            let alerts_only = ["alert", "alarm", "unusual", "suspicious"].iter().any(|k| ml.contains(k));
+            let subject_type = if alerts_only {
+                None
+            } else if ["person", "people", "face", "who "].iter().any(|k| ml.contains(k)) {
+                Some("person")
+            } else if ["plate", "vehicle", "car "].iter().any(|k| ml.contains(k)) {
+                Some("plate")
+            } else if ["said", "heard", "speech", "talk", "conversation"].iter().any(|k| ml.contains(k)) {
+                Some("speaker")
+            } else if ["object", "thing"].iter().any(|k| ml.contains(k)) {
+                Some("object")
+            } else {
+                None
+            };
+            let devices: Vec<String> = device_id.into_iter().collect();
+            let mut s = retrieve::list_events(&st.pool, &devices, after, before, subject_type, alerts_only, limit)
+                .await
+                .map_err(internal)?;
+            let now = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+            for src in &mut s {
+                src.time_label = crate::humanize::humanize_time(src.start_unix_nanos, now, tz);
+            }
+            names = std::collections::HashMap::new();
+            if crate::presence::is_count_intent(&message) {
+                let n = s.len();
+                precomputed_answer = Some(if n == 0 {
+                    "Nothing notable was recorded for that period.".to_string()
+                } else {
+                    format!(
+                        "There {} {} notable event{} in the recordings for that period.",
+                        if n == 1 { "was" } else { "were" },
+                        n,
+                        if n == 1 { "" } else { "s" }
+                    )
+                });
+            } else {
+                precomputed_answer =
+                    Some(st.llm.answer_events(&message, &s).await.map_err(internal)?);
+            }
+            sources = s;
+        }
     }
     } // end else (no camera clarification)
 
@@ -580,7 +630,7 @@ pub async fn rag_chat(
     // they skip this.
     if !matches!(
         agent.kind,
-        AgentKind::Objects | AgentKind::People | AgentKind::Plates
+        AgentKind::Objects | AgentKind::People | AgentKind::Plates | AgentKind::Events
     ) {
         retrieve::enrich_for_display(
             &mut sources,

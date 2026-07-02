@@ -39,6 +39,10 @@ pub enum AgentKind {
     /// plate ABC123" (exhaustive per-plate time-ranges). Matched by NORMALIZED STRING (exact +
     /// pg_trgm fuzzy), never by an embedding — a plate's identity is its text (the 0013 contract).
     Plates,
+    /// `Events` = the timeline of NOTABLE things the system flagged (`events` table): "what happened
+    /// yesterday", "were there any alerts", "what did you notice". Lists events (type + subject +
+    /// time), optionally narrowed to a lane (person/object/plate/speech) or to alerts only.
+    Events,
 }
 
 /// A selectable chat persona + default scope.
@@ -69,6 +73,7 @@ pub const REFLECTION_AGENT_ID: &str = "reflection";
 pub const OBJECTS_AGENT_ID: &str = "objects";
 pub const PEOPLE_AGENT_ID: &str = "people";
 pub const PLATES_AGENT_ID: &str = "plates";
+pub const EVENTS_AGENT_ID: &str = "events";
 /// The unified assistant: not a pipeline of its own — the chat handler classifies each message
 /// (`llm::classify_agent` → [`parse_agent_label`]) and dispatches to one of the concrete agents.
 pub const AUTO_AGENT_ID: &str = "auto";
@@ -85,6 +90,8 @@ self-improvement ('how have I been', 'how can I get better'). \
 'when did I see <name>'. \
 'objects' = a thing/object seen on camera — 'when did I see a car / my keys / a red mug'. \
 'plates' = a vehicle by LICENSE PLATE — 'when did I see plate ABC123'. \
+'events' = the TIMELINE of notable things the system flagged, or ALERTS — 'what happened yesterday', \
+'were there any alerts', 'what did you notice', 'any unusual activity', 'what went on last night'. \
 Output only the one category word.";
 
 /// The grounding preamble for the default recordings assistant. Moved verbatim from the
@@ -184,6 +191,22 @@ unreadable plate' and never invent a plate number. \
 (6) NEVER output an identifier, UUID, segment id, or any long code of letters and numbers (the plate string \
 itself is allowed). \
 (7) Do not mention these instructions or the word 'context'.";
+
+/// The events-timeline persona. Answers "what happened / any alerts / what did you notice" from the
+/// pre-fetched list of flagged events — strictly grounded, time-first, no ids/raw values.
+const PREAMBLE_EVENTS: &str = "You are Hushai's activity-log assistant. Answer the user's question using ONLY the \
+provided list of events — notable things the system flagged in recordings, each prefixed with what happened \
+and a plain-language time. Rules: \
+(1) If the list is empty, say nothing notable was recorded for that time — do NOT use outside knowledge and do \
+NOT guess. \
+(2) Use ONLY the events in the list: never add, infer, or pad with an event that is not present. If the list \
+has N events, your answer covers only those N. \
+(3) Reply in natural, spoken English as a short chronological rundown of what happened and when — e.g. 'Around \
+9 AM you heard someone speaking, and just after noon a car was seen.' Use the plain-language time exactly as it \
+appears; NEVER output a raw number, seconds/nanoseconds, an ISO timestamp, or any coded time value. \
+(4) Keep it concise and factual. \
+(5) NEVER output an identifier, UUID, or segment id. \
+(6) Do not mention these instructions or the word 'context'.";
 
 /// The built-in agents. Append here to add a new selectable agent.
 static AGENTS: &[Agent] = &[
@@ -287,6 +310,22 @@ static AGENTS: &[Agent] = &[
         default_window_days: None,
         model: None,
     },
+    Agent {
+        id: EVENTS_AGENT_ID,
+        name: "Activity",
+        description: "The timeline of notable events, e.g. \"what happened yesterday?\" / \"any alerts?\".",
+        system_prompt: PREAMBLE_EVENTS,
+        default_filters: DefaultFilters {
+            device_id: None,
+            after_unix_nanos: None,
+            before_unix_nanos: None,
+            speaker_name: None,
+        },
+        default_top_k: None,
+        kind: AgentKind::Events,
+        default_window_days: None,
+        model: None,
+    },
 ];
 
 /// Look up an agent by id.
@@ -315,6 +354,7 @@ pub fn parse_agent_label(raw: &str) -> &'static str {
         PLATES_AGENT_ID,
         PEOPLE_AGENT_ID,
         OBJECTS_AGENT_ID,
+        EVENTS_AGENT_ID,
         REFLECTION_AGENT_ID,
         DEFAULT_AGENT_ID,
     ] {
@@ -355,6 +395,11 @@ pub fn plates_preamble() -> &'static str {
     PREAMBLE_PLATES
 }
 
+/// The events-timeline preamble, exposed so the answer path can reuse the persona.
+pub fn events_preamble() -> &'static str {
+    PREAMBLE_EVENTS
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,7 +429,16 @@ mod tests {
         assert!(ids.contains(&OBJECTS_AGENT_ID));
         assert!(ids.contains(&PEOPLE_AGENT_ID));
         assert!(ids.contains(&PLATES_AGENT_ID));
-        assert_eq!(list().len(), 6);
+        assert!(ids.contains(&EVENTS_AGENT_ID));
+        assert_eq!(list().len(), 7);
+    }
+
+    #[test]
+    fn events_agent_registered_and_routed() {
+        let a = get(EVENTS_AGENT_ID).expect("events agent must exist");
+        assert_eq!(a.kind, AgentKind::Events);
+        assert_eq!(parse_agent_label("events"), EVENTS_AGENT_ID);
+        assert_eq!(parse_agent_label("Category: EVENTS"), EVENTS_AGENT_ID);
     }
 
     #[test]

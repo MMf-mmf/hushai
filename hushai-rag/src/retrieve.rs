@@ -627,6 +627,78 @@ pub async fn list_recent_persons(
     Ok(sources)
 }
 
+/// A plain-language description of an event for grounding — no ids/raw values. The worker emits
+/// `speech` / `object_seen` / `plate_seen` / person events (known name or `unknown_person`) /
+/// `plate_of_interest` / `alert_rule`, with the specific thing in `subject_label`.
+fn describe_event(event_type: &str, subject_type: Option<&str>, subject_label: Option<&str>) -> String {
+    let label = subject_label.unwrap_or("").trim();
+    match (event_type, subject_type) {
+        ("speech", _) if !label.is_empty() => format!("heard {label} speaking"),
+        ("speech", _) => "heard someone speaking".to_string(),
+        ("object_seen", _) if !label.is_empty() => format!("saw a {label}"),
+        ("plate_seen", _) | ("plate_of_interest", _) if !label.is_empty() => format!("saw license plate {label}"),
+        (_, Some("person")) if !label.is_empty() => format!("saw {label}"),
+        (_, Some("person")) => "saw an unrecognized person".to_string(),
+        ("alert_rule", _) if !label.is_empty() => format!("an alert fired: {label}"),
+        (_, _) if !label.is_empty() => format!("{}: {label}", event_type.replace('_', " ")),
+        (_, _) => event_type.replace('_', " "),
+    }
+}
+
+/// Timeline of NOTABLE events the system flagged (`events` table), newest first — the "what happened
+/// / any alerts / what did you notice" path (flaw F7). Optional `subject_type` narrows to a lane
+/// ("person"/"object"/"plate"/"speaker"); `alerts_only` keeps just warning/critical severity. Rows
+/// carry a plain-language `text` and `distance` 0.0 (survive the caller's threshold retain).
+pub async fn list_events(
+    pool: &PgPool,
+    devices: &[String],
+    after: Option<i64>,
+    before: Option<i64>,
+    subject_type: Option<&str>,
+    alerts_only: bool,
+    limit: i64,
+) -> anyhow::Result<Vec<Source>> {
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
+        "SELECT device_id, event_type, subject_type, subject_label, segment_id, start_unix_nanos, severity \
+         FROM events WHERE start_unix_nanos IS NOT NULL",
+    );
+    if !devices.is_empty() {
+        qb.push(" AND device_id = ANY(").push_bind(devices.to_vec()).push(")");
+    }
+    if let Some(a) = after {
+        qb.push(" AND start_unix_nanos >= ").push_bind(a);
+    }
+    if let Some(b) = before {
+        qb.push(" AND start_unix_nanos < ").push_bind(b);
+    }
+    if let Some(st) = subject_type {
+        qb.push(" AND subject_type = ").push_bind(st.to_string());
+    }
+    if alerts_only {
+        qb.push(" AND severity IN ('warning','critical')");
+    }
+    qb.push(" ORDER BY start_unix_nanos DESC LIMIT ").push_bind(limit);
+
+    let rows = qb.build().fetch_all(pool).await?;
+    let mut sources = Vec::with_capacity(rows.len());
+    for row in rows {
+        let event_type: String = row.try_get::<Option<String>, _>("event_type")?.unwrap_or_default();
+        let subject_type: Option<String> = row.try_get("subject_type")?;
+        let subject_label: Option<String> = row.try_get("subject_label")?;
+        sources.push(Source {
+            segment_id: row.try_get::<Option<Uuid>, _>("segment_id")?.unwrap_or_else(Uuid::nil),
+            device_id: row.try_get::<Option<String>, _>("device_id")?.unwrap_or_default(),
+            text: describe_event(&event_type, subject_type.as_deref(), subject_label.as_deref()),
+            start_unix_nanos: row.try_get("start_unix_nanos")?,
+            distance: 0.0,
+            speaker_id: None,
+            speaker_name: None,
+            time_label: String::new(),
+        });
+    }
+    Ok(sources)
+}
+
 /// Shared row→Source mapping for the person sighting queries: carry `person_id::text` in
 /// `speaker_id` (the display chokepoint expects strings) + a humanized sentinel in `text`.
 fn person_rows_to_sources(rows: Vec<sqlx::postgres::PgRow>) -> anyhow::Result<Vec<Source>> {
