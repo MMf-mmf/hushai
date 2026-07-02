@@ -9,43 +9,7 @@
       href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='%232ee6d6'/%3E%3C/svg%3E"
     />
     <link rel="stylesheet" href="/styles.css" />
-    <style>
-      /* Page-local styles (kept here, not in the shared sheet, to stay self-contained + low-risk). */
-      .ev-row { display: grid; grid-template-columns: 92px 150px 1fr 150px auto; gap: 10px;
-        align-items: center; padding: 8px 12px; border-bottom: 1px solid rgba(255,255,255,0.06); }
-      .ev-row:hover { background: rgba(255,255,255,0.03); }
-      .ev-row.clickable { cursor: pointer; }
-      .sev { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .04em;
-        padding: 2px 8px; border-radius: 999px; display: inline-block; }
-      .sev-info { background: rgba(120,140,160,.18); color: #9fb3c8; }
-      .sev-warning { background: rgba(240,180,40,.18); color: #f0c040; }
-      .sev-critical { background: rgba(240,70,70,.20); color: #ff7a7a; }
-      .ev-type { font-weight: 600; }
-      .ev-when { color: var(--muted, #8aa); font-size: 12px; white-space: nowrap; }
-      .ev-sub { color: #cfe; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .feed-item { display: flex; gap: 10px; align-items: center; padding: 8px 12px;
-        border-bottom: 1px solid rgba(255,255,255,0.06); }
-      .feed-item .grow { flex: 1; min-width: 0; }
-      .filters { display: flex; gap: 10px; flex-wrap: wrap; align-items: end; margin-bottom: 10px; }
-      .filters label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted,#8aa); }
-      .filters select, .filters input, .rule-form input, .rule-form select {
-        background: rgba(255,255,255,.05); color: inherit; border: 1px solid rgba(255,255,255,.12);
-        border-radius: 6px; padding: 5px 8px; font: inherit; }
-      .rule-form { display: grid; grid-template-columns: repeat(2, minmax(220px, 1fr)); gap: 12px;
-        padding: 12px; border: 1px solid rgba(255,255,255,.10); border-radius: 10px; margin-top: 10px; }
-      .rule-form .full { grid-column: 1 / -1; }
-      .chk-grid { display: flex; gap: 12px; flex-wrap: wrap; }
-      .chk-grid label { display: inline-flex; gap: 5px; align-items: center; font-size: 13px; color: inherit; }
-      .rule-card { display: flex; gap: 10px; align-items: center; padding: 8px 12px;
-        border-bottom: 1px solid rgba(255,255,255,0.06); }
-      .rule-card .grow { flex: 1; min-width: 0; }
-      .rule-card .summary { font-size: 12px; color: var(--muted,#8aa); }
-      .pill { font-size: 11px; padding: 1px 7px; border-radius: 999px; background: rgba(46,230,214,.14); color: #2ee6d6; }
-      .pill.off { background: rgba(255,255,255,.08); color: #889; }
-      .empty { padding: 18px 12px; color: var(--muted,#8aa); }
-      .err { color: #ff7a7a; padding: 8px 12px; }
-      button.link { background: none; border: none; color: #2ee6d6; cursor: pointer; font: inherit; padding: 0; }
-    </style>
+    <!-- Page styles live in the shared styles.css ("Events & alerts page" section). -->
   </head>
   <body class="dash-body">
     <header class="topbar">
@@ -115,7 +79,7 @@
             <input id="rName" type="text" placeholder="e.g. Unknown person at night" required />
           </label>
           <div class="full">
-            <div class="muted small" style="margin-bottom:4px">Event types (none = any)</div>
+            <div class="muted small chk-title">Event types (none = any)</div>
             <div class="chk-grid" id="rTypes">
               <label><input type="checkbox" value="unknown_person" /> unknown_person</label>
               <label><input type="checkbox" value="known_person" /> known_person</label>
@@ -145,14 +109,14 @@
             <input id="rCooldown" type="number" min="0" value="300" />
           </label>
           <div>
-            <div class="muted small" style="margin-bottom:4px">Channels</div>
+            <div class="muted small chk-title">Channels</div>
             <div class="chk-grid">
               <label><input id="rChFeed" type="checkbox" checked /> in-app feed</label>
               <label><input id="rChHook" type="checkbox" /> webhook</label>
             </div>
-            <input id="rHookUrl" type="url" placeholder="https://webhook.url" style="margin-top:6px;width:100%" />
+            <input id="rHookUrl" class="hook-url" type="url" placeholder="https://webhook.url" />
           </div>
-          <div class="full" style="display:flex;gap:10px;align-items:center">
+          <div class="full form-actions">
             <button type="submit" class="ghost">＋ Create rule</button>
             <span id="ruleFormMsg" class="small"></span>
           </div>

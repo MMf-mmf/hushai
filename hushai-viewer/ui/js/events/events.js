@@ -242,7 +242,7 @@ function ruleCard(r) {
     },
   });
   return el("div", { class: "rule-card" },
-    el("span", { class: r.enabled ? "pill" : "pill off", text: r.enabled ? "on" : "off" }),
+    el("span", { class: r.enabled ? "pill on" : "pill off", text: r.enabled ? "on" : "off" }),
     el("div", { class: "grow" },
       el("div", {}, el("strong", { text: r.name })),
       el("div", { class: "summary", text: ruleSummary(r) })),

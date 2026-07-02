@@ -31,10 +31,14 @@ pub fn router(state: ViewerState) -> Router {
     let ui_dir = state.cfg.ui_dir.clone();
 
     // The login surface: reachable past the password gate but still behind the IP gate.
-    let public = Router::new().route(
-        "/login",
-        get(crate::auth::login_page).post(crate::auth::login_submit),
-    );
+    // The shared stylesheet is deliberately public too, so login.html can use the same
+    // design system (CSS carries no secrets; every other UI asset stays session-gated).
+    let public = Router::new()
+        .route(
+            "/login",
+            get(crate::auth::login_page).post(crate::auth::login_submit),
+        )
+        .route("/styles.css", get(serve_styles));
 
     // Everything else requires a valid session cookie (the password gate).
     let gated = Router::new()
@@ -81,6 +85,22 @@ pub fn router(state: ViewerState) -> Router {
                 .on_response(hushai_backend::logging::on_http_response),
         )
         .with_state(state)
+}
+
+/// The shared stylesheet, served past the password gate (see `router`). Route-match wins
+/// over the gated `ServeDir` fallback, so authed pages keep fetching the same URL.
+async fn serve_styles(State(state): State<ViewerState>) -> Response {
+    match tokio::fs::read(state.cfg.ui_dir.join("styles.css")).await {
+        Ok(bytes) => (
+            [
+                (header::CONTENT_TYPE, "text/css; charset=utf-8"),
+                (header::CACHE_CONTROL, "no-cache"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(_) => axum::http::StatusCode::NOT_FOUND.into_response(),
+    }
 }
 
 /// Readiness (roadmap B5): the DB the viewer reads is reachable.

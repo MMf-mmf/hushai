@@ -11,7 +11,9 @@
 // the DPR/resize/roundRect canvas idioms and player.js for the binary-search shape.
 
 import { getDetections } from "./api.js";
+import { detColors } from "./theme.js";
 
+const DET_COLORS = detColors(); // palette owned by the CSS --det-* tokens
 const SNAP_TOLERANCE_MS = 400; // ~half the ~660ms inter-sample interval; stale boxes clear
 const MIN_SCORE = 0.3; // hide low-confidence boxes
 const UNIDENTIFIED = "Unidentified";
@@ -200,10 +202,10 @@ function labelFor(b) {
 // (the class label already disambiguates them). Plates: a distinct warm amber so a license
 // plate reads apart from faces/objects at a glance. Dark chip text reads on all of them.
 function colorFor(b) {
-  if (b.kind === "object") return "#2ee6d6";
-  if (b.kind === "plate") return "#ffd24a";
+  if (b.kind === "object") return DET_COLORS.object;
+  if (b.kind === "plate") return DET_COLORS.plate;
   if (b.personId) return `hsl(${hueFromId(b.personId)} 75% 58%)`;
-  return "#ffae57";
+  return DET_COLORS.personUnknown;
 }
 
 function hueFromId(id) {

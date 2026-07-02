@@ -2,6 +2,7 @@
 // status + work queues. Mirrors the app's polling pattern (6s, busy-guard, paused while hidden).
 
 import { getDashboard } from "../api.js";
+import { chartPalette, cssVar } from "../theme.js";
 
 const $ = (id) => document.getElementById(id);
 const REFRESH_MS = 6000; // matches the player page's refresh cadence
@@ -240,6 +241,35 @@ function errorList(recent) {
   ]);
 }
 
+// Hint-audit trust check: of the sampled hint-skips graded by the worker in the last 24h,
+// how often did the worker's own gate DISAGREE (i.e. find real content the device hints called
+// static/silent)? Warn loudly past 10% with a meaningful sample — miscalibrated hints silently
+// defer real content until an operator reprocesses.
+function auditWarning(q) {
+  const graded = (q.audit_agree_recent || 0) + (q.audit_disagree_recent || 0);
+  if (graded < 20) return null;
+  const ratio = (q.audit_disagree_recent || 0) / graded;
+  if (ratio <= 0.1) return null;
+  return el("div", { class: "qerr-msg down small" }, [
+    `⚠ device hints disagree with worker gates on ${Math.round(ratio * 100)}% of audited skips — ` +
+      `check hint calibration or set INGEST_HINT_GATE_ENABLED=false`,
+  ]);
+}
+
+// One-line explainer when most of the last 24h was skipped: an idle/static camera makes the
+// queue look "quiet", which is healthy — say so instead of letting it read as a stall.
+function skipExplainer(q) {
+  const skipped = q.skipped_recent || 0;
+  const total = skipped + (q.done_recent || 0);
+  if (!total || skipped / total <= 0.5) return null;
+  const viaHints = q.skipped_by_hint_recent || 0;
+  return el("div", { class: "muted small" }, [
+    `content mostly static/silent: AI processing skipped for ${skipped.toLocaleString()} of ` +
+      `${total.toLocaleString()} segments in 24h (${viaHints.toLocaleString()} pre-skipped by device hints); ` +
+      `recordings are stored & playable, skipped segments can be reprocessed`,
+  ]);
+}
+
 function queueCard(title, q) {
   q = q || {};
   return el("div", { class: "card queue" }, [
@@ -252,10 +282,13 @@ function queueCard(title, q) {
       qstat("processing", q.processing),
       qstat("errors", q.error, (q.error || 0) > 0 ? "down" : null),
       qstat("done 24h", q.done_recent),
+      qstat("skipped 24h", q.skipped_recent),
     ]),
     el("div", { class: "muted small" }, [
       `oldest pending ${q.pending ? agoSecs(q.oldest_pending_age_secs) : "—"} · last activity ${agoSecs(q.max_updated_age_secs)}`,
     ]),
+    skipExplainer(q),
+    auditWarning(q),
     errorList(q.recent_errors),
   ]);
 }
@@ -304,12 +337,15 @@ function drawLoadtestChart(canvas, lt) {
   const xOf = (n) => x0 + (nMax === nMin ? 0 : (n - nMin) / (nMax - nMin)) * (x1 - x0);
   const yOf = (v) => y0 - v * (y0 - y1); // v normalized 0..1
 
-  ctx.strokeStyle = "#3a3a3a";
+  const [cLag, cQueue, cTput, cCpu, cGpu] = chartPalette();
+  const cAxis = cssVar("--chart-axis", "#3a3a3a");
+  const cLabel = cssVar("--chart-label", "#888");
+  ctx.strokeStyle = cAxis;
   ctx.lineWidth = 1;
   ctx.beginPath();
   ctx.moveTo(x0, y1); ctx.lineTo(x0, y0); ctx.lineTo(x1, y0);
   ctx.stroke();
-  ctx.fillStyle = "#888";
+  ctx.fillStyle = cLabel;
   ctx.font = "11px system-ui, sans-serif";
   ctx.fillText(String(nMin), x0 - 3, y0 + 16);
   ctx.fillText(String(nMax), x1 - 14, y0 + 16);
@@ -317,20 +353,20 @@ function drawLoadtestChart(canvas, lt) {
 
   if (lt.saturation_n != null) {
     const xs = xOf(lt.saturation_n);
-    ctx.strokeStyle = "#5fb56a";
+    ctx.strokeStyle = cCpu;
     ctx.setLineDash([5, 4]);
     ctx.beginPath(); ctx.moveTo(xs, y1); ctx.lineTo(xs, y0); ctx.stroke();
     ctx.setLineDash([]);
-    ctx.fillStyle = "#5fb56a";
+    ctx.fillStyle = cCpu;
     ctx.fillText(`saturation N=${lt.saturation_n}`, Math.min(xs + 4, x1 - 92), y0 - 4);
   }
 
   const series = [
-    { k: "audio_oldest_pending_age_s", label: "lag s", color: "#e0563f" },
-    { k: "audio_queue_depth", label: "queue", color: "#d9a441" },
-    { k: "audio_throughput_seg_per_s", label: "tput", color: "#3f8ee0" },
-    { k: "worker_cpu_pct", label: "CPU%", color: "#5fb56a" },
-    { k: "gpu_active_pct", label: "GPU%", color: "#9b6fd4" },
+    { k: "audio_oldest_pending_age_s", label: "lag s", color: cLag },
+    { k: "audio_queue_depth", label: "queue", color: cQueue },
+    { k: "audio_throughput_seg_per_s", label: "tput", color: cTput },
+    { k: "worker_cpu_pct", label: "CPU%", color: cCpu },
+    { k: "gpu_active_pct", label: "GPU%", color: cGpu },
   ];
   let legendX = x0 + 6;
   for (const s of series) {
@@ -352,13 +388,13 @@ function drawLoadtestChart(canvas, lt) {
       const v = vals[i];
       if (v == null) return;
       const X = xOf(p.n), Y = yOf(v / max);
-      ctx.fillStyle = p.keeping_up ? s.color : "#e0563f";
+      ctx.fillStyle = p.keeping_up ? s.color : cLag;
       ctx.beginPath(); ctx.arc(X, Y, 2.5, 0, Math.PI * 2); ctx.fill();
     });
     const tag = `${s.label} (≤${max.toFixed(max < 10 ? 1 : 0)})`;
     ctx.fillStyle = s.color;
     ctx.fillRect(legendX, y1 - 12, 9, 9);
-    ctx.fillStyle = "#aaa";
+    ctx.fillStyle = cLabel;
     ctx.fillText(tag, legendX + 12, y1 - 4);
     legendX += 12 + ctx.measureText(tag).width + 16;
   }

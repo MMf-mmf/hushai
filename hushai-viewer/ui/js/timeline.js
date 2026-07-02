@@ -5,6 +5,8 @@
 // All times are ms. Two transforms (xOf/tOf) drive everything — nothing is laid out
 // per-segment, so a busy day stays cheap (the backend pre-coalesces to spans).
 
+import { stageColors, cssVar } from "./theme.js";
+
 const LADDER = [
   1e3, 2e3, 5e3, 1e4, 15e3, 3e4, 6e4, 12e4, 3e5, 6e5, 9e5, 18e5, 36e5, 72e5, 108e5, 216e5, 432e5,
   864e5,
@@ -26,13 +28,14 @@ const RIBBON_BOTTOM = RIBBON_Y1 + RIBBON_H; // =111
 
 // Pipeline-stage colors. Deliberately NOT the coverage teal or session amber, so the
 // ribbons never read as "coverage". Separable by lightness (+ motion on processing,
-// + a chip in the tooltip / popover) for colorblind safety.
-const STATUS_COLORS = {
-  done: "#3b7d6e", // settled green-teal
-  processing: "#3f6fb0", // active blue (animated shimmer overlaid)
-  pending: "#3a3f4a", // dim slate = queued/inert
-  error: "#c0473d", // red (distinct from amber session lines)
-};
+// + a chip in the tooltip / popover) for colorblind safety. The palette itself lives
+// in the CSS --stage-*/--tl-* tokens (styles.css :root), read once via theme.js.
+const STATUS_COLORS = stageColors();
+const TRACK_BG = cssVar("--tl-track", "#15171c");
+const TICK_COLOR = cssVar("--tl-tick", "#79839a");
+const COV_HI = cssVar("--tl-cov-hi", "#2ee6d6");
+const COV_LO = cssVar("--tl-cov-lo", "#1aa899");
+const SESSION_COLOR = cssVar("--tl-session", "rgba(255,174,87,0.85)");
 
 const pad = (n) => String(n).padStart(2, "0");
 
@@ -162,7 +165,7 @@ export class Timeline {
     ctx.clearRect(0, 0, W, H);
 
     // track background
-    ctx.fillStyle = "#15171c";
+    ctx.fillStyle = TRACK_BG;
     roundRect(ctx, 0, TRACK_TOP, W, TRACK_H, 6);
     ctx.fill();
 
@@ -179,7 +182,7 @@ export class Timeline {
       ctx.moveTo(x, TRACK_TOP);
       ctx.lineTo(x, TRACK_TOP + TRACK_H);
       ctx.stroke();
-      ctx.fillStyle = "#79839a";
+      ctx.fillStyle = TICK_COLOR;
       ctx.fillText(this._tickLabel(t, step), x + 4, 16);
     }
 
@@ -190,8 +193,8 @@ export class Timeline {
       const w = Math.max(1, x1 - x0);
       if (x1 < 0 || x0 > W) continue;
       const grad = ctx.createLinearGradient(0, TRACK_TOP, 0, TRACK_TOP + TRACK_H);
-      grad.addColorStop(0, "#2ee6d6");
-      grad.addColorStop(1, "#1aa899");
+      grad.addColorStop(0, COV_HI);
+      grad.addColorStop(1, COV_LO);
       ctx.fillStyle = grad;
       ctx.fillRect(x0, TRACK_TOP + 4, w, TRACK_H - 8);
     }
@@ -200,7 +203,7 @@ export class Timeline {
     for (const s of this.sessions) {
       const x = this.xOf(s);
       if (x < 0 || x > W) continue;
-      ctx.strokeStyle = "rgba(255,174,87,0.85)";
+      ctx.strokeStyle = SESSION_COLOR;
       ctx.beginPath();
       ctx.moveTo(x, TRACK_TOP);
       ctx.lineTo(x, TRACK_TOP + TRACK_H);
@@ -468,7 +471,7 @@ const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;
 
 // One tooltip line's text for a lane's status + output (the colored chip carries the state
 // color). `done` shows what it produced; `error` shows the worker's message (truncated);
-// pending/processing show just the stage word.
+// `skipped` says why (static scene / silent audio); pending/processing show the stage word.
 function laneSummaryText(kind, s) {
   let extra = "";
   if (s.status === "done") {
@@ -479,6 +482,8 @@ function laneSummaryText(kind, s) {
   } else if (s.status === "error" && s.lastError) {
     const e = s.lastError.length > 44 ? `${s.lastError.slice(0, 44)}…` : s.lastError;
     extra = ` — ${e}`;
+  } else if (s.status === "skipped") {
+    extra = kind === "audio" ? " (silent)" : " (static)";
   }
   return `${s.status}${extra}`;
 }
