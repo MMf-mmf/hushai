@@ -153,6 +153,24 @@ export async function getSessionMessages(sessionId) {
   return getJson(`/v1/rag/chat/sessions/${encodeURIComponent(sessionId)}/messages`);
 }
 
+// Saved conversations, newest first: [{session_id, agent_id, title, created_at, updated_at}].
+export async function getSessions() {
+  return getJson("/v1/rag/chat/sessions");
+}
+
+// Local TTS (Kokoro). Returns a WAV blob for `new Audio(URL.createObjectURL(blob))`;
+// throws with status 503 in the message when the engine isn't loaded.
+export async function synthesizeSpeech(text) {
+  const res = await fetch("/v1/tts", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ text }),
+  });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
+  if (!res.ok) throw new Error(`tts -> ${res.status}`);
+  return res.blob();
+}
+
 // ---- speaker admin (proxied to hushai-backend at /v1/speakers*) -----------------
 // The viewer proxy routes these to hushai-backend and injects the device bearer, so the
 // browser calls them on the same origin with no token. See src/proxy.rs.
@@ -163,6 +181,22 @@ export async function getSpeakers() {
 
 export async function getSpeakerDuplicates() {
   return getJson("/v1/speakers/duplicates");
+}
+
+// Re-run voice clustering server-side (semantic pass / deep neural pass). Both are
+// long-running POSTs; callers should disable their trigger while awaiting.
+export async function reclusterSpeakers() {
+  const res = await fetch("/v1/speakers/recluster", { method: "POST" });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
+  if (!res.ok) throw new Error(`recluster -> ${res.status}`);
+  return res.json().catch(() => ({}));
+}
+
+export async function reclusterSpeakersDeep() {
+  const res = await fetch("/v1/speakers/recluster-deep", { method: "POST" });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
+  if (!res.ok) throw new Error(`deep recluster -> ${res.status}`);
+  return res.json().catch(() => ({}));
 }
 
 // URL for a speaker's 2s sample-audio clip — used directly as an <audio> src (the proxy
@@ -443,13 +477,27 @@ export function exportUrl(deviceId, fromMs, toMs, kind = "muxed") {
   )}&to=${msToNsStr(toMs)}&kind=${encodeURIComponent(kind)}`;
 }
 
+// Still frames (src/stills.rs): used directly as <img> src. thumbUrl is the timeline
+// hover preview at wall-clock `ms` (quantize the caller side so the browser cache hits);
+// posterUrl is the device's newest frame for camera-grid tiles.
+export function thumbUrl(deviceId, ms) {
+  return `/api/devices/${encodeURIComponent(deviceId)}/thumb.jpg?t=${msToNsStr(ms)}`;
+}
+
+export function posterUrl(deviceId) {
+  return `/api/devices/${encodeURIComponent(deviceId)}/poster.jpg`;
+}
+
 // POST a chat turn and stream the answer as Server-Sent Events. `onEvent({event, data})`
 // is called per SSE frame: `session` {session_id, agent_id}, `sources` [Source...],
 // `token` {delta}, `done` {message_id}, or `error` {message}. EventSource can't POST a
 // body, so we read the streaming fetch response and parse SSE frames by hand.
 // `playback` = the viewer's live {device_id, playhead_unix_nanos} so the server can scope
 // deictic questions ("who was speaking in this clip") to the open video; null when idle.
-export async function streamChat({ sessionId, agentId, message, filters, playback }, onEvent) {
+export async function streamChat(
+  { sessionId, agentId, message, filters, playback, exhaustive },
+  onEvent,
+) {
   const res = await fetch("/v1/rag/chat", {
     method: "POST",
     headers: { "content-type": "application/json", accept: "text/event-stream" },
@@ -459,6 +507,8 @@ export async function streamChat({ sessionId, agentId, message, filters, playbac
       message,
       filters: filters ?? null,
       playback: playback ?? null,
+      // "Thorough" toggle: exhaustive speaker attribution instead of semantic top-k.
+      exhaustive: exhaustive ?? null,
       // The user's live local UTC offset (seconds) so spoken times ("today at 4:06 PM") match
       // their clock. getTimezoneOffset() is minutes-behind-UTC with inverted sign → negate.
       tz_offset_secs: -new Date().getTimezoneOffset() * 60,
@@ -545,12 +595,24 @@ function eventFromApi(e) {
   };
 }
 
-export async function getEvents({ deviceId, eventType, severity, sinceMs, limit } = {}) {
+export async function getEvents({
+  deviceId,
+  eventType,
+  severity,
+  subjectType,
+  subjectId,
+  sinceMs,
+  untilMs,
+  limit,
+} = {}) {
   const p = new URLSearchParams();
   if (deviceId) p.set("device_id", deviceId);
   if (eventType) p.set("event_type", eventType);
   if (severity) p.set("severity", severity);
+  if (subjectType) p.set("subject_type", subjectType);
+  if (subjectId) p.set("subject_id", subjectId);
   if (sinceMs) p.set("since_unix_nanos", msToNsStr(sinceMs));
+  if (untilMs) p.set("until_unix_nanos", msToNsStr(untilMs));
   if (limit) p.set("limit", String(limit));
   const rows = await getJson(`/v1/events?${p.toString()}`);
   return rows.map(eventFromApi);
@@ -643,4 +705,44 @@ export async function removeWatch(watchId) {
   if (redirectIfUnauth(res)) throw new Error("unauthorized");
   if (!res.ok) throw new Error(`unwatch -> ${res.status}`);
   return res.json().catch(() => ({}));
+}
+
+export async function updateWatch(watchId, { reason, enabled } = {}) {
+  const body = {};
+  if (reason !== undefined) body.reason = reason;
+  if (enabled !== undefined) body.enabled = enabled;
+  const res = await fetch(`/v1/watchlist/${encodeURIComponent(watchId)}`, {
+    method: "PATCH",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
+  if (!res.ok) throw new Error(`update watch -> ${res.status}`);
+  return res.json().catch(() => ({}));
+}
+
+// ---- audit log (proxied to hushai-backend /v1/audit; append-only, read here) --------------------
+
+export async function getAudit({ actor, action, targetType, targetId, sinceMs, limit } = {}) {
+  const p = new URLSearchParams();
+  if (actor) p.set("actor", actor);
+  if (action) p.set("action", action);
+  if (targetType) p.set("target_type", targetType);
+  if (targetId) p.set("target_id", targetId);
+  if (sinceMs) p.set("since_unix_nanos", msToNsStr(sinceMs));
+  if (limit) p.set("limit", String(limit));
+  const rows = await getJson(`/v1/audit?${p.toString()}`);
+  return rows.map((r) => ({
+    id: r.audit_id ?? r.id ?? null,
+    tsMs: nsToMs(r.ts_unix_nanos),
+    actor: r.actor ?? null,
+    ip: r.ip ?? null,
+    action: r.action ?? null,
+    targetType: r.target_type ?? null,
+    targetId: r.target_id ?? null,
+    method: r.method ?? null,
+    path: r.path ?? null,
+    status: r.status ?? null,
+    detail: r.detail ?? null,
+  }));
 }

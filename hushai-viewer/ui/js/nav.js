@@ -7,6 +7,7 @@ import { el } from "./dom.js";
 
 const SECTIONS = [
   { key: "viewer", href: "/", icon: "‹", label: "Viewer", title: "Back to the viewer" },
+  { key: "cameras", href: "/cameras.html", icon: "📷", label: "Cameras", title: "All cameras at a glance" },
   { key: "events", href: "/events.html", icon: "🔔", label: "Events", title: "Alerts & event feed" },
   { key: "system", href: "/dashboard.html", icon: "▦", label: "System", title: "System dashboard" },
   { key: "files", href: "/manage.html", icon: "🗄", label: "Files", title: "Manage devices & footage" },
