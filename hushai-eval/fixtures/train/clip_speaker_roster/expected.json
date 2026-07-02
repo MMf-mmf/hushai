@@ -1,0 +1,43 @@
+{
+  "transcript": {
+    "full_text": "For the eyes of the world now look into space, to the moon and to the planets beyond, and we have vowed",
+    "max_wer": 0.35,
+    "min_similarity": 0.65
+  },
+  "chat": {
+    "similarity_floor": null,
+    "judge_enabled": false,
+    "questions": [
+      {
+        "ask": "Who was speaking in this video clip?",
+        "playback": {
+          "device_id": "eval-clip-roster",
+          "playhead_offset_ns": 3000000000
+        },
+        "expect_routed_agent": "recordings",
+        "must_contain": [
+          "mendel"
+        ],
+        "must_not_contain": [
+          "don't have"
+        ],
+        "min_citations": 1,
+        "citation_must_attribute": [
+          "Mendel"
+        ],
+        "reference_answer": "Mendel was speaking in this clip."
+      },
+      {
+        "ask": "Who was speaking in this video clip?",
+        "expect_routed_agent": "recordings",
+        "must_contain": [
+          "which video"
+        ],
+        "must_not_contain": [
+          "mendel"
+        ],
+        "reference_answer": "You're searching across all cameras, so I'm not sure which video you mean. Pick a camera and ask again."
+      }
+    ]
+  }
+}

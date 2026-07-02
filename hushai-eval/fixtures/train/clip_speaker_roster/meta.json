@@ -1,0 +1,25 @@
+{
+  "case_id": "clip_speaker_roster",
+  "description": "Deictic 'who was speaking in this video clip' with the voice pre-enrolled as Mendel (same JFK window as jfk_moon; that window is the verified mints-exactly-1-voice substrate). Scores the playback-anchored deterministic speaker roster (viewer playback context -> ±2min window -> named answer + attributed citation) and the no-playback CAMERA_CLARIFY fallback.",
+  "device_id": "eval-clip-roster",
+  "media_file": "media.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "transcript",
+    "chat"
+  ],
+  "tier": "full",
+  "enroll": [
+    {
+      "modality": "speaker",
+      "name": "Mendel",
+      "ref": "media.mp4"
+    }
+  ],
+  "poll": {
+    "timeout_secs": 180,
+    "interval_secs": 2
+  }
+}

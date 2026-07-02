@@ -8,7 +8,7 @@ import { Player } from "./player.js";
 import { Timeline } from "./timeline.js";
 import { Detections } from "./detections.js";
 import { clockMs, dateLabel, localDateInput, DAY_MS, tzAbbr, humanDur } from "./time.js";
-import { on } from "./store.js";
+import { on, setPlaybackProvider } from "./store.js";
 
 const $ = (id) => document.getElementById(id);
 const WINDOW_MS = 6 * 3600 * 1000; // matches backend VIEWER_MAX_WINDOW_NANOS default
@@ -54,6 +54,14 @@ async function init() {
   startTicker();
   // Chat citation click -> jump the video here (switching device if needed).
   on("seekToCitation", (e) => seekToCitation(e.detail));
+  // Chat pulls "what's on screen right now" (camera + wall-clock playhead) per send, so the
+  // backend can scope deictic questions ("who was speaking in this clip") to the open video.
+  // The closure reads live state, so registering before a device is selected is fine.
+  setPlaybackProvider(() => {
+    const ms = player ? player.currentWallClockMs() : 0;
+    if (!state.device || !isFinite(ms) || ms <= 0) return null;
+    return { deviceId: state.device.id, playheadMs: ms };
+  });
   $("tzLabel").textContent = tzAbbr();
 
   try {

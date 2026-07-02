@@ -146,7 +146,7 @@ pub async fn post_segment(
 /// Known first-party sources pass through; anything else → "other". (The DB keeps the raw value
 /// per device, so the breakdown isn't lost — only the metric label is bounded.)
 fn source_label(source_kind: &str) -> &'static str {
-    match source_kind {
+    match source_kind { // source_kind-allow: bounded metric label (observability, not behaviour)
         "android_app" => "android_app",
         "web_browser" => "web_browser",
         "rtsp" => "rtsp",

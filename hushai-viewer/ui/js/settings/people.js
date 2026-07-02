@@ -5,6 +5,7 @@
 
 import {
   getPersons, sampleFaceUrl, renamePerson, mergePerson,
+  archivePerson, unarchivePerson,
   getWatchlist, addWatch, removeWatch,
 } from "../api.js";
 import { nsToMs } from "../time.js";
@@ -69,6 +70,9 @@ function lastSeenLabel(sightings) {
 }
 
 // One person: face crop + name (editable) + sample count / last-seen, with Save and "merge into".
+// An archived (disregarded) person renders a reduced card: Watch toggle + Restore only — renaming
+// and merging are noise for something the user chose to tuck away. Watch stays available so a
+// watched+archived person can still be unwatched.
 function personCard(p, others, ctx) {
   const card = div("voice-card person-card");
 
@@ -91,26 +95,28 @@ function personCard(p, others, ctx) {
   );
 
   const actions = div("voice-actions");
-  const input = document.createElement("input");
-  input.type = "text";
-  input.placeholder = "Name this person";
-  input.value = p.display_name || "";
-  const save = document.createElement("button");
-  save.type = "button";
-  save.textContent = "Save";
-  save.addEventListener("click", async () => {
-    const name = input.value.trim();
-    if (!name) return;
-    save.disabled = true;
-    try {
-      await renamePerson(p.person_id, name);
-      await ctx.reload();
-    } catch {
-      save.disabled = false;
-      ctx.flash("Couldn't save that name (Refresh and try again).");
-    }
-  });
-  actions.append(input, save);
+  if (!p.archived) {
+    const input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = "Name this person";
+    input.value = p.display_name || "";
+    const save = document.createElement("button");
+    save.type = "button";
+    save.textContent = "Save";
+    save.addEventListener("click", async () => {
+      const name = input.value.trim();
+      if (!name) return;
+      save.disabled = true;
+      try {
+        await renamePerson(p.person_id, name);
+        await ctx.reload();
+      } catch {
+        save.disabled = false;
+        ctx.flash("Couldn't save that name (Refresh and try again).");
+      }
+    });
+    actions.append(input, save);
+  }
 
   // ⭐ Watch — "Person of Interest": alert whenever this person is seen. Toggles the backend
   // watchlist (which auto-manages a scoped alert rule). `ctx.watched` maps person_id → watch_id.
@@ -136,7 +142,7 @@ function personCard(p, others, ctx) {
   actions.appendChild(watchBtn);
 
   // "Merge into" — fold this face into another person (same human, split across ids).
-  if (others.length) {
+  if (!p.archived && others.length) {
     const merge = document.createElement("select");
     merge.title = "Merge this person into…";
     const def = document.createElement("option");
@@ -164,6 +170,27 @@ function personCard(p, others, ctx) {
     actions.appendChild(merge);
   }
 
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.textContent = p.archived ? "Restore" : "Disregard";
+  toggle.title = p.archived
+    ? "Bring this person back into the active lists"
+    : "Move to Archived — hides it from these lists; recordings are unaffected.";
+  toggle.addEventListener("click", async () => {
+    toggle.disabled = true;
+    try {
+      if (p.archived) await unarchivePerson(p.person_id);
+      else await archivePerson(p.person_id);
+      await ctx.reload();
+    } catch {
+      toggle.disabled = false;
+      ctx.flash(p.archived
+        ? "Couldn't restore that person (Refresh and try again)."
+        : "Couldn't disregard that person (Refresh and try again).");
+    }
+  });
+  actions.appendChild(toggle);
+
   info.appendChild(actions);
   card.appendChild(info);
   return card;
@@ -179,12 +206,14 @@ function render(container, persons, ctx) {
     return;
   }
 
-  const cardFor = (p) => personCard(p, persons.filter((o) => o.person_id !== p.person_id), ctx);
-
   // The known (named) people collapse into a closed disclosure; the still-unidentified faces —
-  // the ones you open this modal to name — stay shown.
-  const known = persons.filter(isIdentified);
-  const unknown = persons.filter((p) => !isIdentified(p));
+  // the ones you open this modal to name — stay shown. Disregarded people sink into a closed
+  // "Archived" disclosure at the bottom and are never offered as merge targets.
+  const archived = persons.filter((p) => p.archived);
+  const active = persons.filter((p) => !p.archived);
+  const cardFor = (p) => personCard(p, active.filter((o) => o.person_id !== p.person_id), ctx);
+  const known = active.filter(isIdentified);
+  const unknown = active.filter((p) => !isIdentified(p));
 
   if (known.length) {
     container.appendChild(collapsibleSection("Known people", known.length, known.map(cardFor)));
@@ -196,6 +225,12 @@ function render(container, persons, ctx) {
   if (unknown.length) {
     container.appendChild(sectionTitle("Unidentified people", unknown.length));
     unknown.forEach((p) => container.appendChild(cardFor(p)));
+  }
+
+  if (archived.length) {
+    container.appendChild(
+      collapsibleSection("Archived", archived.length, archived.map((p) => personCard(p, [], ctx))),
+    );
   }
 }
 

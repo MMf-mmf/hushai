@@ -56,6 +56,7 @@ pub enum IngestError {
     // ---- 507 Insufficient Storage ----
     #[error("storage pressure: insufficient free space")]
     StoragePressure,
+    // ---- 503 Service Unavailable (transient overload) ----
     #[error("database pool exhausted")]
     PoolExhausted,
 
@@ -83,7 +84,10 @@ impl IngestError {
             // permanent client ordering error, not a re-send-able 422.
             SequenceConflict => StatusCode::CONFLICT,
             Overloaded => StatusCode::TOO_MANY_REQUESTS,
-            StoragePressure | PoolExhausted => StatusCode::INSUFFICIENT_STORAGE,
+            // Disk-full is genuinely 507; a pool timeout is transient overload → 503 (not 507, which
+            // would collide with real StoragePressure on the ops dashboard). Client treats both as retryable.
+            StoragePressure => StatusCode::INSUFFICIENT_STORAGE,
+            PoolExhausted => StatusCode::SERVICE_UNAVAILABLE,
             Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         }
     }
@@ -174,7 +178,7 @@ mod tests {
                 IngestError::StoragePressure,
                 StatusCode::INSUFFICIENT_STORAGE,
             ),
-            (IngestError::PoolExhausted, StatusCode::INSUFFICIENT_STORAGE),
+            (IngestError::PoolExhausted, StatusCode::SERVICE_UNAVAILABLE),
         ];
         for (err, want) in cases {
             assert_eq!(err.status(), *want, "wrong status for {err:?}");

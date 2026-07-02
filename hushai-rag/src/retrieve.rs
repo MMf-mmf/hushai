@@ -256,6 +256,79 @@ pub async fn list_by_speaker(
     Ok(sources)
 }
 
+/// One row per DISTINCT speaker heard in a time window (earliest utterance as the sample),
+/// re-sorted chronologically. The deterministic "who was speaking in this clip" path: a roster
+/// question over a short window is a set question, not a similarity question — embedding
+/// "who was speaking" retrieves nothing useful. NULL speaker_ids collapse to a single
+/// "unattributed" row (`DISTINCT ON` treats NULLs as equal), so the caller can tell
+/// "speech but unattributed" from "no speech at all" (empty). `distance` is 0.0. Backed by
+/// `transcript_sentences_speaker_time_idx (speaker_id, start_unix_nanos)`.
+pub async fn list_speakers_in_window(
+    pool: &PgPool,
+    device_id: Option<&str>,
+    after: i64,
+    before: i64,
+    limit: i64,
+) -> anyhow::Result<Vec<Source>> {
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
+        "SELECT DISTINCT ON (ts.speaker_id) \
+             ts.segment_id, ts.device_id, ts.text, ts.start_unix_nanos, ts.speaker_id \
+         FROM transcript_sentences ts \
+         WHERE ts.text IS NOT NULL AND ts.start_unix_nanos >= ",
+    );
+    qb.push_bind(after);
+    qb.push(" AND ts.start_unix_nanos < ").push_bind(before);
+    if let Some(d) = device_id {
+        qb.push(" AND ts.device_id = ").push_bind(d.to_string());
+    }
+    qb.push(" ORDER BY ts.speaker_id, ts.start_unix_nanos ASC LIMIT ")
+        .push_bind(limit);
+
+    let rows = qb.build().fetch_all(pool).await?;
+    let mut sources = Vec::with_capacity(rows.len());
+    for row in rows {
+        sources.push(Source {
+            segment_id: row.try_get("segment_id")?,
+            device_id: row
+                .try_get::<Option<String>, _>("device_id")?
+                .unwrap_or_default(),
+            text: row
+                .try_get::<Option<String>, _>("text")?
+                .unwrap_or_default(),
+            start_unix_nanos: row.try_get("start_unix_nanos")?,
+            distance: 0.0,
+            speaker_id: row.try_get::<Option<String>, _>("speaker_id")?,
+            speaker_name: None,
+            time_label: String::new(),
+        });
+    }
+    sources.sort_by_key(|s| s.start_unix_nanos);
+    Ok(sources)
+}
+
+/// Is there ANY captured footage overlapping `[after, before)` (optionally one device)? Lets an
+/// empty speaker roster distinguish "no speech in this clip" from "nothing recorded / not yet
+/// processed for the moment you're watching".
+pub async fn window_has_footage(
+    pool: &PgPool,
+    device_id: Option<&str>,
+    after: i64,
+    before: i64,
+) -> anyhow::Result<bool> {
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
+        "SELECT EXISTS(SELECT 1 FROM segments WHERE capture_start_unix_nanos < ",
+    );
+    qb.push_bind(before);
+    qb.push(" AND capture_start_unix_nanos + duration_nanos > ")
+        .push_bind(after);
+    if let Some(d) = device_id {
+        qb.push(" AND device_id = ").push_bind(d.to_string());
+    }
+    qb.push(")");
+    let exists: bool = qb.build_query_scalar().fetch_one(pool).await?;
+    Ok(exists)
+}
+
 /// Open-vocabulary OBJECT retrieval (Phase B query side): the `top_k` nearest `scene_objects` rows
 /// to `query_embedding` (a CLIP TEXT-tower vector), closest first, deduped to one sighting per
 /// segment. The "when did I see a car / a red mug" path. The matched `object_label` is carried in

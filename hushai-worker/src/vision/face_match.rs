@@ -256,6 +256,8 @@ pub async fn assign_faces(
 }
 
 /// Nearest person centroid by cosine distance over the (small) catalog — the cold-start fallback.
+/// Deliberately includes ARCHIVED persons (0021): archiving is display-level only — excluding
+/// a disregarded face here would just re-mint a duplicate that reappears under "Unidentified".
 async fn nearest_centroid(
     tx: &mut Transaction<'_, Postgres>,
     embedding: &[f32],

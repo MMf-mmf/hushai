@@ -5,6 +5,7 @@
 
 import {
   getPlates, searchPlates, samplePlateUrl, renamePlate, mergePlate,
+  archivePlate, unarchivePlate,
   getWatchlist, addWatch, removeWatch,
 } from "../api.js";
 import { nsToMs } from "../time.js";
@@ -68,7 +69,8 @@ function lastSeenLabel(sightings) {
 }
 
 // One plate: rectified crop + the plate string + an editable display name + sightings/last-seen,
-// with Save and "merge into".
+// with Save and "merge into". An archived (disregarded) plate renders a reduced card: Watch
+// toggle + Restore only — Watch stays available so a watched+archived plate can be unwatched.
 function plateCard(p, others, ctx) {
   const card = div("voice-card person-card");
 
@@ -92,26 +94,28 @@ function plateCard(p, others, ctx) {
   );
 
   const actions = div("voice-actions");
-  const input = document.createElement("input");
-  input.type = "text";
-  input.placeholder = "Name this plate (e.g. “Mom’s car”)";
-  input.value = p.display_name || "";
-  const save = document.createElement("button");
-  save.type = "button";
-  save.textContent = "Save";
-  save.addEventListener("click", async () => {
-    const name = input.value.trim();
-    if (!name) return;
-    save.disabled = true;
-    try {
-      await renamePlate(p.plate_id, name);
-      await ctx.reload();
-    } catch {
-      save.disabled = false;
-      ctx.flash("Couldn't save that name (Refresh and try again).");
-    }
-  });
-  actions.append(input, save);
+  if (!p.archived) {
+    const input = document.createElement("input");
+    input.type = "text";
+    input.placeholder = "Name this plate (e.g. “Mom’s car”)";
+    input.value = p.display_name || "";
+    const save = document.createElement("button");
+    save.type = "button";
+    save.textContent = "Save";
+    save.addEventListener("click", async () => {
+      const name = input.value.trim();
+      if (!name) return;
+      save.disabled = true;
+      try {
+        await renamePlate(p.plate_id, name);
+        await ctx.reload();
+      } catch {
+        save.disabled = false;
+        ctx.flash("Couldn't save that name (Refresh and try again).");
+      }
+    });
+    actions.append(input, save);
+  }
 
   // ⭐ Watch — "Plate of Interest": alert whenever this plate is seen (auto-managed alert rule).
   const watchId = ctx.watched.get(p.plate_id);
@@ -135,7 +139,7 @@ function plateCard(p, others, ctx) {
   });
   actions.appendChild(watchBtn);
 
-  if (others.length) {
+  if (!p.archived && others.length) {
     const merge = document.createElement("select");
     merge.title = "Merge this plate into…";
     const def = document.createElement("option");
@@ -163,6 +167,27 @@ function plateCard(p, others, ctx) {
     actions.appendChild(merge);
   }
 
+  const toggle = document.createElement("button");
+  toggle.type = "button";
+  toggle.textContent = p.archived ? "Restore" : "Disregard";
+  toggle.title = p.archived
+    ? "Bring this plate back into the active lists"
+    : "Move to Archived — hides it from these lists; recordings are unaffected.";
+  toggle.addEventListener("click", async () => {
+    toggle.disabled = true;
+    try {
+      if (p.archived) await unarchivePlate(p.plate_id);
+      else await archivePlate(p.plate_id);
+      await ctx.reload();
+    } catch {
+      toggle.disabled = false;
+      ctx.flash(p.archived
+        ? "Couldn't restore that plate (Refresh and try again)."
+        : "Couldn't disregard that plate (Refresh and try again).");
+    }
+  });
+  actions.appendChild(toggle);
+
   info.appendChild(actions);
   card.appendChild(info);
   return card;
@@ -180,9 +205,14 @@ function render(container, plates, ctx) {
     return;
   }
 
-  const cardFor = (p) => plateCard(p, plates.filter((o) => o.plate_id !== p.plate_id), ctx);
-  const named = plates.filter(isNamed);
-  const unknown = plates.filter((p) => !isNamed(p));
+  // Disregarded plates sink into a closed "Archived" disclosure at the bottom and are never
+  // offered as merge targets. A text search still surfaces an archived plate (under Archived) —
+  // the right answer to "did I disregard ABC123?".
+  const archivedList = plates.filter((p) => p.archived);
+  const active = plates.filter((p) => !p.archived);
+  const cardFor = (p) => plateCard(p, active.filter((o) => o.plate_id !== p.plate_id), ctx);
+  const named = active.filter(isNamed);
+  const unknown = active.filter((p) => !isNamed(p));
 
   if (named.length) {
     container.appendChild(collapsibleSection("Named plates", named.length, named.map(cardFor)));
@@ -190,6 +220,11 @@ function render(container, plates, ctx) {
   if (unknown.length) {
     container.appendChild(sectionTitle("Unidentified plates", unknown.length));
     unknown.forEach((p) => container.appendChild(cardFor(p)));
+  }
+  if (archivedList.length) {
+    container.appendChild(
+      collapsibleSection("Archived", archivedList.length, archivedList.map((p) => plateCard(p, [], ctx))),
+    );
   }
 }
 

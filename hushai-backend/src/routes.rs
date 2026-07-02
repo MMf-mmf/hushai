@@ -64,6 +64,11 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/speakers/{id}", patch(speakers::rename_speaker))
         .route("/v1/speakers/{id}/merge", post(speakers::merge_speaker))
+        .route("/v1/speakers/{id}/archive", post(speakers::archive_speaker))
+        .route(
+            "/v1/speakers/{id}/unarchive",
+            post(speakers::unarchive_speaker),
+        )
         .route(
             "/v1/speakers/{id}/sample-audio",
             get(speakers::sample_audio),
@@ -79,6 +84,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/persons", get(persons::list_persons))
         .route("/v1/persons/{id}", patch(persons::rename_person))
         .route("/v1/persons/{id}/merge", post(persons::merge_person))
+        .route("/v1/persons/{id}/archive", post(persons::archive_person))
+        .route("/v1/persons/{id}/unarchive", post(persons::unarchive_person))
         .route("/v1/persons/{id}/sample-face", get(persons::sample_face))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -93,6 +100,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/plates/search", get(plates::search_plates))
         .route("/v1/plates/{id}", patch(plates::rename_plate))
         .route("/v1/plates/{id}/merge", post(plates::merge_plate))
+        .route("/v1/plates/{id}/archive", post(plates::archive_plate))
+        .route("/v1/plates/{id}/unarchive", post(plates::unarchive_plate))
         .route(
             "/v1/plates/{id}/sample-crop",
             get(plates::sample_plate_crop),

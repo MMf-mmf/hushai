@@ -27,7 +27,8 @@ class PlatesClientTest {
         server.enqueue(
             MockResponse().setBody(
                 """[{"plate_id":"abc-123","plate_text":"ABC123","display_name":"Mom's car",
-                   "n_samples":7,"n_sightings":2,"sample_sighting_unix_nanos":[3000,2000,1000]},
+                   "n_samples":7,"n_sightings":2,"sample_sighting_unix_nanos":[3000,2000,1000],
+                   "archived":true},
                    {"plate_id":"def-456","plate_text":"XYZ789","display_name":null,"n_samples":2,
                    "sample_sighting_unix_nanos":[]}]""",
             ),
@@ -41,12 +42,26 @@ class PlatesClientTest {
         assertEquals(7L, list[0].nSamples)
         assertEquals(2L, list[0].nSightings) // distinct appearances, not the 7 raw reads
         assertEquals(listOf(3000L, 2000L, 1000L), list[0].sampleSightingsNanos)
+        assertTrue(list[0].archived)
         assertEquals("XYZ789", list[1].plateText)
         assertNull(list[1].displayName) // null display_name -> null, not "null"
         assertEquals(2L, list[1].nSightings) // no n_sightings -> falls back to n_samples
         assertTrue(list[1].sampleSightingsNanos.isEmpty())
+        assertEquals(false, list[1].archived) // absent (older backend) -> false
 
         assertEquals("/v1/plates", server.takeRequest().path)
+    }
+
+    @Test fun setArchivedIssuesPostToVerbRoute() {
+        server.enqueue(MockResponse().setBody("""{"plate_id":"abc","plate_text":"ABC123","display_name":null,"n_samples":1,"archived":true}"""))
+        assertTrue(client().setArchived("abc", true))
+        val req = server.takeRequest()
+        assertEquals("POST", req.method)
+        assertEquals("/v1/plates/abc/archive", req.path)
+
+        server.enqueue(MockResponse().setBody("""{"plate_id":"abc","plate_text":"ABC123","display_name":null,"n_samples":1,"archived":false}"""))
+        assertTrue(client().setArchived("abc", false))
+        assertEquals("/v1/plates/abc/unarchive", server.takeRequest().path)
     }
 
     @Test fun listReturnsNullOnHttpError() {

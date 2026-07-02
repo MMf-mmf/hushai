@@ -48,6 +48,12 @@ impl TokenStore {
                 Some((label, tok)) if !tok.trim().is_empty() => {
                     allowed.insert(tok.trim().to_string(), label.trim().to_string());
                 }
+                // `label:` with an empty token half: the doc promises a BARE token of `label`, not the
+                // literal `label:`. Strip the trailing colon so an operator provisioning `phone` (per the
+                // doc) authenticates, instead of only `phone:`.
+                Some((label, _)) if !label.trim().is_empty() => {
+                    allowed.insert(label.trim().to_string(), format!("device-{i}"));
+                }
                 _ => {
                     allowed.insert(entry.to_string(), format!("device-{i}"));
                 }

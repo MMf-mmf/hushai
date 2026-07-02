@@ -27,7 +27,7 @@ class PersonsClientTest {
         server.enqueue(
             MockResponse().setBody(
                 """[{"person_id":"abc-123","display_name":"Alice","n_samples":7,"n_sightings":2,
-                   "sample_sighting_unix_nanos":[3000,2000,1000]},
+                   "sample_sighting_unix_nanos":[3000,2000,1000],"archived":true},
                    {"person_id":"def-456","display_name":null,"n_samples":2,
                    "sample_sighting_unix_nanos":[]}]""",
             ),
@@ -40,11 +40,25 @@ class PersonsClientTest {
         assertEquals(7L, list[0].nSamples)
         assertEquals(2L, list[0].nSightings) // distinct appearances, not the 7 raw templates
         assertEquals(listOf(3000L, 2000L, 1000L), list[0].sampleSightingsNanos)
+        assertTrue(list[0].archived)
         assertNull(list[1].name) // null display_name -> null, not "null"
         assertEquals(2L, list[1].nSightings) // no n_sightings -> falls back to n_samples
         assertTrue(list[1].sampleSightingsNanos.isEmpty())
+        assertEquals(false, list[1].archived) // absent (older backend) -> false
 
         assertEquals("/v1/persons", server.takeRequest().path)
+    }
+
+    @Test fun setArchivedIssuesPostToVerbRoute() {
+        server.enqueue(MockResponse().setBody("""{"person_id":"abc","display_name":null,"n_samples":1,"archived":true}"""))
+        assertTrue(client().setArchived("abc", true))
+        val req = server.takeRequest()
+        assertEquals("POST", req.method)
+        assertEquals("/v1/persons/abc/archive", req.path)
+
+        server.enqueue(MockResponse().setBody("""{"person_id":"abc","display_name":null,"n_samples":1,"archived":false}"""))
+        assertTrue(client().setArchived("abc", false))
+        assertEquals("/v1/persons/abc/unarchive", server.takeRequest().path)
     }
 
     @Test fun listReturnsNullOnHttpError() {

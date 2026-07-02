@@ -203,5 +203,17 @@ fn build_body(q: &ChatQ, base_ns: i64) -> Value {
             body["filters"] = Value::Object(filters);
         }
     }
+    if let Some(pb) = &q.playback {
+        let mut playback = serde_json::Map::new();
+        if let Some(d) = &pb.device_id {
+            playback.insert("device_id".into(), json!(d));
+        }
+        if let Some(off) = pb.playhead_offset_ns {
+            playback.insert("playhead_unix_nanos".into(), json!(base_ns + off));
+        }
+        if !playback.is_empty() {
+            body["playback"] = Value::Object(playback);
+        }
+    }
     body
 }

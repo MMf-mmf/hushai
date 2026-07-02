@@ -4,6 +4,8 @@
 //! `GET  /v1/persons`                  — list discovered persons + bounded recent sightings
 //! `PATCH /v1/persons/{id}`            — set display_name (name a face)
 //! `POST /v1/persons/{id}/merge`       — fold two ids for the same person into one
+//! `POST /v1/persons/{id}/archive`     — disregard (display-level; matcher still attributes)
+//! `POST /v1/persons/{id}/unarchive`   — restore from the Archived section
 //! `GET  /v1/persons/{id}/sample-face` — a representative cropped face (ID a person by sight)
 //!
 //! Runtime sqlx (`query`/`.bind`/`try_get`), NOT the `query!` macros, for the same reason as
@@ -39,6 +41,9 @@ pub struct PersonSummary {
     pub n_sightings: i64,
     /// Absolute timestamps of up to 3 recent sightings (a "when did we see this face" hint).
     pub sample_sighting_unix_nanos: Vec<i64>,
+    /// Disregarded by the operator (0021). Display-level only: clients tuck archived entries
+    /// into a collapsed "Archived" section; matching/RAG/watchlist behavior is unchanged.
+    pub archived: bool,
 }
 
 /// A new "sighting" begins when consecutive detections of the same face are more than this many
@@ -64,6 +69,7 @@ pub async fn list_persons(
         SELECT p.person_id,
                p.display_name,
                p.n_samples,
+               p.archived_at IS NOT NULL AS archived,
                COALESCE(sight.n, 0) AS n_sightings,
                COALESCE(samp.ts, ARRAY[]::bigint[]) AS sample_sightings
         FROM persons p
@@ -110,6 +116,7 @@ pub async fn list_persons(
             sample_sighting_unix_nanos: r
                 .try_get::<Vec<i64>, _>("sample_sightings")
                 .unwrap_or_default(),
+            archived: r.try_get("archived").unwrap_or(false),
         })
         .collect();
     Ok(Json(out))
@@ -125,6 +132,7 @@ pub struct PersonRow {
     pub person_id: Uuid,
     pub display_name: Option<String>,
     pub n_samples: i64,
+    pub archived: bool,
 }
 
 /// `PATCH /v1/persons/{id}` — name a face (idempotent). 404 if the id is unknown.
@@ -141,7 +149,8 @@ pub async fn rename_person(
     }
     let row = sqlx::query(
         "UPDATE persons SET display_name = $1, updated_at = now() \
-         WHERE person_id = $2 RETURNING person_id, display_name, n_samples",
+         WHERE person_id = $2 \
+         RETURNING person_id, display_name, n_samples, archived_at IS NOT NULL AS archived",
     )
     .bind(name)
     .bind(id)
@@ -149,13 +158,56 @@ pub async fn rename_person(
     .await?
     .ok_or(IngestError::NotFound("person"))?;
 
-    Ok(Json(PersonRow {
+    Ok(Json(person_row(&row)))
+}
+
+fn person_row(row: &sqlx::postgres::PgRow) -> PersonRow {
+    PersonRow {
         person_id: row.get("person_id"),
         display_name: row
             .try_get::<Option<String>, _>("display_name")
             .unwrap_or(None),
         n_samples: row.get("n_samples"),
-    }))
+        archived: row.try_get("archived").unwrap_or(false),
+    }
+}
+
+/// `POST /v1/persons/{id}/archive` — disregard a face (idempotent). Display-level only: the
+/// face matcher still attributes new detections to it (else the next sighting would re-mint a
+/// duplicate that reappears under "Unidentified"). 404 if the id is unknown.
+pub async fn archive_person(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<PersonRow>, IngestError> {
+    set_person_archived(&st, id, true).await
+}
+
+/// `POST /v1/persons/{id}/unarchive` — restore a disregarded face (idempotent).
+pub async fn unarchive_person(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<PersonRow>, IngestError> {
+    set_person_archived(&st, id, false).await
+}
+
+async fn set_person_archived(
+    st: &AppState,
+    id: Uuid,
+    archived: bool,
+) -> Result<Json<PersonRow>, IngestError> {
+    let row = sqlx::query(
+        "UPDATE persons \
+         SET archived_at = CASE WHEN $1 THEN now() ELSE NULL END, updated_at = now() \
+         WHERE person_id = $2 \
+         RETURNING person_id, display_name, n_samples, archived_at IS NOT NULL AS archived",
+    )
+    .bind(archived)
+    .bind(id)
+    .fetch_optional(&st.pool)
+    .await?
+    .ok_or(IngestError::NotFound("person"))?;
+
+    Ok(Json(person_row(&row)))
 }
 
 #[derive(Debug, Deserialize)]

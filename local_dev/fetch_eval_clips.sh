@@ -24,6 +24,10 @@ need curl; need ffmpeg
 # case | source URL | ss (start secs) | t (duration secs)
 CLIPS=(
   "jfk_moon|https://upload.wikimedia.org/wikipedia/commons/5/50/Jfk_rice_university_we_choose_to_go_to_the_moon.ogg|334|14"
+  # Same window as jfk_moon on purpose: it's the verified mints-exactly-1-voice substrate, and the
+  # case doubles the file as its own enrollment ref (identical audio ⇒ the case injection is
+  # guaranteed to match the enrolled "Mendel" centroid).
+  "clip_speaker_roster|https://upload.wikimedia.org/wikipedia/commons/5/50/Jfk_rice_university_we_choose_to_go_to_the_moon.ogg|334|14"
   "fdr_infamy|https://upload.wikimedia.org/wikipedia/commons/7/7e/Roosevelt_Infamy.ogg|0|16"
   "armstrong_step|https://upload.wikimedia.org/wikipedia/commons/d/dd/Armstrong_Small_Step.ogg|0|24"
 )

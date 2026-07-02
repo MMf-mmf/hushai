@@ -13,6 +13,8 @@ import {
   renameSpeaker,
   mergeSpeaker,
   mergeSpeakerGroup,
+  archiveSpeaker,
+  unarchiveSpeaker,
 } from "../api.js";
 
 function note(text) {
@@ -69,6 +71,8 @@ function collapsibleSection(text, count, cardEls) {
 }
 
 // One speaker: name + sample count + sample utterances, with rename, play, and "merge into".
+// An archived (disregarded) voice renders a reduced card: play + Restore only — renaming and
+// merging are noise for something the user chose to tuck away.
 function voiceCard(sp, others, ctx) {
   const card = div("voice-card");
   card.appendChild(div("voice-name", speakerLabel(sp.display_name, sp.speaker_id)));
@@ -78,6 +82,30 @@ function voiceCard(sp, others, ctx) {
   }
 
   const actions = div("voice-actions");
+
+  if (sp.archived) {
+    const play = document.createElement("button");
+    play.type = "button";
+    play.textContent = "Play sample";
+    play.addEventListener("click", () => ctx.play(sp.speaker_id));
+    const restore = document.createElement("button");
+    restore.type = "button";
+    restore.textContent = "Restore";
+    restore.addEventListener("click", async () => {
+      restore.disabled = true;
+      try {
+        await unarchiveSpeaker(sp.speaker_id);
+        await ctx.reload();
+      } catch {
+        restore.disabled = false;
+        ctx.flash("Couldn't restore that voice.");
+      }
+    });
+    actions.append(play, restore);
+    card.appendChild(actions);
+    return card;
+  }
+
   const input = document.createElement("input");
   input.type = "text";
   input.placeholder = "Name this voice";
@@ -131,6 +159,22 @@ function voiceCard(sp, others, ctx) {
     });
     actions.appendChild(merge);
   }
+
+  const disregard = document.createElement("button");
+  disregard.type = "button";
+  disregard.textContent = "Disregard";
+  disregard.title = "Move to Archived — hides it from these lists; recordings are unaffected.";
+  disregard.addEventListener("click", async () => {
+    disregard.disabled = true;
+    try {
+      await archiveSpeaker(sp.speaker_id);
+      await ctx.reload();
+    } catch {
+      disregard.disabled = false;
+      ctx.flash("Couldn't disregard that voice.");
+    }
+  });
+  actions.appendChild(disregard);
 
   card.appendChild(actions);
   return card;
@@ -281,10 +325,14 @@ function render(container, speakers, dups, unattributed, ctx) {
   }
 
   // The known (named) voices collapse into a closed disclosure; the still-unidentified voices —
-  // the ones you open this modal to name — stay shown.
-  const known = speakers.filter(isIdentified);
-  const unknown = speakers.filter((sp) => !isIdentified(sp));
-  const cardFor = (sp) => voiceCard(sp, speakers.filter((o) => o.speaker_id !== sp.speaker_id), ctx);
+  // the ones you open this modal to name — stay shown. Disregarded voices sink into a closed
+  // "Archived" disclosure at the bottom (they keep matching new audio; they're just out of the
+  // labeling to-do list) and are never offered as merge targets.
+  const archived = speakers.filter((sp) => sp.archived);
+  const active = speakers.filter((sp) => !sp.archived);
+  const known = active.filter(isIdentified);
+  const unknown = active.filter((sp) => !isIdentified(sp));
+  const cardFor = (sp) => voiceCard(sp, active.filter((o) => o.speaker_id !== sp.speaker_id), ctx);
 
   if (known.length) {
     container.appendChild(collapsibleSection("Known voices", known.length, known.map(cardFor)));
@@ -296,6 +344,12 @@ function render(container, speakers, dups, unattributed, ctx) {
   if (unknown.length) {
     container.appendChild(sectionTitle("Unidentified voices", unknown.length));
     unknown.forEach((sp) => container.appendChild(cardFor(sp)));
+  }
+
+  if (archived.length) {
+    container.appendChild(
+      collapsibleSection("Archived", archived.length, archived.map((sp) => voiceCard(sp, [], ctx))),
+    );
   }
 }
 

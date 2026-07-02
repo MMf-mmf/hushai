@@ -57,6 +57,8 @@ fun VoicesScreen(client: SpeakersClient, onBack: () -> Unit) {
     var error by remember { mutableStateOf(false) }
     // Known (named) voices collapse behind a closed disclosure so the unidentified ones lead.
     var knownExpanded by remember { mutableStateOf(false) }
+    // Disregarded voices collapse behind their own closed disclosure at the bottom.
+    var archivedExpanded by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val ctx = LocalContext.current
 
@@ -147,10 +149,14 @@ fun VoicesScreen(client: SpeakersClient, onBack: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             else -> {
+                // Disregarded voices sink into a closed "Archived" disclosure at the bottom and
+                // are never offered as merge targets. They keep matching new audio server-side.
+                val archived = speakers.filter { it.archived }
+                val active = speakers.filter { !it.archived }
                 val card: @Composable (SpeakersClient.Speaker) -> Unit = { sp ->
                     SpeakerCard(
                         speaker = sp,
-                        others = speakers.filter { it.id != sp.id },
+                        others = if (sp.archived) emptyList() else active.filter { it.id != sp.id },
                         onSave = { name ->
                             scope.launch {
                                 val ok = withContext(Dispatchers.IO) { client.setName(sp.id, name) }
@@ -164,12 +170,18 @@ fun VoicesScreen(client: SpeakersClient, onBack: () -> Unit) {
                                 if (ok) reload() else Toast.makeText(ctx, "Couldn't complete that — check your connection and try again.", Toast.LENGTH_LONG).show()
                             }
                         },
+                        onSetArchived = { flag ->
+                            scope.launch {
+                                val ok = withContext(Dispatchers.IO) { client.setArchived(sp.id, flag) }
+                                if (ok) reload() else Toast.makeText(ctx, "Couldn't complete that — check your connection and try again.", Toast.LENGTH_LONG).show()
+                            }
+                        },
                     )
                 }
                 // Identified (named) voices first so the known voices are visible at a glance,
                 // then the ones still waiting to be named.
-                val known = speakers.filter { !it.name.isNullOrBlank() }
-                val unknown = speakers.filter { it.name.isNullOrBlank() }
+                val known = active.filter { !it.name.isNullOrBlank() }
+                val unknown = active.filter { it.name.isNullOrBlank() }
 
                 if (known.isEmpty()) {
                     Text("Known voices (0)", style = MaterialTheme.typography.titleMedium)
@@ -189,6 +201,14 @@ fun VoicesScreen(client: SpeakersClient, onBack: () -> Unit) {
                 if (unknown.isNotEmpty()) {
                     Text("Unidentified voices (${unknown.size})", style = MaterialTheme.typography.titleMedium)
                     unknown.forEach { card(it) }
+                }
+                if (archived.isNotEmpty()) {
+                    Text(
+                        "${if (archivedExpanded) "▾" else "▸"} Archived (${archived.size})",
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.clickable { archivedExpanded = !archivedExpanded },
+                    )
+                    if (archivedExpanded) archived.forEach { card(it) }
                 }
             }
         }
@@ -272,6 +292,7 @@ private fun SpeakerCard(
     onSave: (String) -> Unit,
     onPlay: () -> Unit,
     onMerge: (String) -> Unit,
+    onSetArchived: (Boolean) -> Unit,
 ) {
     var name by remember(speaker.id) { mutableStateOf(speaker.name ?: "") }
     var mergeOpen by remember(speaker.id) { mutableStateOf(false) }
@@ -288,6 +309,17 @@ private fun SpeakerCard(
         )
         speaker.samples.forEach {
             Text("“$it”", style = MaterialTheme.typography.bodySmall)
+        }
+
+        // An archived (disregarded) voice renders a reduced card: play + Restore only —
+        // renaming and merging are noise for something the user chose to tuck away.
+        if (speaker.archived) {
+            Spacer(Modifier.height(12.dp))
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                OutlinedButton(onClick = onPlay) { Text("Play sample") }
+                OutlinedButton(onClick = { onSetArchived(false) }) { Text("Restore") }
+            }
+            return@SectionCard
         }
 
         Spacer(Modifier.height(12.dp))
@@ -321,6 +353,7 @@ private fun SpeakerCard(
                     }
                 }
             }
+            OutlinedButton(onClick = { onSetArchived(true) }) { Text("Disregard") }
         }
     }
 }

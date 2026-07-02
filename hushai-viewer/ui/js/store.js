@@ -18,3 +18,24 @@ export function emit(type, detail) {
 export function seekToCitation({ deviceId, ms }) {
   emit("seekToCitation", { deviceId, ms });
 }
+
+// The pull-model twin of seekToCitation: chat asks "what is the viewer showing right now?"
+// without coupling to app.js internals. app.js registers a provider at init; the chat pane
+// pulls it per send so the backend can scope deictic questions ("who was speaking in this
+// clip") to the on-screen camera + playhead.
+let playbackProvider = null;
+
+/// app.js registers `fn() -> { deviceId, playheadMs } | null` (null = nothing playing).
+export function setPlaybackProvider(fn) {
+  playbackProvider = fn;
+}
+
+/// The current playback context, or null (no provider / nothing playing / provider threw).
+export function playbackContext() {
+  if (!playbackProvider) return null;
+  try {
+    return playbackProvider() ?? null;
+  } catch {
+    return null;
+  }
+}

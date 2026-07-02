@@ -584,6 +584,37 @@ pub(crate) fn is_deictic_video_query(query: &str) -> bool {
     .any(|p| q.contains(p))
 }
 
+/// Half-width of the time window anchored on the viewer's playhead for a deictic question
+/// ("who was speaking in this clip"): ±120 s. Segments are ~2 s ingest units, so the containing
+/// segment alone would usually hold one sentence and miss speakers seconds away; two minutes
+/// either side matches what a human means by "this clip" without another DB round trip.
+pub(crate) const DEICTIC_CLIP_WINDOW_NANOS: i64 = 120_000_000_000;
+
+/// Is the question a SPEAKER-ROSTER ask ("who was speaking / talking", "whose voice") rather
+/// than content attribution ("who said X" stays on the semantic path)? Deliberately narrow
+/// phrase match, same idiom as [`is_deictic_video_query`]. Callers use it two ways: the
+/// auto-router pre-routes these to `recordings` (a voice question — the LLM router's "who"
+/// pattern drifts toward the people/faces agent), and the Grounded arm answers them
+/// deterministically when the turn carries a bounded time window.
+pub(crate) fn is_speaker_roster_query(query: &str) -> bool {
+    let q = query.to_lowercase();
+    [
+        "who was speaking",
+        "who is speaking",
+        "who's speaking",
+        "who was talking",
+        "who is talking",
+        "who's talking",
+        "who spoke",
+        "whose voice",
+        "who do you hear",
+        "who can you hear",
+        "who did you hear",
+    ]
+    .iter()
+    .any(|p| q.contains(p))
+}
+
 /// Count of registered cameras (devices). Used to decide whether "this video" is ambiguous: with a
 /// single camera there's nothing to clarify. Cheap; the catalog is tiny.
 pub(crate) async fn camera_count(pool: &PgPool) -> anyhow::Result<i64> {
@@ -933,7 +964,10 @@ pub(crate) fn internal(e: anyhow::Error) -> (StatusCode, String) {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_co_occurrence_query, is_deictic_video_query, normalize_object_label};
+    use super::{
+        is_co_occurrence_query, is_deictic_video_query, is_speaker_roster_query,
+        normalize_object_label,
+    };
 
     #[test]
     fn object_label_resolves_plurals_and_irregulars() {
@@ -954,6 +988,34 @@ mod tests {
         // non-COCO phrases return None → caller falls back to the semantic path (not empty results)
         assert_eq!(n("a spaceship"), None);
         assert_eq!(n("people walking around"), None);
+    }
+
+    #[test]
+    fn speaker_roster_questions_are_detected() {
+        for q in [
+            "Who was speaking in this video clip",
+            "who is talking right now?",
+            "Who's speaking?",
+            "who spoke in this clip",
+            "whose voice is that",
+            "who can you hear in this recording",
+        ] {
+            assert!(is_speaker_roster_query(q), "should be roster: {q:?}");
+        }
+    }
+
+    #[test]
+    fn content_attribution_is_not_a_roster_question() {
+        // "Who said X" is content attribution — the semantic path already handles it; a roster
+        // rewrite would answer the wrong question ("who spoke at all" vs "who said THIS").
+        for q in [
+            "who said we should buy the house",
+            "who mentioned the invoice",
+            "what did Mendel say yesterday",
+            "who did I see in this video",
+        ] {
+            assert!(!is_speaker_roster_query(q), "should not be roster: {q:?}");
+        }
     }
 
     #[test]

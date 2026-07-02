@@ -27,6 +27,8 @@ class SpeakersClient(
         val name: String?,
         val nSamples: Long,
         val samples: List<String>,
+        /** Disregarded by the operator — shown under a collapsed "Archived" section. */
+        val archived: Boolean = false,
     )
 
     /** One member of a suggested duplicate group. */
@@ -67,6 +69,7 @@ class SpeakersClient(
                         nSamples = o.optLong("n_samples"),
                         samples = if (s == null) emptyList()
                         else (0 until s.length()).map { s.getString(it) },
+                        archived = o.optBoolean("archived", false),
                     )
                 }
             }
@@ -79,6 +82,23 @@ class SpeakersClient(
     fun setName(id: String, name: String): Boolean {
         val body = JSONObject().put("display_name", name).toString().toRequestBody(JSON)
         val req = bearer(Request.Builder().url("$base/v1/speakers/$id").patch(body))
+        return try {
+            client.newCall(req).execute().use { it.isSuccessful }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * `POST /v1/speakers/{id}/archive|unarchive` — disregard (or restore) a voice. Display-level
+     * only: the matcher still attributes new audio to it; it just moves to the Archived section.
+     */
+    fun setArchived(id: String, archived: Boolean): Boolean {
+        val verb = if (archived) "archive" else "unarchive"
+        val req = bearer(
+            Request.Builder().url("$base/v1/speakers/$id/$verb")
+                .post(ByteArray(0).toRequestBody(null)),
+        )
         return try {
             client.newCall(req).execute().use { it.isSuccessful }
         } catch (e: Exception) {

@@ -23,9 +23,44 @@ pub enum Persisted {
 }
 
 pub async fn connect(config: &Config) -> anyhow::Result<PgPool> {
+    // Server-side per-connection timeouts + connection recycling so a stuck/abandoned transaction
+    // can't pin a pooled connection indefinitely: a client-cancelled request leaves an orphaned
+    // Postgres backend holding locks, and worker background txns (process/vision) have no HTTP timeout
+    // above them. `idle_in_transaction_session_timeout` is always safe (no legitimate idle-open tx);
+    // `statement_timeout` is generous (real queries are indexed/sub-second) and env-tunable for any
+    // atypically-heavy analytics — 0 disables (Postgres semantics). Values are milliseconds.
+    let stmt_ms = std::env::var("DB_STATEMENT_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(120)
+        .saturating_mul(1000);
+    let idle_tx_ms = std::env::var("DB_IDLE_TX_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(60)
+        .saturating_mul(1000);
+    let init = format!(
+        "SET statement_timeout = {stmt_ms}; SET idle_in_transaction_session_timeout = {idle_tx_ms};"
+    );
     let pool = PgPoolOptions::new()
         .max_connections(config.db_max_connections)
         .acquire_timeout(Duration::from_secs(config.db_acquire_timeout_secs))
+        .max_lifetime(Duration::from_secs(30 * 60))
+        .idle_timeout(Duration::from_secs(10 * 60))
+        .after_connect(move |conn, _meta| {
+            // SAFE: `init` is built only from integer millisecond values (env-parsed u64), no user
+            // input — the SET statements can't carry an injection.
+            let init = sqlx::AssertSqlSafe(init.clone());
+            Box::pin(async move {
+                // Two `;`-separated SET commands MUST go through the SIMPLE query protocol
+                // (`raw_sql`). `sqlx::query` prepares the statement, and Postgres rejects a
+                // multi-command prepared statement ("cannot insert multiple commands into a
+                // prepared statement") — which fails `after_connect` on every pooled connection,
+                // so the pool never opens and the backend exits with "pool timed out".
+                sqlx::raw_sql(init).execute(&mut *conn).await?;
+                Ok(())
+            })
+        })
         .connect(&config.database_url)
         .await?;
     Ok(pool)

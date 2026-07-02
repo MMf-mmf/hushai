@@ -32,6 +32,8 @@ class PersonsClient(
         val nSightings: Long,
         /** Up to 3 recent sighting times (unix nanos), most-recent first. */
         val sampleSightingsNanos: List<Long>,
+        /** Disregarded by the operator — shown under a collapsed "Archived" section. */
+        val archived: Boolean = false,
     )
 
     /**
@@ -55,6 +57,7 @@ class PersonsClient(
                         nSightings = if (o.has("n_sightings")) o.optLong("n_sightings") else o.optLong("n_samples"),
                         sampleSightingsNanos = if (t == null) emptyList()
                         else (0 until t.length()).map { t.getLong(it) },
+                        archived = o.optBoolean("archived", false),
                     )
                 }
             }
@@ -67,6 +70,23 @@ class PersonsClient(
     fun setName(id: String, name: String): Boolean {
         val body = JSONObject().put("display_name", name).toString().toRequestBody(JSON)
         val req = bearer(Request.Builder().url("$base/v1/persons/$id").patch(body))
+        return try {
+            client.newCall(req).execute().use { it.isSuccessful }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * `POST /v1/persons/{id}/archive|unarchive` — disregard (or restore) a face. Display-level
+     * only: the matcher still attributes new detections to it; it just moves to Archived.
+     */
+    fun setArchived(id: String, archived: Boolean): Boolean {
+        val verb = if (archived) "archive" else "unarchive"
+        val req = bearer(
+            Request.Builder().url("$base/v1/persons/$id/$verb")
+                .post(ByteArray(0).toRequestBody(null)),
+        )
         return try {
             client.newCall(req).execute().use { it.isSuccessful }
         } catch (e: Exception) {

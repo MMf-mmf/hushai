@@ -294,6 +294,8 @@ pub async fn assign_speaker(
 
 /// Nearest speaker centroid by cosine distance over the full (small) catalog. The fallback
 /// used at cold-start (too few raw neighbors to vote) and after retention drops raw vectors.
+/// Deliberately includes ARCHIVED speakers (0021): archiving is display-level only — excluding
+/// a disregarded voice here would just re-mint a duplicate that reappears under "Unidentified".
 async fn nearest_centroid(
     tx: &mut Transaction<'_, Postgres>,
     embedding: &[f32],

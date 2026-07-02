@@ -243,6 +243,10 @@ pub struct ChatQ {
     pub agent_id: String,
     #[serde(default)]
     pub filters: Option<ChatFilters>,
+    /// Simulated viewer playback state (the browser sends this on every turn): the on-screen
+    /// camera + playhead. Exercises the deictic clip anchor ("who was speaking in this clip").
+    #[serde(default)]
+    pub playback: Option<ChatPlayback>,
     #[serde(default)]
     pub top_k: Option<i64>,
 
@@ -290,6 +294,16 @@ pub struct ChatFilters {
     pub person_name: Option<String>,
     #[serde(default)]
     pub plate_text: Option<String>,
+}
+
+/// Simulated viewer playback context. `playhead_offset_ns` is an OFFSET from
+/// `base_capture_unix_nanos` (the query step adds the base), identical to `ChatFilters` bounds.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatPlayback {
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub playhead_offset_ns: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

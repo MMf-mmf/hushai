@@ -210,7 +210,10 @@ fn fmt_labels_le(labels: &Labels, le: &str) -> String {
 }
 
 fn escape(v: &str) -> String {
-    v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    // Prometheus exposition format requires \, ", \n AND \r escaped in label values (a stray \r would
+    // corrupt the line). All current labels are constants/bounded, so this is defense-in-depth for any
+    // future runtime-derived label value.
+    v.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n").replace('\r', "\\r")
 }
 
 /// Record a `hushai_build_info{service,version} 1` gauge (so a scraper can see which build is up).

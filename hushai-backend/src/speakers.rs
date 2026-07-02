@@ -3,6 +3,8 @@
 //! `GET /v1/speakers`                 — list discovered speakers + bounded sample utterances
 //! `PATCH /v1/speakers/{id}`          — set display_name (name a voice)
 //! `POST /v1/speakers/{id}/merge`     — merge two ids for the same person
+//! `POST /v1/speakers/{id}/archive`   — disregard (display-level; matcher still attributes)
+//! `POST /v1/speakers/{id}/unarchive` — restore from the Archived section
 //! `GET /v1/speakers/{id}/sample-audio` — a representative segment's audio (ID a voice by ear)
 //!
 //! These use RUNTIME sqlx (`query`/`query_as`/`query_scalar` + `.bind`/`try_get`), NOT the
@@ -39,6 +41,9 @@ pub struct SpeakerSummary {
     pub display_name: Option<String>,
     pub n_samples: i64,
     pub sample_utterances: Vec<String>,
+    /// Disregarded by the operator (0021). Display-level only: clients tuck archived entries
+    /// into a collapsed "Archived" section; matching/RAG/watchlist behavior is unchanged.
+    pub archived: bool,
 }
 
 /// `GET /v1/speakers` — the global (cross-device) catalog with up to 3 sample utterances
@@ -51,6 +56,7 @@ pub async fn list_speakers(
         SELECT s.speaker_id,
                s.display_name,
                s.n_samples,
+               s.archived_at IS NOT NULL AS archived,
                COALESCE(samp.utts, ARRAY[]::text[]) AS sample_utterances
         FROM speakers s
         LEFT JOIN LATERAL (
@@ -81,6 +87,7 @@ pub async fn list_speakers(
             sample_utterances: r
                 .try_get::<Vec<String>, _>("sample_utterances")
                 .unwrap_or_default(),
+            archived: r.try_get("archived").unwrap_or(false),
         })
         .collect();
     Ok(Json(out))
@@ -96,6 +103,7 @@ pub struct SpeakerRow {
     pub speaker_id: Uuid,
     pub display_name: Option<String>,
     pub n_samples: i64,
+    pub archived: bool,
 }
 
 /// `PATCH /v1/speakers/{id}` — name a voice (idempotent). 404 if the id is unknown.
@@ -112,7 +120,8 @@ pub async fn rename_speaker(
     }
     let row = sqlx::query(
         "UPDATE speakers SET display_name = $1, updated_at = now() \
-         WHERE speaker_id = $2 RETURNING speaker_id, display_name, n_samples",
+         WHERE speaker_id = $2 \
+         RETURNING speaker_id, display_name, n_samples, archived_at IS NOT NULL AS archived",
     )
     .bind(name)
     .bind(id)
@@ -120,13 +129,56 @@ pub async fn rename_speaker(
     .await?
     .ok_or(IngestError::NotFound("speaker"))?;
 
-    Ok(Json(SpeakerRow {
+    Ok(Json(speaker_row(&row)))
+}
+
+fn speaker_row(row: &sqlx::postgres::PgRow) -> SpeakerRow {
+    SpeakerRow {
         speaker_id: row.get("speaker_id"),
         display_name: row
             .try_get::<Option<String>, _>("display_name")
             .unwrap_or(None),
         n_samples: row.get("n_samples"),
-    }))
+        archived: row.try_get("archived").unwrap_or(false),
+    }
+}
+
+/// `POST /v1/speakers/{id}/archive` — disregard a voice (idempotent). Display-level only: the
+/// online matcher still attributes new voiceprints to it (else the next utterance would re-mint
+/// a duplicate that reappears under "Unidentified"). 404 if the id is unknown.
+pub async fn archive_speaker(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<SpeakerRow>, IngestError> {
+    set_speaker_archived(&st, id, true).await
+}
+
+/// `POST /v1/speakers/{id}/unarchive` — restore a disregarded voice (idempotent).
+pub async fn unarchive_speaker(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<SpeakerRow>, IngestError> {
+    set_speaker_archived(&st, id, false).await
+}
+
+async fn set_speaker_archived(
+    st: &AppState,
+    id: Uuid,
+    archived: bool,
+) -> Result<Json<SpeakerRow>, IngestError> {
+    let row = sqlx::query(
+        "UPDATE speakers \
+         SET archived_at = CASE WHEN $1 THEN now() ELSE NULL END, updated_at = now() \
+         WHERE speaker_id = $2 \
+         RETURNING speaker_id, display_name, n_samples, archived_at IS NOT NULL AS archived",
+    )
+    .bind(archived)
+    .bind(id)
+    .fetch_optional(&st.pool)
+    .await?
+    .ok_or(IngestError::NotFound("speaker"))?;
+
+    Ok(Json(speaker_row(&row)))
 }
 
 #[derive(Debug, Deserialize)]
@@ -886,15 +938,26 @@ pub async fn list_duplicates(
 
     let mut out: Vec<DuplicateGroup> = Vec::with_capacity(clusters.len());
     for c in &clusters {
-        let names: HashSet<&str> = c
+        // Disregarded voices don't belong in a human review queue: drop archived members, and a
+        // group that no longer has two active members isn't a duplicate worth surfacing. (The
+        // auto-merge path still folds into archived identities — that's an explicit near-certain
+        // match, not a suggestion.)
+        let active: Vec<Uuid> = c
             .members
+            .iter()
+            .copied()
+            .filter(|id| !summaries.get(id).map(|s| s.3).unwrap_or(false))
+            .collect();
+        if active.len() < 2 {
+            continue;
+        }
+        let names: HashSet<&str> = active
             .iter()
             .filter_map(|id| summaries.get(id).and_then(|s| s.0.as_deref()))
             .collect();
         let name_conflict = names.len() >= 2;
         // Suggested survivor: named member if any, else most-sampled.
-        let suggested_into = c
-            .members
+        let suggested_into = active
             .iter()
             .max_by_key(|id| {
                 let s = summaries.get(id);
@@ -907,8 +970,7 @@ pub async fn list_duplicates(
         let Some(suggested_into) = suggested_into else {
             continue;
         };
-        let members = c
-            .members
+        let members = active
             .iter()
             .map(|id| {
                 let s = summaries.get(id);
@@ -936,18 +998,19 @@ pub async fn list_duplicates(
     Ok(Json(out))
 }
 
-/// Load `(display_name, n_samples, sample_utterances)` for the given ids (LATERAL sample join
-/// as in list_speakers, restricted to the cluster members).
+/// Load `(display_name, n_samples, sample_utterances, archived)` for the given ids (LATERAL
+/// sample join as in list_speakers, restricted to the cluster members).
 async fn load_summaries(
     tx: &mut Transaction<'_, Postgres>,
     ids: &[Uuid],
-) -> Result<HashMap<Uuid, (Option<String>, i64, Vec<String>)>, sqlx::Error> {
+) -> Result<HashMap<Uuid, (Option<String>, i64, Vec<String>, bool)>, sqlx::Error> {
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
     let rows = sqlx::query(
         r#"
         SELECT s.speaker_id, s.display_name, s.n_samples,
+               s.archived_at IS NOT NULL AS archived,
                COALESCE(samp.utts, ARRAY[]::text[]) AS sample_utterances
         FROM speakers s
         LEFT JOIN LATERAL (
@@ -976,6 +1039,7 @@ async fn load_summaries(
                 r.get::<i64, _>("n_samples"),
                 r.try_get::<Vec<String>, _>("sample_utterances")
                     .unwrap_or_default(),
+                r.try_get::<bool, _>("archived").unwrap_or(false),
             ),
         );
     }
@@ -1310,6 +1374,7 @@ pub async fn name_unattributed(
         speaker_id: new_id,
         display_name: Some(name.to_string()),
         n_samples,
+        archived: false,
     }))
 }
 

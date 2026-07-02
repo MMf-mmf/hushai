@@ -83,11 +83,12 @@ pub const AUTO_AGENT_ID: &str = "auto";
 /// `recordings`). Categories mirror the concrete agents.
 pub const ROUTER_PREAMBLE: &str = "You route a personal-recordings assistant. Read the user's question (and any recent \
 conversation) and reply with EXACTLY ONE of these category words, lowercase, nothing else: \
-'recordings' = what was SAID/discussed in conversations — topics, summaries, what someone talked about. \
+'recordings' = what was SAID/discussed in conversations — topics, summaries, what someone talked about, \
+and WHO was SPEAKING or talking in a recording or clip (voices heard). \
 'reflection' = how the USER themselves has been doing — their mood, social or conversational patterns, \
 self-improvement ('how have I been', 'how can I get better'). \
-'people' = WHO was seen on camera (faces) — 'who did I see', 'who have you seen', 'who was I with', \
-'when did I see <name>'. \
+'people' = WHO was seen on camera (faces, not voices heard) — 'who did I see', 'who have you seen', \
+'who was I with', 'when did I see <name>'. \
 'objects' = a thing/object seen on camera — 'when did I see a car / my keys / a red mug'. \
 'plates' = a vehicle by LICENSE PLATE — 'when did I see plate ABC123'. \
 'events' = the TIMELINE of notable things the system flagged, or ALERTS — 'what happened yesterday', \

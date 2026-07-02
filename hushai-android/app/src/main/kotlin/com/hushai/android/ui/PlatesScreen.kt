@@ -66,6 +66,8 @@ fun PlatesScreen(client: PlatesClient, onBack: () -> Unit) {
     var error by remember { mutableStateOf(false) }
     // Named plates collapse behind a closed disclosure so the unidentified plates lead.
     var knownExpanded by remember { mutableStateOf(false) }
+    // Disregarded plates collapse behind their own closed disclosure at the bottom.
+    var archivedExpanded by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
     val ctx = LocalContext.current
 
@@ -136,10 +138,14 @@ fun PlatesScreen(client: PlatesClient, onBack: () -> Unit) {
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
             else -> {
+                // Disregarded plates sink into a closed "Archived" disclosure at the bottom and
+                // are never offered as merge targets. They keep matching new reads server-side.
+                val archived = plates.filter { it.archived }
+                val active = plates.filter { !it.archived }
                 val card: @Composable (PlatesClient.Plate) -> Unit = { p ->
                     PlateCard(
                         plate = p,
-                        others = plates.filter { it.plateId != p.plateId },
+                        others = if (p.archived) emptyList() else active.filter { it.plateId != p.plateId },
                         client = client,
                         onSave = { name ->
                             scope.launch {
@@ -153,11 +159,17 @@ fun PlatesScreen(client: PlatesClient, onBack: () -> Unit) {
                                 if (ok) reload() else Toast.makeText(ctx, "Couldn't complete that — check your connection and try again.", Toast.LENGTH_LONG).show()
                             }
                         },
+                        onSetArchived = { flag ->
+                            scope.launch {
+                                val ok = withContext(Dispatchers.IO) { client.setArchived(p.plateId, flag) }
+                                if (ok) reload() else Toast.makeText(ctx, "Couldn't complete that — check your connection and try again.", Toast.LENGTH_LONG).show()
+                            }
+                        },
                     )
                 }
                 // Named plates first (the known vehicles), then the ones still waiting to be named.
-                val known = plates.filter { !it.displayName.isNullOrBlank() }
-                val unknown = plates.filter { it.displayName.isNullOrBlank() }
+                val known = active.filter { !it.displayName.isNullOrBlank() }
+                val unknown = active.filter { it.displayName.isNullOrBlank() }
 
                 if (known.isEmpty()) {
                     Text("Named plates (0)", style = MaterialTheme.typography.titleMedium)
@@ -178,6 +190,14 @@ fun PlatesScreen(client: PlatesClient, onBack: () -> Unit) {
                     Text("Unidentified plates (${unknown.size})", style = MaterialTheme.typography.titleMedium)
                     unknown.forEach { card(it) }
                 }
+                if (archived.isNotEmpty()) {
+                    Text(
+                        "${if (archivedExpanded) "▾" else "▸"} Archived (${archived.size})",
+                        style = MaterialTheme.typography.titleMedium,
+                        modifier = Modifier.clickable { archivedExpanded = !archivedExpanded },
+                    )
+                    if (archivedExpanded) archived.forEach { card(it) }
+                }
             }
         }
     }
@@ -190,6 +210,7 @@ private fun PlateCard(
     client: PlatesClient,
     onSave: (String) -> Unit,
     onMerge: (String) -> Unit,
+    onSetArchived: (Boolean) -> Unit,
 ) {
     var name by remember(plate.plateId) { mutableStateOf(plate.displayName ?: "") }
     var mergeOpen by remember(plate.plateId) { mutableStateOf(false) }
@@ -225,6 +246,14 @@ private fun PlateCard(
             }
         }
 
+        // An archived (disregarded) plate renders a reduced card: Restore only — renaming
+        // and merging are noise for something the user chose to tuck away.
+        if (plate.archived) {
+            Spacer(Modifier.height(12.dp))
+            OutlinedButton(onClick = { onSetArchived(false) }) { Text("Restore") }
+            return@SectionCard
+        }
+
         Spacer(Modifier.height(12.dp))
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             OutlinedTextField(
@@ -237,27 +266,30 @@ private fun PlateCard(
             Button(onClick = { onSave(name.trim()) }, enabled = name.isNotBlank()) { Text("Save") }
         }
 
-        if (others.isNotEmpty()) {
-            Spacer(Modifier.height(8.dp))
-            Box {
-                OutlinedButton(onClick = { mergeOpen = true }) { Text("Merge into…") }
-                DropdownMenu(expanded = mergeOpen, onDismissRequest = { mergeOpen = false }) {
-                    others.forEach { other ->
-                        DropdownMenuItem(
-                            text = {
-                                Text(
-                                    other.displayName
-                                        ?: other.plateText.ifBlank { "Unknown (${other.plateId.take(8)})" },
-                                )
-                            },
-                            onClick = {
-                                mergeOpen = false
-                                onMerge(other.plateId)
-                            },
-                        )
+        Spacer(Modifier.height(8.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (others.isNotEmpty()) {
+                Box {
+                    OutlinedButton(onClick = { mergeOpen = true }) { Text("Merge into…") }
+                    DropdownMenu(expanded = mergeOpen, onDismissRequest = { mergeOpen = false }) {
+                        others.forEach { other ->
+                            DropdownMenuItem(
+                                text = {
+                                    Text(
+                                        other.displayName
+                                            ?: other.plateText.ifBlank { "Unknown (${other.plateId.take(8)})" },
+                                    )
+                                },
+                                onClick = {
+                                    mergeOpen = false
+                                    onMerge(other.plateId)
+                                },
+                            )
+                        }
                     }
                 }
             }
+            OutlinedButton(onClick = { onSetArchived(true) }) { Text("Disregard") }
         }
     }
 }

@@ -59,6 +59,25 @@ pub struct ChatRequest {
     /// absent (e.g. non-browser callers) falls back to `ANALYSIS_TZ_OFFSET_SECS`.
     #[serde(default)]
     pub tz_offset_secs: Option<i64>,
+    /// What the viewer is showing right now (sent on every turn; cheap). CONTEXT, not a filter:
+    /// deliberately outside `filters` — it becomes a device/time scope only when the question is
+    /// deictic ("this video/clip"), so it never disturbs the request-over-default filter merge.
+    /// Absent from old clients / ignored by old servers (serde skips unknown fields).
+    #[serde(default)]
+    pub playback: Option<PlaybackContext>,
+}
+
+/// The viewer's live playback state: which camera is on screen and where the playhead is.
+#[derive(Debug, Deserialize)]
+pub struct PlaybackContext {
+    /// The actively-viewed camera. Fills `filters.device_id` only when the user hasn't scoped
+    /// the chat explicitly (an explicit scope wins).
+    #[serde(default)]
+    pub device_id: Option<String>,
+    /// Wall-clock playhead (unix ns). Anchors a ±`DEICTIC_CLIP_WINDOW_NANOS` window for
+    /// deictic questions when no explicit time filters are set.
+    #[serde(default)]
+    pub playhead_unix_nanos: Option<i64>,
 }
 
 /// `POST /v1/rag/chat` — stream a grounded, multi-turn answer as Server-Sent Events.
@@ -166,11 +185,18 @@ pub async fn rag_chat(
     // Unified assistant: classify each message and dispatch to the right capability. A session
     // bound to a concrete agent keeps that agent (manual override / older sessions).
     let agent = if agent.id == crate::agents::AUTO_AGENT_ID {
-        let routed = st
-            .llm
-            .classify_agent(&message, &router_context)
-            .await
-            .map_err(internal)?;
+        // Deterministic pre-route: "who was speaking/talking" is a VOICE question for the
+        // recordings agent — the LLM router's "who ..." pattern drifts toward `people` (faces).
+        // Same intent-detector idiom as `is_count_intent`; also keeps the eval's
+        // `expect_routed_agent` assertion stable.
+        let routed = if crate::routes::is_speaker_roster_query(&message) {
+            crate::agents::DEFAULT_AGENT_ID
+        } else {
+            st.llm
+                .classify_agent(&message, &router_context)
+                .await
+                .map_err(internal)?
+        };
         tracing::info!(routed_to = %routed, "auto-router selected capability");
         crate::agents::get(routed).unwrap_or_else(crate::agents::default)
     } else {
@@ -179,7 +205,27 @@ pub async fn rag_chat(
 
     // Merge agent default scope under per-request filters (request wins per field), then
     // build this turn's context: a grounded retrieval OR (reflection) an analytics digest.
-    let qf = req.filters.unwrap_or_default();
+    let mut qf = req.filters.unwrap_or_default();
+    // Deictic clip anchor: "this video/clip" + the viewer's live playback context resolves to
+    // the on-screen camera and a ±2 min window around the playhead — for every camera-scoped
+    // capability, before `clarify_camera` (a playing clip answers "which camera?" by itself).
+    // An explicit chat scope / explicit time filters always win; non-deictic questions ignore
+    // playback entirely (zero behavior change). Reflection is excluded (it's not camera-scoped
+    // and resolves its own window).
+    if agent.kind != AgentKind::Reflection && crate::routes::is_deictic_video_query(&message) {
+        if let Some(pb) = &req.playback {
+            if qf.device_id.is_none() {
+                qf.device_id = pb.device_id.clone();
+            }
+            if qf.after_unix_nanos.is_none() && qf.before_unix_nanos.is_none() {
+                if let Some(ph) = pb.playhead_unix_nanos {
+                    let w = crate::routes::DEICTIC_CLIP_WINDOW_NANOS;
+                    qf.after_unix_nanos = Some(ph.saturating_sub(w));
+                    qf.before_unix_nanos = Some(ph.saturating_add(w));
+                }
+            }
+        }
+    }
     let df = &agent.default_filters;
     // Render times in the caller's local civil time (browser offset), falling back to the env default.
     let tz = req.tz_offset_secs.unwrap_or(st.cfg.analysis_tz_offset_secs);
@@ -255,6 +301,49 @@ pub async fn rag_chat(
             let device_id = qf.device_id.or_else(|| df.device_id.clone());
             let after = qf.after_unix_nanos.or(df.after_unix_nanos);
             let before = qf.before_unix_nanos.or(df.before_unix_nanos);
+            // Clip-scoped "who was speaking": a roster question over a bounded window is a SET
+            // question — answer it deterministically (distinct speakers heard in the window),
+            // not by semantic NN (embedding "who was speaking" retrieves nothing useful; that's
+            // exactly the observed "I don't have information" failure). Gated on a bounded
+            // window (the deictic anchor above, or explicit after+before filters), so an
+            // un-anchored "who was speaking" keeps today's semantic path — zero baseline drift.
+            if let (true, Some(after_ns), Some(before_ns)) = (
+                crate::routes::is_speaker_roster_query(&message),
+                after,
+                before,
+            ) {
+                let s = retrieve::list_speakers_in_window(
+                    &st.pool,
+                    device_id.as_deref(),
+                    after_ns,
+                    before_ns,
+                    50,
+                )
+                .await
+                .map_err(internal)?;
+                let ids: Vec<String> = s.iter().filter_map(|x| x.speaker_id.clone()).collect();
+                names = crate::speakers::name_map(&st.pool, &ids)
+                    .await
+                    .map_err(internal)?;
+                let in_clip = crate::routes::is_deictic_video_query(&message);
+                let answer = if s.is_empty() {
+                    // Distinguish "footage exists but nobody spoke" from "nothing captured /
+                    // not yet transcribed for the moment you're watching".
+                    let covered = retrieve::window_has_footage(
+                        &st.pool,
+                        device_id.as_deref(),
+                        after_ns,
+                        before_ns,
+                    )
+                    .await
+                    .map_err(internal)?;
+                    render_empty_roster(covered, in_clip)
+                } else {
+                    render_speaker_roster(&s, &names, in_clip)
+                };
+                precomputed_answer = Some(answer);
+                sources = s;
+            } else {
             let speaker_name = qf.speaker_name.or_else(|| df.speaker_name.clone());
             let speaker_id = resolve_speaker_filter(&st.pool, qf.speaker_id, speaker_name)
                 .await
@@ -285,6 +374,7 @@ pub async fn rag_chat(
                 .await
                 .map_err(internal)?;
             sources = s;
+            }
         }
         AgentKind::Objects => {
             // Open-vocab object retrieval. Answered synchronously (precomputed) — objects have no
@@ -765,6 +855,74 @@ fn distinct_ids(ids: &[String]) -> Vec<String> {
     d
 }
 
+/// Deterministic answer for a windowed "who was speaking" (one source per distinct speaker,
+/// chronological — see `retrieve::list_speakers_in_window`). Labels come from the SAME
+/// `assign_unnamed_ordinals` + `display_label` pair that `enrich_for_display` applies to the
+/// citations, so the spoken answer and the citation chips always agree ("unidentified
+/// speaker 1" in both). A NULL-speaker row (speech with no voiceprint) is reported as
+/// unattributed speech, never as a person.
+fn render_speaker_roster(
+    sources: &[Source],
+    names: &std::collections::HashMap<String, String>,
+    in_clip: bool,
+) -> String {
+    let scope = if in_clip { "in this clip" } else { "during that period" };
+    let ordinals = crate::speakers::assign_unnamed_ordinals(
+        sources.iter().map(|s| s.speaker_id.as_deref()),
+        names,
+    );
+    let mut labels: Vec<String> = Vec::new();
+    let mut unattributed = false;
+    for s in sources {
+        match s.speaker_id.as_deref() {
+            None => unattributed = true,
+            Some(id) => {
+                let label =
+                    crate::speakers::display_label(Some(id), names, ordinals.get(id).copied());
+                if !labels.contains(&label) {
+                    labels.push(label);
+                }
+            }
+        }
+    }
+    if labels.is_empty() {
+        return if unattributed {
+            format!(
+                "Someone was speaking {scope}, but the voice isn't attributed to anyone yet. \
+                 You can name it under Voices."
+            )
+        } else {
+            // Callers answer the empty case via `render_empty_roster`; defensive fallback.
+            format!("I didn't hear any speech {scope}.")
+        };
+    }
+    let list = match labels.len() {
+        1 => labels[0].clone(),
+        2 => format!("{} and {}", labels[0], labels[1]),
+        n => format!("{}, and {}", labels[..n - 1].join(", "), labels[n - 1]),
+    };
+    let verb = if labels.len() == 1 { "was" } else { "were" };
+    let mut out = format!("{list} {verb} speaking {scope}.");
+    if unattributed {
+        out.push_str(" There's also some speech that isn't attributed to a known voice yet.");
+    }
+    out
+}
+
+/// The windowed "who was speaking" answer when NO transcript rows exist in the window:
+/// footage-with-silence and not-yet-processed read very differently to the user.
+fn render_empty_roster(window_has_footage: bool, in_clip: bool) -> String {
+    let scope = if in_clip { "in this clip" } else { "during that period" };
+    if window_has_footage {
+        format!("I didn't hear any speech {scope}.")
+    } else {
+        format!(
+            "I don't have processed audio for {} yet — it may still be uploading or transcribing.",
+            if in_clip { "this clip" } else { "that period" }
+        )
+    }
+}
+
 // ---- read endpoints (agent picker + conversation restore) ----------------------------
 
 #[derive(Debug, Serialize)]
@@ -965,4 +1123,91 @@ pub async fn insert_message(
         .await?;
     tx.commit().await?;
     Ok(message_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{render_empty_roster, render_speaker_roster};
+    use crate::retrieve::Source;
+    use std::collections::HashMap;
+    use uuid::Uuid;
+
+    fn src(speaker_id: Option<&str>, t: i64) -> Source {
+        Source {
+            segment_id: Uuid::nil(),
+            device_id: "cam".into(),
+            text: "hello".into(),
+            start_unix_nanos: t,
+            distance: 0.0,
+            speaker_id: speaker_id.map(str::to_string),
+            speaker_name: None,
+            time_label: String::new(),
+        }
+    }
+
+    fn names(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn roster_names_single_known_speaker() {
+        let s = [src(Some("id-mendel"), 1)];
+        let n = names(&[("id-mendel", "Mendel")]);
+        assert_eq!(
+            render_speaker_roster(&s, &n, true),
+            "Mendel was speaking in this clip."
+        );
+    }
+
+    #[test]
+    fn roster_mixes_named_and_unnamed_with_matching_ordinals() {
+        // The unnamed voice must render as "unidentified speaker 1" — the same label
+        // enrich_for_display puts on its citation chip (same ordinal inputs, same order).
+        let s = [src(Some("id-mendel"), 1), src(Some("id-stranger"), 2)];
+        let n = names(&[("id-mendel", "Mendel")]);
+        assert_eq!(
+            render_speaker_roster(&s, &n, true),
+            "Mendel and unidentified speaker 1 were speaking in this clip."
+        );
+    }
+
+    #[test]
+    fn roster_reports_unattributed_speech_as_speech_not_a_person() {
+        let s = [src(None, 1)];
+        let out = render_speaker_roster(&s, &HashMap::new(), true);
+        assert!(out.contains("isn't attributed"), "got: {out}");
+        assert!(!out.contains("unidentified speaker"), "got: {out}");
+    }
+
+    #[test]
+    fn roster_appends_unattributed_note_alongside_names() {
+        let s = [src(Some("id-mendel"), 1), src(None, 2)];
+        let n = names(&[("id-mendel", "Mendel")]);
+        let out = render_speaker_roster(&s, &n, true);
+        assert!(out.starts_with("Mendel was speaking in this clip."), "got: {out}");
+        assert!(out.contains("isn't attributed to a known voice"), "got: {out}");
+    }
+
+    #[test]
+    fn roster_windowed_phrasing_without_deictic_clip() {
+        let s = [src(Some("id-mendel"), 1)];
+        let n = names(&[("id-mendel", "Mendel")]);
+        assert_eq!(
+            render_speaker_roster(&s, &n, false),
+            "Mendel was speaking during that period."
+        );
+    }
+
+    #[test]
+    fn empty_roster_distinguishes_silence_from_missing_footage() {
+        assert_eq!(
+            render_empty_roster(true, true),
+            "I didn't hear any speech in this clip."
+        );
+        let lagging = render_empty_roster(false, true);
+        assert!(lagging.contains("don't have processed audio"), "got: {lagging}");
+    }
 }

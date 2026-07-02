@@ -3,6 +3,7 @@
 // server holds the actual history + citations).
 
 import { streamChat, getSessionMessages, getDevices } from "../api.js";
+import { playbackContext } from "../store.js";
 import { renderCitation } from "./citation.js";
 
 const SESSION_KEY = (agentId) => `hushai.chat.session.${agentId}`;
@@ -192,8 +193,16 @@ export class ChatPane {
 
     try {
       const filters = this.scope ? { device_id: this.scope } : null;
+      // What the viewer is showing right now (camera + wall-clock playhead), so the server can
+      // scope deictic questions ("who was speaking in this clip") to the open video. Sent every
+      // turn; the server only consults it for deictic questions, and an explicit scope above
+      // still wins for the device. Null when nothing is playing.
+      const pb = playbackContext();
+      const playback = pb
+        ? { device_id: pb.deviceId, playhead_unix_nanos: Math.round(pb.playheadMs * 1e6) }
+        : null;
       await streamChat(
-        { sessionId: this.sessionId, agentId: this.agent.id, message, filters },
+        { sessionId: this.sessionId, agentId: this.agent.id, message, filters, playback },
         (ev) => {
           switch (ev.event) {
             case "session":

@@ -5,6 +5,8 @@
 //! `GET   /v1/plates/search?q=...`      — exact + fuzzy (trigram) lookup by plate text
 //! `PATCH /v1/plates/{id}`              — set display_name (name a plate, e.g. "Mom's car")
 //! `POST  /v1/plates/{id}/merge`        — fold two ids for the same plate into one
+//! `POST  /v1/plates/{id}/archive`      — disregard (display-level; matcher still attributes)
+//! `POST  /v1/plates/{id}/unarchive`    — restore from the Archived section
 //! `GET   /v1/plates/{id}/sample-crop`  — a representative cropped plate (ID a plate by sight)
 //!
 //! KEY DIVERGENCE from persons/speakers: a plate's identity IS its NORMALIZED TEXT, not an
@@ -45,6 +47,9 @@ pub struct PlateSummary {
     pub n_sightings: i64,
     /// Absolute timestamps of up to 3 recent sightings (a "when did we see this plate" hint).
     pub sample_sighting_unix_nanos: Vec<i64>,
+    /// Disregarded by the operator (0021). Display-level only: clients tuck archived entries
+    /// into a collapsed "Archived" section; matching/RAG/watchlist behavior is unchanged.
+    pub archived: bool,
 }
 
 /// A new "sighting" begins when consecutive detections of the same plate are more than this many
@@ -69,6 +74,7 @@ pub async fn list_plates(State(st): State<AppState>) -> Result<Json<Vec<PlateSum
                lp.plate_text,
                lp.display_name,
                lp.n_samples,
+               lp.archived_at IS NOT NULL AS archived,
                COALESCE(sight.n, 0) AS n_sightings,
                COALESCE(samp.ts, ARRAY[]::bigint[]) AS sample_sightings
         FROM license_plates lp
@@ -116,6 +122,7 @@ pub async fn list_plates(State(st): State<AppState>) -> Result<Json<Vec<PlateSum
             sample_sighting_unix_nanos: r
                 .try_get::<Vec<i64>, _>("sample_sightings")
                 .unwrap_or_default(),
+            archived: r.try_get("archived").unwrap_or(false),
         })
         .collect();
     Ok(Json(out))
@@ -156,6 +163,7 @@ pub async fn search_plates(
                lp.plate_text,
                lp.display_name,
                lp.n_samples,
+               lp.archived_at IS NOT NULL AS archived,
                COALESCE(sight.n, 0) AS n_sightings,
                COALESCE(samp.ts, ARRAY[]::bigint[]) AS sample_sightings
         FROM license_plates lp
@@ -204,6 +212,7 @@ pub async fn search_plates(
             sample_sighting_unix_nanos: r
                 .try_get::<Vec<i64>, _>("sample_sightings")
                 .unwrap_or_default(),
+            archived: r.try_get("archived").unwrap_or(false),
         })
         .collect();
     Ok(Json(out))
@@ -220,6 +229,7 @@ pub struct PlateRow {
     pub plate_text: String,
     pub display_name: Option<String>,
     pub n_samples: i64,
+    pub archived: bool,
 }
 
 /// `PATCH /v1/plates/{id}` — name a plate (idempotent). 404 if the id is unknown.
@@ -236,7 +246,9 @@ pub async fn rename_plate(
     }
     let row = sqlx::query(
         "UPDATE license_plates SET display_name = $1, updated_at = now() \
-         WHERE plate_id = $2 RETURNING plate_id, plate_text, display_name, n_samples",
+         WHERE plate_id = $2 \
+         RETURNING plate_id, plate_text, display_name, n_samples, \
+                   archived_at IS NOT NULL AS archived",
     )
     .bind(name)
     .bind(id)
@@ -244,14 +256,58 @@ pub async fn rename_plate(
     .await?
     .ok_or(IngestError::NotFound("plate"))?;
 
-    Ok(Json(PlateRow {
+    Ok(Json(plate_row(&row)))
+}
+
+fn plate_row(row: &sqlx::postgres::PgRow) -> PlateRow {
+    PlateRow {
         plate_id: row.get("plate_id"),
         plate_text: row.get("plate_text"),
         display_name: row
             .try_get::<Option<String>, _>("display_name")
             .unwrap_or(None),
         n_samples: row.get("n_samples"),
-    }))
+        archived: row.try_get("archived").unwrap_or(false),
+    }
+}
+
+/// `POST /v1/plates/{id}/archive` — disregard a plate (idempotent). Display-level only: the
+/// ALPR match-or-mint still attributes new reads to it (else the next pass would re-mint a
+/// duplicate that reappears under "Unidentified"). 404 if the id is unknown.
+pub async fn archive_plate(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<PlateRow>, IngestError> {
+    set_plate_archived(&st, id, true).await
+}
+
+/// `POST /v1/plates/{id}/unarchive` — restore a disregarded plate (idempotent).
+pub async fn unarchive_plate(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<PlateRow>, IngestError> {
+    set_plate_archived(&st, id, false).await
+}
+
+async fn set_plate_archived(
+    st: &AppState,
+    id: Uuid,
+    archived: bool,
+) -> Result<Json<PlateRow>, IngestError> {
+    let row = sqlx::query(
+        "UPDATE license_plates \
+         SET archived_at = CASE WHEN $1 THEN now() ELSE NULL END, updated_at = now() \
+         WHERE plate_id = $2 \
+         RETURNING plate_id, plate_text, display_name, n_samples, \
+                   archived_at IS NOT NULL AS archived",
+    )
+    .bind(archived)
+    .bind(id)
+    .fetch_optional(&st.pool)
+    .await?
+    .ok_or(IngestError::NotFound("plate"))?;
+
+    Ok(Json(plate_row(&row)))
 }
 
 #[derive(Debug, Deserialize)]

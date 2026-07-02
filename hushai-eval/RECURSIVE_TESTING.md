@@ -309,7 +309,9 @@ The harness now scores the **RAG chat answer itself** (not just perception). A f
 stage the same subject across days/cameras. Determinism: `RAG_LLM_TEMPERATURE=0`+`RAG_LLM_SEED` (in
 eval.env + config-hash). Phone: `physical_loopback.py --scenario <case>` scores the same questions
 tolerantly over real capture. Files: `hushai-eval/src/{fixtures,query_rag,score,lib}.rs`,
-`hushai-rag/src/chat.rs` (SSE `routed_agent_id`). Fixtures: `repeat_visitor`, `money_talk`.
+`hushai-rag/src/chat.rs` (SSE `routed_agent_id`). Fixtures: `repeat_visitor`, `money_talk`,
+`clip_speaker_roster`. A question may also carry `playback` (`{device_id, playhead_offset_ns}`,
+offset from base like `ChatFilters`) — the simulated viewer playback context for deictic questions.
 
 **Harness-driven RAG wins (the loop working):**
 - ✅ **F1 — deterministic presence/count aggregation.** The People/Objects/Plates agents listed a
@@ -343,6 +345,20 @@ tolerantly over real capture. Files: `hushai-eval/src/{fixtures,query_rag,score,
   5; "any alerts?" → only the 2 warnings; "how many?" → 5) with router regression clean. Not wired into
   the single-shot `/v1/rag/query` (chat auto-routes it). No eval fixture yet (events come from the worker
   producer; add a scenario that injects event-producing media, or L1-seed the `events` table).
+- ✅ **Deictic "who was speaking in this video clip" — FIXED (2026-07-01).** With a clip clearly
+  playing and the owner's voice enrolled ("Mendel"), chat answered "I don't have information…": the
+  viewer sent only `filters.device_id` (no time anchor) and the Grounded agent ran an UNANCHORED
+  semantic NN on "who was speaking" → nothing relevant. Fix: (a) viewer sends a `playback` object
+  (`{device_id, playhead_unix_nanos}` — on-screen camera + wall-clock playhead; `store.js`
+  pull-provider); (b) `chat.rs` anchors deictic questions to playback (fill unset device, ±2 min
+  window via `DEICTIC_CLIP_WINDOW_NANOS`), which also suppresses CAMERA_CLARIFY while playing;
+  (c) `is_speaker_roster_query` pre-routes "who was speaking/talking" to `recordings`
+  deterministically (the LLM router's "who" drifts to `people`/faces) and, with a bounded window,
+  answers from `retrieve::list_speakers_in_window` (deterministic distinct-speaker roster; empty →
+  `window_has_footage` distinguishes silence from worker lag). Fixture: `clip_speaker_roster`
+  (JFK window enrolled as "Mendel" — the first `enroll:` use in a train fixture; Q1 =
+  playback-anchored roster → "mendel" + attributed citation, Q2 = same ask, no playback →
+  CAMERA_CLARIFY guard).
 - ◐ **Objects SEMANTIC recall false-negative (still OPEN)** — see above; the F1 count path is unaffected.
 
 ---

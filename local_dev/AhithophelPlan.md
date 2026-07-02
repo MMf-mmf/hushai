@@ -240,4 +240,7 @@ errors in the dashboard.html it should also way what the error was in addition w
 
 - [] is a service is down there should be a button in the UI to restart it...
 
+
+
+
 PASSWORD: hushai-dev

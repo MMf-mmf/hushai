@@ -192,6 +192,23 @@ export async function mergeSpeakerGroup(intoId, memberIds) {
   return res.json().catch(() => ({}));
 }
 
+// Disregard/restore a catalog entity (display-level archive: it moves to the "Archived"
+// section in the modal; matching, RAG, and watchlist behavior are unaffected).
+async function postJson(url, label) {
+  const res = await fetch(url, { method: "POST" });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
+  if (!res.ok) throw new Error(`${label} -> ${res.status}`);
+  return res.json().catch(() => ({}));
+}
+
+export function archiveSpeaker(id) {
+  return postJson(`/v1/speakers/${encodeURIComponent(id)}/archive`, "archive speaker");
+}
+
+export function unarchiveSpeaker(id) {
+  return postJson(`/v1/speakers/${encodeURIComponent(id)}/unarchive`, "unarchive speaker");
+}
+
 // Candidate voices clustered from audio the matcher left unattributed (speaker_id NULL).
 export async function getUnattributed() {
   return getJson("/v1/speakers/unattributed");
@@ -253,6 +270,15 @@ export async function mergePerson(loserId, intoId) {
   return res.json().catch(() => ({}));
 }
 
+// Disregard/restore a face (display-level archive; see archiveSpeaker).
+export function archivePerson(id) {
+  return postJson(`/v1/persons/${encodeURIComponent(id)}/archive`, "archive person");
+}
+
+export function unarchivePerson(id) {
+  return postJson(`/v1/persons/${encodeURIComponent(id)}/unarchive`, "unarchive person");
+}
+
 // ---- license plates (ALPR) — the vehicle twin of persons, proxied to hushai-backend ----
 // List/search/name/merge the license plates discovered in recordings, and pull a representative
 // rectified-plate crop. Identity is the plate STRING (matched by normalized text), so a search box
@@ -294,6 +320,15 @@ export async function mergePlate(loserId, intoId) {
   if (redirectIfUnauth(res)) throw new Error("unauthorized");
   if (!res.ok) throw new Error(`merge plate -> ${res.status}`);
   return res.json().catch(() => ({}));
+}
+
+// Disregard/restore a plate (display-level archive; see archiveSpeaker).
+export function archivePlate(id) {
+  return postJson(`/v1/plates/${encodeURIComponent(id)}/archive`, "archive plate");
+}
+
+export function unarchivePlate(id) {
+  return postJson(`/v1/plates/${encodeURIComponent(id)}/unarchive`, "unarchive plate");
 }
 
 // ---- device management (proxied to hushai-backend at /v1/devices*) --------------
@@ -397,7 +432,9 @@ export function exportUrl(deviceId, fromMs, toMs, kind = "muxed") {
 // is called per SSE frame: `session` {session_id, agent_id}, `sources` [Source...],
 // `token` {delta}, `done` {message_id}, or `error` {message}. EventSource can't POST a
 // body, so we read the streaming fetch response and parse SSE frames by hand.
-export async function streamChat({ sessionId, agentId, message, filters }, onEvent) {
+// `playback` = the viewer's live {device_id, playhead_unix_nanos} so the server can scope
+// deictic questions ("who was speaking in this clip") to the open video; null when idle.
+export async function streamChat({ sessionId, agentId, message, filters, playback }, onEvent) {
   const res = await fetch("/v1/rag/chat", {
     method: "POST",
     headers: { "content-type": "application/json", accept: "text/event-stream" },
@@ -406,6 +443,7 @@ export async function streamChat({ sessionId, agentId, message, filters }, onEve
       agent_id: agentId ?? null,
       message,
       filters: filters ?? null,
+      playback: playback ?? null,
       // The user's live local UTC offset (seconds) so spoken times ("today at 4:06 PM") match
       // their clock. getTimezoneOffset() is minutes-behind-UTC with inverted sign → negate.
       tz_offset_secs: -new Date().getTimezoneOffset() * 60,
