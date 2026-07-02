@@ -1,0 +1,19 @@
+{
+  "case_id": "money_talk",
+  "description": "Worried money dialogue + calm reassurance (two voices). Scores transcript + sentiment + RAG chat: money recall, worried-tone recall, no-hallucination decline. Attribution not scored (diarization merges TTS voices at L2).",
+  "device_id": "eval-money-talk",
+  "media_file": "media.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "transcript",
+    "sentiment",
+    "chat"
+  ],
+  "tier": "full",
+  "poll": {
+    "timeout_secs": 180,
+    "interval_secs": 2
+  }
+}

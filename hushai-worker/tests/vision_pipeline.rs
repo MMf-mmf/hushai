@@ -332,6 +332,41 @@ fn inspect_plate_model_io_shapes() {
     }
 }
 
+/// Diagnostic: run the plate DETECTOR on a still image and print the decoded boxes, to validate the
+/// end2end/raw decode against the reference (open-image-models). Gated on the model + PLATE_TEST_IMAGE.
+///   PLATE_TEST_IMAGE=/path/plate_crop.jpg cargo test -p hushai-worker --test vision_pipeline detect_plates_on_test_image -- --nocapture
+#[test]
+fn detect_plates_on_test_image() {
+    let dy = dylib();
+    let det = repo_root().join("models/lp_detector.onnx");
+    let img_path = match std::env::var("PLATE_TEST_IMAGE") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => {
+            eprintln!("SKIP: set PLATE_TEST_IMAGE to a plate photo");
+            return;
+        }
+    };
+    if !dy.exists() || !det.exists() || !img_path.exists() {
+        eprintln!("SKIP: dylib/lp_detector/image not all present");
+        return;
+    }
+    model::init_ort(dy.to_str().unwrap());
+    let cfg = WorkerConfig::from_env().expect("config");
+    let detector = hushai_worker::vision::plates::detect::PlateDetector::new(
+        model::load_session(det.to_str().unwrap(), false).unwrap(),
+        cfg.plate_detect_input_size,
+        cfg.plate_min_det_score,
+        cfg.plate_detect_end2end,
+    );
+    let img = image::open(&img_path).expect("open image").to_rgb8();
+    eprintln!("image {}x{} end2end={} thresh={}", img.width(), img.height(), cfg.plate_detect_end2end, cfg.plate_min_det_score);
+    let plates = detector.detect(&img).expect("detect");
+    eprintln!("detected {} plate(s):", plates.len());
+    for p in &plates {
+        eprintln!("  score={:.2} bbox=[{:.0},{:.0},{:.0},{:.0}] corners={}", p.score, p.bbox[0], p.bbox[1], p.bbox[2], p.bbox[3], p.corners.is_some());
+    }
+}
+
 /// Decode validation for the object lane: run RF-DETR + the CLIP image tower over a clip that
 /// RELIABLY contains a COCO object (synthesize one with `local_dev/make_object_clip.sh`). Asserts at
 /// least one detection with a REAL COCO label (not `class_<i>` — which would mean the class indexing

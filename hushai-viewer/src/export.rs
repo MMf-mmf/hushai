@@ -102,7 +102,9 @@ pub async fn export_mp4(
     let stdout = child.stdout.take().expect("piped stdout");
 
     // Feeder: remux each segment to its (cached) TS and write it to ffmpeg's stdin in order, then
-    // EOF. A read/remux error skips that segment; a write error means the client/ffmpeg went away.
+    // EOF. A read/remux error TRUNCATES the export (break) rather than silently skipping the segment:
+    // an interior skip yields a clean-EOF MP4 with a hidden gap, which for evidence footage is worse
+    // than an obviously-short download. A write error means the client/ffmpeg went away.
     let feeder_state = state.clone();
     tokio::spawn(async move {
         for seg in &segs {
@@ -114,11 +116,13 @@ pub async fn export_mp4(
                         }
                     }
                     Err(e) => {
-                        tracing::warn!(error = %e, sha = %seg.sha_hex, "export: read TS failed; skipping")
+                        tracing::warn!(error = %e, sha = %seg.sha_hex, "export: read TS failed; truncating export here");
+                        break;
                     }
                 },
                 Err(e) => {
-                    tracing::warn!(error = %e, sha = %seg.sha_hex, "export: remux failed; skipping")
+                    tracing::warn!(error = %e, sha = %seg.sha_hex, "export: remux failed; truncating export here");
+                    break;
                 }
             }
         }

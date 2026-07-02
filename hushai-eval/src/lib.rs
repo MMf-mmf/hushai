@@ -14,6 +14,7 @@ pub mod manifest;
 pub mod poll;
 pub mod probe;
 pub mod query;
+pub mod query_rag;
 pub mod report;
 pub mod reset;
 pub mod score;
@@ -80,49 +81,116 @@ async fn run_case(
     let (cid, split, tier) = (fx.meta.case_id.as_str(), fx.split.as_str(), fx.meta.tier.as_str());
 
     reset::reset_db(ctx).await.context("reset db")?;
-    reset::upsert_device(ctx, &fx.meta.device_id).await?;
 
     if let Err(e) = enroll::enroll_all(ctx, fx, base_ns).await {
         return Ok(CaseResult::inconclusive(cid, split, tier, format!("enroll failed: {e:#}")));
     }
 
-    let inj = match inject::inject(
-        ctx,
-        &fx.media_path(),
-        &fx.meta.device_id,
-        &fx.meta.seed(),
-        base_ns,
-        fx.meta.seg_seconds,
-        fx.meta.limit,
-        cid,
-    ) {
-        Ok(o) => o,
-        Err(e) => return Ok(CaseResult::inconclusive(cid, split, tier, format!("inject failed: {e:#}"))),
-    };
-    let ids = inj.segment_uuids()?;
+    // Inject the whole timeline (one clip for legacy fixtures, several for a scenario). Each clip is
+    // injected then polled to terminal BEFORE the next — serialized processing keeps mint-vs-match
+    // ordering deterministic under WORKER_CONCURRENCY=1. We aggregate the poll counters, union the
+    // touched devices, and grow the observe window to span the whole scenario.
+    let plan = fx.meta.effective_injections();
+    let mut all_ids: Vec<uuid::Uuid> = Vec::new();
+    let mut devices: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut injected_total = 0usize;
+    let mut audio_done_total = 0i64;
+    let mut vision_done_total = 0i64;
+    let mut win_lo = i64::MAX;
+    let mut win_hi = i64::MIN;
 
-    let poll = poll::wait_until_complete(ctx, &fx.meta, &ids, base_ns).await?;
-    if !poll.settled {
-        return Ok(CaseResult::inconclusive(
-            cid,
-            split,
-            tier,
-            format!(
-                "processing incomplete: audio_done={} vision_done={} injected={} timed_out={} errors={:?}",
-                poll.audio_done, poll.vision_done, poll.injected, poll.timed_out, poll.errors
-            ),
-        ));
+    for ri in &plan {
+        reset::upsert_device(ctx, &ri.device_id).await?;
+        let inj = match inject::inject(
+            ctx,
+            &fx.dir.join(&ri.media_file),
+            &ri.device_id,
+            &ri.seed,
+            ri.base_ns,
+            ri.seg_seconds,
+            ri.limit,
+            &ri.label,
+        ) {
+            Ok(o) => o,
+            Err(e) => return Ok(CaseResult::inconclusive(cid, split, tier, format!("inject failed ({}): {e:#}", ri.label))),
+        };
+        let ids = inj.segment_uuids()?;
+
+        let poll = poll::wait_until_complete(ctx, &fx.meta, &ri.device_id, &ids, ri.base_ns).await?;
+        if !poll.settled {
+            return Ok(CaseResult::inconclusive(
+                cid,
+                split,
+                tier,
+                format!(
+                    "processing incomplete ({}): audio_done={} vision_done={} injected={} timed_out={} errors={:?}",
+                    ri.label, poll.audio_done, poll.vision_done, poll.injected, poll.timed_out, poll.errors
+                ),
+            ));
+        }
+        // `settled` only means "terminal for polling" — a segment that exhausted its retries counts
+        // as settled but NOT done, and lands in `poll.errors`. Never SCORE a run with permanently-
+        // errored segments (or a done-count below injected): surviving segments might happen to cover
+        // the ground-truth windows and mask real pipeline breakage — exactly what inconclusive/exit-2
+        // exists to surface. Fail closed to inconclusive.
+        let fully_done = poll.audio_done.max(poll.vision_done) >= poll.injected as i64;
+        if !fully_done || !poll.errors.is_empty() {
+            return Ok(CaseResult::inconclusive(
+                cid,
+                split,
+                tier,
+                format!(
+                    "processing not fully successful ({}) (would mask real breakage if scored): \
+                     audio_done={} vision_done={} injected={} errors={:?}",
+                    ri.label, poll.audio_done, poll.vision_done, poll.injected, poll.errors
+                ),
+            ));
+        }
+
+        injected_total += poll.injected;
+        audio_done_total += poll.audio_done;
+        vision_done_total += poll.vision_done;
+        all_ids.extend(ids);
+        devices.insert(ri.device_id.clone());
+        win_lo = win_lo.min(ri.base_ns);
+        win_hi = win_hi.max(inj.end_unix_nanos());
     }
+    let _ = &all_ids; // ids are per-injection polled above; kept for potential future cross-checks.
 
-    let obs = query::observe(ctx, &fx.meta.device_id, base_ns, inj.end_unix_nanos(), &fx.meta.modalities)
+    let devices_vec: Vec<String> = devices.into_iter().collect();
+    let obs = query::observe(ctx, &devices_vec, win_lo, win_hi, &fx.meta.modalities)
         .await
         .context("querying observed results")?;
-    let metrics = score::score_all(&fx.expected, &obs, base_ns, &fx.meta.modalities);
+    let mut metrics = score::score_all(&fx.expected, &obs, base_ns, &fx.meta.modalities);
+
+    // RAG step: score LIVE chat answers. Unlike `observe` (DB-direct), this needs the running RAG
+    // service — a down service / transport error is INFRASTRUCTURE (INCONCLUSIVE / exit 2), never a
+    // false regression. Only assertion failures on a SUCCESSFUL answer produce a FAIL.
+    if fx.meta.needs_rag() {
+        if let Some(chat_gt) = &fx.expected.chat {
+            if !query_rag::rag_up(ctx).await {
+                return Ok(CaseResult::inconclusive(
+                    cid,
+                    split,
+                    tier,
+                    "RAG service unreachable (the chat/rag modality needs the live :8090 stack)".to_string(),
+                ));
+            }
+            let mut answers = Vec::with_capacity(chat_gt.questions.len());
+            for (qi, q) in chat_gt.questions.iter().enumerate() {
+                match query_rag::ask(ctx, q, base_ns).await {
+                    Ok(a) => answers.push(a),
+                    Err(e) => return Ok(CaseResult::inconclusive(cid, split, tier, format!("rag chat q{qi} transport error: {e:#}"))),
+                }
+            }
+            metrics.extend(score::score_chat(chat_gt, &answers, ctx).await);
+        }
+    }
 
     let baseline = baseline::load(ctx, &manifest.config_hash, cid);
     let bmap = baseline.as_ref().map(|b| b.metrics.clone());
-    let processed = poll.audio_done.max(poll.vision_done);
-    let case = CaseResult::from_metrics(cid, split, tier, poll.injected, processed, metrics.clone(), |m| {
+    let processed = audio_done_total.max(vision_done_total);
+    let case = CaseResult::from_metrics(cid, split, tier, injected_total, processed, metrics.clone(), |m| {
         let bv = bmap.as_ref().and_then(|mm| mm.get(&m.key).copied());
         let (cls, delta) = baseline::classify(m, bv);
         (cls, bv, delta)

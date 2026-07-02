@@ -89,6 +89,105 @@ json.dump({
 PY
 
 # ---------------------------------------------------------------------------
+# 2b) repeat_visitor (train, full) — FLAGSHIP for the RAG-chat instrument. The SAME voice speaks on
+#     two cameras a "day" apart (multi-injection); scores transcript + LIVE RAG chat. Ground truth is
+#     construction-known. Deliberately audio-only + NO speaker enrollment: the core assertions ride
+#     on SEMANTIC retrieval + the no-hallucination decline path (robust), so this proves the chat
+#     instrument end-to-end without depending on the fragile TTS speaker-minting lane. The counting
+#     question is a PROBE — it may fail today (exposes the missing count-aggregation flaw F1/F3), which
+#     is the first target of the recursive fix loop.
+# ---------------------------------------------------------------------------
+echo "[fixtures] repeat_visitor (flagship)"
+RV_VOICE="Daniel"
+RV_DAY1="This is the front door camera. A package delivery arrived on Monday morning and the courier left it by the gate."
+RV_DAY2="This is the garage camera. The delivery truck came back on Tuesday afternoon to drop off a second parcel."
+D="$FX/train/repeat_visitor"; mkdir -p "$D/clips"
+render "$RV_VOICE" "$RV_DAY1" "$TMP/rv1.aiff"; mux "$TMP/rv1.aiff" "$D/clips/day1_front.mp4"
+render "$RV_VOICE" "$RV_DAY2" "$TMP/rv2.aiff"; mux "$TMP/rv2.aiff" "$D/clips/day2_garage.mp4"
+python3 - "$D" "$BASE_NS" "$RV_DAY1" "$RV_DAY2" <<'PY'
+import json,sys
+d,base,day1,day2=sys.argv[1],int(sys.argv[2]),sys.argv[3],sys.argv[4]
+DAY_NS=86_400_000_000_000
+json.dump({
+ "case_id":"repeat_visitor",
+ "description":"Same voice on two cameras a day apart (multi-injection). Scores transcript + live RAG chat: semantic recall + routing + no-hallucination decline (robust), plus a counting PROBE for the missing aggregation.",
+ "device_id":"eval-repeat-front","media_file":"clips/day1_front.mp4","media_kind":"muxed","seg_seconds":2,
+ "base_capture_unix_nanos":base,"modalities":["transcript","chat"],"tier":"full",
+ "injections":[
+   {"media_file":"clips/day1_front.mp4","device_id":"eval-repeat-front","capture_start_offset_ns":0},
+   {"media_file":"clips/day2_garage.mp4","device_id":"eval-repeat-garage","capture_start_offset_ns":DAY_NS}],
+ "poll":{"timeout_secs":180,"interval_secs":2}
+}, open(d+"/meta.json","w"), indent=2)
+json.dump({
+ "transcript":{"full_text":day1+" "+day2,"max_wer":0.35,"min_similarity":0.65},
+ "chat":{
+   "similarity_floor":None,
+   "judge_enabled":False,
+   "questions":[
+     {"ask":"What do the recordings say about the delivery?",
+      "expect_routed_agent":"recordings",
+      "must_contain":["delivery"],
+      "min_citations":1,
+      "reference_answer":"The recordings mention a package delivery: one arrived Monday morning and was left by the gate, and a delivery truck returned Tuesday afternoon with a second parcel."},
+     {"ask":"What do the recordings say about the stock market?",
+      "must_contain":["don't have"],
+      "must_not_contain":["rose","fell","nasdaq","dow jones"],
+      "reference_answer":"I don't have information about the stock market in the recordings."},
+     {"ask":"On how many separate days did a delivery happen, according to the recordings?",
+      "expect_number":2,
+      "must_not_contain":["don't have","no information"]}
+   ]}
+}, open(d+"/expected.json","w"), indent=2)
+PY
+
+# ---------------------------------------------------------------------------
+# 2c) money_talk (train, full) — DIALOGUE recall + SENTIMENT + negative. A worried money
+#     conversation (two voices) with a calm reassurance. Ground truth is construction-known.
+#     Scores transcript + sentiment + LIVE RAG chat (money recall, worried-tone recall, and a
+#     no-hallucination decline about an absent topic). Attribution ("who said it") is NOT scored
+#     here — diarization merges TTS voices at L2; content recall rides on semantic retrieval.
+# ---------------------------------------------------------------------------
+echo "[fixtures] money_talk"
+MT_A1="I'm really worried about the money. We can't cover the rent this month."
+MT_B1="Don't worry, the weather is beautiful and everything will work out just fine."
+MT_A2="The money situation is still stressing me out and I can't sleep."
+D="$FX/train/money_talk"; mkdir -p "$D"
+render "Samantha" "$MT_A1" "$TMP/mt_a1.aiff"
+render "Daniel"   "$MT_B1" "$TMP/mt_b1.aiff"
+render "Samantha" "$MT_A2" "$TMP/mt_a2.aiff"
+ffmpeg -y -loglevel error -i "$TMP/mt_a1.aiff" -i "$TMP/mt_b1.aiff" -i "$TMP/mt_a2.aiff" \
+  -filter_complex "[0:a][1:a][2:a]concat=n=3:v=0:a=1" "$TMP/mt.wav"
+mux "$TMP/mt.wav" "$D/media.mp4"
+python3 - "$D" "$BASE_NS" "$MT_A1" "$MT_B1" "$MT_A2" <<'PY'
+import json,sys
+d,base,a1,b1,a2=sys.argv[1],int(sys.argv[2]),sys.argv[3],sys.argv[4],sys.argv[5]
+json.dump({
+ "case_id":"money_talk",
+ "description":"Worried money dialogue + calm reassurance (two voices). Scores transcript + sentiment + RAG chat: money recall, worried-tone recall, no-hallucination decline. Attribution not scored (diarization merges TTS voices at L2).",
+ "device_id":"eval-money-talk","media_file":"media.mp4","media_kind":"muxed","seg_seconds":2,
+ "base_capture_unix_nanos":base,"modalities":["transcript","sentiment","chat"],"tier":"full",
+ "poll":{"timeout_secs":180,"interval_secs":2}
+}, open(d+"/meta.json","w"), indent=2)
+json.dump({
+ "transcript":{"full_text":a1+" "+b1+" "+a2,"max_wer":0.35,"min_similarity":0.6},
+ "sentiment":{"min_accuracy":0.4,"allow_null":True,"windows":[
+   {"start_ns":0,"end_ns":6000000000,"label":"negative","allow":["negative","neutral"]}]},
+ "chat":{
+   "similarity_floor":None,"judge_enabled":False,
+   "questions":[
+     {"ask":"What do the recordings say about money?",
+      "expect_routed_agent":"recordings","must_contain":["money"],"min_citations":1,
+      "reference_answer":"The recordings mention worry about money — not being able to cover the rent this month and feeling stressed about it."},
+     {"ask":"Was the tone about money worried or relaxed in the recordings?",
+      "must_contain":["worried"],"must_not_contain":["don't have"]},
+     {"ask":"What do the recordings say about a beach vacation?",
+      "must_contain":["information"],"must_not_contain":["booked","flight","hotel"],
+      "reference_answer":"The recordings do not contain any information about a beach vacation."}
+   ]}
+}, open(d+"/expected.json","w"), indent=2)
+PY
+
+# ---------------------------------------------------------------------------
 # 3) silence_no_speech (holdout, full) — counter-fixture: must NOT hallucinate speech/speakers.
 # ---------------------------------------------------------------------------
 echo "[fixtures] silence_no_speech (holdout)"

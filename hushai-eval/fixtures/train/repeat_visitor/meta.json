@@ -1,0 +1,30 @@
+{
+  "case_id": "repeat_visitor",
+  "description": "Same voice on two cameras a day apart (multi-injection). Scores transcript + live RAG chat: semantic recall + routing + no-hallucination decline (robust), plus a counting PROBE for the missing aggregation.",
+  "device_id": "eval-repeat-front",
+  "media_file": "clips/day1_front.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "transcript",
+    "chat"
+  ],
+  "tier": "full",
+  "injections": [
+    {
+      "media_file": "clips/day1_front.mp4",
+      "device_id": "eval-repeat-front",
+      "capture_start_offset_ns": 0
+    },
+    {
+      "media_file": "clips/day2_garage.mp4",
+      "device_id": "eval-repeat-garage",
+      "capture_start_offset_ns": 86400000000000
+    }
+  ],
+  "poll": {
+    "timeout_secs": 180,
+    "interval_secs": 2
+  }
+}

@@ -135,12 +135,40 @@ pub async fn rag_chat(
         })
         .collect();
 
+    // Persist the user turn immediately (the ORIGINAL text, so the transcript shows what was typed):
+    // a crash mid-answer still records it, and seq stays gap-free.
+    insert_message(&st.pool, session_id, "user", &message, None, &agent_id)
+        .await
+        .map_err(internal)?;
+
+    // F4 query condensation: rewrite a follow-up into a standalone query (carry subject + resolve
+    // relative time) BEFORE routing + retrieval, so "…and the week before?" doesn't re-embed bare and
+    // mis-route. No-op on the first turn / when disabled / when already standalone. From here on
+    // `message` is the effective (possibly rewritten) query used for routing, retrieval, and the
+    // answer prompt.
+    // After condensing, the query is STANDALONE, so the router must classify it ALONE — feeding it the
+    // prior turns as well drags it back toward the previous capability (observed: a condensed
+    // "How many times did I see a chair?" routed to `recordings` with context but `objects` without).
+    let (message, router_context) = if st.cfg.query_condense && !history.is_empty() {
+        let condensed = st
+            .llm
+            .condense(&message, &recent_context)
+            .await
+            .map_err(internal)?;
+        if condensed != message {
+            tracing::info!(original = %message, condensed = %condensed, "condensed follow-up query");
+        }
+        (condensed, String::new())
+    } else {
+        (message, recent_context)
+    };
+
     // Unified assistant: classify each message and dispatch to the right capability. A session
     // bound to a concrete agent keeps that agent (manual override / older sessions).
     let agent = if agent.id == crate::agents::AUTO_AGENT_ID {
         let routed = st
             .llm
-            .classify_agent(&message, &recent_context)
+            .classify_agent(&message, &router_context)
             .await
             .map_err(internal)?;
         tracing::info!(routed_to = %routed, "auto-router selected capability");
@@ -148,12 +176,6 @@ pub async fn rag_chat(
     } else {
         agent
     };
-
-    // Persist the user turn immediately: a crash mid-answer still records it, and seq stays
-    // gap-free.
-    insert_message(&st.pool, session_id, "user", &message, None, &agent_id)
-        .await
-        .map_err(internal)?;
 
     // Merge agent default scope under per-request filters (request wins per field), then
     // build this turn's context: a grounded retrieval OR (reflection) an analytics digest.
@@ -286,6 +308,50 @@ pub async fn rag_chat(
                         .or(agent.default_top_k)
                         .unwrap_or(st.cfg.object_top_k_default)
                         .clamp(1, 50);
+                    // F1 (presence aggregation): "how many times / how often did I see a <COCO class>"
+                    // is answered from the deterministic exact-class rollup (uncapped count + rhythm),
+                    // not by asking the LLM to count a CLIP-retrieved list. Only fires when the query
+                    // names a concrete COCO class; open-vocab "when did I see a red mug" still takes the
+                    // semantic CLIP path below.
+                    let count_class = if crate::presence::is_count_intent(&message) {
+                        crate::routes::find_object_class_in_query(&message)
+                    } else {
+                        None
+                    };
+                    if let Some(label) = count_class {
+                        let now = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+                        let summary = crate::presence::object_presence(
+                            &st.pool,
+                            &label,
+                            device_id.as_deref(),
+                            after,
+                            before,
+                            tz,
+                        )
+                        .await
+                        .map_err(internal)?;
+                        let mut s = retrieve::list_by_object_class(
+                            &st.pool,
+                            std::slice::from_ref(&label),
+                            device_id.as_deref(),
+                            after,
+                            before,
+                            top_k,
+                        )
+                        .await
+                        .map_err(internal)?;
+                        for src in &mut s {
+                            src.time_label =
+                                crate::humanize::humanize_time(src.start_unix_nanos, now, tz);
+                        }
+                        precomputed_answer = Some(crate::presence::render_presence(
+                            &summary,
+                            &format!("A {label}"),
+                            now,
+                            tz,
+                        ));
+                        sources = s;
+                    } else {
                     let filters = Filters {
                         device_id,
                         after_unix_nanos: after,
@@ -319,6 +385,7 @@ pub async fn rag_chat(
                             .map_err(internal)?,
                     );
                     sources = s;
+                    }
                 }
             }
         }
@@ -366,12 +433,51 @@ pub async fn rag_chat(
                     Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
                     tz,
                 );
-                precomputed_answer = Some(
-                    st.llm
-                        .answer_people(&message, &s, &names)
-                        .await
-                        .map_err(internal)?,
-                );
+                // F1 (presence aggregation): a "how many times / how often / when first-last / what
+                // times" question about ONE specific person is answered from a DETERMINISTIC rollup
+                // (uncapped COUNT(DISTINCT segment) + first/last + rhythm), not by asking the small
+                // LLM to count a top-k-capped sighting list (which undercounts past the cap and
+                // miscounts even within it). The sighting list still rides along as citations.
+                let distinct = distinct_ids(&pids);
+                if crate::presence::is_count_intent(&message) && distinct.len() == 1 {
+                    let now = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+                    let summary = crate::presence::person_presence(
+                        &st.pool,
+                        &distinct,
+                        device_id.as_deref(),
+                        after,
+                        before,
+                        tz,
+                    )
+                    .await
+                    .map_err(internal)?;
+                    let label = names
+                        .get(&distinct[0])
+                        .cloned()
+                        .unwrap_or_else(|| "That person".to_string());
+                    precomputed_answer =
+                        Some(crate::presence::render_presence(&summary, &label, now, tz));
+                } else if crate::routes::is_co_occurrence_query(&message) && !s.is_empty() {
+                    // "Who was I with": each source is one co-present person. The small LLM sometimes
+                    // drops one when listing several, so enumerate the distinct set deterministically.
+                    let mut seen = std::collections::BTreeSet::new();
+                    let mut who: Vec<String> = Vec::new();
+                    for src in &s {
+                        if let Some(n) = &src.speaker_name {
+                            if seen.insert(n.clone()) {
+                                who.push(n.clone());
+                            }
+                        }
+                    }
+                    precomputed_answer = Some(crate::presence::render_people_list(&who));
+                } else {
+                    precomputed_answer = Some(
+                        st.llm
+                            .answer_people(&message, &s, &names)
+                            .await
+                            .map_err(internal)?,
+                    );
+                }
             }
             sources = s;
         }
@@ -433,12 +539,35 @@ pub async fn rag_chat(
                 Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
                 tz,
             );
-            precomputed_answer = Some(
-                st.llm
-                    .answer_plates(&message, &s, &names)
-                    .await
-                    .map_err(internal)?,
-            );
+            // F1 (presence aggregation): "how many times / how often did I see plate X" about ONE
+            // plate is answered from the deterministic rollup, not the LLM counting a capped list.
+            let distinct = distinct_ids(&plate_ids);
+            if crate::presence::is_count_intent(&message) && distinct.len() == 1 {
+                let now = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+                let summary = crate::presence::plate_presence(
+                    &st.pool,
+                    &distinct,
+                    device_id.as_deref(),
+                    after,
+                    before,
+                    tz,
+                )
+                .await
+                .map_err(internal)?;
+                let label = names
+                    .get(&distinct[0])
+                    .cloned()
+                    .unwrap_or_else(|| "That plate".to_string());
+                precomputed_answer =
+                    Some(crate::presence::render_presence(&summary, &label, now, tz));
+            } else {
+                precomputed_answer = Some(
+                    st.llm
+                        .answer_plates(&message, &s, &names)
+                        .await
+                        .map_err(internal)?,
+                );
+            }
             sources = s;
         }
     }
@@ -467,6 +596,10 @@ pub async fn rag_chat(
     let llm = st.llm.clone();
     let system_prompt = agent.system_prompt; // &'static str
     let agent_id_stream = agent_id.clone();
+    // The concrete capability the auto-router landed on (or the session's pinned agent). The
+    // request `agent_id` may be the synthetic "auto"; this is where the answer actually came from.
+    // Surfaced in the `session` event + persisted so both the UI and the eval harness can see it.
+    let routed_agent_id = agent.id.to_string();
     let is_reflection = agent.kind == AgentKind::Reflection;
     // Reflection model override (cfg wins over a compiled-in agent default).
     let reflection_model = st
@@ -478,7 +611,7 @@ pub async fn rag_chat(
     let stream = async_stream::stream! {
         yield Ok::<Event, Infallible>(sse_event(
             "session",
-            &json!({ "session_id": session_id, "agent_id": agent_id_stream }),
+            &json!({ "session_id": session_id, "agent_id": agent_id_stream, "routed_agent_id": routed_agent_id }),
         ));
         yield Ok(sse_event(
             "sources",
@@ -488,7 +621,7 @@ pub async fn rag_chat(
         // Reflection with no resolvable target: stream the setup hint, persist, done.
         if let Some(answer) = precomputed_answer {
             yield Ok(sse_event("token", &json!({ "delta": answer })));
-            match insert_message(&pool, session_id, "assistant", &answer, Some(&sources), &agent_id_stream).await {
+            match insert_message(&pool, session_id, "assistant", &answer, Some(&sources), &routed_agent_id).await {
                 Ok(message_id) => yield Ok(sse_event("done", &json!({ "message_id": message_id }))),
                 Err(e) => {
                     tracing::error!(error = format!("{e:#}"), "failed to persist rag chat answer (precomputed)");
@@ -541,7 +674,7 @@ pub async fn rag_chat(
                             "assistant",
                             &answer,
                             Some(&sources),
-                            &agent_id_stream,
+                            &routed_agent_id,
                         )
                         .await
                         {
@@ -571,6 +704,15 @@ pub async fn rag_chat(
 
 fn sse_event(name: &str, data: &serde_json::Value) -> Event {
     Event::default().event(name).data(data.to_string())
+}
+
+/// Distinct, sorted ids — used to decide whether a count question is about ONE subject (route to
+/// the deterministic presence rollup) vs many (fall back to the LLM/list answer).
+fn distinct_ids(ids: &[String]) -> Vec<String> {
+    let mut d = ids.to_vec();
+    d.sort();
+    d.dedup();
+    d
 }
 
 // ---- read endpoints (agent picker + conversation restore) ----------------------------

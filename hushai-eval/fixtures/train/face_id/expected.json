@@ -1,0 +1,7 @@
+{
+  "persons": {
+    "distinct_count": 1,
+    "count_tolerance": 0,
+    "min_sightings": 1
+  }
+}

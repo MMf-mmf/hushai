@@ -56,13 +56,13 @@ const SLACK_NS: i64 = 5_000_000_000;
 
 pub async fn observe(
     ctx: &Ctx,
-    device_id: &str,
-    base_ns: i64,
-    end_ns: i64,
+    devices: &[String],
+    win_lo: i64,
+    win_hi: i64,
     modalities: &[String],
 ) -> Result<Observed> {
-    let lo = base_ns - SLACK_NS;
-    let hi = end_ns + SLACK_NS;
+    let lo = win_lo - SLACK_NS;
+    let hi = win_hi + SLACK_NS;
     let has = |m: &str| modalities.iter().any(|x| x == m);
     let mut o = Observed { window: (lo, hi), ..Default::default() };
 
@@ -72,10 +72,10 @@ pub async fn observe(
         let rows: Vec<(String, i64, i64, Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT text, start_unix_nanos, end_unix_nanos, sentiment, speaker_id
              FROM transcript_sentences
-             WHERE device_id = $1 AND start_unix_nanos >= $2 AND start_unix_nanos < $3
+             WHERE device_id = ANY($1) AND start_unix_nanos >= $2 AND start_unix_nanos < $3
              ORDER BY start_unix_nanos",
         )
-        .bind(device_id)
+        .bind(devices)
         .bind(lo)
         .bind(hi)
         .fetch_all(&ctx.pool)
@@ -103,18 +103,31 @@ pub async fn observe(
     if has("persons") || has("faces") {
         let (n,): (i64,) = sqlx::query_as(
             "SELECT count(DISTINCT person_id) FROM person_segments
-             WHERE device_id = $1 AND start_unix_nanos >= $2 AND start_unix_nanos < $3
+             WHERE device_id = ANY($1) AND start_unix_nanos >= $2 AND start_unix_nanos < $3
                AND person_id IS NOT NULL",
         )
-        .bind(device_id)
+        .bind(devices)
         .bind(lo)
         .bind(hi)
         .fetch_one(&ctx.pool)
         .await?;
         o.distinct_persons = n;
+        // Window+device-scoped named-attribution: count IN-WINDOW sightings on THIS device per named
+        // person, NOT the global `persons` catalog. Enrollment mints+names a person on a `-ref` device
+        // before the case window, so the old global `SELECT display_name,n_samples FROM persons` passed
+        // `persons.named` on enrollment alone — a broken re-identification (person never re-seen in the
+        // clip) still scored 1.0. This ties the metric to actual in-window attribution (person_segments).
         o.persons_named = sqlx::query_as(
-            "SELECT display_name, n_samples FROM persons WHERE display_name IS NOT NULL",
+            "SELECT p.display_name, count(*)::bigint
+             FROM person_segments ps
+             JOIN persons p ON p.person_id = ps.person_id
+             WHERE ps.device_id = ANY($1) AND ps.start_unix_nanos >= $2 AND ps.start_unix_nanos < $3
+               AND p.display_name IS NOT NULL
+             GROUP BY p.display_name",
         )
+        .bind(devices)
+        .bind(lo)
+        .bind(hi)
         .fetch_all(&ctx.pool)
         .await?
         .into_iter()
@@ -125,10 +138,10 @@ pub async fn observe(
     if has("objects") {
         let rows: Vec<(String, i64, i64)> = sqlx::query_as(
             "SELECT object_label, start_unix_nanos, end_unix_nanos FROM scene_objects
-             WHERE device_id = $1 AND start_unix_nanos >= $2 AND start_unix_nanos < $3
+             WHERE device_id = ANY($1) AND start_unix_nanos >= $2 AND start_unix_nanos < $3
                AND object_label <> '__frame__'",
         )
-        .bind(device_id)
+        .bind(devices)
         .bind(lo)
         .bind(hi)
         .fetch_all(&ctx.pool)
@@ -153,10 +166,10 @@ pub async fn observe(
         let reads: Vec<(String, i64)> = sqlx::query_as(
             "SELECT lp.plate_text_norm, count(*)::bigint
              FROM plate_detections pd JOIN license_plates lp ON pd.plate_id = lp.plate_id
-             WHERE pd.device_id = $1 AND pd.start_unix_nanos >= $2 AND pd.start_unix_nanos < $3
+             WHERE pd.device_id = ANY($1) AND pd.start_unix_nanos >= $2 AND pd.start_unix_nanos < $3
              GROUP BY lp.plate_text_norm",
         )
-        .bind(device_id)
+        .bind(devices)
         .bind(lo)
         .bind(hi)
         .fetch_all(&ctx.pool)
@@ -168,10 +181,10 @@ pub async fn observe(
         let rows: Vec<(String, String, Option<String>, Option<String>, i64)> = sqlx::query_as(
             "SELECT event_type, severity, subject_type, subject_label, start_unix_nanos
              FROM events
-             WHERE device_id = $1 AND start_unix_nanos >= $2 AND start_unix_nanos < $3
+             WHERE device_id = ANY($1) AND start_unix_nanos >= $2 AND start_unix_nanos < $3
              ORDER BY start_unix_nanos",
         )
-        .bind(device_id)
+        .bind(devices)
         .bind(lo)
         .bind(hi)
         .fetch_all(&ctx.pool)

@@ -735,7 +735,7 @@ fn median(values: &mut [f64]) -> f64 {
 }
 
 /// Indices of the `k` largest non-zero buckets, descending by count.
-fn top_indices(counts: &[i64], k: usize) -> Vec<usize> {
+pub(crate) fn top_indices(counts: &[i64], k: usize) -> Vec<usize> {
     let mut idx: Vec<usize> = (0..counts.len()).filter(|&i| counts[i] > 0).collect();
     idx.sort_by(|&a, &b| counts[b].cmp(&counts[a]));
     idx.truncate(k);
@@ -743,7 +743,7 @@ fn top_indices(counts: &[i64], k: usize) -> Vec<usize> {
 }
 
 /// Bucket a UTC nanos timestamp (with a fixed offset) into (hour, weekday0=Mon, week_start_nanos).
-fn bucket(nanos: i64, tz_offset_secs: i64) -> (u32, u32, i64) {
+pub(crate) fn bucket(nanos: i64, tz_offset_secs: i64) -> (u32, u32, i64) {
     let dt: DateTime<Utc> =
         DateTime::from_timestamp_nanos(nanos) + Duration::seconds(tz_offset_secs);
     let hour = dt.hour();

@@ -1,0 +1,58 @@
+{
+  "transcript": {
+    "full_text": "I'm really worried about the money. We can't cover the rent this month. Don't worry, the weather is beautiful and everything will work out just fine. The money situation is still stressing me out and I can't sleep.",
+    "max_wer": 0.35,
+    "min_similarity": 0.6
+  },
+  "sentiment": {
+    "min_accuracy": 0.4,
+    "allow_null": true,
+    "windows": [
+      {
+        "start_ns": 0,
+        "end_ns": 6000000000,
+        "label": "negative",
+        "allow": [
+          "negative",
+          "neutral"
+        ]
+      }
+    ]
+  },
+  "chat": {
+    "similarity_floor": null,
+    "judge_enabled": false,
+    "questions": [
+      {
+        "ask": "What do the recordings say about money?",
+        "expect_routed_agent": "recordings",
+        "must_contain": [
+          "money"
+        ],
+        "min_citations": 1,
+        "reference_answer": "The recordings mention worry about money \u2014 not being able to cover the rent this month and feeling stressed about it."
+      },
+      {
+        "ask": "Was the tone about money worried or relaxed in the recordings?",
+        "must_contain": [
+          "worried"
+        ],
+        "must_not_contain": [
+          "don't have"
+        ]
+      },
+      {
+        "ask": "What do the recordings say about a beach vacation?",
+        "must_contain": [
+          "information"
+        ],
+        "must_not_contain": [
+          "booked",
+          "flight",
+          "hotel"
+        ],
+        "reference_answer": "The recordings do not contain any information about a beach vacation."
+      }
+    ]
+  }
+}

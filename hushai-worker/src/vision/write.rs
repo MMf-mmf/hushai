@@ -739,13 +739,16 @@ fn process_plate_lane(
     abs: i64,
 ) -> Vec<PlateCand> {
     let mut out = Vec::new();
-    // ROIs: each vehicle's bbox; or the whole frame if configured and no vehicle is present.
+    // ROIs: each vehicle's bbox. When `detect_whole_frame` is set, ALSO scan the whole frame — not
+    // just when no vehicle is found — so a plate that falls outside an imperfect RF-DETR vehicle box
+    // (partial/occluded car, motorcycle, distant plate) is still caught. Duplicates across ROIs
+    // collapse downstream (cross-frame clustering + match-or-mint by normalized plate string).
     let mut rois: Vec<([f32; 4], Option<String>)> = dets
         .iter()
         .filter(|d| is_vehicle(&d.label))
         .map(|d| (d.bbox, Some(d.label.clone())))
         .collect();
-    if rois.is_empty() && p.detect_whole_frame {
+    if p.detect_whole_frame {
         rois.push(([0.0, 0.0, img.width() as f32, img.height() as f32], None));
     }
 

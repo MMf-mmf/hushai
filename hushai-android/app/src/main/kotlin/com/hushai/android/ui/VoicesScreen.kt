@@ -33,6 +33,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import android.widget.Toast
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import com.hushai.android.net.SpeakersClient
@@ -114,7 +115,7 @@ fun VoicesScreen(client: SpeakersClient, onBack: () -> Unit) {
                         val ok = withContext(Dispatchers.IO) {
                             client.mergeGroup(g.suggestedInto, g.members.map { it.id })
                         }
-                        if (ok) reload()
+                        if (ok) reload() else Toast.makeText(ctx, "Couldn't complete that — check your connection and try again.", Toast.LENGTH_LONG).show()
                     }
                 },
                 onMergeAll = {
@@ -153,14 +154,14 @@ fun VoicesScreen(client: SpeakersClient, onBack: () -> Unit) {
                         onSave = { name ->
                             scope.launch {
                                 val ok = withContext(Dispatchers.IO) { client.setName(sp.id, name) }
-                                if (ok) reload()
+                                if (ok) reload() else Toast.makeText(ctx, "Couldn't complete that — check your connection and try again.", Toast.LENGTH_LONG).show()
                             }
                         },
                         onPlay = { playSample(ctx, client, sp.id, scope) },
                         onMerge = { intoId ->
                             scope.launch {
                                 val ok = withContext(Dispatchers.IO) { client.merge(sp.id, intoId) }
-                                if (ok) reload()
+                                if (ok) reload() else Toast.makeText(ctx, "Couldn't complete that — check your connection and try again.", Toast.LENGTH_LONG).show()
                             }
                         },
                     )
@@ -202,7 +203,7 @@ fun VoicesScreen(client: SpeakersClient, onBack: () -> Unit) {
                         val ok = withContext(Dispatchers.IO) {
                             client.nameUnattributed(name, cluster.segmentIds)
                         }
-                        if (ok) reload()
+                        if (ok) reload() else Toast.makeText(ctx, "Couldn't complete that — check your connection and try again.", Toast.LENGTH_LONG).show()
                     }
                 },
             )

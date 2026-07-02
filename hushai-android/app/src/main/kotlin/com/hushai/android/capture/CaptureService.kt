@@ -120,6 +120,8 @@ class CaptureService : Service() {
         fun setAssistantEnabled(enabled: Boolean) = this@CaptureService.setAssistantEnabled(enabled)
         fun enrollOwner() { assistant?.startEnrollment() }
         fun cancelImport() { importManager?.cancelCurrent() }
+        /** Apply a new offline-storage cap (bytes) to the running buffer immediately. */
+        fun updateDiskCap(bytes: Long) = this@CaptureService.updateDiskCap(bytes)
     }
 
     override fun onBind(intent: Intent?): IBinder = binder
@@ -132,6 +134,30 @@ class CaptureService : Service() {
     private fun detachPreview() {
         previewSurface = null
         camera?.setPreviewSurface(null)
+    }
+
+    /**
+     * Apply a new offline-storage byte cap to the LIVE buffer (from the Settings UI),
+     * with no capture restart. Updates the import back-pressure watermark, resizes the
+     * buffer (evicting the oldest segments immediately if the cap shrank), and refreshes
+     * the status readout. The value itself is persisted by the caller (Settings), so it
+     * also survives the next cold start when the buffer is rebuilt.
+     */
+    private fun updateDiskCap(bytes: Long) {
+        importWatermarkBytes = (bytes.toDouble() * IMPORT_WATERMARK_FRACTION).toLong()
+        val buf = buffer
+        val evicted = buf?.setMaxBytes(bytes) ?: 0
+        if (evicted > 0) {
+            HushaiLog.info("disk cap set to $bytes B; evicted $evicted oldest segment(s) to fit")
+        }
+        StatusBus.update {
+            it.copy(
+                diskCapBytes = bytes,
+                pending = buf?.size() ?: it.pending,
+                bufferedBytes = buf?.byteSize() ?: it.bufferedBytes,
+                diskFreeBytes = buf?.freeBytes() ?: it.diskFreeBytes,
+            )
+        }
     }
 
     private fun setWakeWord(word: String) {

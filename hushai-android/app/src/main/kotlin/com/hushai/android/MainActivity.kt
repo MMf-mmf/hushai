@@ -185,7 +185,12 @@ class MainActivity : ComponentActivity() {
                         onAudioOnlyChange = { ao -> Thread { settings.setAudioOnlyBlocking(ao) }.start() },
                         onDiskCapChange = { gb ->
                             val bytes = (gb.coerceAtLeast(0.5f).toDouble() * 1024 * 1024 * 1024).toLong()
-                            Thread { settings.setDiskCapBytesBlocking(bytes) }.start()
+                            Thread {
+                                settings.setDiskCapBytesBlocking(bytes)
+                                // Apply to the running capture immediately (no-op if not bound/started);
+                                // persistence above still covers the next cold start.
+                                captureBinder?.updateDiskCap(bytes)
+                            }.start()
                         },
                         onPickImport = { runCatching { importPicker.launch(arrayOf("audio/*", "video/*")) } },
                         onCancelImport = { captureBinder?.cancelImport() },

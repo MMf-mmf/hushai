@@ -16,6 +16,7 @@ pub mod humanize;
 pub mod llm;
 pub mod persons;
 pub mod plates;
+pub mod presence;
 pub mod retrieve;
 pub mod routes;
 pub mod speakers;
@@ -103,7 +104,12 @@ pub async fn run() -> anyhow::Result<()> {
         .context("running migrations")?;
 
     let embedder = Arc::new(Embedder::new(&cfg.embed_ollama_base_url, &cfg.embed_model)?);
-    let llm = Arc::new(Llm::new(&cfg.llm_ollama_base_url, &cfg.rag_llm_model)?);
+    let llm = Arc::new(Llm::new(
+        &cfg.llm_ollama_base_url,
+        &cfg.rag_llm_model,
+        cfg.rag_llm_temperature,
+        cfg.rag_llm_seed,
+    )?);
     let bind_addr = cfg.bind_addr;
     let tls = cfg.tls.clone();
     // Redacted startup banner (no RAG_TOKEN / DB credentials).

@@ -3577,6 +3577,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "clap",
+ "futures-util",
  "hex",
  "reqwest 0.12.28",
  "serde",

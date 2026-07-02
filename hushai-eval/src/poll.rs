@@ -29,19 +29,29 @@ struct LaneState {
     errors: Vec<String>,
 }
 
-pub async fn wait_until_complete(ctx: &Ctx, meta: &Meta, ids: &[Uuid], base_ns: i64) -> Result<PollOutcome> {
+/// `device_id` is passed explicitly (not read from `meta`) so a multi-clip scenario polls each
+/// injection's own camera for event quiescence; `meta` still supplies the lane/poll config.
+pub async fn wait_until_complete(
+    ctx: &Ctx,
+    meta: &Meta,
+    device_id: &str,
+    ids: &[Uuid],
+    base_ns: i64,
+) -> Result<PollOutcome> {
     let max_attempts: i32 = std::env::var("MAX_ATTEMPTS").ok().and_then(|v| v.parse().ok()).unwrap_or(5);
     let timeout = Duration::from_secs(meta.poll.timeout_secs);
     let interval = Duration::from_secs(meta.poll.interval_secs.max(1));
 
-    // Which lanes to wait on. Events do NOT force the vision lane: an audio fixture's `speech`
-    // events come from the AUDIO lane, and vision-derived events (person/object/plate) are only
-    // expected when that modality is also scored (which sets needs_vision). Waiting on a lane that
-    // is disabled / has no rows for these segments would hang until timeout.
+    // Which lanes to wait on. `events` can be EITHER audio-derived (speech, from the audio lane) or
+    // vision-derived (object_seen/plate_seen/person_seen, from the vision lane), so a fixture that
+    // scores events must wait on BOTH lanes that could produce them — gated by what media exists.
+    // (Previously events forced only the audio lane, so a video fixture's vision-events were scored
+    // before the slower vision lane had emitted anything → false 0/N regression or false pass.)
+    // The `&& has_{audio,video}` guards keep us from waiting on a lane with no rows (which hangs).
     let has_audio = meta.media_kind != "video";
     let has_video = meta.media_kind != "audio";
     let wait_audio = (meta.needs_audio() || meta.modality("events")) && has_audio;
-    let wait_vision = meta.needs_vision() && has_video;
+    let wait_vision = (meta.needs_vision() || meta.modality("events")) && has_video;
 
     let start = Instant::now();
     let mut audio = LaneState { settled: 0, done: 0, errors: vec![] };
@@ -69,7 +79,7 @@ pub async fn wait_until_complete(ctx: &Ctx, meta: &Meta, ids: &[Uuid], base_ns: 
                 injected: ids.len(),
                 audio_done: audio.done,
                 vision_done: vision.done,
-                event_count: event_count(ctx, &meta.device_id, base_ns).await?,
+                event_count: event_count(ctx, device_id, base_ns).await?,
                 errors,
             });
         }
@@ -77,11 +87,11 @@ pub async fn wait_until_complete(ctx: &Ctx, meta: &Meta, ids: &[Uuid], base_ns: 
     }
 
     // Phase 2: event-producer quiescence.
-    let mut last = event_count(ctx, &meta.device_id, base_ns).await?;
+    let mut last = event_count(ctx, device_id, base_ns).await?;
     let mut stable = 0u32;
     while stable < meta.poll.quiesce_polls {
         tokio::time::sleep(interval).await;
-        let now = event_count(ctx, &meta.device_id, base_ns).await?;
+        let now = event_count(ctx, device_id, base_ns).await?;
         if now == last {
             stable += 1;
         } else {
@@ -89,7 +99,21 @@ pub async fn wait_until_complete(ctx: &Ctx, meta: &Meta, ids: &[Uuid], base_ns: 
             last = now;
         }
         if start.elapsed() > timeout {
-            break; // settled on the lanes; just didn't fully confirm quiescence — still scoreable.
+            // Event quiescence never confirmed within budget. The event producer commits AFTER a
+            // segment's lane status flips `done` (a separate tx), so an un-quiesced count may be
+            // partial — scoring it would be a false verdict. Fail closed to INCONCLUSIVE (mirrors
+            // the Phase-1 timeout branch) rather than scoring a possibly-incomplete event_count.
+            let mut errors = audio.errors.clone();
+            errors.extend(vision.errors.clone());
+            return Ok(PollOutcome {
+                settled: false,
+                timed_out: true,
+                injected: ids.len(),
+                audio_done: audio.done,
+                vision_done: vision.done,
+                event_count: last,
+                errors,
+            });
         }
     }
 

@@ -5,7 +5,6 @@
     "min_similarity": 0.7
   },
   "speakers": {
-    "_status": "staged: pipeline currently merges these 2 voices into 1; enable once diarization separates them",
     "distinct_count": 2,
     "count_tolerance": 0,
     "min_purity": 0.75,

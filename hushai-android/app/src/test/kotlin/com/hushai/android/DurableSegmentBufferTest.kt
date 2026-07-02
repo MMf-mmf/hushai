@@ -172,4 +172,45 @@ class DurableSegmentBufferTest {
         assertTrue(head!!.manifestBytes.isNotEmpty())
         assertEquals("cam0-video", head.streamId)
     }
+
+    @Test
+    fun set_max_bytes_shrink_evicts_oldest_and_flags_gap() {
+        val root = root()
+        val buf = newBuffer(root, maxBytes = 1_000)
+        buf.offer(seg(root, "cam0-video", 0, 100))
+        buf.offer(seg(root, "cam0-video", 1, 100))
+        buf.offer(seg(root, "cam0-video", 2, 100))
+        assertEquals(3, buf.size())
+        assertEquals(300L, buf.byteSize())
+
+        // Lowering the live cap to hold only two 100-byte segments evicts the oldest (seq 0)
+        // immediately and reclaims its bytes — no capture restart needed.
+        val evicted = buf.setMaxBytes(250)
+        assertEquals(1, evicted)
+        assertEquals(2, buf.size())
+        assertEquals(200L, buf.byteSize())
+        assertEquals(250L, buf.maxBytes())
+        assertEquals(1L, buf.peek()!!.sequence) // seq 1 is now the oldest survivor
+        // The eviction flags a gap on that stream, exactly once.
+        assertTrue(buf.consumeGap("cam0-video"))
+        assertFalse(buf.consumeGap("cam0-video"))
+    }
+
+    @Test
+    fun set_max_bytes_grow_evicts_nothing_and_admits_more() {
+        val root = root()
+        val buf = newBuffer(root, maxBytes = 250) // holds two 100-byte segments
+        buf.offer(seg(root, "cam0-audio", 0, 100))
+        buf.offer(seg(root, "cam0-audio", 1, 100))
+        assertEquals(2, buf.size())
+
+        // Raising the cap evicts nothing and lets a third segment fit that would
+        // otherwise have dropped the oldest under the old 250-byte cap.
+        assertEquals(0, buf.setMaxBytes(1_000))
+        assertEquals(2, buf.size())
+        buf.offer(seg(root, "cam0-audio", 2, 100))
+        assertEquals(3, buf.size())
+        assertEquals(300L, buf.byteSize())
+        assertFalse(buf.consumeGap("cam0-audio")) // nothing was ever evicted
+    }
 }

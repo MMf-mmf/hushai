@@ -33,16 +33,23 @@ class Settings(private val context: Context) {
 
     /** Stable per-install id, minted once and persisted (contract §4 device_id). */
     suspend fun deviceId(): String {
-        context.dataStore.data.map { it[KEY_DEVICE_ID] }.first()?.let { return it }
-        val minted = "android-" + Uuid7.bytes().hex()
-        edit(KEY_DEVICE_ID, minted)
-        return minted
+        // Mint atomically inside ONE DataStore transaction. A separate read-then-write let two
+        // concurrent callers on a fresh install (cold onCreate + a headless startForegroundService
+        // autostart) both observe null and mint two different ids, fragmenting uploaded data across
+        // device_ids (the RAG scoping key). The edit{} lambda runs in DataStore's serialized
+        // transaction, so a second caller sees the first's committed value.
+        val prefs = context.dataStore.edit { p ->
+            if (p[KEY_DEVICE_ID] == null) p[KEY_DEVICE_ID] = "android-" + Uuid7.bytes().hex()
+        }
+        return prefs[KEY_DEVICE_ID]!!
     }
 
     /** Hard cap (bytes) on the local store-and-forward buffer's segment bodies.
      *  Bounds how much footage we keep on disk while offline; the buffer drops the
-     *  OLDEST segment (marking a gap) once this is reached. User-adjustable; the
-     *  core layer additionally enforces a device-free safety reserve. */
+     *  OLDEST segment (marking a gap) once this is reached. User-adjustable — and the
+     *  change applies LIVE to a running capture via `CaptureService.updateDiskCap`
+     *  (not just at next start). The core layer additionally enforces a device-free
+     *  safety reserve. */
     suspend fun diskCapBytes(): Long =
         context.dataStore.data.map { it[KEY_DISK_CAP_BYTES] ?: DEFAULT_DISK_CAP_BYTES }.first()
 

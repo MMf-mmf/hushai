@@ -36,6 +36,52 @@ const KNOBS: &[&str] = &[
     "SENTIMENT_MODEL",
     "SENTIMENT_ENABLED",
     "EVENTS_ENABLED",
+    // RAG answer/routing determinism + retrieval shape. These now determine SCORED output (the
+    // `chat` modality scores live RAG answers), so a baseline is only comparable under the same
+    // decode + retrieval profile. `RAG_`/`OWNER_`/`ANALYSIS_`/`REFLECTION_` are deliberately NOT
+    // prefix-folded (that would sweep in secrets/urls/bind addr and fragment baselines per machine);
+    // the output-determining ones are hand-listed here instead.
+    "RAG_LLM_TEMPERATURE",
+    "RAG_LLM_SEED",
+    "RAG_TOP_K_DEFAULT",
+    "RAG_DISTANCE_THRESHOLD",
+    "RAG_HNSW_EF_SEARCH",
+    "RAG_OBJECT_DISTANCE_THRESHOLD",
+    "RAG_OBJECT_TOP_K_DEFAULT",
+    "RAG_PERSON_TOP_K_DEFAULT",
+    "RAG_PLATE_TOP_K_DEFAULT",
+    "RAG_CHAT_HISTORY_TURNS",
+    "RAG_QUERY_CONDENSE",
+    "REFLECTION_LLM_MODEL",
+    "ANALYSIS_WINDOW_DAYS_DEFAULT",
+    "CONVERSATION_GAP_SECS",
+    "ANALYSIS_TZ_OFFSET_SECS",
+    "OWNER_SPEAKER_ID",
+    "OWNER_SPEAKER_NAME",
+    "OWNER_PERSON_ID",
+    "OWNER_PERSON_NAME",
+];
+
+/// Env-var PREFIXES whose vars change what the pipeline produces. Folded into the config-hash BY
+/// PREFIX (not only the hand-list above) so a NEW knob is captured automatically. A hand-maintained
+/// allowlist previously omitted many output-determining knobs (OBJECT_*/PLATE_*/FACE_*/AUDIO_SILENCE_*/
+/// EVENTS_*/ASR_*/…), so tuning them reused a STALE baseline → silent false-pass. Over-inclusion (a
+/// perf-only timeout minting a fresh baseline lineage) is deliberate and cheap; a MISSED knob is not.
+const KNOB_PREFIXES: &[&str] = &[
+    "OBJECT_",
+    "PLATE_",
+    "FACE_",
+    "SPEAKER_",
+    "AUDIO_SILENCE_",
+    "EVENTS_",
+    "WHISPER_",
+    "ASR_",
+    "SENTIMENT_",
+    "VISION_",
+    "MOTION_",
+    "LOAD_GOVERNOR_",
+    "LOAD_PAUSE_",
+    "FRAMES_PER_SEGMENT",
 ];
 
 #[derive(Debug, Clone, Serialize)]
@@ -72,6 +118,14 @@ impl EnvManifest {
         for k in KNOBS {
             if let Ok(v) = std::env::var(k) {
                 knobs.insert((*k).to_string(), v);
+            }
+        }
+        // Fold ANY env var under a determinism-relevant prefix, so a newly-added output-determining
+        // knob is captured without editing the hand-list (the gap that let knob tuning silently reuse
+        // a stale baseline → false pass). BTreeMap dedups against the explicit KNOBS above.
+        for (k, v) in std::env::vars() {
+            if KNOB_PREFIXES.iter().any(|p| k.starts_with(p)) {
+                knobs.insert(k, v);
             }
         }
         // Per-case worker-config overrides participate in the hash too (a case can pin a knob).

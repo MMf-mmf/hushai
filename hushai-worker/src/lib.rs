@@ -467,6 +467,7 @@ fn build_vision_models(cfg: &WorkerConfig) -> anyhow::Result<VisionModels> {
                 s,
                 cfg.plate_detect_input_size,
                 cfg.plate_min_det_score,
+                cfg.plate_detect_end2end,
             ))
         });
         let ocr = load_plate_charset(&cfg.plate_ocr_charset_path).and_then(|charset| {

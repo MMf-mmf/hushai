@@ -1,6 +1,7 @@
 package com.hushai.android.ui
 
 import android.graphics.BitmapFactory
+import android.widget.Toast
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -63,6 +64,7 @@ fun PeopleScreen(client: PersonsClient, onBack: () -> Unit) {
     // Known (named) people collapse behind a closed disclosure so the unidentified faces lead.
     var knownExpanded by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
+    val ctx = LocalContext.current
 
     suspend fun reload() {
         loading = true
@@ -127,13 +129,13 @@ fun PeopleScreen(client: PersonsClient, onBack: () -> Unit) {
                         onSave = { name ->
                             scope.launch {
                                 val ok = withContext(Dispatchers.IO) { client.setName(p.id, name) }
-                                if (ok) reload()
+                                if (ok) reload() else Toast.makeText(ctx, "Couldn't complete that — check your connection and try again.", Toast.LENGTH_LONG).show()
                             }
                         },
                         onMerge = { intoId ->
                             scope.launch {
                                 val ok = withContext(Dispatchers.IO) { client.merge(p.id, intoId) }
-                                if (ok) reload()
+                                if (ok) reload() else Toast.makeText(ctx, "Couldn't complete that — check your connection and try again.", Toast.LENGTH_LONG).show()
                             }
                         },
                     )

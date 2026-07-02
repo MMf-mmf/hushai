@@ -111,6 +111,28 @@ pub async fn run() -> anyhow::Result<()> {
         inflight: Arc::new(Mutex::new(HashMap::new())),
     };
 
+    // Background TS-cache reaper — the remux cache is content-addressed and never self-evicts, so
+    // without this it grows unbounded on the disk the watermark guards. Runs once at startup then on
+    // the configured interval; 0 bytes disables it. Blocking prune off the runtime via spawn_blocking.
+    if state.cfg.cache_max_bytes > 0 {
+        let cache_dir = state.cfg.cache_dir.clone();
+        let max_bytes = state.cfg.cache_max_bytes;
+        let interval = std::time::Duration::from_secs(state.cfg.cache_reap_interval_secs.max(60));
+        tokio::spawn(async move {
+            loop {
+                let dir = cache_dir.clone();
+                match tokio::task::spawn_blocking(move || crate::remux::reap_cache(&dir, max_bytes)).await {
+                    Ok(Ok((total, freed))) if freed > 0 => {
+                        tracing::info!(total_bytes = total, freed_bytes = freed, "ts-cache reaped")
+                    }
+                    Ok(Err(e)) => tracing::warn!(error = %e, "ts-cache reap failed"),
+                    _ => {}
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
+    }
+
     let app = routes::router(state);
     // `serve_with_connect_info` populates `ConnectInfo<SocketAddr>` (the peer IP) on
     // BOTH the cleartext and TLS branches — the IP allowlist middleware (auth.rs) reads

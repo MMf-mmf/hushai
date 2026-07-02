@@ -1,6 +1,7 @@
 package com.hushai.android.ui
 
 import android.text.format.DateUtils
+import android.widget.Toast
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -53,6 +54,7 @@ fun EventsScreen(client: EventsClient, onBack: () -> Unit) {
     val notifsBlocked = remember { !NotificationManagerCompat.from(context).areNotificationsEnabled() }
 
     suspend fun reload() {
+        loading = true // else the Refresh button (enabled = !loading) never disables during a refresh
         error = false
         withContext(Dispatchers.IO) {
             val f = client.listFeed(limit = 100) // null = call failed (retryable) vs [] = no alerts
@@ -123,6 +125,8 @@ fun EventsScreen(client: EventsClient, onBack: () -> Unit) {
                                 if (it.deliveryId == item.deliveryId) it.copy(acknowledged = true) else it
                             }
                             reload()
+                        } else {
+                            Toast.makeText(context, "Couldn't acknowledge that alert — check your connection and try again.", Toast.LENGTH_LONG).show()
                         }
                     }
                 }

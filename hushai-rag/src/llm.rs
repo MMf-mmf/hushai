@@ -26,10 +26,19 @@ use crate::retrieve::Source;
 pub struct Llm {
     client: ollama::Client,
     model: String,
+    /// Sampling temperature applied to every agent build (0.0 = greedy/deterministic).
+    temperature: f64,
+    /// Optional Ollama sampling seed, merged into `options.seed`.
+    seed: Option<i64>,
 }
 
 impl Llm {
-    pub fn new(ollama_base_url: &str, model: &str) -> anyhow::Result<Self> {
+    pub fn new(
+        ollama_base_url: &str,
+        model: &str,
+        temperature: f64,
+        seed: Option<i64>,
+    ) -> anyhow::Result<Self> {
         let client = ollama::Client::builder()
             .api_key(ollama::OllamaApiKey::default())
             .base_url(ollama_base_url)
@@ -38,7 +47,25 @@ impl Llm {
         Ok(Self {
             client,
             model: model.to_string(),
+            temperature,
+            seed,
         })
+    }
+
+    /// Apply the deterministic-decode knobs to a freshly-created agent builder. `.temperature()`
+    /// maps to `options.temperature`; the seed (when set) rides in `additional_params` and Rig
+    /// merges it into `options.seed` (only `think`/`keep_alive` are lifted to top-level, so `seed`
+    /// stays a model option). Every agent-build site funnels through here so routing AND answers
+    /// share one decode profile.
+    fn tune(
+        &self,
+        b: rig::agent::AgentBuilder<ollama::CompletionModel>,
+    ) -> rig::agent::AgentBuilder<ollama::CompletionModel> {
+        let b = b.temperature(self.temperature);
+        match self.seed {
+            Some(seed) => b.additional_params(serde_json::json!({ "seed": seed })),
+            None => b,
+        }
     }
 
     /// Route a chat message to one capability for the unified "auto" assistant: returns one of
@@ -52,8 +79,7 @@ impl Llm {
         recent_context: &str,
     ) -> anyhow::Result<&'static str> {
         let agent = self
-            .client
-            .agent(&self.model)
+            .tune(self.client.agent(&self.model))
             .preamble(crate::agents::ROUTER_PREAMBLE)
             .build();
         let prompt = if recent_context.trim().is_empty() {
@@ -68,6 +94,42 @@ impl Llm {
         Ok(crate::agents::parse_agent_label(&raw))
     }
 
+    /// Condense a follow-up message into a STANDALONE query using the recent conversation (flaw F4).
+    /// "…and the week before?" after "how many times did I see a chair?" → "how many times did I see
+    /// a chair the week before?". Returns the message UNCHANGED when it's already self-contained (or on
+    /// any doubt) — this must never distort a clear question. Runs at the shared temp (0 = deterministic).
+    pub async fn condense(&self, message: &str, recent_context: &str) -> anyhow::Result<String> {
+        if recent_context.trim().is_empty() {
+            return Ok(message.to_string());
+        }
+        let agent = self.tune(self.client.agent(&self.model))
+            .preamble(
+                "You rewrite the user's LATEST message into a single standalone question for a \
+                 personal-recordings search. Carry over any subject (a person, object, or license \
+                 plate) and any time frame that the latest message refers to from the recent \
+                 conversation. Resolve relative time words (e.g. 'the week before') into an explicit \
+                 phrase. If the latest message is ALREADY a complete standalone question, or you are \
+                 unsure, return it EXACTLY unchanged. Output ONLY the rewritten question, nothing else.",
+            )
+            .build();
+        let prompt = format!(
+            "Recent conversation:\n{recent_context}\n\nLatest message: {message}\n\nStandalone question:"
+        );
+        match agent.prompt(prompt).await {
+            Ok(rewritten) => {
+                let r = rewritten.trim().trim_matches('"').trim();
+                // Guard against a degenerate/empty/oversized rewrite → fall back to the original.
+                if r.is_empty() || r.len() > message.len() + 200 {
+                    Ok(message.to_string())
+                } else {
+                    Ok(r.to_string())
+                }
+            }
+            // Condensation is best-effort: never fail the turn over it.
+            Err(_) => Ok(message.to_string()),
+        }
+    }
+
     /// Produce a grounded answer for `question` given the retrieved `sources`. `names`
     /// maps speaker-id strings to display names for per-passage attribution. Single-shot
     /// (no history) using the default recordings persona — this is the `/v1/rag/query`
@@ -79,8 +141,7 @@ impl Llm {
         names: &HashMap<String, String>,
     ) -> anyhow::Result<String> {
         let agent = self
-            .client
-            .agent(&self.model)
+            .tune(self.client.agent(&self.model))
             .preamble(crate::agents::default_preamble())
             .build();
         let prompt = build_prompt(question, sources, names);
@@ -104,8 +165,7 @@ impl Llm {
         history: Vec<Message>,
     ) -> anyhow::Result<impl Stream<Item = anyhow::Result<String>> + Send> {
         let agent = self
-            .client
-            .agent(&self.model)
+            .tune(self.client.agent(&self.model))
             .preamble(system_prompt)
             .build();
         let prompt = build_prompt(question, sources, names);
@@ -131,8 +191,7 @@ impl Llm {
         sources: &[Source],
     ) -> anyhow::Result<String> {
         let agent = self
-            .client
-            .agent(&self.model)
+            .tune(self.client.agent(&self.model))
             .preamble(crate::agents::objects_preamble())
             .build();
         let prompt = build_objects_prompt(question, sources);
@@ -153,8 +212,7 @@ impl Llm {
         names: &HashMap<String, String>,
     ) -> anyhow::Result<String> {
         let agent = self
-            .client
-            .agent(&self.model)
+            .tune(self.client.agent(&self.model))
             .preamble(crate::agents::people_preamble())
             .build();
         let prompt = build_prompt(question, sources, names);
@@ -176,8 +234,7 @@ impl Llm {
         names: &HashMap<String, String>,
     ) -> anyhow::Result<String> {
         let agent = self
-            .client
-            .agent(&self.model)
+            .tune(self.client.agent(&self.model))
             .preamble(crate::agents::plates_preamble())
             .build();
         let prompt = build_prompt(question, sources, names);
@@ -200,8 +257,7 @@ impl Llm {
         model: Option<&str>,
     ) -> anyhow::Result<String> {
         let agent = self
-            .client
-            .agent(model.unwrap_or(&self.model))
+            .tune(self.client.agent(model.unwrap_or(&self.model)))
             .preamble(crate::agents::reflection_preamble())
             .build();
         let prompt = build_reflection_prompt(question, digest_text, excerpts, names);
@@ -225,8 +281,7 @@ impl Llm {
         model: Option<&str>,
     ) -> anyhow::Result<impl Stream<Item = anyhow::Result<String>> + Send> {
         let agent = self
-            .client
-            .agent(model.unwrap_or(&self.model))
+            .tune(self.client.agent(model.unwrap_or(&self.model)))
             .preamble(system_prompt)
             .build();
         let prompt = build_reflection_prompt(question, digest_text, excerpts, names);

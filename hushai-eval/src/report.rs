@@ -125,10 +125,13 @@ impl SuiteResult {
         let any_inconclusive = cases.iter().any(|c| c.verdict == Verdict::Inconclusive);
         let any_fail = cases.iter().any(|c| c.verdict == Verdict::Fail);
         let any_improved = cases.iter().any(|c| c.verdict == Verdict::PassImproved);
-        let (verdict, exit_code) = if any_inconclusive {
-            (Verdict::Inconclusive, 2)
-        } else if any_fail {
+        // FAIL dominates INCONCLUSIVE: exit 1 ("regression — act") must never be downgraded to exit 2
+        // ("infra — retry") just because a sibling case was flaky. A CI/agent loop that retries on 2
+        // would otherwise never act on a real regression while any flaky case masks it.
+        let (verdict, exit_code) = if any_fail {
             (Verdict::Fail, 1)
+        } else if any_inconclusive {
+            (Verdict::Inconclusive, 2)
         } else if any_improved {
             (Verdict::PassImproved, 0)
         } else {
@@ -199,5 +202,68 @@ fn verdict_glyph(v: Verdict) -> &'static str {
         Verdict::PassImproved => "IMPR",
         Verdict::Fail => "FAIL",
         Verdict::Inconclusive => "INCO",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    fn case(verdict: Verdict) -> CaseResult {
+        CaseResult {
+            case_id: "c".into(),
+            split: "train".into(),
+            tier: "fast".into(),
+            verdict,
+            note: String::new(),
+            injected: 1,
+            processed: 1,
+            metrics: vec![],
+        }
+    }
+
+    fn manifest() -> EnvManifest {
+        EnvManifest {
+            config_hash: "h".into(),
+            git_sha: "g".into(),
+            git_dirty: false,
+            migration_head: "m".into(),
+            models: BTreeMap::new(),
+            ollama: BTreeMap::new(),
+            ort_dylib: "o".into(),
+            execution_provider: "cpu".into(),
+            knobs: BTreeMap::new(),
+        }
+    }
+
+    // A real regression (Fail, exit 1 = "act") must NEVER be downgraded to Inconclusive
+    // (exit 2 = "retry") by a flaky sibling — else a CI/agent loop retries forever and never acts.
+    #[test]
+    fn fail_dominates_inconclusive() {
+        let s = SuiteResult::finalize("fast", manifest(), vec![case(Verdict::Fail), case(Verdict::Inconclusive)]);
+        assert_eq!(s.verdict, Verdict::Fail);
+        assert_eq!(s.exit_code, 1);
+    }
+
+    #[test]
+    fn inconclusive_without_fail_is_exit_2() {
+        let s = SuiteResult::finalize("fast", manifest(), vec![case(Verdict::Pass), case(Verdict::Inconclusive)]);
+        assert_eq!(s.verdict, Verdict::Inconclusive);
+        assert_eq!(s.exit_code, 2);
+    }
+
+    #[test]
+    fn all_pass_with_one_improved_is_pass_improved() {
+        let s = SuiteResult::finalize("fast", manifest(), vec![case(Verdict::Pass), case(Verdict::PassImproved)]);
+        assert_eq!(s.verdict, Verdict::PassImproved);
+        assert_eq!(s.exit_code, 0);
+    }
+
+    #[test]
+    fn clean_pass_is_exit_0() {
+        let s = SuiteResult::finalize("fast", manifest(), vec![case(Verdict::Pass)]);
+        assert_eq!(s.verdict, Verdict::Pass);
+        assert_eq!(s.exit_code, 0);
     }
 }

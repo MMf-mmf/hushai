@@ -57,6 +57,48 @@ fn cache_path(cache_dir: &Path, sha_hex: &str, variant: Variant) -> PathBuf {
         .join(format!("{sha_hex}.{}.ts", variant.suffix()))
 }
 
+/// LRU-evict the TS remux cache down to `max_bytes` (oldest mtime first). The cache is
+/// content-addressed derived data — safe to delete, regenerated on demand — and never self-evicts,
+/// so without this it grows unbounded on the same volume the disk watermark guards. Blocking (std::fs);
+/// call via spawn_blocking. Returns (total_bytes_seen, bytes_freed). Best-effort: unreadable/undeletable
+/// entries are skipped.
+pub fn reap_cache(cache_dir: &Path, max_bytes: u64) -> std::io::Result<(u64, u64)> {
+    let ts_dir = cache_dir.join("ts");
+    if !ts_dir.exists() {
+        return Ok((0, 0));
+    }
+    fn walk(dir: &Path, files: &mut Vec<(PathBuf, u64, std::time::SystemTime)>, total: &mut u64) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                walk(&e.path(), files, total);
+            } else if md.is_file() {
+                *total += md.len();
+                files.push((e.path(), md.len(), md.modified().unwrap_or(std::time::UNIX_EPOCH)));
+            }
+        }
+    }
+    let mut files = Vec::new();
+    let mut total = 0u64;
+    walk(&ts_dir, &mut files, &mut total);
+    if total <= max_bytes {
+        return Ok((total, 0));
+    }
+    files.sort_by_key(|(_, _, mt)| *mt); // oldest first
+    let (mut cur, mut freed) = (total, 0u64);
+    for (p, sz, _) in files {
+        if cur <= max_bytes {
+            break;
+        }
+        if std::fs::remove_file(&p).is_ok() {
+            cur -= sz.min(cur);
+            freed += sz;
+        }
+    }
+    Ok((total, freed))
+}
+
 /// `file:///abs/path` -> `/abs/path` (the backend always writes absolute `file://` URIs).
 fn blob_path(blob_uri: &str) -> anyhow::Result<PathBuf> {
     let p = blob_uri
@@ -220,6 +262,10 @@ async fn remux_to(
         .arg(&tmp_out);
 
     let output = cmd
+        // Kill the child if this future is dropped (a cancelled /hls/seg scrub) — otherwise the
+        // orphaned ffmpeg outlives its semaphore permit and transiently exceeds ffmpeg_concurrency.
+        // (export.rs already sets this on its long-lived ffmpeg.)
+        .kill_on_drop(true)
         .output()
         .await
         .with_context(|| format!("running {}", state.cfg.ffmpeg_bin))?;

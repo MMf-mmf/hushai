@@ -408,6 +408,12 @@ async fn teardown_device(
         .bind(device_id)
         .execute(&mut *tx)
         .await?;
+    // license_plates has the SAME first_seen_device_id FK (NO ACTION) as speakers/persons — NULL it
+    // too, else the DELETE FROM devices below throws 23503 for any camera that first-saw a plate.
+    sqlx::query("UPDATE license_plates SET first_seen_device_id = NULL WHERE first_seen_device_id = $1")
+        .bind(device_id)
+        .execute(&mut *tx)
+        .await?;
     let rows: Vec<(Vec<u8>, i64)> =
         sqlx::query_as("DELETE FROM segments WHERE device_id = $1 RETURNING content_sha256, byte_len")
             .bind(device_id)
@@ -418,6 +424,13 @@ async fn teardown_device(
         .execute(&mut *tx)
         .await?;
     sqlx::query("DELETE FROM sessions WHERE device_id = $1")
+        .bind(device_id)
+        .execute(&mut *tx)
+        .await?;
+    // events.device_id FK is NO ACTION and events are this device's own sightings — delete them with
+    // the device (alert_deliveries.event_id is ON DELETE SET NULL, so delivery records survive), else
+    // the DELETE FROM devices below throws 23503 for any camera that produced an event.
+    sqlx::query("DELETE FROM events WHERE device_id = $1")
         .bind(device_id)
         .execute(&mut *tx)
         .await?;

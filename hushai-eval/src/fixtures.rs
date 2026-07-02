@@ -46,6 +46,12 @@ pub struct Meta {
     /// Reference-identity enrollment performed after reset, before injection.
     #[serde(default)]
     pub enroll: Vec<EnrollSpec>,
+    /// Optional multi-clip timeline. When NON-EMPTY it SUPERSEDES `media_file`: the harness injects
+    /// each spec in order at its own pinned capture-start, so one case can stage the same
+    /// voice/face/plate across hours/days AND across multiple cameras. Empty (default) => the
+    /// existing single `media_file` path, byte-for-byte unchanged.
+    #[serde(default)]
+    pub injections: Vec<InjectionSpec>,
     #[serde(default)]
     pub poll: PollSpec,
 }
@@ -67,6 +73,7 @@ impl Meta {
             tier: "full".into(),
             config: serde_json::Map::new(),
             enroll: vec![],
+            injections: vec![],
             poll: PollSpec::default(),
         }
     }
@@ -85,6 +92,83 @@ impl Meta {
     pub fn needs_audio(&self) -> bool {
         ["transcript", "speakers", "sentiment"].iter().any(|m| self.modality(m))
     }
+
+    /// True if this case scores live RAG answers (the `chat` / `rag` modality).
+    pub fn needs_rag(&self) -> bool {
+        self.modality("chat") || self.modality("rag")
+    }
+
+    /// The concrete list of clips to inject, in order. A single, fully-resolved plan whether the
+    /// fixture is legacy single-clip (`injections` empty) or multi-clip. Legacy resolves to EXACTLY
+    /// today's parameters (same device, base, seg_seconds, seed, label) so existing baselines are
+    /// untouched; multi-clip specs inherit meta defaults and get an index-namespaced seed/label.
+    pub fn effective_injections(&self) -> Vec<ResolvedInjection> {
+        let base = self.base_capture_unix_nanos;
+        if self.injections.is_empty() {
+            return vec![ResolvedInjection {
+                media_file: self.media_file.clone(),
+                device_id: self.device_id.clone(),
+                base_ns: base,
+                seg_seconds: self.seg_seconds,
+                limit: self.limit,
+                seed: self.seed(),
+                label: self.case_id.clone(),
+            }];
+        }
+        self.injections
+            .iter()
+            .enumerate()
+            .map(|(i, s)| ResolvedInjection {
+                media_file: s.media_file.clone(),
+                device_id: s.device_id.clone().unwrap_or_else(|| self.device_id.clone()),
+                base_ns: s.resolved_base_ns(base),
+                seg_seconds: s.seg_seconds.unwrap_or(self.seg_seconds),
+                limit: s.limit.or(self.limit),
+                seed: s.seed.clone().unwrap_or_else(|| format!("{}::inj{i}", self.seed())),
+                label: format!("{}-inj{i}", self.case_id),
+            })
+            .collect()
+    }
+}
+
+/// One clip in a multi-clip timeline (see [`Meta::injections`]). Capture-start is a nanosecond
+/// OFFSET from `meta.base_capture_unix_nanos` (preferred — a single base shift relocates the whole
+/// scenario), OR an absolute pin. `device_id`/`seg_seconds`/`limit`/`seed` fall back to meta.
+#[derive(Debug, Clone, Deserialize)]
+pub struct InjectionSpec {
+    pub media_file: String,
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub capture_start_offset_ns: Option<i64>,
+    #[serde(default)]
+    pub absolute_capture_unix_nanos: Option<i64>,
+    #[serde(default)]
+    pub seg_seconds: Option<u32>,
+    #[serde(default)]
+    pub limit: Option<u32>,
+    #[serde(default)]
+    pub seed: Option<String>,
+}
+
+impl InjectionSpec {
+    /// Absolute capture-start: the absolute pin wins; else `meta_base + offset` (offset defaults 0).
+    pub fn resolved_base_ns(&self, meta_base: i64) -> i64 {
+        self.absolute_capture_unix_nanos
+            .unwrap_or_else(|| meta_base + self.capture_start_offset_ns.unwrap_or(0))
+    }
+}
+
+/// A fully-resolved injection (meta defaults folded in). Built by [`Meta::effective_injections`].
+#[derive(Debug, Clone)]
+pub struct ResolvedInjection {
+    pub media_file: String,
+    pub device_id: String,
+    pub base_ns: i64,
+    pub seg_seconds: u32,
+    pub limit: Option<u32>,
+    pub seed: String,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -127,6 +211,85 @@ pub struct Expected {
     pub objects: Option<ObjectsGt>,
     pub plates: Option<PlatesGt>,
     pub events: Option<EventsGt>,
+    /// Live RAG-chat ground truth (scored only when the `chat`/`rag` modality is listed). Accepts
+    /// either `"chat"` or `"rag"` as the JSON key.
+    #[serde(default, alias = "rag")]
+    pub chat: Option<ChatGt>,
+}
+
+// ----- chat / rag ground truth -----------------------------------------------
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatGt {
+    pub questions: Vec<ChatQ>,
+    /// When set, answer-vs-reference cosine similarity is a FLOORED metric (gates); otherwise it's
+    /// Info-only. Keep it high enough to catch a wrong answer but not so tight it flakes on phrasing.
+    #[serde(default)]
+    pub similarity_floor: Option<f64>,
+    /// Run an LLM-as-judge per question (rubric-scored). ALWAYS Info-only — never gates the verdict,
+    /// so its run-to-run wobble can't flip a pass/fail. A dashboard signal for the agent loop.
+    #[serde(default)]
+    pub judge_enabled: bool,
+}
+
+/// One question fired at the live RAG chat + its assertions. Deterministic-first: the `must_*` /
+/// `expect_*` / `min_citations` / `citation_must_attribute` checks test FACTS + STRUCTURE and are
+/// robust to LLM wording; `reference_answer` (cosine) + `judge_rubric` are soft signals.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatQ {
+    pub ask: String,
+    /// `"auto"` (default) exercises the product's auto-router; a concrete id pins one capability.
+    #[serde(default = "d_auto")]
+    pub agent_id: String,
+    #[serde(default)]
+    pub filters: Option<ChatFilters>,
+    #[serde(default)]
+    pub top_k: Option<i64>,
+
+    // ---- deterministic assertions ----
+    /// Every listed string must appear (normalized substring) in the answer.
+    #[serde(default)]
+    pub must_contain: Vec<String>,
+    /// None of these may appear (hallucination / decline markers).
+    #[serde(default)]
+    pub must_not_contain: Vec<String>,
+    /// A count that must appear in the answer as digits OR an English number-word.
+    #[serde(default)]
+    pub expect_number: Option<i64>,
+    /// The concrete agent the auto-router SHOULD land on (e.g. "people"/"plates"/"objects"/
+    /// "reflection"/"recordings"). Scored against the SSE `routed_agent_id`.
+    #[serde(default)]
+    pub expect_routed_agent: Option<String>,
+    /// The returned `sources` array must have at least this many entries.
+    #[serde(default)]
+    pub min_citations: Option<i64>,
+    /// Each listed name must appear across the returned sources' `speaker_name` (normalized).
+    #[serde(default)]
+    pub citation_must_attribute: Vec<String>,
+
+    // ---- soft signals ----
+    #[serde(default)]
+    pub reference_answer: Option<String>,
+    #[serde(default)]
+    pub judge_rubric: Option<String>,
+}
+
+/// Chat request filters. Time bounds are OFFSETS from `base_capture_unix_nanos` (the query step
+/// adds the base), identical to every other GT window in this crate.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatFilters {
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub after_offset_ns: Option<i64>,
+    #[serde(default)]
+    pub before_offset_ns: Option<i64>,
+    #[serde(default)]
+    pub speaker_name: Option<String>,
+    #[serde(default)]
+    pub person_name: Option<String>,
+    #[serde(default)]
+    pub plate_text: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -325,6 +488,7 @@ fn read_json<T: serde::de::DeserializeOwned>(p: &Path) -> Result<T> {
 
 fn d_muxed() -> String { "muxed".into() }
 fn d_full() -> String { "full".into() }
+fn d_auto() -> String { "auto".into() }
 fn d_info() -> String { "info".into() }
 fn d_seg_seconds() -> u32 { 2 }
 fn d_poll_timeout() -> u64 { 180 }

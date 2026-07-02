@@ -145,7 +145,21 @@ pub async fn promote(root: &Path, hashed: &mut HashedTemp) -> Result<String, Ing
     tokio::fs::create_dir_all(&parent).await.map_err(io_err)?;
 
     if tokio::fs::try_exists(&final_path).await.map_err(io_err)? {
-        // Content already durable. Leave guard unpersisted so the temp is removed.
+        // Content already durable. Refresh its mtime so a re-ingest of byte-identical content — a distinct
+        // segment_id sharing one blob, reachable via re-import/loadtest since content_sha256 has no unique
+        // constraint — resets the reclaim grace clock (see reclaim_blobs's too_new check). Otherwise a
+        // concurrent background reclaim can observe the blob as unreferenced (the re-ingesting row not yet
+        // committed) with an already-expired grace and unlink it, leaving a committed segment row pointing
+        // at missing bytes. Best-effort: on failure the pre-existing grace window still applies.
+        let refresh = final_path.clone();
+        let _ = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(&refresh)?
+                .set_modified(std::time::SystemTime::now())
+        })
+        .await;
+        // Leave guard unpersisted so the temp is removed.
         return Ok(blob_uri(&final_path));
     }
 

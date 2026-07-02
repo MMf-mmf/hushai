@@ -50,6 +50,12 @@ pub struct ViewerConfig {
     pub ui_dir: PathBuf,
     /// Where remuxed `.ts` segments are cached (pure derived data; safe to delete).
     pub cache_dir: PathBuf,
+    /// Soft cap (bytes) on the TS remux cache. A background reaper LRU-evicts (oldest mtime first)
+    /// down to this size — the cache is content-addressed and never self-evicts, so without it it
+    /// grows unbounded on the same disk the watermark guards (0 = disable the reaper).
+    pub cache_max_bytes: u64,
+    /// How often the cache reaper runs.
+    pub cache_reap_interval_secs: u64,
     /// ffmpeg binary used to remux blobs to MPEG-TS. Shared `FFMPEG_BIN` with the worker.
     pub ffmpeg_bin: String,
     /// Max concurrent ffmpeg processes (separate budget from the ingest backend).
@@ -153,6 +159,9 @@ impl ViewerConfig {
             ffmpeg_bin: opt("FFMPEG_BIN", "ffmpeg"),
             ffmpeg_concurrency: parse("VIEWER_FFMPEG_CONCURRENCY", &default_cpus.to_string())?,
             export_concurrency: parse("VIEWER_EXPORT_CONCURRENCY", "2")?,
+            // 5 GiB default TS-cache cap; reap hourly. 0 disables.
+            cache_max_bytes: parse("VIEWER_CACHE_MAX_BYTES", &(5u64 * 1024 * 1024 * 1024).to_string())?,
+            cache_reap_interval_secs: parse("VIEWER_CACHE_REAP_INTERVAL_SECS", "3600")?,
             default_window_nanos: parse("VIEWER_DEFAULT_WINDOW_NANOS", &HOUR_NANOS.to_string())?,
             // 6h cap: comfortably covers a day's worth of intermittent capture as a single
             // playlist on localhost, while still bounding worst-case playlist size.

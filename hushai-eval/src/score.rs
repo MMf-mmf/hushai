@@ -5,8 +5,10 @@
 //! flag (from expected.json), and a human detail string. Identity metrics never key on minted
 //! UUIDs — they use optimal label assignment + denormalized display names.
 
+use crate::ctx::Ctx;
 use crate::fixtures::*;
 use crate::query::*;
+use crate::query_rag::RagAnswer;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
 
@@ -344,9 +346,13 @@ fn score_plates(gt: &PlatesGt, obs: &Observed) -> Vec<Metric> {
             found += 1;
         }
         if let Some(name) = &p.expect_display_name {
-            let nok = matched.and_then(|c| c.display_name.as_deref()) == Some(name.as_str());
+            // Gate on actual in-window OCR reads too, not just the seeded catalog row's display_name:
+            // enroll_plate INSERTs a named row directly, so without the `reads` gate this passed 1.0
+            // even when the pipeline never re-read/attributed the plate in the clip.
+            let nok = reads >= p.min_reads.max(1)
+                && matched.and_then(|c| c.display_name.as_deref()) == Some(name.as_str());
             out.push(Metric::new(format!("plates.named.{}", p.text), if nok { 1.0 } else { 0.0 }, Direction::Boolean, nok,
-                format!("plate {} display_name expected {}", p.text, name)));
+                format!("plate {} display_name expected {} (>= {} reads)", p.text, name, p.min_reads.max(1))));
         }
     }
     let recall = if gt.expected.is_empty() { 1.0 } else { found as f64 / gt.expected.len() as f64 };
@@ -435,5 +441,268 @@ fn severity_rank(s: &str) -> i32 {
         "critical" => 2,
         "warning" => 1,
         _ => 0,
+    }
+}
+
+// ----- chat / rag ------------------------------------------------------------
+
+/// Score live RAG answers. Deterministic-first: `contains`/`clean`/`count_ok`/`routed`/`citations`/
+/// `attribution`/`errored` gate the verdict (they test facts + structure, robust to LLM wording);
+/// `similarity` gates only if the fixture set a floor; `judge` is ALWAYS Info-only. Metric keys are
+/// indexed by question position (`chat.q{i}.*`) so baselines line up — do NOT reorder a fixture's
+/// questions once a baseline exists. Async because similarity + judge call Ollama via `ctx`.
+pub async fn score_chat(gt: &ChatGt, answers: &[RagAnswer], ctx: &Ctx) -> Vec<Metric> {
+    let mut m = Vec::new();
+    let embed_model = std::env::var("EMBED_MODEL").unwrap_or_else(|_| "mxbai-embed-large".into());
+    for (i, (q, a)) in gt.questions.iter().zip(answers.iter()).enumerate() {
+        let p = |k: &str| format!("chat.q{i}.{k}");
+        let ans_norm = normalize(&a.answer);
+
+        // Guard: a swallowed `error` event must not silently pass the other checks.
+        m.push(Metric::new(
+            p("errored"),
+            if a.errored { 0.0 } else { 1.0 },
+            Direction::Boolean,
+            !a.errored,
+            if a.errored { "stream reported an error event" } else { "clean stream" },
+        ));
+
+        if !q.must_contain.is_empty() {
+            let hits = q.must_contain.iter().filter(|s| ans_norm.contains(&normalize(s))).count();
+            let frac = hits as f64 / q.must_contain.len() as f64;
+            m.push(Metric::new(
+                p("contains"),
+                frac,
+                Direction::HigherBetter,
+                frac >= 1.0,
+                format!("{hits}/{} required phrases present", q.must_contain.len()),
+            ));
+        }
+        if !q.must_not_contain.is_empty() {
+            let bad: Vec<&String> =
+                q.must_not_contain.iter().filter(|s| ans_norm.contains(&normalize(s))).collect();
+            m.push(Metric::new(
+                p("clean"),
+                if bad.is_empty() { 1.0 } else { 0.0 },
+                Direction::Boolean,
+                bad.is_empty(),
+                if bad.is_empty() { "no forbidden phrases".to_string() } else { format!("forbidden phrase(s) present: {bad:?}") },
+            ));
+        }
+        if let Some(n) = q.expect_number {
+            let ok = answer_has_number(&ans_norm, n);
+            m.push(Metric::new(
+                p("count_ok"),
+                if ok { 1.0 } else { 0.0 },
+                Direction::Boolean,
+                ok,
+                format!("expected count {n} {}", if ok { "present" } else { "MISSING" }),
+            ));
+        }
+        if let Some(want) = &q.expect_routed_agent {
+            match &a.routed_agent_id {
+                Some(got) => {
+                    let ok = got.eq_ignore_ascii_case(want);
+                    m.push(Metric::new(
+                        p("routed"),
+                        if ok { 1.0 } else { 0.0 },
+                        Direction::Boolean,
+                        ok,
+                        format!("routed to '{got}', expected '{want}'"),
+                    ));
+                }
+                // Old RAG binary without the routed_agent_id field: degrade to Info (never gates).
+                None => m.push(Metric::info(
+                    p("routed"),
+                    0.0,
+                    format!("routed_agent_id absent (RAG binary predates it); expected '{want}'"),
+                )),
+            }
+        }
+        if let Some(minc) = q.min_citations {
+            let n = a.sources.len() as f64;
+            m.push(Metric::new(
+                p("citations"),
+                n,
+                Direction::HigherBetter,
+                n >= minc as f64,
+                format!("{} citations (min {minc})", a.sources.len()),
+            ));
+        }
+        if !q.citation_must_attribute.is_empty() {
+            let names: Vec<String> = a
+                .sources
+                .iter()
+                .filter_map(|s| s.speaker_name.as_ref())
+                .map(|s| normalize(s))
+                .collect();
+            let hits = q
+                .citation_must_attribute
+                .iter()
+                .filter(|want| {
+                    let w = normalize(want);
+                    names.iter().any(|n| n.contains(&w))
+                })
+                .count();
+            let frac = hits as f64 / q.citation_must_attribute.len() as f64;
+            m.push(Metric::new(
+                p("attribution"),
+                frac,
+                Direction::HigherBetter,
+                frac >= 1.0,
+                format!("{hits}/{} expected names attributed in citations", q.citation_must_attribute.len()),
+            ));
+        }
+        if let Some(reference) = &q.reference_answer {
+            let sim = match (
+                embed(ctx, &embed_model, &a.answer).await,
+                embed(ctx, &embed_model, reference).await,
+            ) {
+                (Ok(x), Ok(y)) => cosine(&x, &y),
+                _ => f64::NAN,
+            };
+            if sim.is_nan() {
+                m.push(Metric::info(p("similarity"), 0.0, "similarity unavailable (embed failed)"));
+            } else if let Some(floor) = gt.similarity_floor {
+                m.push(Metric::new(
+                    p("similarity"),
+                    sim,
+                    Direction::HigherBetter,
+                    sim >= floor,
+                    format!("cosine {sim:.3} vs floor {floor:.3}"),
+                ));
+            } else {
+                m.push(Metric::info(p("similarity"), sim, format!("cosine {sim:.3} (Info)")));
+            }
+        }
+        if gt.judge_enabled {
+            if let Some(rubric) = &q.judge_rubric {
+                let score = judge(ctx, &q.ask, &a.answer, rubric).await.unwrap_or(0.0);
+                m.push(Metric::info(p("judge"), score, format!("LLM-judge {score:.2} (Info)")));
+            }
+        }
+    }
+    m
+}
+
+/// Embed `text` via the same Ollama the RAG/worker use (`/api/embeddings`, `EMBED_MODEL`). Local +
+/// deterministic; the model is already in the config-hash.
+async fn embed(ctx: &Ctx, model: &str, text: &str) -> anyhow::Result<Vec<f32>> {
+    let url = format!("{}/api/embeddings", ctx.ollama_url.trim_end_matches('/'));
+    let resp = ctx
+        .http
+        .post(&url)
+        .json(&serde_json::json!({ "model": model, "prompt": text }))
+        .send()
+        .await?
+        .error_for_status()?;
+    let v: serde_json::Value = resp.json().await?;
+    let emb = v
+        .get("embedding")
+        .and_then(|e| e.as_array())
+        .ok_or_else(|| anyhow::anyhow!("no embedding in Ollama response"))?
+        .iter()
+        .filter_map(|x| x.as_f64().map(|f| f as f32))
+        .collect::<Vec<f32>>();
+    if emb.is_empty() {
+        anyhow::bail!("empty embedding");
+    }
+    Ok(emb)
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f64 {
+    if a.len() != b.len() || a.is_empty() {
+        return f64::NAN;
+    }
+    let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += (*x as f64) * (*y as f64);
+        na += (*x as f64).powi(2);
+        nb += (*y as f64).powi(2);
+    }
+    if na == 0.0 || nb == 0.0 { f64::NAN } else { dot / (na.sqrt() * nb.sqrt()) }
+}
+
+/// Info-only LLM judge: ask the local model to grade the answer 0..1 against a rubric. Best-effort —
+/// any failure yields 0.0 and, being an Info metric, never gates the verdict.
+async fn judge(ctx: &Ctx, question: &str, answer: &str, rubric: &str) -> anyhow::Result<f64> {
+    let model = std::env::var("RAG_LLM_MODEL").unwrap_or_else(|_| "qwen2.5:7b".into());
+    let prompt = format!(
+        "You are grading an assistant's answer. Rubric: {rubric}\n\nQuestion: {question}\nAnswer: {answer}\n\n\
+         Reply with ONLY a number from 0.0 (fails the rubric) to 1.0 (fully satisfies it)."
+    );
+    let url = format!("{}/api/generate", ctx.ollama_url.trim_end_matches('/'));
+    let resp = ctx
+        .http
+        .post(&url)
+        .json(&serde_json::json!({ "model": model, "prompt": prompt, "stream": false, "options": {"temperature": 0.0} }))
+        .send()
+        .await?
+        .error_for_status()?;
+    let v: serde_json::Value = resp.json().await?;
+    let text = v.get("response").and_then(|x| x.as_str()).unwrap_or("");
+    // Pull the first float-looking token.
+    let num: String = text
+        .chars()
+        .skip_while(|c| !c.is_ascii_digit() && *c != '.')
+        .take_while(|c| c.is_ascii_digit() || *c == '.')
+        .collect();
+    Ok(num.parse::<f64>().unwrap_or(0.0).clamp(0.0, 1.0))
+}
+
+/// True if `answer_norm` (already normalized: lowercase, single-spaced) contains `n` as a digit
+/// token OR its English number-word form. Whole-token match so "13" doesn't satisfy "3".
+fn answer_has_number(answer_norm: &str, n: i64) -> bool {
+    let tokens: Vec<&str> = answer_norm.split_whitespace().collect();
+    let digit = n.to_string();
+    if tokens.iter().any(|t| *t == digit) {
+        return true;
+    }
+    if let Some(word) = number_word(n) {
+        let wt: Vec<&str> = word.split_whitespace().collect();
+        if !wt.is_empty() && tokens.windows(wt.len()).any(|w| w == wt.as_slice()) {
+            return true;
+        }
+    }
+    false
+}
+
+/// English number-word for 0..=99 (lowercase, space-separated e.g. "twenty three"). None otherwise.
+fn number_word(n: i64) -> Option<String> {
+    const ONES: [&str; 20] = [
+        "zero", "one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten",
+        "eleven", "twelve", "thirteen", "fourteen", "fifteen", "sixteen", "seventeen", "eighteen",
+        "nineteen",
+    ];
+    const TENS: [&str; 10] =
+        ["", "", "twenty", "thirty", "forty", "fifty", "sixty", "seventy", "eighty", "ninety"];
+    match n {
+        0..=19 => Some(ONES[n as usize].to_string()),
+        20..=99 => {
+            let (t, o) = ((n / 10) as usize, (n % 10) as usize);
+            if o == 0 { Some(TENS[t].to_string()) } else { Some(format!("{} {}", TENS[t], ONES[o])) }
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod chat_tests {
+    use super::*;
+
+    #[test]
+    fn number_matches_digit_and_word_whole_token() {
+        assert!(answer_has_number(&normalize("Alice visited 3 times"), 3));
+        assert!(answer_has_number(&normalize("Alice visited three times"), 3));
+        // whole-token: "13" must not satisfy 3
+        assert!(!answer_has_number(&normalize("there were 13 visits"), 3));
+        assert!(answer_has_number(&normalize("twenty three sightings"), 23));
+        assert!(answer_has_number(&normalize("I counted 0 visits"), 0));
+    }
+
+    #[test]
+    fn cosine_of_identical_is_one() {
+        let v = vec![0.1f32, 0.2, 0.3];
+        assert!((cosine(&v, &v) - 1.0).abs() < 1e-9);
     }
 }

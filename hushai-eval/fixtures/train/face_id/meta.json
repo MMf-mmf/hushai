@@ -1,0 +1,17 @@
+{
+  "case_id": "face_id",
+  "description": "PD NASA official portrait (Judith A. Resnik), ken-burns'd to a 6s muxed clip; recipe in fetch_eval_clips.sh. Clear single frontal face -> locks the SCRFD face-detect + ArcFace identity lane (distinct_count=1). Persons lane only.",
+  "device_id": "eval-face-id",
+  "media_file": "media.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "persons"
+  ],
+  "tier": "full",
+  "poll": {
+    "timeout_secs": 180,
+    "interval_secs": 2
+  }
+}

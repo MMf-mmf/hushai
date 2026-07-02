@@ -22,6 +22,10 @@ pub struct PlateOcr {
     h: usize,
     w: usize,
     nchw: bool,
+    /// Input dtype: `true` = the model takes RAW uint8 pixels 0-255 (fast-plate-ocr CCT normalizes
+    /// internally), `false` = float32 normalized 0-1 (CRNN/PaddleOCR). Detected from the ONNX input
+    /// element type; feeding the wrong dtype makes ORT reject the run ("plate-ocr inference").
+    u8_input: bool,
     /// Decode head: `true` = CTC/CRNN (collapse consecutive duplicates), `false` = fixed-length
     /// per-slot softmax (fast-plate-ocr CCT — a real double letter like "BB1234" MUST survive, so we
     /// do NOT collapse). Auto-default is fixed-length (the primary model); set `PLATE_OCR_CTC=true`
@@ -33,11 +37,12 @@ impl PlateOcr {
     /// `charset` is the ordered class→character map (index = class id), loaded from the export's
     /// sidecar JSON. Input geometry is read from the session, with sane fallbacks for dynamic axes.
     pub fn new(session: Session, charset: Vec<char>) -> Self {
-        let dims = session
-            .inputs
-            .first()
+        let input0 = session.inputs.first();
+        let dims = input0
             .and_then(|i| i.input_type.tensor_dimensions().map(|d| d.to_vec()))
             .unwrap_or_default();
+        let u8_input = input0.and_then(|i| i.input_type.tensor_type())
+            == Some(ort::tensor::TensorElementType::Uint8);
         // Identify layout: a channel axis is 1 (gray) or 3 (RGB).
         let (mut c, mut h, mut w, mut nchw) = (3usize, 48usize, 160usize, true);
         if dims.len() == 4 {
@@ -70,6 +75,7 @@ impl PlateOcr {
             h: h.max(8),
             w: w.max(8),
             nchw,
+            u8_input,
             ctc: false,
         }
     }
@@ -84,13 +90,15 @@ impl PlateOcr {
     /// Read a (rectified, enhanced) plate image. CPU-bound; call inside `spawn_blocking`.
     pub fn read(&self, img: &RgbImage) -> Result<PlateRead> {
         let resized = crate::vision::enhance::resize_rgb(img, self.w as u32, self.h as u32);
-        let pixel = |x: usize, y: usize, ch: usize| -> f32 {
+        // Raw 0-255 pixel (luma when the model wants 1 channel).
+        let raw = |x: usize, y: usize, ch: usize| -> u8 {
             let p = resized.get_pixel(x as u32, y as u32).0;
             if self.c == 1 {
-                // luma
-                (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32) / 255.0
+                (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32)
+                    .round()
+                    .clamp(0.0, 255.0) as u8
             } else {
-                p[ch.min(2)] as f32 / 255.0
+                p[ch.min(2)]
             }
         };
         let shape: Vec<usize> = if self.nchw {
@@ -98,24 +106,36 @@ impl PlateOcr {
         } else {
             vec![1, self.h, self.w, self.c]
         };
-        let mut input = ArrayD::<f32>::zeros(ndarray::IxDyn(&shape));
-        for y in 0..self.h {
-            for x in 0..self.w {
-                for ch in 0..self.c {
-                    let v = pixel(x, y, ch);
-                    if self.nchw {
-                        input[[0, ch, y, x]] = v;
-                    } else {
-                        input[[0, y, x, ch]] = v;
+        let idx = |ch: usize, y: usize, x: usize| -> [usize; 4] {
+            if self.nchw { [0, ch, y, x] } else { [0, y, x, ch] }
+        };
+        // Feed the dtype the model declares: RAW uint8 (fast-plate-ocr CCT normalizes internally) or
+        // float32 normalized to 0-1 (CRNN/PaddleOCR). Feeding the wrong one makes ORT reject the run.
+        let outputs = if self.u8_input {
+            let mut input = ArrayD::<u8>::zeros(ndarray::IxDyn(&shape));
+            for y in 0..self.h {
+                for x in 0..self.w {
+                    for ch in 0..self.c {
+                        input[idx(ch, y, x)] = raw(x, y, ch);
                     }
                 }
             }
-        }
-
-        let outputs = self
-            .session
-            .run(ort::inputs![input].context("plate-ocr inputs")?)
-            .context("plate-ocr inference")?;
+            self.session
+                .run(ort::inputs![input].context("plate-ocr inputs")?)
+                .context("plate-ocr inference")?
+        } else {
+            let mut input = ArrayD::<f32>::zeros(ndarray::IxDyn(&shape));
+            for y in 0..self.h {
+                for x in 0..self.w {
+                    for ch in 0..self.c {
+                        input[idx(ch, y, x)] = raw(x, y, ch) as f32 / 255.0;
+                    }
+                }
+            }
+            self.session
+                .run(ort::inputs![input].context("plate-ocr inputs")?)
+                .context("plate-ocr inference")?
+        };
         let out_name = self
             .session
             .outputs
@@ -203,13 +223,18 @@ fn greedy_decode(
         }
         prev = Some(argmax);
         if let Some(&ch) = charset.get(argmax) {
-            let mut denom = 0.0f32;
-            for cls in 0..classes {
-                denom += (at(s, cls) - max).exp();
-            }
-            let prob = if denom > 0.0 { 1.0 / denom } else { 0.0 };
+            // Confidence = the winning class probability. If the head already output softmax
+            // probabilities (max ≤ 1, e.g. fast-plate-ocr CCT), use it directly; only softmax when
+            // the values are raw logits (max > 1, e.g. a CRNN). Double-softmaxing a probability output
+            // collapsed confidence to ~0.07 and would trip the OCR quality gates on good reads.
+            let conf = if max <= 1.0 {
+                max
+            } else {
+                let denom: f32 = (0..classes).map(|cls| (at(s, cls) - max).exp()).sum();
+                if denom > 0.0 { 1.0 / denom } else { 0.0 }
+            };
             text.push(ch);
-            confs.push(prob);
+            confs.push(conf);
         }
     }
     (text, confs)

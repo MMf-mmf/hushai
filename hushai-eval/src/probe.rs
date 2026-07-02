@@ -43,12 +43,12 @@ pub async fn probe(opts: ProbeOpts) -> Result<()> {
 
     let inj = inject::inject(&ctx, &media, &device, &meta.seed(), PROBE_BASE_NS, 2, None, &format!("probe-{}", opts.case))?;
     let ids = inj.segment_uuids()?;
-    let p = poll::wait_until_complete(&ctx, &meta, &ids, PROBE_BASE_NS).await?;
+    let p = poll::wait_until_complete(&ctx, &meta, &device, &ids, PROBE_BASE_NS).await?;
     if !p.settled {
         eprintln!("[probe] ⚠ processing did not fully settle (timed_out={}, errors={:?}); showing partial results", p.timed_out, p.errors);
     }
 
-    let obs = query::observe(&ctx, &device, PROBE_BASE_NS, inj.end_unix_nanos(), &modalities).await?;
+    let obs = query::observe(&ctx, std::slice::from_ref(&device), PROBE_BASE_NS, inj.end_unix_nanos(), &modalities).await?;
     print_report(&opts, &obs, &p, ids.len());
 
     let staging = write_draft(&ctx, &opts, &media, &obs)?;

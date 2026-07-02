@@ -1,0 +1,12 @@
+{
+  "plates": {
+    "expected": [
+      {
+        "text": "EMD774",
+        "text_norm": "EM0774",
+        "min_reads": 1
+      }
+    ],
+    "max_norm_edit_distance": 1
+  }
+}

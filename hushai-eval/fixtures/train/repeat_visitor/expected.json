@@ -1,0 +1,43 @@
+{
+  "transcript": {
+    "full_text": "This is the front door camera. A package delivery arrived on Monday morning and the courier left it by the gate. This is the garage camera. The delivery truck came back on Tuesday afternoon to drop off a second parcel.",
+    "max_wer": 0.35,
+    "min_similarity": 0.65
+  },
+  "chat": {
+    "similarity_floor": null,
+    "judge_enabled": false,
+    "questions": [
+      {
+        "ask": "What do the recordings say about the delivery?",
+        "expect_routed_agent": "recordings",
+        "must_contain": [
+          "delivery"
+        ],
+        "min_citations": 1,
+        "reference_answer": "The recordings mention a package delivery: one arrived Monday morning and was left by the gate, and a delivery truck returned Tuesday afternoon with a second parcel."
+      },
+      {
+        "ask": "What do the recordings say about the stock market?",
+        "must_contain": [
+          "don't have"
+        ],
+        "must_not_contain": [
+          "rose",
+          "fell",
+          "nasdaq",
+          "dow jones"
+        ],
+        "reference_answer": "I don't have information about the stock market in the recordings."
+      },
+      {
+        "ask": "On how many separate days did a delivery happen, according to the recordings?",
+        "expect_number": 2,
+        "must_not_contain": [
+          "don't have",
+          "no information"
+        ]
+      }
+    ]
+  }
+}

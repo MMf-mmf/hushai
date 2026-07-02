@@ -1,0 +1,17 @@
+{
+  "case_id": "plate_ocr",
+  "description": "PD Auckland street photo (Wikimedia), cropped to a full car + readable plate 'EMD774'; recipe in fetch_eval_clips.sh. Locks the ALPR lane end-to-end: RF-DETR vehicle ROI -> YOLOv9-t plate detect (end2end) -> fast-plate-ocr CCT (uint8) -> normalize/mint. Plate lane only.",
+  "device_id": "eval-plate-ocr",
+  "media_file": "media.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "plates"
+  ],
+  "tier": "full",
+  "poll": {
+    "timeout_secs": 180,
+    "interval_secs": 2
+  }
+}

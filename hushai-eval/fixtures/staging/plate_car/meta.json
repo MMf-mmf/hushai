@@ -1,0 +1,18 @@
+{
+  "base_capture_unix_nanos": 1781784000000000000,
+  "case_id": "plate_car",
+  "description": "probed from /private/tmp/claude-501/-Users-mf-Documents-Rust-Code-Rig-AI-Agent/81c81b55-2823-4f55-b22f-e40883e7ab77/scratchpad/car_clip.mp4",
+  "device_id": "eval-plate_car",
+  "media_file": "media.mp4",
+  "media_kind": "muxed",
+  "modalities": [
+    "transcript",
+    "events"
+  ],
+  "poll": {
+    "interval_secs": 2,
+    "timeout_secs": 180
+  },
+  "seg_seconds": 2,
+  "tier": "full"
+}

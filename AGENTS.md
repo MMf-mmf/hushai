@@ -546,16 +546,22 @@ shared core in `hushai-worker/src/vision/`:
   Migration **`0013_license_plates.sql`**: `license_plates` catalog (pg_trgm + fuzzystrmatch, unique
   `plate_text_norm`) + monthly-partitioned `plate_detections`. `ensure_plate_detection_partitions` is
   called at worker startup.
-  - **Provisioning state (2026-06-30):** OCR is **provisioned + decode-validated**. `export_plate_ocr.py`
-    (adapted to fast-plate-ocr ≥2.x: `LicensePlateRecognizer` + `inference.hub.download_model`) writes
-    `models/lp_ocr_cct.onnx` (NHWC `[1,64,128,3]` → `[1,9,37]`) + `lp_ocr_charset.json` (36 chars, pad `_`
-    omitted so class 36 = the blank/pad). The fast-plate-ocr CCT head is **fixed-length** (9 slots), NOT
-    CTC — `ocr.rs` now has a `PLATE_OCR_CTC` knob (**default false**) that disables duplicate-collapse so
-    real double letters ("BB1234") survive; CRNN/PaddleOCR sets it true. Decode is `greedy_decode` (pure +
-    unit-tested). **Remaining blocker: the plate DETECTOR.** It needs an operator-authorized model
-    (`PLATE_DETECTOR_ONNX_URL` → `fetch_plate_detector.sh`, or a `yolo export`'d YOLOv8/11 LP `.pt`);
-    auto-loading a 3rd-party `.pt` is blocked (pickle RCE) and is a licensing call. Validate any detector
-    with `cargo test -p hushai-worker --test vision_pipeline inspect_plate_model_io_shapes` (now exists).
+  - **✅ ALPR WORKING END-TO-END (2026-07-01), verified.** Provision: `fetch_plate_detector.sh` (default =
+    open-image-models **`yolo-v9-t-640-license-plate`, MIT**, a plain ONNX so no pickle-RCE) → `lp_detector.onnx`;
+    `export_plate_ocr.py` (fast-plate-ocr ≥2.x `LicensePlateRecognizer` + `inference.hub.download_model`) →
+    `lp_ocr_cct.onnx` + `lp_ocr_charset.json`. Verified on a real plate: detect conf ~0.90 → OCR read
+    "EMD774" (exact) → minted. Load-bearing decode facts baked into `detect.rs`/`ocr.rs`:
+    (1) the detector is **END2END** — output `[N,7] = [batch,x1,y1,x2,y2,class,score]`, NMS baked in, coords
+    in the letterboxed 640 space (**`PLATE_DETECT_END2END=true`**, the default); `detect.rs` also still
+    decodes raw YOLOv8/11 `[C,N]` cxcywh [+4 corner kpts] when false. Preprocessing is **centered 114-gray
+    letterbox** (Ultralytics/YOLOv9), unpadded via dw/dh. (2) the OCR input dtype is **UINT8** (raw 0-255 —
+    fast-plate-ocr normalizes internally); `ocr.rs` auto-detects the ONNX input element type and feeds u8
+    vs f32 accordingly (feeding f32 to the u8 model made ORT reject the run). (3) the CCT head is
+    fixed-length (9 slots), softmax-probability output — `PLATE_OCR_CTC=false` (default; no duplicate-collapse)
+    and confidence = the max prob (do NOT re-softmax). `PLATE_DETECT_WHOLE_FRAME=true` also scans the whole
+    frame (not just RF-DETR vehicle ROIs) so an imperfect car box can't hide a plate. Inspect I/O:
+    `cargo test -p hushai-worker --test vision_pipeline inspect_plate_model_io_shapes`; decode-check a photo:
+    `PLATE_TEST_IMAGE=x.jpg cargo test … detect_plates_on_test_image`.
 - **Surfaces:** backend `plates.rs` (`GET /v1/plates`, `/v1/plates/search?q=`, `PATCH`, `merge`,
   `sample-crop`); RAG **Plates agent** (`AgentKind::Plates`, `resolve_plate*` + `list_by_plate`) answers
   *"when did I see plate ABC123"*; viewer **🚗 Plates** modal (`ui/js/settings/plates.js` + proxy
@@ -901,6 +907,18 @@ file-injection tier (the regression backbone + agent inner-loop); a physical cam
 **Agent playbook (read this to USE the loop): `hushai-eval/RECURSIVE_TESTING.md`** — bring-up, the
 validate-a-change inner loop, the labeling flow, trust invariants, and gotchas. Quick reference: `hushai-eval/README.md`.
 
+- **RAG-CHAT ANSWER scoring (2026-07-01):** the harness now also scores the RAG chat ANSWER (the
+  PI-workflow layer), not just perception. A fixture with the `chat`/`rag` modality carries
+  `Expected.chat.questions[]`; the harness POSTs each to the live `/v1/rag/chat`, parses the SSE, and
+  scores deterministic-first assertions (`must_contain`/`must_not_contain`/`expect_number`/
+  `expect_routed_agent`/`min_citations`/`citation_must_attribute`) + Info-only cosine/judge. Multi-clip
+  `Meta.injections[]` stage a subject across days/cameras. `physical_loopback.py --scenario <case>` runs
+  the same questions over phone capture (tolerant). Determinism: `RAG_LLM_TEMPERATURE=0`+`RAG_LLM_SEED`.
+  This drove RAG fixes now LIVE: `hushai-rag/src/presence.rs` (deterministic count/first-last/rhythm for
+  people/objects/plates so the LLM narrates a computed figure, not a capped-list guess), the SSE `session`
+  event now carries `routed_agent_id`, a deterministic co-occurrence enumeration, and `RAG_QUERY_CONDENSE`
+  multi-turn follow-up condensation (`chat.rs`/`llm.rs`). Fixtures: `repeat_visitor`, `money_talk`. Full
+  findings + open items (Objects CLIP recall, named-person co-presence, F7 events agent) in RECURSIVE_TESTING.md §6.
 - **Run:** `cargo run -p hushai-eval -- run --tier {fast|full} [--fixtures train|holdout|all]
   [--update-baseline] [--json]`. Requires the stack pointed at the **`hushai_test`** DB with the
   determinism profile `local_dev/eval.env` (`./local_dev/run_stack.sh --test-db`). The harness

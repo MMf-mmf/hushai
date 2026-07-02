@@ -299,6 +299,9 @@ pub struct WorkerConfig {
     pub plate_ocr_charset_path: String,
     /// Square input side of the plate detector (letterboxed). Validate at provisioning.
     pub plate_detect_input_size: usize,
+    /// Plate-detector output layout: true = END2END (open-image-models YOLOv9 `[N,7]` xyxy, NMS baked
+    /// in — the default provisioned model), false = raw YOLOv8/11 `[C,N]` cxcywh [+ corner keypoints].
+    pub plate_detect_end2end: bool,
     /// Plate-detector confidence floor.
     pub plate_min_det_score: f32,
     /// Drop plates whose smaller side (original-frame px) is below this.
@@ -590,6 +593,7 @@ impl WorkerConfig {
             plate_ocr_ctc: parse("PLATE_OCR_CTC", "false")?,
             plate_ocr_charset_path: opt("PLATE_OCR_CHARSET_PATH", "./models/lp_ocr_charset.json"),
             plate_detect_input_size: parse("PLATE_DETECT_INPUT_SIZE", "640")?,
+            plate_detect_end2end: parse("PLATE_DETECT_END2END", "true")?,
             plate_min_det_score: parse("PLATE_MIN_DET_SCORE", "0.35")?,
             plate_min_px: parse("PLATE_MIN_PX", "16.0")?,
             plate_min_ocr_conf: parse("PLATE_MIN_OCR_CONF", "0.55")?,

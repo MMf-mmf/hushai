@@ -51,6 +51,7 @@ echo "[done] regenerated real-audio fixture media under $FX"
 # case | source image URL (PD, Wikimedia) | duration secs
 VISION_CLIPS=(
   "car_object|https://upload.wikimedia.org/wikipedia/commons/1/18/Public_domain_image_-_Peugeot_iOn_electric_car_in_front_of_wind_turbines.JPG|6"
+  "face_id|https://commons.wikimedia.org/wiki/Special:FilePath/Judith%20A.%20Resnik,%20official%20portrait%20(cropped).jpg|6"
 )
 FPS=25
 for row in "${VISION_CLIPS[@]}"; do
@@ -71,3 +72,23 @@ for row in "${VISION_CLIPS[@]}"; do
 done
 
 echo "[done] regenerated vision fixture media under $FX"
+
+# --- PLATE (ALPR) fixture: crop a full car + readable plate from a PD street photo, into a muxed clip.
+# The crop keeps the WHOLE car so RF-DETR boxes it (the plate lane runs inside vehicle ROIs), with the
+# plate 'EMD774' large enough to OCR. Coords are for the 5184x3456 source; adjust if the source changes.
+PLATE_CASE="plate_ocr"
+PLATE_URL="https://commons.wikimedia.org/wiki/Special:FilePath/Cars_in_traffic_in_Auckland,_New_Zealand_-_copyright-free_photo_released_to_public_domain.jpg"
+PLATE_CROP="crop=1100:900:3950:2450"
+pdest="$FX/$PLATE_CASE"
+if [[ -d "$pdest" ]]; then
+  psrc="$CACHE/$PLATE_CASE.jpg"
+  [[ -s "$psrc" ]] || { echo "[fetch] $PLATE_CASE ← $PLATE_URL"; curl -fSL -m 180 -o "$psrc" "$PLATE_URL"; }
+  echo "[plate] $PLATE_CASE → $pdest/media.mp4"
+  ffmpeg -y -loglevel error -loop 1 -i "$psrc" -f lavfi -i "anullsrc=r=16000:cl=mono" \
+    -vf "${PLATE_CROP},scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
+    -t 6 -r 5 -map 0:v -map 1:a -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -shortest \
+    "$pdest/media.mp4"
+  echo "[done] regenerated plate fixture media under $FX"
+else
+  echo "[skip] $PLATE_CASE — no fixture dir (ground truth not committed?)"
+fi

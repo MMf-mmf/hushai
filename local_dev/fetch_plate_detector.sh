@@ -4,22 +4,27 @@
 # car/truck/bus/motorcycle) and emits plate boxes — ideally with 4 corner keypoints so the plate can
 # be perspective-RECTIFIED (deskewed) before OCR.
 #
-# detect.rs is a defensive YOLOv8/YOLO11-style decoder: it reads the largest 2-D output [C,N]/[N,C],
-# takes channels 0..4 as cx,cy,w,h (model-input px), channel 4 as confidence, and — when there are
-# >=8 trailing channels — the next four (x,y[,vis]) groups as plate corners. Validate the real export:
+# DEFAULT MODEL (2026-07-01): open-image-models `yolo-v9-t-640-license-plate` — a lightweight YOLOv9-t
+# plate detector, **MIT-licensed** (clean for a shipped product), that pairs natively with our
+# fast-plate-ocr CCT recognizer (same author, ankandrew). Verified end-to-end: detects at conf ~0.90,
+# reads real plates correctly. It is an END2END export: output `[N,7] = [batch,x1,y1,x2,y2,class,score]`
+# (NMS baked in) — so run the worker with PLATE_DETECT_END2END=true (the default). It is bbox-only (no
+# corner keypoints → axis-aligned crop, no deskew), which the fast-plate-ocr CCT handles fine.
+#
+# detect.rs decodes BOTH end2end ([N,7] xyxy) and raw YOLOv8/11 ([C,N] cxcywh [+ 4 corner keypoints];
+# set PLATE_DETECT_END2END=false). A 4-keypoint pose model would additionally enable rectification.
+# Validate any model against the real export:
 #   cargo test -p hushai-worker --test vision_pipeline inspect_plate_model_io_shapes -- --nocapture
 #
-# Default PLATE_DETECT_MODEL_PATH = models/lp_detector.onnx. A 4-keypoint (pose) plate model enables
-# true rectification; a bbox-only model still works (axis-aligned crop, no deskew).
-#
-# LICENSE: prefer a permissively-licensed plate detector. Ultralytics-derived weights are AGPL — fine
-# for personal/research, a copyleft obligation for a shipped product (this repo's posture is
-# best-accuracy-any-license: weights gitignored under models/, code path MIT). Document your source.
+# Default PLATE_DETECT_MODEL_PATH = models/lp_detector.onnx. Override PLATE_DETECTOR_ONNX_URL to fetch
+# a different model (e.g. a larger yolo-v9-s-608, or an AGPL Ultralytics export — your licensing call).
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEST="$ROOT/models/lp_detector.onnx"
-URL="${PLATE_DETECTOR_ONNX_URL:-}"
+# MIT-licensed default; a plain ONNX (no pickle) so it's safe to fetch + load.
+DEFAULT_URL="https://github.com/ankandrew/open-image-models/releases/download/assets/yolo-v9-t-640-license-plates-end2end.onnx"
+URL="${PLATE_DETECTOR_ONNX_URL:-$DEFAULT_URL}"
 
 if [ -f "$DEST" ]; then
   echo "Plate detector already present at: $DEST"

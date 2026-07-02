@@ -19,7 +19,9 @@ sqlx = { version = "0.9", features = [
     "json",
 ] }
 # HTTP: read APIs (/v1/speakers|persons|plates|events), RAG (/v1/rag/query), enroll PATCH.
-reqwest = { version = "0.12", features = ["json"] }
+# `stream` for the SSE body of /v1/rag/chat (query_rag.rs consumes bytes_stream()).
+reqwest = { version = "0.12", features = ["json", "stream"] }
+futures-util = "0.3"   # StreamExt for consuming the reqwest byte stream
 
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }

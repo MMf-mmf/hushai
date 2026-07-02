@@ -20,7 +20,9 @@ import java.io.FileOutputStream
  * scanning the directory on startup. The buffer is bounded by BYTES (a user cap +
  * a device-free safety floor), not a segment count: on overflow we drop the OLDEST
  * (deleting both files) and remember its stream so the next surviving segment on that
- * stream declares `gap_before` — an honest gap instead of a silent loss.
+ * stream declares `gap_before` — an honest gap instead of a silent loss. The user cap is
+ * adjustable at runtime via [setMaxBytes] (the Settings "Max local storage" control), which
+ * applies to the LIVE buffer with no capture restart — lowering it evicts oldest immediately.
  *
  * Thread-safety: a single lock. The capture/import threads
  * [offer]; the uploader thread [peek]/[remove]/[quarantine]. [recover] runs once on the
@@ -30,7 +32,7 @@ import java.io.FileOutputStream
 class DurableSegmentBuffer(
     private val segmentDir: File,
     private val quarantineDir: File,
-    private val maxBytes: Long,
+    private var maxBytes: Long,
     private val minFreeBytesFloor: Long,
     private val identity: DeviceIdentity,
     /** SHA re-verify on recovery is expensive and the body is immutable once
@@ -82,6 +84,12 @@ class DurableSegmentBuffer(
         // 1. Reap incomplete sidecar writes.
         var reaped = 0
         for (f in files) if (f.name.endsWith(MANIFEST_TMP_SUFFIX)) { if (f.delete()) reaped++ }
+        // Also reap orphaned encoder/import scratch bodies in the incoming/ subdir: a hard kill
+        // (OOM/force-stop/reboot) mid-mux leaves an open .mp4 there that normal completion would have
+        // renamed out and abort() would have deleted. recover() previously scanned only segmentDir, so
+        // nothing reaped these and the byte cap couldn't see them — a cumulative leak on an always-on
+        // device. Any file in incoming/ at startup is by definition an un-finalized orphan.
+        File(segmentDir, "incoming").listFiles()?.forEach { if (it.isFile && it.delete()) reaped++ }
 
         val bodies = HashMap<String, File>()      // stem -> body
         val sidecars = HashMap<String, File>()     // stem -> sidecar
@@ -163,11 +171,7 @@ class DurableSegmentBuffer(
         // Enforce the bound by evicting oldest entries until the incoming fits.
         var evicted = 0
         while (queue.isNotEmpty() && !fits(incoming)) {
-            val oldest = queue.entries.iterator().next().value
-            deleteEntryFiles(oldest)
-            queue.remove(oldest.segmentId)
-            totalBytes -= oldest.byteLen
-            gapPending.add(oldest.streamId)
+            evictOldestLocked()
             evicted++
         }
         // The lone incoming segment still won't fit on an empty buffer — drop it.
@@ -217,6 +221,25 @@ class DurableSegmentBuffer(
         OfferResult.Stored(evicted)
     }
 
+    /**
+     * Change the disk byte cap at runtime (the user setting). Takes effect immediately
+     * on the LIVE buffer — no capture restart. If the new cap is below what's already
+     * buffered, evicts the OLDEST segments right now (each marking a `gap_before` on its
+     * stream, exactly like an overflow) to reclaim disk. Returns the number evicted.
+     */
+    fun setMaxBytes(newMax: Long): Int = synchronized(lock) {
+        maxBytes = newMax
+        var evicted = 0
+        while (queue.isNotEmpty() && totalBytes > maxBytes) {
+            evictOldestLocked()
+            evicted++
+        }
+        evicted
+    }
+
+    /** The current byte cap in effect. */
+    fun maxBytes(): Long = synchronized(lock) { maxBytes }
+
     /** Head of the queue (oldest by capture time) to attempt next, or null. */
     fun peek(): Entry? = synchronized(lock) { queue.entries.firstOrNull()?.value }
 
@@ -259,6 +282,16 @@ class DurableSegmentBuffer(
         // Keep minFreeBytesFloor free on the volume AFTER writing this segment.
         if (segmentDir.usableSpace - incoming < minFreeBytesFloor) return false
         return true
+    }
+
+    /** Drop the single oldest queued segment: delete its files, adjust accounting, and
+     *  flag a `gap_before` on its stream. Caller holds [lock] and ensures a non-empty queue. */
+    private fun evictOldestLocked() {
+        val oldest = queue.entries.iterator().next().value
+        deleteEntryFiles(oldest)
+        queue.remove(oldest.segmentId)
+        totalBytes -= oldest.byteLen
+        gapPending.add(oldest.streamId)
     }
 
     private fun deleteEntryFiles(e: Entry) {

@@ -19,6 +19,14 @@ pub struct RagConfig {
     pub embed_model: String,
     /// Chat model used to synthesize the grounded answer.
     pub rag_llm_model: String,
+    /// LLM sampling temperature applied to EVERY Rig agent build (answer, chat, reflection, and —
+    /// most importantly — the auto-router `classify_agent`). Default 0.0 = greedy decode, so routing
+    /// and answers are reproducible run-to-run; this is what lets the eval harness gate on RAG
+    /// answers/routing without flaking. Raise for production if more varied phrasing is wanted.
+    pub rag_llm_temperature: f64,
+    /// Optional Ollama sampling seed (passed as `options.seed`). Belt-and-suspenders with temp 0 for
+    /// determinism. `None` -> Ollama's default (nondeterministic seed).
+    pub rag_llm_seed: Option<i64>,
     /// Address/port the HTTP server binds to.
     pub bind_addr: SocketAddr,
     /// Optional native TLS (`RAG_TLS_CERT_PATH`/`RAG_TLS_KEY_PATH`, falling back to the
@@ -43,6 +51,12 @@ pub struct RagConfig {
     pub chat_history_turns: i64,
     /// Reject chat messages longer than this (defensive; mirrors the TTS char guard).
     pub chat_max_message_chars: usize,
+    /// Multi-turn query CONDENSATION (flaw F4): on a follow-up turn, rewrite the latest message into
+    /// a STANDALONE query (carrying the subject + resolving relative time from the prior turns) BEFORE
+    /// routing + retrieval — otherwise "…and the week before?" re-embeds bare, loses the entity, and
+    /// mis-routes. Default on; the rewrite runs at temp 0 (deterministic) and returns the message
+    /// unchanged when it's already standalone. Env `RAG_QUERY_CONDENSE`.
+    pub query_condense: bool,
 
     /// Reflection agent — owner identity for the "how have *I* been" case. `OWNER_SPEAKER_ID`
     /// (a speaker uuid as text) wins; else `OWNER_SPEAKER_NAME` is resolved against the
@@ -122,6 +136,13 @@ impl RagConfig {
             // extractive grounding the answer paths need — the small llama3.2:3b would embellish
             // attribution answers with sightings not in the sources. Override with RAG_LLM_MODEL.
             rag_llm_model: opt("RAG_LLM_MODEL", "qwen2.5:7b"),
+            rag_llm_temperature: parse("RAG_LLM_TEMPERATURE", "0.0")?,
+            rag_llm_seed: std::env::var("RAG_LLM_SEED")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().parse::<i64>())
+                .transpose()
+                .map_err(|e| anyhow!("env var RAG_LLM_SEED is invalid: {e}"))?,
             bind_addr: parse("RAG_BIND_ADDR", "0.0.0.0:8090")?,
             tls: hushai_backend::tls::TlsPaths::from_env("RAG_")?,
             top_k_default: parse("RAG_TOP_K_DEFAULT", "8")?,
@@ -131,6 +152,7 @@ impl RagConfig {
             rag_token,
             chat_history_turns: parse("RAG_CHAT_HISTORY_TURNS", "8")?,
             chat_max_message_chars: parse("RAG_CHAT_MAX_MESSAGE_CHARS", "4000")?,
+            query_condense: parse("RAG_QUERY_CONDENSE", "true")?,
             owner_speaker_id: std::env::var("OWNER_SPEAKER_ID")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),

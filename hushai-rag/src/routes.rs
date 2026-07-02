@@ -400,6 +400,29 @@ fn normalize_object_label(query: &str) -> Option<String> {
     None
 }
 
+/// Scan a free-text QUESTION (a whole sentence) for a COCO object class, checking bigrams first
+/// (so "wine glass"/"cell phone"/"stop sign" win over their parts) then unigrams. Used by the chat
+/// Objects arm to answer "how many times did I see a car" from the deterministic presence rollup —
+/// `normalize_object_label` alone only resolves a query that IS the object phrase, not a sentence.
+pub(crate) fn find_object_class_in_query(query: &str) -> Option<String> {
+    let lower = query.to_lowercase();
+    let words: Vec<&str> = lower
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    for w in words.windows(2) {
+        if let Some(l) = normalize_object_label(&format!("{} {}", w[0], w[1])) {
+            return Some(l);
+        }
+    }
+    for w in &words {
+        if let Some(l) = normalize_object_label(w) {
+            return Some(l);
+        }
+    }
+    None
+}
+
 /// Shown when "who was I with" can't resolve the owner (no request person, no configured owner).
 pub(crate) const PEOPLE_NO_OWNER: &str = "I'm not sure which face is yours yet. Open the People screen, name your own face, and set \
      OWNER_PERSON_NAME so I can tell who you were with — then ask me again.";

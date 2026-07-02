@@ -42,8 +42,14 @@ ignored; capture/upload unaffected throughout.
   retain + backoff. **Never deletes a local copy on a non-`200`.**
 - **Always-on `CaptureService`** — foreground service typed `camera|microphone`,
   `START_STICKY`, partial wakelock; survives screen-off, backgrounding, Activity death.
-- **Bounded retry buffer** (in-memory + file spill); overflow drops oldest and sets
-  `gap_before=true` on the next surviving segment of that stream.
+- **Crash-durable store-and-forward buffer** (`DurableSegmentBuffer`): each undelivered
+  segment persists as a `<segmentId>.mp4` body + a `.manifest` sidecar (the verbatim
+  re-upload payload) under `noBackupFilesDir/segments/`, rebuilt by `recover()` on startup
+  so buffered footage survives process death / reboot and replays on reconnect
+  (oldest-first). Bounded by a **user-configurable, live-adjustable byte cap** (see
+  "Offline store-and-forward" below) plus a device-free safety floor; on overflow it drops
+  the **oldest** segment and sets `gap_before=true` on the next surviving segment of that
+  stream (an honest gap, never a silent loss).
 - **Compose UI** + **headless Intent-extra control** (`url`/`token`/`rag_url`/`autostart`/
   `stop`/`audio_only`).
 
@@ -167,6 +173,34 @@ on-device owner voice-ID used by the assistant (§ Speaker verification below). 
 
 All `SpeakersClient` calls are blocking OkHttp run off the main thread (org.json + bearer, mirrors
 `RagClient`); failures degrade to an empty list / no-op.
+
+### 8. Offline store-and-forward + configurable storage cap
+
+When the backend is unreachable the client keeps capturing and **buffers segments locally**,
+then drains them (oldest-first) automatically on reconnect — nothing is lost to a transient
+outage. The buffer is `DurableSegmentBuffer` (crash-durable `<segmentId>.mp4` + `.manifest`
+sidecar pairs under `noBackupFilesDir/segments/`, rebuilt by `recover()` on startup).
+
+- **How much is kept is user-controllable** — the **"Max local storage (GB)"** field in
+  **Debug / Advanced** sets the byte cap (`Settings.disk_cap_bytes`, default **2 GB**). Once
+  buffered footage reaches the cap the **oldest** segment is dropped (flagging `gap_before` on
+  that stream) to make room; a device-free safety floor (`MIN_FREE_BYTES_FLOOR`, 500 MB) is
+  always preserved on the volume regardless of the cap.
+- **The cap applies live** — tapping **Set** takes effect on a *running* capture with no
+  restart: `MainActivity.onDiskCapChange` persists it to DataStore **and** pushes it to the
+  service (`LocalBinder.updateDiskCap` → `CaptureService.updateDiskCap` →
+  `DurableSegmentBuffer.setMaxBytes`). **Lowering** the cap below what's already buffered evicts
+  the oldest segments immediately to reclaim disk (flagging gaps); **raising** it just grants
+  more headroom. (The value is `@Volatile`/lock-guarded; the binder call runs off the main
+  thread. Covered by `DurableSegmentBufferTest.set_max_bytes_*`.)
+- **Sizing guidance** — video dominates: `cam0-video` is ~1.8 MB per ~2 s segment
+  (≈ **3.2 GB/hour**), so a 2 GB cap holds only ~37 min of continuous *video* before it starts
+  dropping the oldest (audio-only is far lighter — hours per GB). Raise the cap to survive longer
+  outages; e.g. a multi-hour disconnect at the 2 GB default will keep only the most recent
+  ~37 min of video and evict the rest.
+- **Status/UI** — an "▲ Offline — storing locally" banner (with buffered count / duration /
+  bytes) while offline, and "↑ Reconnected — uploading backlog" while draining. The status card
+  shows live **Buffered**, **Disk free**, and **Local cap**.
 
 ---
 
@@ -298,7 +332,7 @@ app/src/main/kotlin/com/hushai/android/
     NetworkMonitor.kt          ConnectivityManager callback (validated link up/down)                 [new]
     ConnectivityState.kt       fuses link + upload outcomes + probe -> offline/draining/online       [new]
     Uploader / UploadOutcome / Reachability / Http.kt   (Http.kt adds a long-timeout `rag` client)  [+rag]
-  config/{Settings,DeviceIdentity}.kt   DataStore: url/token/device_id + wake_word/rag_url/enabled/owner_embedding
+  config/{Settings,DeviceIdentity}.kt   DataStore: url/token/device_id + audio_only + disk_cap_bytes (live) + wake_word/rag_url/enabled/owner_embedding
   util/{AssistantBus,Status,HushaiLog,Uuid7,Sha,Format}.kt    status buses; HUSHAI_TX logging; UUIDv7; SHA-256; byte/duration formatting
 app/src/main/res/xml/device_admin.xml   force-lock policy
 app/src/main/assets/vosk/{model-en,model-spk}/   Vosk models (GITIGNORED; fetch via script)
@@ -386,7 +420,8 @@ returns adbd to USB-only listening afterward.
   centroid; `SPEAKER_THRESHOLD` (0.50) is the accept/reject knob.
 - **RAG is stateless single-turn** — no conversation memory across questions.
 - **No TLS; `RAG_TOKEN` unset** — fine for local dev, must change for any network use.
-- Capture fast-follows still open: crash-durable on-disk retry queue, Doze/OEM battery
-  hardening, the shared-proto golden-vector CI check.
+- Capture fast-follows still open: Doze/OEM battery hardening, the shared-proto
+  golden-vector CI check. (The crash-durable on-disk store-and-forward buffer — with a
+  user-configurable, live-adjustable storage cap — is now **done**; see Features § 8.)
 - See `../Issues/` for the broader roadmap (speaker/sentiment attribution, face/emotion,
   rolling-window ASR conversation grouping).
