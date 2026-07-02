@@ -332,14 +332,18 @@ tolerantly over real capture. Files: `hushai-eval/src/{fixtures,query_rag,score,
   returned "did not see" though laptop=3 in the DB (full-sentence CLIP text embeds poorly). The COUNT path
   (exact label) is unaffected. Candidate: use exact-class `list_by_object_class` for "when did I see a
   <COCO class>" too — but that drops modifiers ("red car"), so test carefully; do NOT fix blind.
-- ◐ **Named-person "was I with X?" (OPEN).** Routes to `list_by_person` (X's solo sightings), not a
-  co-presence check against the owner → can imply co-presence that didn't happen. Follow-up: add a
-  co-presence intersection when a co-occurrence query also names a person.
-- ☐ **F7 events/alerts agent (NOT BUILT).** No agent queries `events` (schema: event_type/severity/
-  subject_label/start_unix_nanos). Design: new `AgentKind::Events` + `retrieve::list_events` (time/type/
-  severity filters) + router category "events" + preamble, mirroring the Objects arm. Deferred: net-new
-  capability + the test DB only has `speech` events, so it can't be *carefully* tested yet — build with its
-  own scenario fixtures.
+- ✅ **Named-person "was I with X?" — FIXED.** `resolve_people_sources` now routes a co-occurrence
+  query that NAMES someone to `retrieve::list_co_presence_pair` (X's sightings only in segments where the
+  owner was ALSO present), not `list_by_person` (solos). Verified: "was I with Bob?"→"You were with Bob";
+  "was I with the Stranger?"→"I didn't see you with anyone" (Stranger was alone); no-name "who was I with"
+  still enumerates all.
+- ✅ **F7 events/alerts agent — BUILT.** New `AgentKind::Events` + `retrieve::list_events` (lane +
+  alerts-only severity filters) + router "events" category + persona; `llm::answer_events` narrates the
+  timeline, count-intent → deterministic count. Verified live (5 seeded events → "what happened" lists all
+  5; "any alerts?" → only the 2 warnings; "how many?" → 5) with router regression clean. Not wired into
+  the single-shot `/v1/rag/query` (chat auto-routes it). No eval fixture yet (events come from the worker
+  producer; add a scenario that injects event-producing media, or L1-seed the `events` table).
+- ◐ **Objects SEMANTIC recall false-negative (still OPEN)** — see above; the F1 count path is unaffected.
 
 ---
 
