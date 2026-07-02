@@ -57,16 +57,14 @@ fn cache_path(cache_dir: &Path, sha_hex: &str, variant: Variant) -> PathBuf {
         .join(format!("{sha_hex}.{}.ts", variant.suffix()))
 }
 
-/// LRU-evict the TS remux cache down to `max_bytes` (oldest mtime first). The cache is
-/// content-addressed derived data — safe to delete, regenerated on demand — and never self-evicts,
-/// so without this it grows unbounded on the same volume the disk watermark guards. Blocking (std::fs);
+/// LRU-evict the derived-data caches down to `max_bytes` (oldest mtime first): the TS remux
+/// cache plus the still-frame cache (stills.rs). Both are content-addressed derived data —
+/// safe to delete, regenerated on demand — and never self-evict, so without this they grow
+/// unbounded on the same volume the disk watermark guards. Blocking (std::fs);
 /// call via spawn_blocking. Returns (total_bytes_seen, bytes_freed). Best-effort: unreadable/undeletable
 /// entries are skipped.
 pub fn reap_cache(cache_dir: &Path, max_bytes: u64) -> std::io::Result<(u64, u64)> {
-    let ts_dir = cache_dir.join("ts");
-    if !ts_dir.exists() {
-        return Ok((0, 0));
-    }
+    let roots = [cache_dir.join("ts"), cache_dir.join("still")];
     fn walk(dir: &Path, files: &mut Vec<(PathBuf, u64, std::time::SystemTime)>, total: &mut u64) {
         let Ok(rd) = std::fs::read_dir(dir) else { return };
         for e in rd.flatten() {
@@ -81,7 +79,11 @@ pub fn reap_cache(cache_dir: &Path, max_bytes: u64) -> std::io::Result<(u64, u64
     }
     let mut files = Vec::new();
     let mut total = 0u64;
-    walk(&ts_dir, &mut files, &mut total);
+    for root in &roots {
+        if root.exists() {
+            walk(root, &mut files, &mut total);
+        }
+    }
     if total <= max_bytes {
         return Ok((total, 0));
     }
@@ -100,7 +102,7 @@ pub fn reap_cache(cache_dir: &Path, max_bytes: u64) -> std::io::Result<(u64, u64
 }
 
 /// `file:///abs/path` -> `/abs/path` (the backend always writes absolute `file://` URIs).
-fn blob_path(blob_uri: &str) -> anyhow::Result<PathBuf> {
+pub(crate) fn blob_path(blob_uri: &str) -> anyhow::Result<PathBuf> {
     let p = blob_uri
         .strip_prefix("file://")
         .ok_or_else(|| anyhow!("unsupported blob_uri scheme (expected file://): {blob_uri}"))?;
@@ -108,9 +110,9 @@ fn blob_path(blob_uri: &str) -> anyhow::Result<PathBuf> {
 }
 
 /// Removes a path on drop unless disarmed (RAII for temp inputs/outputs).
-struct TempPath(Option<PathBuf>);
+pub(crate) struct TempPath(pub(crate) Option<PathBuf>);
 impl TempPath {
-    fn disarm(&mut self) {
+    pub(crate) fn disarm(&mut self) {
         self.0 = None;
     }
 }
@@ -122,7 +124,7 @@ impl Drop for TempPath {
     }
 }
 
-async fn lookup_blob(
+pub(crate) async fn lookup_blob(
     pool: &PgPool,
     sha_hex: &str,
 ) -> ViewerResult<Option<(String, String, Option<Vec<u8>>, i64)>> {
@@ -216,25 +218,8 @@ async fn remux_to(
         .map_err(anyhow::Error::from)?;
 
     // fmp4 blobs are bare fragments — stage init+blob to a seekable temp mp4 first.
-    let needs_init = container.eq_ignore_ascii_case("fmp4");
-    let mut staged_input = TempPath(None);
-    let input_path: PathBuf = if needs_init {
-        let media = tokio::fs::read(&blob)
-            .await
-            .with_context(|| format!("reading blob {}", blob.display()))?;
-        let init_bytes = init.as_deref().unwrap_or_default();
-        let mut buf = Vec::with_capacity(init_bytes.len() + media.len());
-        buf.extend_from_slice(init_bytes);
-        buf.extend_from_slice(&media);
-        let tmp = parent.join(format!(".in-{sha_hex}-{}.mp4", Uuid::now_v7()));
-        tokio::fs::write(&tmp, &buf)
-            .await
-            .context("staging fmp4 input for ffmpeg")?;
-        staged_input = TempPath(Some(tmp.clone()));
-        tmp
-    } else {
-        blob.clone()
-    };
+    let (input_path, staged_input) =
+        stage_input(parent, sha_hex, &blob, &container, init.as_deref()).await?;
 
     let tmp_out = parent.join(format!(".out-{sha_hex}-{}.ts", Uuid::now_v7()));
     let mut out_guard = TempPath(Some(tmp_out.clone()));
@@ -285,4 +270,32 @@ async fn remux_to(
     out_guard.disarm(); // renamed away; nothing to clean
     drop(staged_input); // remove the fmp4 staging temp now
     Ok(())
+}
+
+/// Stage a blob as a seekable ffmpeg input (shared with stills.rs). `fmp4` blobs are bare
+/// `moof`+`mdat` fragments — prepend `codec_init_data` (`ftyp`+`moov`) into a temp mp4
+/// beside `parent`; `mp4` blobs pass through untouched. The returned guard removes any
+/// staged temp on drop.
+pub(crate) async fn stage_input(
+    parent: &Path,
+    sha_hex: &str,
+    blob: &Path,
+    container: &str,
+    init: Option<&[u8]>,
+) -> ViewerResult<(PathBuf, TempPath)> {
+    if !container.eq_ignore_ascii_case("fmp4") {
+        return Ok((blob.to_path_buf(), TempPath(None)));
+    }
+    let media = tokio::fs::read(blob)
+        .await
+        .with_context(|| format!("reading blob {}", blob.display()))?;
+    let init_bytes = init.unwrap_or_default();
+    let mut buf = Vec::with_capacity(init_bytes.len() + media.len());
+    buf.extend_from_slice(init_bytes);
+    buf.extend_from_slice(&media);
+    let tmp = parent.join(format!(".in-{sha_hex}-{}.mp4", Uuid::now_v7()));
+    tokio::fs::write(&tmp, &buf)
+        .await
+        .context("staging fmp4 input for ffmpeg")?;
+    Ok((tmp.clone(), TempPath(Some(tmp))))
 }

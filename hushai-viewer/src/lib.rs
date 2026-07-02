@@ -21,6 +21,7 @@ pub mod proxy;
 pub mod remux;
 pub mod routes;
 pub mod state;
+pub mod stills;
 pub mod timeline;
 
 use std::collections::HashMap;

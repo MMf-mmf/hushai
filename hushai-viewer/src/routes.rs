@@ -25,6 +25,7 @@ use crate::processing;
 use crate::proxy;
 use crate::remux::{self, Variant};
 use crate::state::ViewerState;
+use crate::stills;
 use crate::timeline;
 
 pub fn router(state: ViewerState) -> Router {
@@ -46,6 +47,10 @@ pub fn router(state: ViewerState) -> Router {
         .route("/api/devices/{device_id}/timeline", get(get_timeline))
         .route("/api/devices/{device_id}/detections", get(get_detections))
         .route("/api/devices/{device_id}/processing", get(get_processing))
+        // Still frames (ffmpeg single-frame extraction, cached like the TS remux):
+        // thumb.jpg backs the timeline hover preview, poster.jpg the camera-grid tiles.
+        .route("/api/devices/{device_id}/thumb.jpg", get(thumb_jpg))
+        .route("/api/devices/{device_id}/poster.jpg", get(poster_jpg))
         // Footage export (streamed MP4 download); viewer-owned (ffmpeg + blob cache), not proxied.
         .route("/api/devices/{device_id}/export.mp4", get(export::export_mp4))
         // System dashboard: cameras + background-process status (one aggregating payload).
@@ -268,6 +273,79 @@ async fn segment_ts(
         Variant::parse(variant_str).ok_or_else(|| ViewerError::BadRequest("bad variant".into()))?;
     let path = remux::ensure_ts(&state, sha, variant).await?;
     serve_ts(path).await
+}
+
+// --- still frames (hover thumbs + grid posters) ----------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct StillParams {
+    pub t: Option<i64>,
+}
+
+/// Timeline hover preview: the frame at wall-clock `t` (unix nanos). Content-addressed —
+/// the URL's `t` maps to an immutable segment, so long cache + ETag revalidation.
+async fn thumb_jpg(
+    State(state): State<ViewerState>,
+    Path(device_id): Path<String>,
+    Query(p): Query<StillParams>,
+    headers: axum::http::HeaderMap,
+) -> ViewerResult<Response> {
+    let t = p
+        .t
+        .ok_or_else(|| ViewerError::BadRequest("missing t (unix nanos)".into()))?;
+    let sha = stills::video_sha_at(&state.pool, &device_id, t)
+        .await?
+        .ok_or_else(|| ViewerError::NotFound("no video at that instant".into()))?;
+    serve_still(&state, &headers, &sha, stills::THUMB_W, "public, max-age=86400").await
+}
+
+/// Camera-grid tile: the newest frame (or the frame at `t` when given). "Latest" moves
+/// as footage arrives, so cache briefly and revalidate by ETag.
+async fn poster_jpg(
+    State(state): State<ViewerState>,
+    Path(device_id): Path<String>,
+    Query(p): Query<StillParams>,
+    headers: axum::http::HeaderMap,
+) -> ViewerResult<Response> {
+    let sha = match p.t {
+        Some(t) => stills::video_sha_at(&state.pool, &device_id, t).await?,
+        None => stills::latest_video_sha(&state.pool, &device_id).await?,
+    }
+    .ok_or_else(|| ViewerError::NotFound("no video for device".into()))?;
+    serve_still(&state, &headers, &sha, stills::POSTER_W, "private, max-age=5").await
+}
+
+async fn serve_still(
+    state: &ViewerState,
+    headers: &axum::http::HeaderMap,
+    sha: &str,
+    width: u32,
+    cache_control: &str,
+) -> ViewerResult<Response> {
+    let etag = format!("\"{sha}.{width}\"");
+    if headers
+        .get(header::IF_NONE_MATCH)
+        .and_then(|v| v.to_str().ok())
+        == Some(etag.as_str())
+    {
+        return Response::builder()
+            .status(axum::http::StatusCode::NOT_MODIFIED)
+            .header(header::ETAG, etag)
+            .header(header::CACHE_CONTROL, cache_control)
+            .body(Body::empty())
+            .map_err(|e| ViewerError::Internal(anyhow!(e)));
+    }
+    let path = stills::ensure_still(state, sha, width).await?;
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| ViewerError::Internal(anyhow!("reading cached still: {e}")))?;
+    Response::builder()
+        .header(header::CONTENT_TYPE, "image/jpeg")
+        .header(header::CONTENT_LENGTH, bytes.len())
+        .header(header::CACHE_CONTROL, cache_control)
+        .header(header::ETAG, etag)
+        .body(Body::from(bytes))
+        .map_err(|e| ViewerError::Internal(anyhow!(e)))
 }
 
 // --- file/response helpers -----------------------------------------------------
