@@ -620,6 +620,20 @@ pub(crate) async fn resolve_people_sources(
         ));
     }
     let mentioned = crate::persons::resolve_names_in_text(&st.pool, query).await?;
+    // "Was I with <name>?" — a co-occurrence question that NAMES someone → co-presence intersection
+    // (segments where the owner was ALSO present), not that person's solo sightings (which would
+    // imply togetherness that may not have happened). Needs the owner; declines if unset.
+    if is_co_occurrence_query(query) && !mentioned.is_empty() {
+        let owner = resolve_owner_person(st).await?;
+        if owner.is_empty() {
+            return Ok(PeopleSources::NeedsOwner);
+        }
+        let others: Vec<String> = mentioned.iter().map(|u| u.to_string()).collect();
+        return Ok(PeopleSources::Found(
+            retrieve::list_co_presence_pair(&st.pool, &owner, &others, device_id, after, before, limit)
+                .await?,
+        ));
+    }
     if !mentioned.is_empty() {
         let ids: Vec<String> = mentioned.iter().map(|u| u.to_string()).collect();
         return Ok(PeopleSources::Found(

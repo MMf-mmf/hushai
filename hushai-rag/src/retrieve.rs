@@ -627,6 +627,47 @@ pub async fn list_recent_persons(
     Ok(sources)
 }
 
+/// "Was I with <name>?" — the named person's sightings ONLY in segments where the OWNER was also
+/// present (co-presence intersection), one per shared segment, in time order. Empty ⇒ they were
+/// never together. Distinct from `list_by_person` (which returns the name's solo sightings and would
+/// mislead a "was I with X" question into implying co-presence).
+pub async fn list_co_presence_pair(
+    pool: &PgPool,
+    owner_person_ids: &[String],
+    other_person_ids: &[String],
+    device_id: Option<&str>,
+    after: Option<i64>,
+    before: Option<i64>,
+    limit: i64,
+) -> anyhow::Result<Vec<Source>> {
+    if owner_person_ids.is_empty() || other_person_ids.is_empty() {
+        return Ok(vec![]);
+    }
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
+        "SELECT DISTINCT ON (ps.segment_id) ps.segment_id, ps.device_id, ps.person_id, ps.start_unix_nanos \
+         FROM person_segments ps WHERE ps.person_id = ANY(",
+    );
+    qb.push_bind(other_person_ids.to_vec())
+        .push("::uuid[]) AND ps.start_unix_nanos IS NOT NULL AND ps.segment_id IN (\
+               SELECT o.segment_id FROM person_segments o WHERE o.person_id = ANY(")
+        .push_bind(owner_person_ids.to_vec())
+        .push("::uuid[]))");
+    if let Some(d) = device_id {
+        qb.push(" AND ps.device_id = ").push_bind(d.to_string());
+    }
+    if let Some(a) = after {
+        qb.push(" AND ps.start_unix_nanos >= ").push_bind(a);
+    }
+    if let Some(b) = before {
+        qb.push(" AND ps.start_unix_nanos < ").push_bind(b);
+    }
+    qb.push(" ORDER BY ps.segment_id, ps.start_unix_nanos ASC LIMIT ").push_bind(limit);
+    let rows = qb.build().fetch_all(pool).await?;
+    let mut sources = person_rows_to_sources(rows)?;
+    sources.sort_by_key(|s| s.start_unix_nanos);
+    Ok(sources)
+}
+
 /// A plain-language description of an event for grounding — no ids/raw values. The worker emits
 /// `speech` / `object_seen` / `plate_seen` / person events (known name or `unknown_person`) /
 /// `plate_of_interest` / `alert_rule`, with the specific thing in `subject_label`.

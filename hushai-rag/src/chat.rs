@@ -457,9 +457,9 @@ pub async fn rag_chat(
                         .unwrap_or_else(|| "That person".to_string());
                     precomputed_answer =
                         Some(crate::presence::render_presence(&summary, &label, now, tz));
-                } else if crate::routes::is_co_occurrence_query(&message) && !s.is_empty() {
-                    // "Who was I with": each source is one co-present person. The small LLM sometimes
-                    // drops one when listing several, so enumerate the distinct set deterministically.
+                } else if crate::routes::is_co_occurrence_query(&message) {
+                    // "Who/was I with": each source is a co-present person (empty = nobody). The small
+                    // LLM sometimes drops one when listing several, so enumerate deterministically.
                     let mut seen = std::collections::BTreeSet::new();
                     let mut who: Vec<String> = Vec::new();
                     for src in &s {
