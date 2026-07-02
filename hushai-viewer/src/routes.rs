@@ -24,6 +24,7 @@ use crate::playlist;
 use crate::processing;
 use crate::proxy;
 use crate::remux::{self, Variant};
+use crate::sentiment;
 use crate::state::ViewerState;
 use crate::stills;
 use crate::timeline;
@@ -47,6 +48,8 @@ pub fn router(state: ViewerState) -> Router {
         .route("/api/devices/{device_id}/timeline", get(get_timeline))
         .route("/api/devices/{device_id}/detections", get(get_detections))
         .route("/api/devices/{device_id}/processing", get(get_processing))
+        // Sentiment coverage (mood ribbon on the scrub bar).
+        .route("/api/devices/{device_id}/sentiment", get(get_sentiment))
         // Still frames (ffmpeg single-frame extraction, cached like the TS remux):
         // thumb.jpg backs the timeline hover preview, poster.jpg the camera-grid tiles.
         .route("/api/devices/{device_id}/thumb.jpg", get(thumb_jpg))
@@ -273,6 +276,26 @@ async fn segment_ts(
         Variant::parse(variant_str).ok_or_else(|| ViewerError::BadRequest("bad variant".into()))?;
     let path = remux::ensure_ts(&state, sha, variant).await?;
     serve_ts(path).await
+}
+
+async fn get_sentiment(
+    State(state): State<ViewerState>,
+    Path(device_id): Path<String>,
+    Query(p): Query<WindowParams>,
+) -> ViewerResult<Json<sentiment::SentimentResponse>> {
+    let from = p.from.unwrap_or(0);
+    let to = p.to.unwrap_or(i64::MAX);
+    // Same 6h clamp the playlists use, so an unbounded request can't run away.
+    let (from, to) = clamp_window(from, to, state.cfg.max_window_nanos);
+    let resp = sentiment::windowed_sentiment(
+        &state.pool,
+        &device_id,
+        from,
+        to,
+        state.cfg.processing_max_rows,
+    )
+    .await?;
+    Ok(Json(resp))
 }
 
 // --- still frames (hover thumbs + grid posters) ----------------------------------

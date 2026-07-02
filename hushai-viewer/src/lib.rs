@@ -20,6 +20,7 @@ pub mod processing;
 pub mod proxy;
 pub mod remux;
 pub mod routes;
+pub mod sentiment;
 pub mod state;
 pub mod stills;
 pub mod timeline;
