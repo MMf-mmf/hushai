@@ -1789,3 +1789,107 @@ button.link {
   height: auto;
   margin-top: 10px;
 }
+
+/* ============================ Shared primitives ============================ */
+/* Toasts (js/toast.js): one bottom-center stack on every page. */
+.toast-stack {
+  position: fixed;
+  left: 50%;
+  bottom: 24px;
+  transform: translateX(-50%);
+  z-index: var(--z-toast);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  pointer-events: none;
+  max-width: min(480px, calc(100vw - 32px));
+}
+.toast-item {
+  pointer-events: auto;
+  cursor: pointer;
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  color: var(--text);
+  padding: 10px 16px;
+  border-radius: 10px;
+  box-shadow: 0 6px 24px rgba(0, 0, 0, 0.4);
+  font-size: 13px;
+  max-width: 100%;
+  overflow-wrap: anywhere;
+  animation: toast-in 0.18s ease-out;
+  transition: opacity 0.18s ease-out, transform 0.18s ease-out;
+}
+.toast-item.leaving {
+  opacity: 0;
+  transform: translateY(6px);
+}
+.toast-item.is-error {
+  border-color: var(--bad);
+}
+.toast-item.is-success {
+  border-color: var(--ok);
+}
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Loading skeleton: apply to placeholder blocks while a section's first load runs. */
+.skeleton {
+  position: relative;
+  overflow: hidden;
+  background: var(--panel2);
+  border-radius: var(--radius-md);
+  min-height: 42px;
+}
+.skeleton::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.05), transparent);
+  animation: skeleton-sweep 1.4s infinite;
+}
+@keyframes skeleton-sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(100%);
+  }
+}
+
+/* Failed-section state (js/dom.js errorState): message + Retry inside the standard
+   .empty block. */
+.empty.is-error {
+  border-color: rgba(255, 93, 93, 0.4);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+}
+.empty.is-error .err-msg {
+  color: var(--sev-critical);
+}
+.empty.is-error button {
+  border: 1px solid var(--line);
+  border-radius: var(--radius-sm);
+  font-size: 13px;
+  padding: 5px 14px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .toast-item {
+    animation: none;
+    transition: none;
+  }
+  .skeleton::after {
+    animation: none;
+  }
+}
