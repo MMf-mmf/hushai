@@ -3,30 +3,16 @@
 
 import { getDashboard } from "../api.js";
 import { chartPalette, cssVar } from "../theme.js";
+import { el, renderBanner } from "../dom.js";
+import { createPoller } from "../poll.js";
+import { initTopbar, setLive, setUpdated } from "../nav.js";
 
 const $ = (id) => document.getElementById(id);
 const REFRESH_MS = 6000; // matches the player page's refresh cadence
 
-let timer = null;
-let busy = false;
 let everLoaded = false;
 
-// ---- small DOM + format helpers -------------------------------------------
-
-function el(tag, props = {}, children = []) {
-  const node = document.createElement(tag);
-  for (const [k, v] of Object.entries(props)) {
-    if (k === "class") node.className = v;
-    else if (k === "html") node.innerHTML = v;
-    else if (k === "text") node.textContent = v;
-    else if (v != null) node.setAttribute(k, v);
-  }
-  for (const c of [].concat(children)) {
-    if (c == null) continue;
-    node.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
-  }
-  return node;
-}
+// ---- small format helpers --------------------------------------------------
 
 // "connected"/"up" -> green; "idle"/"degraded" -> amber; "offline"/"down" -> red; else grey.
 function statusClass(state) {
@@ -90,10 +76,11 @@ function freshestError(queues) {
 
 // ---- KPI tiles ------------------------------------------------------------
 
-function kpi(label, valueHtml, sub, klass) {
+// `value` is an el() child (string or node) or an array of them — never an HTML string.
+function kpi(label, value, sub, klass) {
   return el("div", { class: `kpi ${klass || ""}` }, [
     el("div", { class: "kpi-label", text: label }),
-    el("div", { class: "kpi-value", html: valueHtml }),
+    el("div", { class: "kpi-value" }, value),
     el("div", { class: "kpi-sub", text: sub || "" }),
   ]);
 }
@@ -106,7 +93,7 @@ function renderKpis(data) {
   const online = cs.connected + cs.idle;
   const camKlass = online === 0 ? (cs.total ? "down" : "unknown") : online === cs.total ? "up" : "degraded";
   root.appendChild(
-    kpi("Cameras online", `${online}<span class="unit">/ ${cs.total}</span>`,
+    kpi("Cameras online", [`${online}`, el("span", { class: "unit", text: `/ ${cs.total}` })],
       `${cs.connected} live · ${cs.idle} idle · ${cs.offline} offline`, camKlass),
   );
 
@@ -116,7 +103,7 @@ function renderKpis(data) {
   const bad = real.filter((s) => s.state === "down").length;
   const svcKlass = bad > 0 ? "down" : up === real.length ? "up" : "degraded";
   root.appendChild(
-    kpi("Services healthy", `${up}<span class="unit">/ ${real.length}</span>`,
+    kpi("Services healthy", [`${up}`, el("span", { class: "unit", text: `/ ${real.length}` })],
       bad > 0 ? `${bad} down` : "all systems go", svcKlass),
   );
 
@@ -403,41 +390,34 @@ function drawLoadtestChart(canvas, lt) {
 // ---- poll loop ------------------------------------------------------------
 
 async function refresh() {
-  if (busy || document.hidden) return;
-  busy = true;
   try {
     const data = await getDashboard();
     everLoaded = true;
     $("dashBanner").hidden = true;
-    $("liveDot").classList.add("live");
-    $("generatedAt").textContent = `updated ${fmtClock(data.generated_at)}`;
+    setLive(true);
+    setUpdated(`updated ${fmtClock(data.generated_at)}`);
     renderKpis(data);
     renderCameras(data.cameras || [], data.camera_summary);
     renderServices(data.services || []);
     renderQueues(data.queues || {});
     renderLoadtest(data.loadtest || null);
   } catch (e) {
-    $("liveDot").classList.remove("live");
-    $("generatedAt").textContent = "disconnected";
-    const banner = $("dashBanner");
-    banner.hidden = false;
-    banner.className = "dash-banner error";
-    banner.innerHTML = everLoaded
-      ? `Lost connection to the viewer — retrying every ${REFRESH_MS / 1000}s. <span class="muted">(${String(e.message || e)})</span>`
-      : `Couldn't load <b>/api/dashboard</b>. Make sure the viewer is running the latest build (restart <span class="mono">hushai-viewer</span>), then this page recovers automatically. <span class="muted">(${String(e.message || e)})</span>`;
-  } finally {
-    busy = false;
+    setLive(false);
+    setUpdated("disconnected");
+    // Text-only banner: e.message can echo server output and must never be parsed as HTML.
+    renderBanner($("dashBanner"), {
+      mode: "error",
+      message: everLoaded
+        ? `Lost connection to the viewer — retrying every ${REFRESH_MS / 1000}s.`
+        : "Couldn't load /api/dashboard. Make sure the viewer is running the latest build (restart hushai-viewer), then this page recovers automatically.",
+      detail: String(e.message || e),
+    });
   }
 }
 
-function start() {
-  refresh();
-  if (timer) clearInterval(timer);
-  timer = setInterval(refresh, REFRESH_MS);
-}
+// createPoller supplies the busy-guard, the hidden-tab pause, and the refocus refresh the old
+// setInterval + visibilitychange pair implemented. refresh() renders its own error state.
+const poller = createPoller(refresh, { intervalMs: REFRESH_MS });
 
-document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) refresh(); // refresh immediately on return; interval keeps running
-});
-
-start();
+initTopbar({ section: "system" });
+poller.start();

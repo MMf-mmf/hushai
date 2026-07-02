@@ -20,14 +20,16 @@ const HLS_CONFIG = {
 };
 
 export class Player {
-  constructor(videoEl, { onError } = {}) {
+  constructor(videoEl, { onError, onNotice } = {}) {
     this.video = videoEl;
     this.onError = onError || (() => {});
+    this.onNotice = onNotice || (() => {});
     this.hls = null;
     this.fragments = []; // {programDateTime (ms), start (s), duration (s)}
     this.pendingSeekMs = null;
     this.supported = !!(Hls && Hls.isSupported());
     this.nativeHls = !this.supported && videoEl.canPlayType("application/vnd.apple.mpegurl");
+    this._nativeNoticed = false; // reduced-accuracy notice shown at most once per instance
   }
 
   // Load a new master playlist (a device+window). Optionally seek once ready.
@@ -47,6 +49,10 @@ export class Player {
       hls.on(Hls.Events.LEVEL_UPDATED, (_e, data) => this._captureFragments(data));
       hls.on(Hls.Events.ERROR, (_e, data) => this._onHlsError(hls, data));
     } else if (this.nativeHls) {
+      if (!this._nativeNoticed) {
+        this._nativeNoticed = true;
+        this.onNotice("Native HLS playback: reduced seek accuracy");
+      }
       this.video.src = src;
       this.video.addEventListener("loadedmetadata", () => this._onReady(), { once: true });
     } else {
@@ -71,7 +77,7 @@ export class Player {
   }
 
   _onReady() {
-    if (this.pendingSeekMs != null && this.fragments.length) {
+    if (this.pendingSeekMs != null && (this.fragments.length || this.nativeHls)) {
       const ms = this.pendingSeekMs;
       this.pendingSeekMs = null;
       this.seekToWallClock(ms);
@@ -82,17 +88,48 @@ export class Player {
   // ---- the core: absolute wall-clock time -> media currentTime --------------
 
   seekToWallClock(targetMs) {
+    if (!Number.isFinite(targetMs)) return;
+    if (this.nativeHls) {
+      this._seekNativeWallClock(targetMs);
+      return;
+    }
     if (!this.fragments.length) {
       this.pendingSeekMs = targetMs; // applied on next LEVEL_LOADED
       return;
     }
-    const f = this._fragAt(targetMs) ?? this._nearestFrag(targetMs);
+    let f = this._fragAt(targetMs);
+    if (f && f.duration <= 0.05) f = null; // degenerate sliver — land on a real neighbor instead
+    if (!f) f = this._nearestFrag(targetMs);
     if (!f) return;
-    const within = Math.min(Math.max((targetMs - f.pdt) / 1000, 0), Math.max(f.duration - 0.05, 0));
+    // Seek a safe offset into the fragment; on very short fragments the clamp math
+    // collapses (or goes negative), so land exactly on the fragment start instead.
+    const t =
+      f.duration > 0.1
+        ? f.start + Math.min(Math.max((targetMs - f.pdt) / 1000, 0), f.duration - 0.05)
+        : f.start;
     try {
-      this.video.currentTime = f.start + within;
+      this.video.currentTime = t;
     } catch {
       /* not seekable yet */
+      this.pendingSeekMs = targetMs;
+    }
+  }
+
+  // Native-HLS (Safari) wall-clock seek: there is no hls.js fragment list, so map through
+  // the playlist's absolute start (video.getStartDate() reads #EXT-X-PROGRAM-DATE-TIME)
+  // and clamp into the seekable range. Coarser than the fragment path — see onNotice.
+  _seekNativeWallClock(targetMs) {
+    const start = typeof this.video.getStartDate === "function" ? this.video.getStartDate() : null;
+    if (!start || isNaN(start.getTime())) {
+      this.pendingSeekMs = targetMs; // metadata not parsed yet — applied on loadedmetadata
+      return;
+    }
+    let t = (targetMs - start.getTime()) / 1000;
+    const s = this.video.seekable;
+    if (s.length) t = Math.min(Math.max(t, s.start(0)), s.end(s.length - 1));
+    try {
+      this.video.currentTime = t;
+    } catch {
       this.pendingSeekMs = targetMs;
     }
   }
@@ -130,6 +167,7 @@ export class Player {
     let best = null,
       bestD = Infinity;
     for (const f of this.fragments) {
+      if (f.duration <= 0.05) continue; // never land on a degenerate sliver
       const d = Math.min(Math.abs(targetMs - f.pdt), Math.abs(targetMs - (f.pdt + f.duration * 1000)));
       if (d < bestD) {
         bestD = d;
@@ -140,19 +178,63 @@ export class Player {
   }
 
   _mediaToWall(t) {
-    // inverse mapping via the fragment list (fallback when playingDate is null)
-    for (const f of this.fragments) {
-      if (t >= f.start && t < f.start + f.duration) return f.pdt + (t - f.start) * 1000;
+    // inverse mapping via the fragment list (fallback when playingDate is null).
+    // Fragments are sorted ascending by `start`; binary-search the LAST one with
+    // f.start <= t so a discontinuity overlap resolves to the fragment actually playing.
+    const a = this.fragments;
+    if (!a.length) return 0;
+    let lo = 0,
+      hi = a.length - 1,
+      ans = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (a[mid].start <= t) {
+        ans = mid;
+        lo = mid + 1;
+      } else hi = mid - 1;
     }
-    return this.fragments.length ? this.fragments[0].pdt + t * 1000 : 0;
+    // t precedes every fragment (media time need not start at 0) — extrapolate off the first.
+    if (ans < 0) return a[0].pdt + (t - a[0].start) * 1000;
+    const f = a[ans];
+    return Math.min(f.pdt + (t - f.start) * 1000, f.pdt + f.duration * 1000);
   }
 
-  // The wall-clock extent currently buffered/loaded (first..last fragment).
+  // The wall-clock extent currently buffered/loaded. `fromMs`/`toMs` is the outer envelope
+  // (first..last fragment); `ranges` are the merged contiguous PDT runs (fragments within
+  // 1s of each other coalesce), so callers can tell loaded footage from a gap inside it.
   loadedRangeMs() {
+    if (this.nativeHls) return this._nativeLoadedRange();
     if (!this.fragments.length) return null;
-    const first = this.fragments[0];
-    const last = this.fragments[this.fragments.length - 1];
-    return { fromMs: first.pdt, toMs: last.pdt + last.duration * 1000 };
+    const ranges = [];
+    for (const f of this.fragments) {
+      const end = f.pdt + f.duration * 1000;
+      const prev = ranges[ranges.length - 1];
+      if (prev && f.pdt - prev.toMs <= 1000) prev.toMs = Math.max(prev.toMs, end);
+      else ranges.push({ fromMs: f.pdt, toMs: end });
+    }
+    return { fromMs: ranges[0].fromMs, toMs: ranges[ranges.length - 1].toMs, ranges };
+  }
+
+  // True when wall-clock `ms` falls inside a loaded (merged) range — not merely inside
+  // the envelope, which can straddle unloaded gaps.
+  isLoadedAt(ms) {
+    const r = this.loadedRangeMs();
+    return !!r && r.ranges.some((x) => ms >= x.fromMs && ms <= x.toMs);
+  }
+
+  // Native-HLS twin of loadedRangeMs: no fragment list, so derive the ranges from
+  // video.seekable anchored at getStartDate().
+  _nativeLoadedRange() {
+    const start = typeof this.video.getStartDate === "function" ? this.video.getStartDate() : null;
+    if (!start || isNaN(start.getTime())) return null;
+    const base = start.getTime();
+    const s = this.video.seekable;
+    if (!s.length) return null;
+    const ranges = [];
+    for (let i = 0; i < s.length; i++) {
+      ranges.push({ fromMs: base + s.start(i) * 1000, toMs: base + s.end(i) * 1000 });
+    }
+    return { fromMs: ranges[0].fromMs, toMs: ranges[ranges.length - 1].toMs, ranges };
   }
 
   _onHlsError(hls, data) {

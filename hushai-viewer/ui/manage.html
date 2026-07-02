@@ -11,20 +11,9 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body class="dash-body">
-    <header class="topbar">
-      <div class="brand"><span class="logo">◉</span> HUSHAI <span class="muted">files</span></div>
-      <a class="navlink" href="/" title="Back to the viewer">‹ Viewer</a>
-      <a class="navlink" href="/events.html" title="Alerts &amp; event feed">🔔 Events</a>
-      <a class="navlink" href="/dashboard.html" title="System dashboard">▦ System</a>
-      <span class="spacer"></span>
-      <div class="clock dash-updated">
-        <span id="liveDot" class="dot"></span>
-        <span id="generatedAt" class="muted small">connecting…</span>
-      </div>
-      <button id="mgmtRefresh" class="ghost" title="Refresh">⟳</button>
-      <button id="btnLogout" class="ghost" title="Log out"
-        onclick="fetch('/logout',{method:'POST'}).finally(()=>location.href='/login')">⎋</button>
-    </header>
+    <!-- Rendered by js/nav.js initTopbar() — the shared brand/navlinks/live-chip/logout bar.
+         manage.js inserts its page-specific ⟳ refresh button next to the logout button. -->
+    <header class="topbar" data-topbar></header>
 
     <main class="dash">
       <div id="mgmtBanner" class="dash-banner loading">Loading devices…</div>

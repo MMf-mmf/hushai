@@ -1,6 +1,6 @@
 // File-management page: per-device storage usage, rename, retention policy, and footage/device
-// deletion. Mirrors the dashboard's poll/busy-guard + el() DOM style; all calls go to
-// hushai-backend's /v1/devices* surface via the viewer proxy (export is a viewer route).
+// deletion. Built on the shared primitives (dom.js el(), poll.js, toast.js, nav.js); all calls
+// go to hushai-backend's /v1/devices* surface via the viewer proxy (export is a viewer route).
 
 import {
   getManagedDevices,
@@ -14,6 +14,10 @@ import {
 } from "../api.js";
 import { confirmAction, confirmOpen } from "../confirm.js";
 import { humanBytes, dateLabel } from "../time.js";
+import { el, renderBanner } from "../dom.js";
+import { toast } from "../toast.js";
+import { createPoller } from "../poll.js";
+import { initTopbar, setLive, setUpdated } from "../nav.js";
 
 const $ = (id) => document.getElementById(id);
 const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";
@@ -23,35 +27,8 @@ let devices = [];
 const usage = new Map(); // deviceId -> days[]
 const expanded = new Set(); // open drill-downs
 const selected = new Map(); // deviceId -> Set(dayString)
-let busy = false;
+let busy = false; // direct reload() calls (mutations / ⟳) must not stack with a poll tick
 let everLoaded = false;
-let timer = null;
-
-// ---- DOM helper (same shape as dashboard.js) ------------------------------
-
-function el(tag, props = {}, children = []) {
-  const node = document.createElement(tag);
-  for (const [k, v] of Object.entries(props)) {
-    if (k === "class") node.className = v;
-    else if (k === "html") node.innerHTML = v;
-    else if (k === "text") node.textContent = v;
-    else if (v != null) node.setAttribute(k, v);
-  }
-  for (const c of [].concat(children)) {
-    if (c == null) continue;
-    node.appendChild(typeof c === "string" ? document.createTextNode(c) : c);
-  }
-  return node;
-}
-
-const esc = (s) =>
-  String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
-
-function flash(msg) {
-  const f = el("div", { class: "mgmt-flash", text: msg });
-  document.body.appendChild(f);
-  setTimeout(() => f.remove(), 4000);
-}
 
 function deviceLabel(d) {
   return d.displayName || d.id;
@@ -298,15 +275,15 @@ function renderUsage(d, body) {
 async function doRename(d, raw) {
   const name = (raw || "").trim();
   if (!name) {
-    flash("Name can't be empty.");
+    toast("Name can't be empty.", { kind: "error" });
     return;
   }
   if (name === d.displayName) return;
   try {
     await renameDevice(d.id, name);
-    await reload(true);
+    await reload();
   } catch {
-    flash("Couldn't rename that device.");
+    toast("Couldn't rename that device.", { kind: "error" });
   }
 }
 
@@ -316,16 +293,16 @@ async function doRetention(d, raw) {
   if (s !== "") {
     const n = Number(s);
     if (!Number.isInteger(n) || n < 1) {
-      flash("Retention must be a whole number of days ≥ 1 (or blank to keep forever).");
+      toast("Retention must be a whole number of days ≥ 1 (or blank to keep forever).", { kind: "error" });
       return;
     }
     days = n;
   }
   try {
     await setRetention(d.id, days);
-    await reload(true);
+    await reload();
   } catch {
-    flash("Couldn't update the retention policy.");
+    toast("Couldn't update the retention policy.", { kind: "error" });
   }
 }
 
@@ -341,9 +318,9 @@ async function doDeleteDay(d, day) {
   try {
     await deleteFootageDay(d.id, TZ, day.date);
     (selected.get(d.id) || new Set()).delete(day.date);
-    await reload(true);
+    await reload();
   } catch {
-    flash("Couldn't delete that day.");
+    toast("Couldn't delete that day.", { kind: "error" });
   }
 }
 
@@ -365,9 +342,9 @@ async function doBulkDelete(d, dayList, allDays) {
   try {
     await bulkDeleteFootageDays(d.id, TZ, dayList);
     selected.delete(d.id);
-    await reload(true);
+    await reload();
   } catch {
-    flash("Couldn't delete the selected days.");
+    toast("Couldn't delete the selected days.", { kind: "error" });
   }
 }
 
@@ -386,9 +363,9 @@ async function doDeleteDevice(d) {
     expanded.delete(d.id);
     usage.delete(d.id);
     selected.delete(d.id);
-    await reload(true);
+    await reload();
   } catch {
-    flash("Couldn't delete that device.");
+    toast("Couldn't delete that device.", { kind: "error" });
   }
 }
 
@@ -407,21 +384,20 @@ async function loadUsage(id) {
     usage.set(id, await getDeviceUsage(id, TZ));
   } catch {
     usage.set(id, []);
-    flash("Couldn't load that device's footage breakdown.");
+    toast("Couldn't load that device's footage breakdown.", { kind: "error" });
   }
   render();
 }
 
-async function reload(force = false) {
-  if (busy || document.hidden) return;
-  if (!force && (isEditing() || confirmOpen())) return; // don't clobber typing / an open dialog
+async function reload() {
+  if (busy) return;
   busy = true;
   try {
     devices = await getManagedDevices();
     everLoaded = true;
     $("mgmtBanner").hidden = true;
-    $("liveDot").classList.add("live");
-    $("generatedAt").textContent = `updated ${new Date().toLocaleTimeString()}`;
+    setLive(true);
+    setUpdated(`updated ${new Date().toLocaleTimeString()}`);
 
     const ids = new Set(devices.map((d) => d.id));
     for (const id of [...expanded]) {
@@ -441,30 +417,37 @@ async function reload(force = false) {
     render();
     $("mgmtCount").textContent = `${devices.length} device${devices.length === 1 ? "" : "s"}`;
   } catch (e) {
-    $("liveDot").classList.remove("live");
-    $("generatedAt").textContent = "disconnected";
-    const b = $("mgmtBanner");
-    b.hidden = false;
-    b.className = "dash-banner error";
-    b.innerHTML = everLoaded
-      ? `Lost connection — retrying every ${REFRESH_MS / 1000}s. <span class="muted">(${esc(e.message || e)})</span>`
-      : `Couldn't load devices. Make sure <span class="mono">hushai-backend</span> is running and the viewer's BACKEND_TOKEN / DEVICE_TOKEN is set, then it recovers automatically. <span class="muted">(${esc(e.message || e)})</span>`;
+    setLive(false);
+    setUpdated("disconnected");
+    // Text-only banner: e.message can echo server output and must never be parsed as HTML.
+    renderBanner($("mgmtBanner"), {
+      mode: "error",
+      message: everLoaded
+        ? `Lost connection — retrying every ${REFRESH_MS / 1000}s.`
+        : "Couldn't load devices. Make sure hushai-backend is running and the viewer's BACKEND_TOKEN / DEVICE_TOKEN is set, then it recovers automatically.",
+      detail: String(e.message || e),
+    });
   } finally {
     busy = false;
   }
 }
 
+// Background refresh: don't clobber typing / an open confirm dialog (isPaused); user-invoked
+// reload()s (mutations, the ⟳ button) still go through directly, like the old force flag did.
+const poller = createPoller(reload, {
+  intervalMs: REFRESH_MS,
+  isPaused: () => isEditing() || confirmOpen(),
+});
+
 function start() {
+  initTopbar({ section: "files" });
+  // Page-specific ⟳ button, re-inserted next to the shared topbar's logout button.
+  $("btnLogout")?.before(
+    el("button", { id: "mgmtRefresh", class: "ghost", type: "button", title: "Refresh", text: "⟳", onclick: () => reload() }),
+  );
   const focus = new URLSearchParams(location.search).get("device");
   if (focus) expanded.add(focus); // auto-open the drill-down for a linked device
-  reload(true);
-  if (timer) clearInterval(timer);
-  timer = setInterval(() => reload(false), REFRESH_MS);
+  poller.start();
 }
-
-document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) reload(false);
-});
-$("mgmtRefresh")?.addEventListener("click", () => reload(true));
 
 start();

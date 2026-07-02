@@ -16,6 +16,8 @@ import {
   archiveSpeaker,
   unarchiveSpeaker,
 } from "../api.js";
+import { wireModal } from "../modal.js";
+import { toast } from "../toast.js";
 
 function note(text) {
   const el = document.createElement("div");
@@ -373,11 +375,8 @@ function boot() {
       audio.play().catch(() => {});
     },
     reload: () => load(),
-    flash(msg) {
-      const n = note(msg);
-      body.prepend(n);
-      setTimeout(() => n.remove(), 4000);
-    },
+    // Operation failures ("couldn't save/merge/…") surface as page-level error toasts.
+    flash: (msg) => toast(msg, { kind: "error" }),
   };
 
   async function load() {
@@ -401,24 +400,16 @@ function boot() {
     render(body, speakers || [], dups || [], unattributed || [], ctx);
   }
 
-  function open() {
-    modal.hidden = false;
-    load();
-  }
-  function close() {
-    modal.hidden = true;
-    audio.pause();
-  }
+  // Shared modal behavior (backdrop click, Escape, focus trap + restore) lives in modal.js;
+  // opening (re)loads the list, closing stops any playing sample.
+  const m = wireModal(modal, {
+    onOpen: load,
+    onClose: () => audio.pause(),
+  });
 
-  openBtn.addEventListener("click", open);
-  if (closeBtn) closeBtn.addEventListener("click", close);
+  openBtn.addEventListener("click", m.open);
+  if (closeBtn) closeBtn.addEventListener("click", m.close);
   if (refreshBtn) refreshBtn.addEventListener("click", load);
-  modal.addEventListener("click", (e) => {
-    if (e.target === modal) close(); // click the backdrop to dismiss
-  });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !modal.hidden) close();
-  });
 }
 
 boot();

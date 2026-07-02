@@ -9,6 +9,7 @@ import { Timeline } from "./timeline.js";
 import { Detections } from "./detections.js";
 import { clockMs, dateLabel, localDateInput, DAY_MS, tzAbbr, humanDur } from "./time.js";
 import { on, setPlaybackProvider } from "./store.js";
+import { createPoller } from "./poll.js";
 
 const $ = (id) => document.getElementById(id);
 const WINDOW_MS = 6 * 3600 * 1000; // matches backend VIEWER_MAX_WINDOW_NANOS default
@@ -26,11 +27,11 @@ const state = {
   userMuted: true,
   detMode: false,
   aiEnabled: true, // AI processing-status ribbons on the scrub bar
+  seekIntent: null, // {ms, at}: optimistic playhead target while a seek is still landing
 };
 
 let player, timeline, detections, toastTimer;
-let refreshTimer = null,
-  refreshing = false,
+let refreshPoller = null,
   lastDeviceSig = "";
 let procSeq = 0, // stale-response guard for the processing-status fetch
   procDebounce = null,
@@ -39,7 +40,7 @@ let procSeq = 0, // stale-response guard for the processing-status fetch
 async function init() {
   const video = $("video");
   video.muted = true; // allow autoplay; user unmutes
-  player = new Player(video, { onError: showError });
+  player = new Player(video, { onError: showError, onNotice: toast });
   timeline = new Timeline($("timeline"), {
     onSeek: (ms) => seekTo(ms, { play: true }),
     onWindowChange: (from, to) => {
@@ -71,20 +72,23 @@ async function init() {
     startAutoRefresh(); // keep polling so we recover automatically once the backend is reachable
     return;
   }
-  // Small debug handle for local automated verification (this is a localhost-only tool).
-  window.viewerDebug = {
-    seekTo,
-    setMode,
-    setProcessingEnabled,
-    state,
-    get player() {
-      return player;
-    },
-    get timeline() {
-      return timeline;
-    },
-    currentMs: () => (player ? player.currentWallClockMs() : 0),
-  };
+  // Small debug handle for local automated verification (this is a localhost-only tool),
+  // gated to localhost so a LAN/tunnel deploy doesn't hand app internals to any visitor.
+  if (["localhost", "127.0.0.1", "::1"].includes(location.hostname)) {
+    window.viewerDebug = {
+      seekTo,
+      setMode,
+      setProcessingEnabled,
+      state,
+      get player() {
+        return player;
+      },
+      get timeline() {
+        return timeline;
+      },
+      currentMs: () => (player ? player.currentWallClockMs() : 0),
+    };
+  }
   lastDeviceSig = deviceSig(state.devices);
   populateDeviceSelect();
   const usable = state.devices.filter((d) => d.segmentCount > 0 && d.latestMs);
@@ -259,24 +263,19 @@ async function refreshDevices() {
 }
 
 function startAutoRefresh() {
-  if (refreshTimer != null) return; // idempotent
-  const tick = async () => {
-    if (refreshing || document.hidden) return; // skip while a poll is in flight or tab is hidden
-    refreshing = true;
-    try {
+  if (refreshPoller) return; // idempotent (init reaches here from two paths)
+  refreshPoller = createPoller(
+    async () => {
       await refreshDevices();
       // Always refresh AI status (not gated by the new-footage signature): processing
       // advances as the worker catches up on already-ingested segments.
       await refetchProcessing();
-    } finally {
-      refreshing = false;
-    }
-  };
-  refreshTimer = setInterval(tick, REFRESH_MS);
-  // Polling pauses while the tab is hidden; re-sync the moment it's focused again.
-  document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) tick();
-  });
+    },
+    { intervalMs: REFRESH_MS },
+  );
+  // First tick after one interval (matching the old setInterval cadence). The poller
+  // busy-guards, pauses while the tab is hidden, and re-syncs the moment it's focused again.
+  refreshPoller.start({ immediate: false });
 }
 
 // The continuous coverage span (recorded run) containing `ms`, or null if `ms` is in a gap.
@@ -348,7 +347,7 @@ function setMode(on) {
   }
 }
 
-const AI_GLYPH = { done: "✓", processing: "⟳", pending: "◌", error: "✕" };
+const AI_GLYPH = { done: "✓", processing: "⟳", pending: "◌", error: "✕", skipped: "∅" };
 
 // Live "AI status under the playhead" badge in the topbar. Reports the worst of the two
 // lanes with the active modality's verb. Diffed by a key so the DOM is only touched on change.
@@ -372,8 +371,9 @@ function updateAiBadge(ms) {
     badge.hidden = true; // no AI lane here (gap / outside footage)
     return;
   }
-  // worst-state precedence: error > processing > pending > done
-  const rank = { error: 3, processing: 2, pending: 1, done: 0 };
+  // worst-state precedence: error > processing > pending > done > skipped
+  // (skipped ranks below done: a content-gate no-op should never mask real work/failures).
+  const rank = { error: 4, processing: 3, pending: 2, done: 1, skipped: 0 };
   const worst = [a, v].filter(Boolean).sort((x, y) => rank[y] - rank[x])[0];
   let text;
   if (worst === "error") text = "Processing failed";
@@ -385,6 +385,7 @@ function updateAiBadge(ms) {
           ? "Transcribing…"
           : "Analyzing video…";
   else if (worst === "pending") text = "Not yet processed";
+  else if (worst === "skipped") text = "Skipped (static/silent)";
   else text = "Processed";
 
   badge.hidden = false;
@@ -405,11 +406,19 @@ function setProcessingEnabled(on) {
 
 function seekTo(ms, { play = false } = {}) {
   if (!state.device) return;
-  if (timeline && !timeline.isCovered(ms)) toast("Skipping to nearest recording");
-  if (!state.loaded || ms < state.loaded.fromMs || ms > state.loaded.toMs) {
-    loadWindowAround(ms, { seekMs: ms, play: true });
+  const { ms: snapped, movedMs } = timeline.snapInfo(ms);
+  // Sub-second snaps happen on every gap-edge click — only narrate jumps a human would notice.
+  if (Math.abs(movedMs) >= 1000)
+    toast(`No footage here — skipping ${humanDur(Math.abs(movedMs))} ${movedMs > 0 ? "ahead" : "back"}`);
+  // Optimistic playhead: show the landing spot immediately and let the ticker hold it
+  // until the player reports a nearby position (see startTicker) — otherwise the playhead
+  // sits stale at the old position while a far seek reloads the HLS window.
+  timeline.setPlayhead(snapped);
+  state.seekIntent = { ms: snapped, at: performance.now() };
+  if (!state.loaded || snapped < state.loaded.fromMs || snapped > state.loaded.toMs) {
+    loadWindowAround(snapped, { seekMs: snapped, play: true });
   } else {
-    player.seekToWallClock(ms);
+    player.seekToWallClock(snapped);
     if (play) {
       player.play().catch(() => {});
       state.playing = true;
@@ -455,8 +464,12 @@ function setMuted(m) {
 }
 
 function relSeek(deltaMs) {
+  // The player reports 0/NaN mid-reload; fall back to where the UI says we are so the
+  // arrow keys never go dead while a far seek is still loading its window.
   const ms = player.currentWallClockMs();
-  if (ms && isFinite(ms)) seekTo(ms + deltaMs, { play: false });
+  const base = Number.isFinite(ms) && ms > 0 ? ms : (state.seekIntent?.ms ?? timeline.playheadMs);
+  if (!Number.isFinite(base) || !Number.isFinite(deltaMs)) return;
+  seekTo(base + deltaMs, { play: false });
 }
 
 function jumpToDay(dayStartMs) {
@@ -537,6 +550,9 @@ function stepDay(dir) {
 
 function wireKeys() {
   window.addEventListener("keydown", (e) => {
+    if (e.metaKey || e.ctrlKey || e.altKey) return; // never eat browser/system chords
+    // An open modal owns the keyboard — typing/navigating in it must not scrub the player.
+    if (document.querySelector(".modal:not([hidden])")) return;
     const t = e.target;
     if (t && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA")) return;
     switch (e.key) {
@@ -609,7 +625,18 @@ function wireKeys() {
 function startTicker() {
   const loop = () => {
     if (player && state.device) {
-      const ms = player.currentWallClockMs();
+      const reported = player.currentWallClockMs();
+      // While a seek is in flight, prefer its optimistic target over the player's report:
+      // hold it until the player lands within 2s of the intent (satisfied) or the intent
+      // goes stale (4s — e.g. the seek failed), then fall back to the reported position.
+      let ms = reported;
+      const intent = state.seekIntent;
+      if (intent) {
+        const stale = performance.now() - intent.at > 4000;
+        const satisfied = isFinite(reported) && Math.abs(reported - intent.ms) < 2000;
+        if (stale || satisfied) state.seekIntent = null;
+        else ms = intent.ms;
+      }
       if (ms && isFinite(ms) && ms > 0) {
         timeline.setPlayhead(ms);
         $("readout").textContent = clockMs(ms);
@@ -664,4 +691,4 @@ function toast(msg) {
   toastTimer = setTimeout(() => el.classList.remove("show"), 1400);
 }
 
-init();
+init().catch((e) => showError("Failed to start viewer: " + (e?.message || e)));

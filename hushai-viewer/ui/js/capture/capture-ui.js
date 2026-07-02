@@ -4,6 +4,7 @@
 // All wire/transport logic lives in ./controller.js; this file is only DOM + glue.
 
 import { CaptureController } from "../capture/controller.js";
+import { wireModal } from "../modal.js";
 
 function boot() {
   const openBtn = document.getElementById("btnCapture");
@@ -104,9 +105,8 @@ function boot() {
     return e?.message || String(e);
   }
 
-  async function open() {
+  async function onOpen() {
     clearError();
-    modal.hidden = false;
     if (!CaptureController.isSupported(audioOnlyCb.checked)) {
       showError(
         "This browser can't record H.264/AAC MP4 (or this isn't a secure origin). Use Chrome/Edge 130+ or Safari on http://127.0.0.1.",
@@ -115,7 +115,7 @@ function boot() {
     await populateDevices();
     render();
   }
-  function close() {
+  function onClose() {
     // Dismissing the modal (X / backdrop / Escape) must NOT leave the camera+mic live and the
     // recorder+uploader running invisibly with no UI to stop them. Do the same graceful stop as the
     // Stop button: flush the final segment, release the stream (via the recorder's onStopped), and
@@ -123,7 +123,6 @@ function boot() {
     // for a plain dismiss too.
     controller.stop();
     preview.srcObject = null;
-    modal.hidden = true;
   }
 
   startBtn.addEventListener("click", async () => {
@@ -150,14 +149,11 @@ function boot() {
     render();
   });
 
-  openBtn.addEventListener("click", open);
-  if (closeBtn) closeBtn.addEventListener("click", close);
-  modal.addEventListener("click", (e) => {
-    if (e.target === modal) close(); // click the backdrop to dismiss
-  });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !modal.hidden) close();
-  });
+  // Shared modal behavior (backdrop click, Escape, focus trap + restore) lives in modal.js.
+  const m = wireModal(modal, { onOpen, onClose });
+
+  openBtn.addEventListener("click", m.open);
+  if (closeBtn) closeBtn.addEventListener("click", m.close);
 
   // Warn before leaving if we're still capturing or have unsent segments buffered.
   window.addEventListener("beforeunload", (e) => {

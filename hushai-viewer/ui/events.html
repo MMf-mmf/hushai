@@ -12,19 +12,8 @@
     <!-- Page styles live in the shared styles.css ("Events & alerts page" section). -->
   </head>
   <body class="dash-body">
-    <header class="topbar">
-      <div class="brand"><span class="logo">◉</span> HUSHAI <span class="muted">events</span></div>
-      <a class="navlink" href="/" title="Back to the viewer">‹ Viewer</a>
-      <a class="navlink" href="/dashboard.html" title="System dashboard">▦ System</a>
-      <a class="navlink" href="/manage.html" title="Manage devices &amp; footage">🗄 Files</a>
-      <span class="spacer"></span>
-      <div class="clock dash-updated">
-        <span id="liveDot" class="dot"></span>
-        <span id="generatedAt" class="muted small">connecting…</span>
-      </div>
-      <button id="btnLogout" class="ghost" title="Log out"
-        onclick="fetch('/logout',{method:'POST'}).finally(()=>location.href='/login')">⎋</button>
-    </header>
+    <!-- Rendered by js/nav.js initTopbar() — the shared brand/navlinks/live-chip/logout bar. -->
+    <header class="topbar" data-topbar></header>
 
     <main class="dash">
       <div id="banner" class="dash-banner loading">Loading events…</div>

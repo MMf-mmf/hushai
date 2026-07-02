@@ -9,6 +9,8 @@ import {
   getWatchlist, addWatch, removeWatch,
 } from "../api.js";
 import { nsToMs } from "../time.js";
+import { wireModal } from "../modal.js";
+import { toast } from "../toast.js";
 
 function note(text) {
   const el = document.createElement("div");
@@ -241,11 +243,8 @@ function boot() {
     query: "",
     reload: () => load(ctx.query),
     watched: new Map(), // plate_id -> watch_id (refreshed each load)
-    flash(msg) {
-      const n = note(msg);
-      body.prepend(n);
-      setTimeout(() => n.remove(), 4000);
-    },
+    // Operation failures ("couldn't save/merge/…") surface as page-level error toasts.
+    flash: (msg) => toast(msg, { kind: "error" }),
   };
 
   async function load(query) {
@@ -275,16 +274,12 @@ function boot() {
     render(body, plates || [], ctx);
   }
 
-  function open() {
-    modal.hidden = false;
-    load("");
-  }
-  function close() {
-    modal.hidden = true;
-  }
+  // Shared modal behavior (backdrop click, Escape, focus trap + restore) lives in modal.js;
+  // opening always starts from the unfiltered list.
+  const m = wireModal(modal, { onOpen: () => load("") });
 
-  openBtn.addEventListener("click", open);
-  if (closeBtn) closeBtn.addEventListener("click", close);
+  openBtn.addEventListener("click", m.open);
+  if (closeBtn) closeBtn.addEventListener("click", m.close);
   if (refreshBtn) refreshBtn.addEventListener("click", () => load(ctx.query));
   if (searchBox) {
     let t;
@@ -293,12 +288,6 @@ function boot() {
       t = setTimeout(() => load(searchBox.value.trim()), 250);
     });
   }
-  modal.addEventListener("click", (e) => {
-    if (e.target === modal) close();
-  });
-  document.addEventListener("keydown", (e) => {
-    if (e.key === "Escape" && !modal.hidden) close();
-  });
 }
 
 boot();

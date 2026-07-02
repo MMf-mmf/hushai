@@ -14,8 +14,22 @@ function redirectIfUnauth(res) {
   return false;
 }
 
+// One retry after 400ms on a network failure (fetch rejects with TypeError) or a gateway
+// hiccup (502/503/504). Blind retry is safe here because everything routed through this
+// helper is a GET — mutations all use their own fetch wrappers below.
+async function fetchWithRetry(url) {
+  try {
+    const res = await fetch(url);
+    if (![502, 503, 504].includes(res.status)) return res;
+  } catch (e) {
+    if (!(e instanceof TypeError)) throw e;
+  }
+  await new Promise((r) => setTimeout(r, 400));
+  return fetch(url);
+}
+
 async function getJson(url) {
-  const res = await fetch(url);
+  const res = await fetchWithRetry(url);
   if (redirectIfUnauth(res)) throw new Error("unauthorized");
   if (!res.ok) throw new Error(`${url} -> ${res.status}`);
   return res.json();
@@ -157,6 +171,7 @@ export function sampleAudioUrl(id) {
   return `/v1/speakers/${encodeURIComponent(id)}/sample-audio`;
 }
 
+// Here and in every mutation wrapper below: `res.json().catch(() => ({}))` runs after the res.ok check, so it only tolerates a legitimately empty 200 body — it does not swallow errors.
 export async function renameSpeaker(id, displayName) {
   const res = await fetch(`/v1/speakers/${encodeURIComponent(id)}`, {
     method: "PATCH",
@@ -457,6 +472,13 @@ export async function streamChat({ sessionId, agentId, message, filters, playbac
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = "";
+  let skipped = 0; // frames with real content but no usable data lines (malformed)
+  const feed = (frame) => {
+    const ev = parseFrame(frame);
+    if (ev) onEvent(ev);
+    // Pure keep-alive comment frames are legitimate SSE — only count the rest.
+    else if (frame.split(/\r?\n/).some((l) => l && !l.startsWith(":"))) skipped += 1;
+  };
   for (;;) {
     const { value, done } = await reader.read();
     if (done) break;
@@ -466,10 +488,12 @@ export async function streamChat({ sessionId, agentId, message, filters, playbac
     while ((sep = nextFrameBreak(buf)) !== null) {
       const frame = buf.slice(0, sep.idx);
       buf = buf.slice(sep.idx + sep.len);
-      const ev = parseFrame(frame);
-      if (ev) onEvent(ev);
+      feed(frame);
     }
   }
+  buf += decoder.decode(); // flush any buffered multi-byte tail
+  if (buf.trim()) feed(buf); // a final frame may arrive without its trailing blank line
+  if (skipped) console.warn(`streamChat: skipped ${skipped} malformed SSE frame(s)`);
 }
 
 function nextFrameBreak(buf) {

@@ -141,6 +141,12 @@ export class Timeline {
     return best;
   }
 
+  // snap() plus how far it moved — lets the caller tell the user about a gap jump.
+  snapInfo(ms) {
+    const snapped = this.snap(ms);
+    return { ms: snapped, movedMs: snapped - ms };
+  }
+
   isCovered(ms) {
     return this.coverage.some((c) => ms >= c.startMs && ms <= c.endMs);
   }
@@ -370,6 +376,7 @@ export class Timeline {
     });
     c.addEventListener("pointerdown", (e) => this._onDown(e));
     window.addEventListener("pointerup", (e) => this._onUp(e));
+    window.addEventListener("pointercancel", () => this._onCancel());
     c.addEventListener(
       "wheel",
       (e) => {
@@ -382,17 +389,28 @@ export class Timeline {
   _localX(e) {
     return e.clientX - this.canvas.getBoundingClientRect().left;
   }
+  // Which horizontal band `y` (canvas-local px) falls in. Pointer handling dispatches on
+  // this: the labels pan, the track scrubs, the ribbons are hover/tooltip-only.
+  _zoneAt(y) {
+    if (y < TRACK_TOP) return "labels";
+    if (y >= RIBBON_Y0) return "ribbons";
+    return "track"; // the coverage track, incl. the small breather above the ribbons
+  }
   _onDown(e) {
     const x = this._localX(e);
     const y = e.clientY - this.canvas.getBoundingClientRect().top;
     this.canvas.setPointerCapture?.(e.pointerId);
-    if (y < TRACK_TOP) {
+    // Middle-button drag pans from anywhere; otherwise the hit zone decides.
+    if (e.button === 1) e.preventDefault(); // suppress the browser's middle-click autoscroll
+    const zone = e.button === 1 ? "labels" : this._zoneAt(y);
+    if (zone === "labels") {
       this._drag = { mode: "pan", startX: x, startFrom: this.from, startTo: this.to };
-    } else {
+    } else if (zone === "track") {
       this._drag = { mode: "scrub" };
       this.ghostMs = this.snap(this.tOf(x));
       this.render();
     }
+    // "ribbons" starts no drag — that band only hovers.
   }
   _onMove(e) {
     const x = this._localX(e);
@@ -417,6 +435,13 @@ export class Timeline {
     } else {
       this._drag = null;
     }
+  }
+  // A cancelled pointer (touch handed off to scrolling, capture lost) abandons the
+  // gesture: clear the drag + ghost without seeking, like a pointerup that never lands.
+  _onCancel() {
+    this._drag = null;
+    this.ghostMs = null;
+    this.render();
   }
   _onWheel(e) {
     const x = this._localX(e);

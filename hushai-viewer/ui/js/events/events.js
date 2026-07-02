@@ -8,28 +8,17 @@ import {
   getDevices, getEvents, getEventFeed, ackDelivery,
   getAlertRules, createAlertRule, updateAlertRule, deleteAlertRule,
 } from "../api.js";
+import { el, errorState } from "../dom.js";
+import { toast } from "../toast.js";
+import { createPoller } from "../poll.js";
+import { confirmAction } from "../confirm.js";
+import { initTopbar, setLive, setUpdated } from "../nav.js";
 
 const $ = (id) => document.getElementById(id);
 
 let devices = [];
-let pollTimer = null;
-let polling = false; // in-flight guard so slow ticks don't stack
 let eventsSeq = 0; // monotonic render guards: a stale (slow) response must not clobber a newer render
 let feedSeq = 0;
-
-/** Minimal DOM builder. `text` sets textContent (XSS-safe); `on*` adds a listener. */
-function el(tag, props = {}, ...kids) {
-  const n = document.createElement(tag);
-  for (const [k, v] of Object.entries(props)) {
-    if (v == null) continue;
-    if (k === "class") n.className = v;
-    else if (k === "text") n.textContent = v;
-    else if (k.startsWith("on") && typeof v === "function") n.addEventListener(k.slice(2), v);
-    else n.setAttribute(k, v);
-  }
-  for (const kid of kids) if (kid != null) n.append(kid);
-  return n;
-}
 
 function deviceName(id) {
   const d = devices.find((x) => x.id === id);
@@ -78,7 +67,7 @@ async function renderFeed() {
     items = await getEventFeed({ limit: 100 });
   } catch (e) {
     if (seq === feedSeq) {
-      box.replaceChildren(el("div", { class: "err", text: "Feed error: " + e.message }));
+      box.replaceChildren(errorState("Feed error: " + e.message, renderFeed));
       $("feedCount").textContent = "—";
     }
     return false;
@@ -101,15 +90,15 @@ function feedRow(i) {
   const ackBtn = el("button", {
     class: "ghost",
     text: i.acknowledged ? "✓ read" : "Acknowledge",
-    disabled: i.acknowledged ? "" : null,
-    onclick: async (ev) => {
-      ev.currentTarget.disabled = true;
+    disabled: !!i.acknowledged,
+    onclick: async () => {
+      ackBtn.disabled = true;
       try {
         await ackDelivery(i.deliveryId);
         await renderFeed();
       } catch (err) {
-        alert("Acknowledge failed: " + err.message);
-        ev.currentTarget.disabled = false;
+        toast("Acknowledge failed: " + err.message, { kind: "error" });
+        ackBtn.disabled = false;
       }
     },
   });
@@ -143,7 +132,7 @@ async function renderEvents() {
     evs = await getEvents(filters);
   } catch (e) {
     if (seq === eventsSeq) {
-      box.replaceChildren(el("div", { class: "err", text: "Events error: " + e.message }));
+      box.replaceChildren(errorState("Events error: " + e.message, renderEvents));
       $("eventCount").textContent = "—";
     }
     return false;
@@ -202,7 +191,7 @@ async function renderRules() {
   try {
     rules = await getAlertRules();
   } catch (e) {
-    box.replaceChildren(el("div", { class: "err", text: "Rules error: " + e.message }));
+    box.replaceChildren(errorState("Rules error: " + e.message, renderRules));
     $("ruleCount").textContent = "—";
     return false;
   }
@@ -224,7 +213,7 @@ function ruleCard(r) {
         await updateAlertRule(r.rule_id, { ...r, enabled: !r.enabled });
         await renderRules();
       } catch (e) {
-        alert("Toggle failed: " + e.message);
+        toast("Toggle failed: " + e.message, { kind: "error" });
       }
     },
   });
@@ -232,12 +221,17 @@ function ruleCard(r) {
     class: "link",
     text: "delete",
     onclick: async () => {
-      if (!confirm(`Delete rule "${r.name}"?`)) return;
+      const ok = await confirmAction({
+        title: "Delete alert rule",
+        message: `Delete rule “${r.name}”? Deliveries already sent are kept.`,
+        confirmLabel: "Delete rule",
+      });
+      if (!ok) return;
       try {
         await deleteAlertRule(r.rule_id);
         await renderRules();
       } catch (e) {
-        alert("Delete failed: " + e.message);
+        toast("Delete failed: " + e.message, { kind: "error" });
       }
     },
   });
@@ -320,44 +314,43 @@ async function submitRule(ev) {
   }
 }
 
+// Don't claim "ok" / a fresh timestamp when a section failed — the live dot must not lie.
+function markLive(allOk) {
+  setUpdated((allOk ? "updated " : "partial · ") + new Date().toLocaleTimeString());
+  setLive(allOk);
+}
+
 async function refreshAll() {
   const oks = await Promise.all([renderFeed(), renderEvents(), renderRules()]);
   $("banner").style.display = "none";
-  const allOk = oks.every(Boolean);
-  // Don't claim "ok" / a fresh timestamp when a section failed — the live dot must not lie.
-  $("generatedAt").textContent = (allOk ? "updated " : "partial · ") + new Date().toLocaleTimeString();
-  $("liveDot").classList.toggle("ok", allOk);
+  markLive(oks.every(Boolean));
 }
 
-// One poll tick: skip when the tab is hidden or a prior tick is still running (no stacking).
-async function pollTick() {
-  if (document.hidden || polling) return;
-  polling = true;
-  try {
-    await Promise.all([renderFeed(), renderEvents()]);
-  } finally {
-    polling = false;
-  }
-}
+// Light polling so new alerts/events surface without a manual reload (rules only change through
+// user actions here, which re-render them directly). createPoller supplies the in-flight guard,
+// the hidden-tab pause, and the refocus kick the old hand-rolled loop implemented.
+const poller = createPoller(async () => {
+  const oks = await Promise.all([renderFeed(), renderEvents()]);
+  markLive(oks.every(Boolean));
+}, { intervalMs: 8000 });
 
 async function main() {
+  initTopbar({ section: "events" });
   await loadDevices();
   $("fApply").addEventListener("click", () => { renderEvents(); renderFeed(); });
   for (const id of ["fDevice", "fType", "fSeverity"]) $(id).addEventListener("change", renderEvents);
   $("ruleForm").addEventListener("submit", submitRule);
   await refreshAll();
-  // Light polling so new alerts/events surface without a manual reload.
-  pollTimer = setInterval(pollTick, 8000);
-  // Resume promptly when the tab is refocused; tear the timer down on navigate-away.
-  document.addEventListener("visibilitychange", () => { if (!document.hidden) pollTick(); });
-  window.addEventListener("pagehide", () => { if (pollTimer) { clearInterval(pollTimer); pollTimer = null; } });
+  poller.start({ immediate: false });
 }
 
 main().catch((e) => {
   const b = $("banner");
   b.textContent = "Failed to load: " + e.message;
-  b.className = "dash-banner err";
+  b.className = "dash-banner error";
 });
 
 // Tiny debug handle for headless verification (localhost-only tool).
-window.eventsDebug = { renderFeed, renderEvents, renderRules, refreshAll, get devices() { return devices; } };
+if (["localhost", "127.0.0.1", "::1"].includes(location.hostname)) {
+  window.eventsDebug = { renderFeed, renderEvents, renderRules, refreshAll, get devices() { return devices; } };
+}

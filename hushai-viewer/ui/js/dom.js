@@ -45,3 +45,15 @@ export function errorState(message, onRetry) {
 export function emptyState(message) {
   return el("div", { class: "empty muted", text: message });
 }
+
+/** Fill a page-top `.dash-banner` element. Text-only on purpose: `detail` usually carries a
+ *  server/exception message, which must never be parsed as HTML. `mode` is the banner variant
+ *  class ("error" | "loading"). */
+export function renderBanner(node, { mode = "error", message = "", detail = "" } = {}) {
+  node.hidden = false;
+  node.className = `dash-banner ${mode}`;
+  node.replaceChildren(
+    message,
+    ...(detail ? [" ", el("span", { class: "muted", text: `(${detail})` })] : []),
+  );
+}
