@@ -7,14 +7,20 @@ import { getDevices, getTimeline, getProcessing, masterUrl } from "./api.js";
 import { Player } from "./player.js";
 import { Timeline } from "./timeline.js";
 import { Detections } from "./detections.js";
-import { clockMs, dateLabel, localDateInput, DAY_MS, tzAbbr, humanDur } from "./time.js";
+import { clock, clockMs, dateLabel, localDateInput, DAY_MS, tzAbbr, humanDur } from "./time.js";
 import { on, setPlaybackProvider } from "./store.js";
 import { createPoller } from "./poll.js";
+import { wireModal } from "./modal.js";
 
 const $ = (id) => document.getElementById(id);
 const WINDOW_MS = 6 * 3600 * 1000; // matches backend VIEWER_MAX_WINDOW_NANOS default
 const REFRESH_MS = 6000; // how often we poll for newly-ingested footage (devices + timeline)
 const FOLLOW_EPS_MS = 5000; // the view counts as "parked at the live edge" within this of latest
+const RATES = [0.25, 0.5, 1, 2, 4, 8]; // the <'/'>' speed ladder (and the #speed options)
+const LIVE_BEHIND_MS = 4000; // go-live seeks land this far behind latest (encode/ingest headroom)
+const LIVE_NEAR_MS = 10_000; // playhead within this of latest counts as "watching live"
+const LIVE_EDGE_FRESH_MS = 30_000; // latest footage younger than this draws the live-edge cap
+const FOLLOW_RELOAD_EPS_MS = 8000; // follow-live reloads once playback rides this close to the loaded edge
 
 const state = {
   devices: [],
@@ -28,21 +34,24 @@ const state = {
   detMode: false,
   aiEnabled: true, // AI processing-status ribbons on the scrub bar
   seekIntent: null, // {ms, at}: optimistic playhead target while a seek is still landing
+  followLive: false, // LIVE pill engaged: auto-chase newest footage as it lands
 };
 
-let player, timeline, detections, toastTimer;
+let player, timeline, detections, toastTimer, helpModal;
 let refreshPoller = null,
   lastDeviceSig = "";
 let procSeq = 0, // stale-response guard for the processing-status fetch
   procDebounce = null,
-  lastBadgeKey = "";
+  lastBadgeKey = "",
+  lastA11yTick = 0; // 1 Hz throttle for ARIA slider values + LIVE pill + live-edge cap
 
 async function init() {
   const video = $("video");
   video.muted = true; // allow autoplay; user unmutes
   player = new Player(video, { onError: showError, onNotice: toast });
   timeline = new Timeline($("timeline"), {
-    onSeek: (ms) => seekTo(ms, { play: true }),
+    // Alt-drag scrubs pass exact:true so the raw millisecond survives (no gap-snap).
+    onSeek: (ms, opts = {}) => seekTo(ms, { play: true, exact: !!opts.exact }),
     onWindowChange: (from, to) => {
       state.view = { fromMs: from, toMs: to };
       scheduleProcessingRefetch(); // pan/zoom changed the visible window
@@ -50,6 +59,8 @@ async function init() {
   });
   detections = new Detections($("detOverlay"), video);
   detections.onError = (e) => toast("detections: " + (e?.message || e));
+  // The loaded HLS window ran dry: auto-advance across gaps / follow the live edge.
+  video.addEventListener("ended", onVideoEnded);
   wireControls();
   wireKeys();
   startTicker();
@@ -79,6 +90,7 @@ async function init() {
       seekTo,
       setMode,
       setProcessingEnabled,
+      goLive,
       state,
       get player() {
         return player;
@@ -124,6 +136,7 @@ function populateDeviceSelect() {
 async function selectDevice(id, { seekMs = null } = {}) {
   const d = state.devices.find((x) => x.id === id);
   if (!d) return;
+  state.followLive = false; // switching cameras is manual navigation — drop live-follow
   state.device = d;
   $("deviceSelect").value = id;
   setDeviceMeta(d);
@@ -260,6 +273,31 @@ async function refreshDevices() {
     timeline.setWindow(state.view.fromMs, state.view.toMs);
   }
   await refetchTimeline();
+  maybeFollowLive(fresh);
+}
+
+// Follow loop (piggybacks the 6s device poll): when new footage lands beyond the
+// loaded HLS window and playback is riding its edge, reload the window at the live
+// edge and keep rolling. The playlist is a fixed from..to window, so following MUST
+// reload — a plain seek near the old edge would just park on the last old fragment.
+function maybeFollowLive(fresh) {
+  if (!state.followLive || !fresh?.latestMs) return;
+  const target = fresh.latestMs - LIVE_BEHIND_MS;
+  const lr = player.loadedRangeMs();
+  if (!lr) {
+    seekTo(target, { play: true, fromLive: true });
+    return;
+  }
+  const ms = player.currentWallClockMs();
+  const riding = !(Number.isFinite(ms) && ms > 0) || lr.toMs - ms < FOLLOW_RELOAD_EPS_MS;
+  if (fresh.latestMs > lr.toMs + 1000 && riding) {
+    // Continue from the playhead when it's already near the edge (seamless); a stale
+    // playhead (hidden tab, big backlog) jumps straight to just-behind-latest.
+    const at = Math.max(Number.isFinite(ms) && ms > 0 ? ms : 0, target);
+    state.seekIntent = { ms: at, at: performance.now() };
+    timeline.setPlayhead(at);
+    loadWindowAround(at, { seekMs: at, play: true });
+  }
 }
 
 function startAutoRefresh() {
@@ -404,9 +442,13 @@ function setProcessingEnabled(on) {
   else lastBadgeKey = ""; // let the next tick hide the badge
 }
 
-function seekTo(ms, { play = false } = {}) {
+function seekTo(ms, { play = false, exact = false, fromLive = false } = {}) {
   if (!state.device) return;
-  const { ms: snapped, movedMs } = timeline.snapInfo(ms);
+  // Single live-follow choke point: any manual seek/scrub/jump drops the follow.
+  // The follow loop's own seeks pass fromLive so chasing the edge doesn't un-follow.
+  if (!fromLive) state.followLive = false;
+  // Alt-precision (exact) seeks skip gap-snap entirely and land on the raw millisecond.
+  const { ms: snapped, movedMs } = exact ? { ms, movedMs: 0 } : timeline.snapInfo(ms);
   // Sub-second snaps happen on every gap-edge click — only narrate jumps a human would notice.
   if (Math.abs(movedMs) >= 1000)
     toast(`No footage here — skipping ${humanDur(Math.abs(movedMs))} ${movedMs > 0 ? "ahead" : "back"}`);
@@ -432,10 +474,13 @@ function seekTo(ms, { play = false } = {}) {
 function sortedCoverage() {
   return (state.timeline?.coverage ?? []).slice().sort((a, b) => a.startMs - b.startMs);
 }
+// Start of the first coverage span after `ms` (null when nothing lies ahead).
+function nextSpanStart(ms) {
+  return sortedCoverage().find((x) => x.startMs > ms + 500)?.startMs ?? null;
+}
 function gotoNextSpan() {
-  const ms = player.currentWallClockMs();
-  const c = sortedCoverage().find((x) => x.startMs > ms + 500);
-  if (c) seekTo(c.startMs, { play: true });
+  const t = nextSpanStart(player.currentWallClockMs());
+  if (t != null) seekTo(t, { play: true });
 }
 function gotoPrevSpan() {
   const ms = player.currentWallClockMs();
@@ -444,17 +489,100 @@ function gotoPrevSpan() {
   if (target != null) seekTo(target, { play: true });
 }
 
+// The loaded window ran out. Three cases: the run continues past the window cap
+// (reload forward), a later run exists (narrate the gap and auto-advance), or nothing
+// lies ahead (hold at the live edge when following, else just stay ended).
+function onVideoEnded() {
+  const reported = player.currentWallClockMs();
+  const ms =
+    Number.isFinite(reported) && reported > 0
+      ? reported
+      : (state.seekIntent?.ms ?? timeline.playheadMs ?? 0);
+  if (!state.device || !ms) return;
+  if (spanContaining(ms + 2000)) {
+    // The run continues but the loaded window was capped mid-span: keep rolling.
+    loadWindowAround(ms + 1000, { seekMs: ms, play: true });
+    return;
+  }
+  const next = nextSpanStart(ms);
+  if (next != null) {
+    toast(`Gap ${humanDur(next - ms)} — continuing`);
+    // Auto-advance is not a manual seek: keep the follow when it's on.
+    seekTo(next, { play: true, fromLive: state.followLive });
+  } else if (state.followLive && state.device.latestMs) {
+    // Hold at the live edge; the 6s poll extends the window as footage lands.
+    seekTo(state.device.latestMs - LIVE_BEHIND_MS, { play: true, fromLive: true });
+  }
+}
+
+// The LIVE pill / Shift+L: jump just behind the newest footage and start following.
+function goLive() {
+  const d = state.device;
+  if (!d?.latestMs) return;
+  state.followLive = true;
+  seekTo(d.latestMs - LIVE_BEHIND_MS, { play: true, fromLive: true });
+  updateLivePill(d.latestMs - LIVE_BEHIND_MS);
+}
+
+// Solid red LIVE only while actually following at the edge; dimmed GO LIVE otherwise.
+function updateLivePill(ms) {
+  const btn = $("btnLive");
+  if (!btn) return;
+  const latest = state.device?.latestMs ?? 0;
+  const live =
+    state.followLive && latest > 0 && Number.isFinite(ms) && ms > 0 && latest - ms < LIVE_NEAR_MS;
+  btn.classList.toggle("is-live", live);
+  btn.textContent = live ? "LIVE" : "GO LIVE";
+}
+
+// The timeline's live-edge cap only makes sense while footage is actually arriving.
+function updateLiveEdge() {
+  const latest = state.device?.latestMs ?? 0;
+  timeline.setLiveEdge(latest && Date.now() - latest < LIVE_EDGE_FRESH_MS ? latest : null);
+}
+
+// Screen-reader mirror of the canvas slider (role=slider on #timeline), 1 Hz.
+function updateAria(ms) {
+  const el = $("timeline");
+  const d = state.device;
+  if (!el || !d) return;
+  el.setAttribute("aria-valuemin", String(Math.round((d.earliestMs ?? 0) / 1000)));
+  el.setAttribute("aria-valuemax", String(Math.round((d.latestMs ?? 0) / 1000)));
+  if (Number.isFinite(ms) && ms > 0) {
+    el.setAttribute("aria-valuenow", String(Math.round(ms / 1000)));
+    el.setAttribute(
+      "aria-valuetext",
+      `${clock(ms)}, ${timeline.isCovered(ms) ? "recorded" : "gap"}`,
+    );
+  }
+}
+
 function togglePlay() {
-  if (player.video.paused) player.play().catch(() => {});
-  else player.pause();
+  if (player.video.paused) {
+    player.play().catch(() => {});
+  } else {
+    player.pause();
+    state.followLive = false; // a manual pause drops live-follow
+  }
 }
 
 function setRate(r) {
   state.rate = r;
   player.setRate(r);
   $("speed").value = String(r);
-  // Audio garbles at high speed: mute >=4x but restore the user's choice at 1x/2x.
+  // Audio garbles at high speed: mute >=4x but restore the user's choice at <=2x
+  // (slow-mo included — 0.25x/0.5x keep sound).
   player.setMuted(r >= 4 ? true : state.userMuted);
+}
+
+// <'/'>' walk the RATES ladder (0.25x..8x) with a toast naming the new rate.
+function cycleRate(dir) {
+  let i = RATES.indexOf(state.rate);
+  if (i < 0) i = RATES.findIndex((r) => r >= state.rate); // off-ladder: snap to the next step up
+  if (i < 0) i = RATES.length - 1;
+  const next = RATES[Math.min(Math.max(i + dir, 0), RATES.length - 1)];
+  setRate(next);
+  toast(`Speed ${next}×`);
 }
 
 function setMuted(m) {
@@ -490,14 +618,11 @@ function wireControls() {
     player.setVolume(Number(e.target.value));
     if (Number(e.target.value) > 0 && state.userMuted) setMuted(false);
   };
-  $("btnLatest").onclick = () => {
-    const d = state.device;
-    if (d?.latestMs) seekTo(d.latestMs - 4000, { play: true });
-  };
-  $("btnFit").onclick = () => {
-    const d = state.device;
-    if (d) timeline.fit(d.earliestMs - 2000, d.latestMs + 2000);
-  };
+  $("btnLive").onclick = goLive;
+  $("btnFit").onclick = fitAll;
+  // Shortcut cheat-sheet (?): a static dialog, so wireModal covers Esc/backdrop/focus.
+  helpModal = wireModal($("helpModal"));
+  $("helpClose").onclick = () => helpModal.close();
   $("zoomIn").onclick = () => timeline.zoom(1 / 1.6);
   $("zoomOut").onclick = () => timeline.zoom(1.6);
   $("btnFull").onclick = () => {
@@ -548,11 +673,24 @@ function stepDay(dir) {
   jumpToDay(new Date(y, m - 1, d + dir).getTime());
 }
 
+// Zoom the bar out to the device's whole footage range (btnFit + the `0` key).
+function fitAll() {
+  const d = state.device;
+  if (d) timeline.fit(d.earliestMs - 2000, d.latestMs + 2000);
+}
+
 function wireKeys() {
   window.addEventListener("keydown", (e) => {
     if (e.metaKey || e.ctrlKey || e.altKey) return; // never eat browser/system chords
-    // An open modal owns the keyboard — typing/navigating in it must not scrub the player.
-    if (document.querySelector(".modal:not([hidden])")) return;
+    // An open modal owns the keyboard — typing/navigating in it must not scrub the
+    // player. Exception: `?` still toggles the cheat-sheet closed from inside itself.
+    if (document.querySelector(".modal:not([hidden])")) {
+      if (e.key === "?" && helpModal?.isOpen()) {
+        e.preventDefault();
+        helpModal.close();
+      }
+      return;
+    }
     const t = e.target;
     if (t && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA")) return;
     switch (e.key) {
@@ -562,16 +700,33 @@ function wireKeys() {
         togglePlay();
         break;
       case "ArrowLeft":
-        relSeek(-5000);
+        relSeek(e.shiftKey ? -60000 : -5000);
         break;
       case "ArrowRight":
-        relSeek(5000);
+        relSeek(e.shiftKey ? 60000 : 5000);
         break;
       case "j":
         relSeek(-10000);
         break;
       case "l":
         relSeek(10000);
+        break;
+      case "L": // Shift+L
+        goLive();
+        break;
+      case ",": // step one frame back (pauses)
+        player.stepFrame(-1);
+        state.followLive = false;
+        break;
+      case ".": // step one frame forward (pauses)
+        player.stepFrame(1);
+        state.followLive = false;
+        break;
+      case "<": // Shift+, — slower
+        cycleRate(-1);
+        break;
+      case ">": // Shift+. — faster
+        cycleRate(1);
         break;
       case "[":
         gotoPrevSpan();
@@ -604,6 +759,9 @@ function wireKeys() {
       case "-":
         timeline.zoom(1.6);
         break;
+      case "0":
+        fitAll();
+        break;
       case "1":
         setRate(1);
         break;
@@ -615,6 +773,10 @@ function wireKeys() {
         break;
       case "4":
         setRate(8);
+        break;
+      case "?":
+        e.preventDefault();
+        helpModal?.open();
         break;
     }
   });
@@ -642,6 +804,14 @@ function startTicker() {
         $("readout").textContent = clockMs(ms);
         if (state.detMode) detections.onTick(ms);
         updateAiBadge(ms);
+      }
+      // 1 Hz side-channel: ARIA slider values, LIVE pill state, live-edge cap freshness.
+      const nowTick = performance.now();
+      if (nowTick - lastA11yTick >= 1000) {
+        lastA11yTick = nowTick;
+        updateAria(ms);
+        updateLivePill(ms);
+        updateLiveEdge();
       }
       // Advance the 'processing' shimmer (cheap no-op unless something is processing on screen).
       timeline.tickAnim(performance.now());

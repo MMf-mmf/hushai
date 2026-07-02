@@ -30,6 +30,9 @@ export class Player {
     this.supported = !!(Hls && Hls.isSupported());
     this.nativeHls = !this.supported && videoEl.canPlayType("application/vnd.apple.mpegurl");
     this._nativeNoticed = false; // reduced-accuracy notice shown at most once per instance
+    this._frameDur = null; // measured seconds-per-frame (rVFC deltas); null until known
+    this._measuring = false; // a frame-duration measurement is in flight
+    this._gen = 0; // load generation — lets stale async callbacks self-discard
   }
 
   // Load a new master playlist (a device+window). Optionally seek once ready.
@@ -38,6 +41,9 @@ export class Player {
     this.fragments = [];
     this.pendingSeekMs = seekMs;
     this._autoplay = autoplay;
+    this._gen++;
+    this._frameDur = null; // a new source may have a different frame rate — re-measure
+    this._measuring = false;
 
     if (this.supported) {
       const hls = new Hls(HLS_CONFIG);
@@ -83,6 +89,7 @@ export class Player {
       this.seekToWallClock(ms);
     }
     if (this._autoplay) this.video.play().catch(() => {});
+    this._maybeMeasureFrameDur();
   }
 
   // ---- the core: absolute wall-clock time -> media currentTime --------------
@@ -237,6 +244,52 @@ export class Player {
     return { fromMs: ranges[0].fromMs, toMs: ranges[ranges.length - 1].toMs, ranges };
   }
 
+  // ---- frame stepping --------------------------------------------------------
+
+  // Pause and nudge currentTime by exactly one frame (`dir` = ±1). The frame duration
+  // comes from measured requestVideoFrameCallback mediaTime deltas (cached per load);
+  // 1/30 until a measurement lands, or on browsers without rVFC.
+  stepFrame(dir) {
+    this.video.pause();
+    this._maybeMeasureFrameDur(); // no-op once measured; arms early for the next play
+    const dur = this._frameDur ?? 1 / 30;
+    let t = this.video.currentTime + dir * dur;
+    const s = this.video.seekable;
+    if (s.length) t = Math.min(Math.max(t, s.start(0)), s.end(s.length - 1));
+    try {
+      this.video.currentTime = t;
+    } catch {
+      /* not seekable yet */
+    }
+  }
+
+  // One-shot: watch two consecutively presented frames and cache their mediaTime delta.
+  // Frames only present during playback, so this is kicked on ready/play and simply
+  // waits until they do; load() bumps _gen so a callback from a torn-down source
+  // can't poison the new one.
+  _maybeMeasureFrameDur() {
+    const v = this.video;
+    if (this._frameDur != null || this._measuring) return;
+    if (typeof v.requestVideoFrameCallback !== "function") return;
+    this._measuring = true;
+    const gen = this._gen;
+    let last = null;
+    const cb = (_now, meta) => {
+      if (gen !== this._gen) return; // superseded by a newer load()
+      const d = last != null ? meta.mediaTime - last : null;
+      // Accept only plausible frame durations (8.3ms..100ms): seeks and dropped
+      // frames produce outlier deltas that must not stick.
+      if (d != null && d > 1 / 120 && d < 1 / 10) {
+        this._frameDur = d;
+        this._measuring = false;
+        return;
+      }
+      last = meta.mediaTime;
+      v.requestVideoFrameCallback(cb);
+    };
+    v.requestVideoFrameCallback(cb);
+  }
+
   _onHlsError(hls, data) {
     if (!data.fatal) return;
     switch (data.type) {
@@ -253,6 +306,7 @@ export class Player {
   }
 
   play() {
+    this._maybeMeasureFrameDur();
     return this.video.play();
   }
   pause() {

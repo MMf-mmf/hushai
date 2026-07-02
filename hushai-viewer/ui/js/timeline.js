@@ -5,16 +5,21 @@
 // All times are ms. Two transforms (xOf/tOf) drive everything — nothing is laid out
 // per-segment, so a busy day stays cheap (the backend pre-coalesces to spans).
 
-import { stageColors, cssVar } from "./theme.js";
+import { stageColors, cssVar, prefersReducedMotion } from "./theme.js";
 
 const LADDER = [
-  1e3, 2e3, 5e3, 1e4, 15e3, 3e4, 6e4, 12e4, 3e5, 6e5, 9e5, 18e5, 36e5, 72e5, 108e5, 216e5, 432e5,
-  864e5,
+  250, 500, 1e3, 2e3, 5e3, 1e4, 15e3, 3e4, 6e4, 12e4, 3e5, 6e5, 9e5, 18e5, 36e5, 72e5, 108e5,
+  216e5, 432e5, 864e5,
 ];
 
 const TRACK_TOP = 30;
 const TRACK_H = 46;
-const MIN_WINDOW = 20_000; // 20s most-zoomed-in
+const MIN_WINDOW = 5_000; // 5s most-zoomed-in
+const HIT_SLOP_TOUCH = 22; // ±px hit tolerance for touch pointers (edge grips, marker hits)
+const GRIP_SLOP = 7; // ±px hit tolerance for selection edge grips with a mouse
+const PINCH_MIN_DIST = 12; // px floor so pinch scaling can't blow up as the fingers converge
+const MS_TOOLTIP_SPAN = 120_000; // under this visible span the tooltip gains millisecond precision
+const GAP_HATCH_MAX_SPAN = 30 * 60_000; // hatch gap regions only when zoomed in past 30 minutes
 
 // AI processing-status ribbons drawn under the coverage track (audio lane, then vision).
 // Each is a labeled track so the two lanes are always identifiable; a faint base shows the
@@ -36,16 +41,19 @@ const TICK_COLOR = cssVar("--tl-tick", "#79839a");
 const COV_HI = cssVar("--tl-cov-hi", "#2ee6d6");
 const COV_LO = cssVar("--tl-cov-lo", "#1aa899");
 const SESSION_COLOR = cssVar("--tl-session", "rgba(255,174,87,0.85)");
+const ACCENT = cssVar("--accent", "#2ee6d6");
+const LIVE_COLOR = cssVar("--sev-critical", "#ff7a7a");
 
 const pad = (n) => String(n).padStart(2, "0");
 
 export class Timeline {
-  constructor(canvas, { onSeek, onWindowChange, onHover } = {}) {
+  constructor(canvas, { onSeek, onWindowChange, onHover, onSelectionChange } = {}) {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d");
     this.onSeek = onSeek || (() => {});
     this.onWindowChange = onWindowChange || (() => {});
     this.onHover = onHover || (() => {});
+    this.onSelectionChange = onSelectionChange || (() => {});
 
     this.from = 0;
     this.to = 1;
@@ -61,10 +69,20 @@ export class Timeline {
     this.playheadMs = null;
     this.hoverX = null;
     this.ghostMs = null; // while scrubbing
+    this.liveEdgeMs = null; // newest-footage cap (bar + pulsing dot); null hides it
     this.cssW = 0;
     this.cssH = 0;
 
-    this._drag = null; // {mode:'scrub'|'pan', startX, startFrom, startTo}
+    // Range selection, shared by Shift+drag zoom-to-selection and (persistently) by
+    // export mode: with `selectMode` on, a plain track-drag creates/adjusts `_sel`
+    // via draggable edge grips instead of scrubbing.
+    this.selectMode = false;
+    this._sel = null; // {fromMs,toMs} or null
+    this._selBefore = null; // snapshot for Escape-cancel of an in-flight selection drag
+    this._escOnKey = null; // keydown listener armed only while a cancellable drag runs
+
+    this._pointers = new Map(); // active pointerId -> {x,y}; two entries = pinch
+    this._drag = null; // {mode:'scrub'|'pan'|'zoomsel'|'selnew'|'seledge'|'pinch', ...}
     this._wire();
     this._resize();
     new ResizeObserver(() => this._resize()).observe(canvas);
@@ -88,6 +106,13 @@ export class Timeline {
     this.playheadMs = ms;
     this.render();
   }
+  // Newest-footage cap: a 2px bar + small dot at `ms` (null hides it). The dot pulses
+  // via tickAnim; under prefers-reduced-motion it sits static.
+  setLiveEdge(ms) {
+    if (ms === this.liveEdgeMs) return;
+    this.liveEdgeMs = ms;
+    this.render();
+  }
   // Per-lane AI processing-status intervals. Independent of coverage/window/playhead.
   setProcessing({ audio, vision }) {
     this.procAudio = audio || [];
@@ -107,10 +132,16 @@ export class Timeline {
     const find = (arr) => arr.find((i) => ms >= i.startMs && ms <= i.endMs) || null;
     return { audio: find(this.procAudio), vision: find(this.procVision) };
   }
-  // Advance the shimmer. Driven by the app rAF loop; only repaints when something is
-  // actually processing, so a paused, fully-processed bar stays cheap.
+  // Advance the shimmer + live-edge pulse. Driven by the app rAF loop; only repaints
+  // when something is actually animating, so a paused, fully-processed bar stays cheap.
   tickAnim(nowMs) {
-    if (!this._procEnabled || !this._hasProcessing) return;
+    const shimmer = this._procEnabled && this._hasProcessing;
+    const livePulse =
+      this.liveEdgeMs != null &&
+      this.liveEdgeMs >= this.from &&
+      this.liveEdgeMs <= this.to &&
+      !prefersReducedMotion();
+    if (!shimmer && !livePulse) return;
     this._animPhase = (nowMs / 1200) % 1;
     this.render();
   }
@@ -151,6 +182,37 @@ export class Timeline {
     return this.coverage.some((c) => ms >= c.startMs && ms <= c.endMs);
   }
 
+  // ---- range selection --------------------------------------------------------
+  // Programmatic set (does NOT fire onSelectionChange — that callback narrates user
+  // gestures; a caller setting it already knows). `setSelection(null)` clears.
+  setSelection(fromMs, toMs = null) {
+    this._sel =
+      fromMs == null || toMs == null
+        ? null
+        : { fromMs: Math.min(fromMs, toMs), toMs: Math.max(fromMs, toMs) };
+    this.render();
+  }
+  getSelection() {
+    return this._sel ? { ...this._sel } : null;
+  }
+  // Gesture-driven update: keeps fromMs <= toMs and tells the owner.
+  _setSelFromDrag(fromMs, toMs) {
+    this._sel =
+      fromMs == null || toMs == null
+        ? null
+        : { fromMs: Math.min(fromMs, toMs), toMs: Math.max(fromMs, toMs) };
+    this.onSelectionChange(this.getSelection());
+  }
+  // Which selection edge grip (if any) `x` hits; touch gets the wider target.
+  _selEdgeAt(x, slop) {
+    if (!this._sel) return null;
+    const df = Math.abs(x - this.xOf(this._sel.fromMs));
+    const dt = Math.abs(x - this.xOf(this._sel.toMs));
+    if (df <= slop && df <= dt) return "from";
+    if (dt <= slop) return "to";
+    return null;
+  }
+
   // ---- rendering ------------------------------------------------------------
   _resize() {
     const dpr = window.devicePixelRatio || 1;
@@ -174,6 +236,9 @@ export class Timeline {
     ctx.fillStyle = TRACK_BG;
     roundRect(ctx, 0, TRACK_TOP, W, TRACK_H, 6);
     ctx.fill();
+
+    // Zoomed in, hatch the gaps so "no data here" reads differently from "not loaded yet".
+    if (this.to - this.from < GAP_HATCH_MAX_SPAN) this._drawGapHatch();
 
     // gridlines + tick labels
     const step = this._chooseStep();
@@ -216,11 +281,17 @@ export class Timeline {
       ctx.stroke();
     }
 
+    // range selection band (persistent) / zoom-to-selection band (while dragging)
+    this._drawSelection();
+
     // AI processing-status ribbons (audio lane, then vision lane)
     if (this._procEnabled) {
       this._drawRibbon(this.procAudio, RIBBON_Y0, "Audio");
       this._drawRibbon(this.procVision, RIBBON_Y1, "Vision");
     }
+
+    // live-edge cap (newest footage): 2px bar + pulsing dot
+    this._drawLiveEdge();
 
     // hover hairline + tooltip
     if (this.hoverX != null && this._drag == null) {
@@ -234,8 +305,11 @@ export class Timeline {
       this._tooltip(ms, this.hoverX);
     }
 
-    // ghost (while scrubbing)
-    if (this.ghostMs != null) this._playhead(this.ghostMs, "rgba(255,255,255,0.5)");
+    // ghost (while scrubbing) + its tooltip, so the landing time reads mid-drag
+    if (this.ghostMs != null) {
+      this._playhead(this.ghostMs, "rgba(255,255,255,0.5)");
+      if (this._drag?.mode === "scrub") this._tooltip(this.ghostMs, this.xOf(this.ghostMs));
+    }
     // playhead
     if (this.playheadMs != null) this._playhead(this.playheadMs, "#ffffff");
   }
@@ -252,6 +326,92 @@ export class Timeline {
     ctx.lineTo(x, TRACK_TOP + 4);
     ctx.closePath();
     ctx.fill();
+  }
+
+  // Diagonal hatch over the gap x-ranges of the visible window, in the same inset band
+  // as the coverage fill. Only drawn once coverage data exists — before the first fetch
+  // the whole track IS "not loaded yet", which is exactly what the hatch must not claim.
+  _drawGapHatch() {
+    if (!this.coverage.length) return;
+    const pat = hatchPattern(this.ctx);
+    if (!pat) return;
+    const ctx = this.ctx;
+    ctx.fillStyle = pat;
+    const fill = (a, b) => {
+      const x0 = Math.max(0, this.xOf(a));
+      const x1 = Math.min(this.cssW, this.xOf(b));
+      if (x1 > x0) ctx.fillRect(x0, TRACK_TOP + 4, x1 - x0, TRACK_H - 8);
+    };
+    const spans = this.coverage.slice().sort((a, b) => a.startMs - b.startMs);
+    let cur = this.from;
+    for (const c of spans) {
+      if (c.startMs > cur) fill(cur, Math.min(c.startMs, this.to));
+      cur = Math.max(cur, c.endMs);
+      if (cur >= this.to) break;
+    }
+    if (cur < this.to) fill(cur, this.to);
+  }
+
+  // Translucent accent band for the persistent range selection (edge grips in
+  // selectMode) or the transient Shift+drag zoom-select band — same rendering,
+  // different lifetime.
+  _drawSelection() {
+    const dz = this._drag?.mode === "zoomsel" ? this._drag : null;
+    const band = dz
+      ? { fromMs: Math.min(dz.startMs, dz.curMs), toMs: Math.max(dz.startMs, dz.curMs) }
+      : this._sel;
+    if (!band) return;
+    const ctx = this.ctx;
+    const W = this.cssW;
+    const x0 = this.xOf(band.fromMs);
+    const x1 = this.xOf(band.toMs);
+    if (x1 < 0 || x0 > W) return;
+    ctx.save();
+    ctx.globalAlpha = 0.16;
+    ctx.fillStyle = ACCENT;
+    ctx.fillRect(Math.max(0, x0), TRACK_TOP, Math.min(W, x1) - Math.max(0, x0), TRACK_H);
+    ctx.restore();
+    ctx.strokeStyle = ACCENT;
+    for (const x of [x0, x1]) {
+      if (x < 0 || x > W) continue;
+      ctx.beginPath();
+      ctx.moveTo(x, TRACK_TOP);
+      ctx.lineTo(x, TRACK_TOP + TRACK_H);
+      ctx.stroke();
+    }
+    // Edge grips (drag handles) — only for the persistent selection in select mode.
+    if (!dz && this.selectMode) {
+      ctx.fillStyle = ACCENT;
+      for (const x of [x0, x1]) {
+        if (x < -4 || x > W + 4) continue;
+        roundRect(ctx, x - 3, TRACK_TOP + TRACK_H / 2 - 8, 6, 16, 3);
+        ctx.fill();
+      }
+    }
+  }
+
+  // 2px newest-footage bar in --sev-critical with a small dot on top. The dot's halo
+  // pulses via _animPhase (advanced by tickAnim); static under prefers-reduced-motion.
+  _drawLiveEdge() {
+    const ms = this.liveEdgeMs;
+    if (ms == null) return;
+    const x = this.xOf(ms);
+    if (x < 0 || x > this.cssW) return;
+    const ctx = this.ctx;
+    ctx.fillStyle = LIVE_COLOR;
+    ctx.fillRect(x - 1, TRACK_TOP, 2, TRACK_H);
+    ctx.beginPath();
+    ctx.arc(x, TRACK_TOP - 6, 3, 0, Math.PI * 2);
+    ctx.fill();
+    if (!prefersReducedMotion()) {
+      const pulse = 0.5 + 0.5 * Math.sin(this._animPhase * Math.PI * 2);
+      ctx.save();
+      ctx.globalAlpha = 0.45 * (1 - pulse);
+      ctx.beginPath();
+      ctx.arc(x, TRACK_TOP - 6, 3 + 4 * pulse, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+    }
   }
 
   // One lane ribbon: a faint base track (so the lane is always visible + identifiable),
@@ -313,8 +473,10 @@ export class Timeline {
   _tooltip(ms, x) {
     const ctx = this.ctx;
     const covered = this.isCovered(ms);
+    // Millisecond precision once the window is tight enough for it to mean anything.
+    const when = this.to - this.from < MS_TOOLTIP_SPAN ? fmtFullMs(ms) : fmtFull(ms);
     const lines = [
-      { text: `${fmtFull(ms)}   ${covered ? "● recorded" : "○ gap"}`, color: covered ? "#cdd6e4" : "#79839a", chip: null },
+      { text: `${when}   ${covered ? "● recorded" : "○ gap"}`, color: covered ? "#cdd6e4" : "#79839a", chip: null },
     ];
     if (this._procEnabled && covered) {
       const st = this.statusAt(ms);
@@ -376,7 +538,7 @@ export class Timeline {
     });
     c.addEventListener("pointerdown", (e) => this._onDown(e));
     window.addEventListener("pointerup", (e) => this._onUp(e));
-    window.addEventListener("pointercancel", () => this._onCancel());
+    window.addEventListener("pointercancel", (e) => this._onCancel(e));
     c.addEventListener(
       "wheel",
       (e) => {
@@ -397,50 +559,195 @@ export class Timeline {
     return "track"; // the coverage track, incl. the small breather above the ribbons
   }
   _onDown(e) {
-    const x = this._localX(e);
-    const y = e.clientY - this.canvas.getBoundingClientRect().top;
+    const rect = this.canvas.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
     this.canvas.setPointerCapture?.(e.pointerId);
+    this._pointers.set(e.pointerId, { x, y });
+    // A second finger turns any one-finger gesture into a pinch (nothing is committed).
+    if (this._pointers.size === 2) {
+      this._startPinch();
+      return;
+    }
+    if (this._pointers.size > 2 || this._drag?.mode === "pinch") return;
     // Middle-button drag pans from anywhere; otherwise the hit zone decides.
     if (e.button === 1) e.preventDefault(); // suppress the browser's middle-click autoscroll
     const zone = e.button === 1 ? "labels" : this._zoneAt(y);
     if (zone === "labels") {
       this._drag = { mode: "pan", startX: x, startFrom: this.from, startTo: this.to };
     } else if (zone === "track") {
-      this._drag = { mode: "scrub" };
-      this.ghostMs = this.snap(this.tOf(x));
+      const raw = this.tOf(x);
+      if (e.shiftKey && !this.selectMode) {
+        // Zoom-to-selection: accent band while dragging, fit() on release, Esc cancels.
+        this._drag = { mode: "zoomsel", startMs: raw, curMs: raw };
+        this._armEscCancel();
+      } else if (this.selectMode) {
+        // Select mode: grab an edge grip when hit, else start a fresh selection.
+        this._armEscCancel();
+        const slop = e.pointerType === "touch" ? HIT_SLOP_TOUCH : GRIP_SLOP;
+        const edge = this._selEdgeAt(x, slop);
+        if (edge) {
+          this._drag = { mode: "seledge", edge };
+        } else {
+          this._drag = { mode: "selnew", startMs: raw };
+          this._setSelFromDrag(raw, raw);
+        }
+      } else {
+        // Plain drag scrubs; Alt bypasses gap-snap for exact-millisecond seeks.
+        this._drag = { mode: "scrub", noSnap: e.altKey };
+        this.ghostMs = e.altKey ? raw : this.snap(raw);
+      }
       this.render();
     }
     // "ribbons" starts no drag — that band only hovers.
   }
   _onMove(e) {
     const x = this._localX(e);
-    this.hoverX = x;
-    if (this._drag?.mode === "scrub") {
-      this.ghostMs = this.snap(this.tOf(x));
-    } else if (this._drag?.mode === "pan") {
-      const dt = ((x - this._drag.startX) / this.cssW) * (this._drag.startTo - this._drag.startFrom);
-      this._panTo(this._drag.startFrom - dt, this._drag.startTo - dt);
+    // Two-finger pinch owns the pointer stream: zoom/pan only, no hover/ghost.
+    if (this._drag?.mode === "pinch") {
+      if (this._pointers.has(e.pointerId) && this._pointers.size >= 2) this._pinchMove(e);
       return;
+    }
+    if (this._pointers.has(e.pointerId)) {
+      this._pointers.set(e.pointerId, {
+        x,
+        y: e.clientY - this.canvas.getBoundingClientRect().top,
+      });
+    }
+    this.hoverX = x;
+    const d = this._drag;
+    if (d?.mode === "scrub") {
+      this.ghostMs = d.noSnap ? this.tOf(x) : this.snap(this.tOf(x));
+    } else if (d?.mode === "pan") {
+      const dt = ((x - d.startX) / this.cssW) * (d.startTo - d.startFrom);
+      this._panTo(d.startFrom - dt, d.startTo - dt);
+      return;
+    } else if (d?.mode === "zoomsel") {
+      d.curMs = this.tOf(x);
+    } else if (d?.mode === "selnew") {
+      this._setSelFromDrag(d.startMs, this.tOf(x));
+    } else if (d?.mode === "seledge") {
+      this._dragSelEdge(this.tOf(x));
     }
     this.onHover(this.tOf(x));
     this.render();
   }
-  _onUp() {
-    if (this._drag?.mode === "scrub" && this.ghostMs != null) {
+  // Move the grabbed selection edge to `ms`; crossing the other edge hands the grip over.
+  _dragSelEdge(ms) {
+    const s = this._sel;
+    const d = this._drag;
+    if (!s || !d) return;
+    const anchor = d.edge === "from" ? s.toMs : s.fromMs;
+    if (d.edge === "from" && ms > anchor) d.edge = "to";
+    else if (d.edge === "to" && ms < anchor) d.edge = "from";
+    this._setSelFromDrag(anchor, ms);
+  }
+  _onUp(e) {
+    if (e && this._pointers.has(e.pointerId)) {
+      this._pointers.delete(e.pointerId);
+      if (this._drag?.mode === "pinch") {
+        // A lifted finger ends the pinch. The survivor does NOT become a scrub —
+        // it has to start its own pointerdown.
+        if (this._pointers.size < 2) this._drag = null;
+        this.render();
+        return;
+      }
+    }
+    const d = this._drag;
+    if (!d) return;
+    this._drag = null;
+    this._disarmEscCancel();
+    if (d.mode === "scrub" && this.ghostMs != null) {
       const ms = this.ghostMs;
       this.ghostMs = null;
-      this._drag = null;
-      this.onSeek(ms);
-      this.render();
-    } else {
-      this._drag = null;
+      this.onSeek(ms, { exact: !!d.noSnap });
+    } else if (d.mode === "zoomsel") {
+      const a = Math.min(d.startMs, d.curMs);
+      const b = Math.max(d.startMs, d.curMs);
+      // Bands under ~4px are accidental shift-clicks — do nothing rather than dive to 5s.
+      if (this.xOf(b) - this.xOf(a) >= 4) this.fit(a, b); // fit() enforces MIN_WINDOW
+    } else if (d.mode === "selnew" && this._sel) {
+      // A no-drag click in select mode clears instead of leaving a zero-width selection.
+      if (this.xOf(this._sel.toMs) - this.xOf(this._sel.fromMs) < 3)
+        this._setSelFromDrag(null, null);
     }
+    this.render();
   }
   // A cancelled pointer (touch handed off to scrolling, capture lost) abandons the
-  // gesture: clear the drag + ghost without seeking, like a pointerup that never lands.
-  _onCancel() {
+  // gesture: clear the drag + ghost without seeking, restore a mid-drag selection.
+  _onCancel(e) {
+    if (e) this._pointers.delete(e.pointerId);
+    const d = this._drag;
     this._drag = null;
     this.ghostMs = null;
+    if (d && (d.mode === "selnew" || d.mode === "seledge")) {
+      const prev = this._selBefore;
+      this._setSelFromDrag(prev?.fromMs ?? null, prev?.toMs ?? null);
+    }
+    this._disarmEscCancel();
+    this.render();
+  }
+
+  // ---- pinch (two pointers) -----------------------------------------------------
+  _startPinch() {
+    // Entering pinch abandons whatever one-finger gesture was underway.
+    const d = this._drag;
+    if (d && (d.mode === "selnew" || d.mode === "seledge")) {
+      const prev = this._selBefore;
+      this._setSelFromDrag(prev?.fromMs ?? null, prev?.toMs ?? null);
+    }
+    this._disarmEscCancel();
+    this._drag = { mode: "pinch" };
+    this.ghostMs = null;
+    this.hoverX = null;
+    this.onHover(null);
+    this.render();
+  }
+  // One pointer of the pair moved: rescale the span about the pinch midpoint's time
+  // (the _onWheel anchor math) plus the midpoint's own x-delta pan, in one _panTo.
+  _pinchMove(e) {
+    const rect = this.canvas.getBoundingClientRect();
+    const [idA, idB] = [...this._pointers.keys()];
+    const prevA = this._pointers.get(idA);
+    const prevB = this._pointers.get(idB);
+    const cur = { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    const curA = e.pointerId === idA ? cur : prevA;
+    const curB = e.pointerId === idB ? cur : prevB;
+    const prevDist = Math.max(Math.abs(prevA.x - prevB.x), PINCH_MIN_DIST);
+    const curDist = Math.max(Math.abs(curA.x - curB.x), PINCH_MIN_DIST);
+    const anchor = this.tOf((prevA.x + prevB.x) / 2); // the time pinned under the midpoint
+    const span = this.to - this.from;
+    const newSpan = Math.min(Math.max(span * (prevDist / curDist), MIN_WINDOW), this._maxSpan());
+    const from = anchor - ((curA.x + curB.x) / 2 / this.cssW) * newSpan;
+    this._pointers.set(e.pointerId, cur);
+    this._panTo(from, from + newSpan);
+  }
+
+  // ---- Escape-cancel for selection / zoom-select drags ----------------------------
+  _armEscCancel() {
+    if (this._escOnKey) return;
+    this._selBefore = this.getSelection();
+    this._escOnKey = (ev) => {
+      if (ev.key === "Escape") this._cancelDrag();
+    };
+    window.addEventListener("keydown", this._escOnKey);
+  }
+  _disarmEscCancel() {
+    if (!this._escOnKey) return;
+    window.removeEventListener("keydown", this._escOnKey);
+    this._escOnKey = null;
+    this._selBefore = null;
+  }
+  _cancelDrag() {
+    const d = this._drag;
+    if (!d) return;
+    this._drag = null;
+    this.ghostMs = null;
+    if (d.mode === "selnew" || d.mode === "seledge") {
+      const prev = this._selBefore;
+      this._setSelFromDrag(prev?.fromMs ?? null, prev?.toMs ?? null);
+    }
+    this._disarmEscCancel();
     this.render();
   }
   _onWheel(e) {
@@ -490,6 +797,34 @@ export class Timeline {
 function fmtFull(ms) {
   const d = new Date(ms);
   return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+}
+
+// HH:MM:SS.mmm — the tooltip's precision form for tight (sub-2-minute) windows.
+function fmtFullMs(ms) {
+  return `${fmtFull(ms)}.${String(Math.floor(ms % 1000)).padStart(3, "0")}`;
+}
+
+// Cached 8x8 diagonal-hatch tile for gap regions ("no data here", vs. the plain dark
+// track meaning "not loaded"). Built lazily once from the first context that asks.
+let _hatch = null;
+function hatchPattern(ctx) {
+  if (_hatch) return _hatch;
+  const tile = document.createElement("canvas");
+  tile.width = tile.height = 8;
+  const g = tile.getContext("2d");
+  g.strokeStyle = "rgba(255,255,255,0.07)";
+  g.lineWidth = 1.5;
+  g.beginPath();
+  // The main diagonal plus the two corner halves, so the tile repeats seamlessly.
+  g.moveTo(0, 8);
+  g.lineTo(8, 0);
+  g.moveTo(-4, 4);
+  g.lineTo(4, -4);
+  g.moveTo(4, 12);
+  g.lineTo(12, 4);
+  g.stroke();
+  _hatch = ctx.createPattern(tile, "repeat");
+  return _hatch;
 }
 
 const plural = (n, w) => `${n} ${w}${n === 1 ? "" : "s"}`;

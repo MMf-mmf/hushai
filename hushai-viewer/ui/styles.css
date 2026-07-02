@@ -463,6 +463,73 @@ input[type="date"] {
   font-style: italic;
 }
 
+/* The timeline canvas is keyboard-focusable (role=slider) — make that visible. */
+.timeline:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+}
+
+/* ---- LIVE pill (video transport) ---- */
+/* Dimmed "GO LIVE" by default; solid red "LIVE" while actually following the edge. */
+.live-pill {
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.8px;
+  border-radius: var(--radius-pill);
+  padding: 7px 14px;
+  color: var(--muted);
+}
+.live-pill.is-live {
+  color: #fff;
+  background: var(--sev-critical);
+  border-color: var(--sev-critical);
+  text-shadow: 0 1px 2px rgba(0, 0, 0, 0.35);
+}
+
+/* ---- keyboard cheat-sheet (the "?" overlay; markup in index.html #helpModal) ---- */
+/* Compound selectors on purpose: the base .modal-card/.modal-body rules live later
+   in this file, so these need the extra specificity to win. */
+.modal-card.help-card {
+  width: min(680px, 100%);
+}
+.modal-body.help-body {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+  gap: 18px 28px;
+}
+.help-group h3 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  color: var(--muted);
+}
+.help-row {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 3px 0;
+  font-size: 13px;
+}
+.help-row .keys {
+  flex: 0 0 148px;
+  text-align: right;
+  color: var(--muted);
+  font-size: 12px;
+}
+.help-row kbd {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--text);
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  border-radius: 5px;
+  padding: 1px 6px;
+  white-space: nowrap;
+}
+
 /* ---- live AI-status badge (topbar) ---- */
 .ai-badge {
   display: inline-flex;
@@ -1891,5 +1958,149 @@ button.link {
   }
   .skeleton::after {
     animation: none;
+  }
+}
+
+/* ==== Cameras grid page ==== */
+/* cameras.html (js/cameras/cameras.js): poster tile per device + one shared live-peek
+   player. Reuses .dot.* / .pill.* / .dash chrome above; only tile-specific bits here. */
+.cam-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 14px;
+}
+.cam-tile {
+  position: relative;
+  background: var(--panel);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  transition: border-color 0.15s;
+}
+.cam-tile:hover,
+.cam-tile:focus-within {
+  border-color: var(--accent-dim);
+}
+/* The stretched link that makes the whole tile navigate (valid markup with the peek
+   button alongside, and middle-click/new-tab work). Content stays below it except the
+   peek button, which stacks above. */
+.cam-tile .tile-link {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  border-radius: inherit;
+}
+.cam-tile .frame {
+  position: relative;
+  aspect-ratio: 16 / 9;
+  background: #000;
+}
+.cam-tile .frame img,
+.cam-tile .frame video {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+/* `display: block` above would defeat the hidden attribute — restore it explicitly. */
+.cam-tile .frame img[hidden],
+.cam-tile .no-video[hidden] {
+  display: none;
+}
+.cam-tile .no-video {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 13px;
+  letter-spacing: 0.3px;
+  background: var(--panel2);
+}
+.cam-tile .peek-btn {
+  position: absolute;
+  right: 10px;
+  bottom: 10px;
+  z-index: 2; /* above .tile-link so it toggles the peek instead of navigating */
+  width: 36px;
+  height: 36px;
+  padding: 0;
+  border-radius: var(--radius-pill);
+  border: 1px solid rgba(255, 255, 255, 0.22);
+  background: rgba(0, 0, 0, 0.55);
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.cam-tile:hover .peek-btn,
+.cam-tile:focus-within .peek-btn,
+.cam-tile.peeking .peek-btn {
+  opacity: 1;
+}
+.cam-tile .peek-btn:hover {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+/* No hover on touch — the peek button is always visible there. */
+@media (pointer: coarse) {
+  .cam-tile .peek-btn {
+    opacity: 1;
+    width: 44px;
+    height: 44px;
+  }
+}
+.cam-meta {
+  padding: 10px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.cam-name-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.cam-name {
+  font-weight: 600;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+/* Unacked-alert count, tinted like a critical severity. */
+.alert-chip {
+  flex: none;
+  font-size: 11px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: var(--radius-pill);
+  color: var(--sev-critical);
+  background: rgba(255, 122, 122, 0.15);
+  border: 1px solid rgba(255, 122, 122, 0.35);
+}
+.cam-status-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.cam-status-row .dot {
+  flex: none;
+}
+.cam-status-row .cam-ago {
+  margin-left: auto;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+@media (prefers-reduced-motion: reduce) {
+  .cam-tile,
+  .cam-tile .peek-btn {
+    transition: none;
   }
 }

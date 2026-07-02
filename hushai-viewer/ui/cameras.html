@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hushai · Cameras</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='%232ee6d6'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+    <!-- Vendored hls.js (UMD) — sets window.Hls before the module runs (the live "peek"
+         player needs it). Same include as index.html; no CDN. -->
+    <script src="/vendor/hls.min.js"></script>
+  </head>
+  <body class="dash-body">
+    <!-- Rendered by js/nav.js initTopbar() — the shared brand/navlinks/live-chip/logout bar. -->
+    <header class="topbar" data-topbar></header>
+
+    <main class="dash">
+      <div id="camBanner" class="dash-banner loading">Loading cameras…</div>
+
+      <!-- One poster tile per device (populated by cameras.js). -->
+      <div id="grid" class="cam-grid"></div>
+    </main>
+
+    <script type="module" src="/js/cameras/cameras.js"></script>
+  </body>
+</html>

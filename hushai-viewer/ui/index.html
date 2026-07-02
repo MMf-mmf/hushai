@@ -23,9 +23,9 @@
         <span id="deviceMeta" class="muted small"></span>
       </div>
       <div class="daynav">
-        <button id="dayPrev" title="Previous day">‹</button>
-        <input id="dateInput" type="date" />
-        <button id="dayNext" title="Next day">›</button>
+        <button id="dayPrev" title="Previous day" aria-label="Previous day">‹</button>
+        <input id="dateInput" type="date" aria-label="Date" />
+        <button id="dayNext" title="Next day" aria-label="Next day">›</button>
         <span id="dayLabel" class="muted small"></span>
       </div>
       <div class="clock">
@@ -40,11 +40,12 @@
       <a class="navlink" href="/events.html" title="Alerts &amp; event feed">🔔 Events</a>
       <a class="navlink" href="/dashboard.html" title="System dashboard">▦ System</a>
       <a class="navlink" href="/manage.html" title="Manage devices &amp; footage (rename, retention, delete)">🗄 Files</a>
-      <button id="btnCapture" class="ghost" title="Capture from this browser's camera &amp; mic">●</button>
-      <button id="btnPeople" class="ghost" title="People &amp; faces">👤</button>
-      <button id="btnPlates" class="ghost" title="License plates">🚗</button>
-      <button id="btnSettings" class="ghost" title="Voices &amp; settings">⚙</button>
-      <button id="btnLogout" class="ghost" title="Log out"
+      <button id="btnCapture" class="ghost" title="Capture from this browser's camera &amp; mic"
+        aria-label="Capture from this browser's camera and mic">●</button>
+      <button id="btnPeople" class="ghost" title="People &amp; faces" aria-label="People and faces">👤</button>
+      <button id="btnPlates" class="ghost" title="License plates" aria-label="License plates">🚗</button>
+      <button id="btnSettings" class="ghost" title="Voices &amp; settings" aria-label="Voices and settings">⚙</button>
+      <button id="btnLogout" class="ghost" title="Log out" aria-label="Log out"
         onclick="fetch('/logout',{method:'POST'}).finally(()=>location.href='/login')">⎋</button>
     </header>
 
@@ -59,22 +60,25 @@
             <button id="modeDet" class="mode-btn" role="tab" aria-selected="false">Detections</button>
           </div>
           <div id="status" class="status" style="display: none">Loading…</div>
-          <div id="toast" class="toast"></div>
+          <div id="toast" class="toast" role="status" aria-live="polite"></div>
           <div class="overlay">
-            <button id="btnPrev" title="Previous recording [">⏮</button>
-            <button id="btnPlay" class="primary" title="Play/Pause (Space)">▶</button>
-            <button id="btnNext" title="Next recording ]">⏭</button>
-            <select id="speed" title="Playback speed">
-              <option value="1">1×</option>
+            <button id="btnPrev" title="Previous recording [" aria-label="Previous recording">⏮</button>
+            <button id="btnPlay" class="primary" title="Play/Pause (Space)" aria-label="Play/Pause">▶</button>
+            <button id="btnNext" title="Next recording ]" aria-label="Next recording">⏭</button>
+            <select id="speed" title="Playback speed" aria-label="Playback speed">
+              <option value="0.25">0.25×</option>
+              <option value="0.5">0.5×</option>
+              <option value="1" selected>1×</option>
               <option value="2">2×</option>
               <option value="4">4×</option>
               <option value="8">8×</option>
             </select>
-            <button id="btnMute" title="Mute (M)">🔇</button>
-            <input id="volume" type="range" min="0" max="1" step="0.05" value="1" title="Volume" />
+            <button id="btnMute" title="Mute (M)" aria-label="Mute">🔇</button>
+            <input id="volume" type="range" min="0" max="1" step="0.05" value="1" title="Volume" aria-label="Volume" />
             <span class="spacer"></span>
-            <button id="btnLatest" title="Jump to latest (End)">⦿ Latest</button>
-            <button id="btnFull" title="Fullscreen (F)">⛶</button>
+            <!-- LIVE pill: solid red while following at the edge; "GO LIVE" jumps there. -->
+            <button id="btnLive" class="live-pill" title="Go live (Shift+L)" aria-label="Go live">GO LIVE</button>
+            <button id="btnFull" title="Fullscreen (F)" aria-label="Fullscreen">⛶</button>
           </div>
         </main>
 
@@ -109,17 +113,27 @@
                 <p class="ai-pop-hint">Hover the strips for per-moment status and counts.</p>
               </div>
             </span>
-            <button id="btnFit" title="Fit all footage">Fit all</button>
-            <button id="zoomOut" title="Zoom out (−)">−</button>
-            <button id="zoomIn" title="Zoom in (+)">+</button>
+            <button id="btnFit" title="Fit all footage (0)">Fit all</button>
+            <button id="zoomOut" title="Zoom out (−)" aria-label="Zoom out">−</button>
+            <button id="zoomIn" title="Zoom in (+)" aria-label="Zoom in">+</button>
           </div>
-          <canvas id="timeline" class="timeline"></canvas>
+          <canvas
+            id="timeline"
+            class="timeline"
+            tabindex="0"
+            role="slider"
+            aria-label="Recording timeline"
+            aria-orientation="horizontal"
+            aria-valuemin="0"
+            aria-valuemax="0"
+            aria-valuenow="0"
+          ></canvas>
           <div class="legend muted small">
             <span><i class="sw rec"></i> recorded</span>
             <span><i class="sw gap"></i> gap</span>
             <span><i class="sw sess"></i> session start</span>
             <span class="spacer"></span>
-            <span>click/drag the track to scrub · drag the time labels (or middle-drag) to pan · scroll to zoom</span>
+            <span>drag the track to scrub (Shift+drag zooms a range) · drag the time labels (or middle-drag) to pan · scroll or pinch to zoom · press ? for all shortcuts</span>
           </div>
         </section>
       </div>
@@ -207,6 +221,53 @@
           </div>
           <div id="captureStatus" class="capture-status"></div>
           <div id="captureError" class="capture-error small" hidden></div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Keyboard shortcut cheat-sheet, toggled with "?" (wired via js/modal.js). -->
+    <div id="helpModal" class="modal" hidden>
+      <div class="modal-card help-card">
+        <div class="modal-head">
+          <span class="lbl">Keyboard shortcuts</span>
+          <span class="spacer"></span>
+          <button id="helpClose" type="button" title="Close" aria-label="Close">✕</button>
+        </div>
+        <div class="modal-body help-body">
+          <section class="help-group">
+            <h3>Playback</h3>
+            <div class="help-row"><span class="keys"><kbd>Space</kbd> <kbd>K</kbd></span><span>Play / pause</span></div>
+            <div class="help-row"><span class="keys"><kbd>,</kbd> <kbd>.</kbd></span><span>Step one frame back / forward</span></div>
+            <div class="help-row"><span class="keys"><kbd>1</kbd> <kbd>2</kbd> <kbd>3</kbd> <kbd>4</kbd></span><span>Speed 1× / 2× / 4× / 8×</span></div>
+            <div class="help-row"><span class="keys"><kbd>&lt;</kbd> <kbd>&gt;</kbd></span><span>Cycle speed 0.25×–8×</span></div>
+            <div class="help-row"><span class="keys"><kbd>M</kbd></span><span>Mute / unmute</span></div>
+            <div class="help-row"><span class="keys"><kbd>F</kbd></span><span>Fullscreen</span></div>
+          </section>
+          <section class="help-group">
+            <h3>Seeking</h3>
+            <div class="help-row"><span class="keys"><kbd>←</kbd> <kbd>→</kbd></span><span>Back / forward 5s</span></div>
+            <div class="help-row"><span class="keys"><kbd>Shift</kbd>+<kbd>←</kbd>/<kbd>→</kbd></span><span>Back / forward 60s</span></div>
+            <div class="help-row"><span class="keys"><kbd>J</kbd> <kbd>L</kbd></span><span>Back / forward 10s</span></div>
+            <div class="help-row"><span class="keys"><kbd>[</kbd> <kbd>]</kbd></span><span>Previous / next recording</span></div>
+            <div class="help-row"><span class="keys"><kbd>Home</kbd> <kbd>End</kbd></span><span>Oldest / newest footage</span></div>
+            <div class="help-row"><span class="keys"><kbd>Shift</kbd>+<kbd>L</kbd></span><span>Go live</span></div>
+          </section>
+          <section class="help-group">
+            <h3>Timeline</h3>
+            <div class="help-row"><span class="keys"><kbd>+</kbd> <kbd>−</kbd></span><span>Zoom in / out</span></div>
+            <div class="help-row"><span class="keys"><kbd>0</kbd></span><span>Fit all footage</span></div>
+            <div class="help-row"><span class="keys">drag track</span><span>Scrub</span></div>
+            <div class="help-row"><span class="keys"><kbd>Shift</kbd>+drag</span><span>Zoom to selection (Esc cancels)</span></div>
+            <div class="help-row"><span class="keys"><kbd>Alt</kbd>+click</span><span>Seek exactly (no gap snap)</span></div>
+            <div class="help-row"><span class="keys">drag labels / middle-drag</span><span>Pan</span></div>
+            <div class="help-row"><span class="keys">scroll / pinch</span><span>Zoom at cursor</span></div>
+          </section>
+          <section class="help-group">
+            <h3>Panels</h3>
+            <div class="help-row"><span class="keys"><kbd>D</kbd></span><span>Detections overlay</span></div>
+            <div class="help-row"><span class="keys"><kbd>A</kbd></span><span>AI status ribbons</span></div>
+            <div class="help-row"><span class="keys"><kbd>?</kbd></span><span>This cheat-sheet</span></div>
+          </section>
         </div>
       </div>
     </div>
