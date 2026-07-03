@@ -143,6 +143,24 @@ export async function getProcessing(deviceId, fromMs, toMs) {
   };
 }
 
+// Sentiment coverage for the scrub-bar mood ribbon: coalesced positive/neutral/negative
+// runs (segment-grain server-side; see src/sentiment.rs). ns->ms at the boundary.
+export async function getSentiment(deviceId, fromMs, toMs) {
+  const url = `/api/devices/${encodeURIComponent(deviceId)}/sentiment?from=${msToNsStr(
+    fromMs,
+  )}&to=${msToNsStr(toMs)}`;
+  const p = await getJson(url);
+  return {
+    intervals: (p.intervals ?? []).map((i) => ({
+      startMs: nsToMs(i.start_unix_nanos),
+      endMs: nsToMs(i.end_unix_nanos),
+      sentiment: i.sentiment,
+      segments: i.segments ?? 0,
+    })),
+    truncated: !!p.truncated,
+  };
+}
+
 // ---- chat over recordings (proxied to hushai-rag at /v1/rag/*) ----------------
 
 export async function getAgents() {
