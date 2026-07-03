@@ -18,6 +18,7 @@ import { el, renderBanner } from "../dom.js";
 import { toast } from "../toast.js";
 import { createPoller } from "../poll.js";
 import { initTopbar, setLive, setUpdated } from "../nav.js";
+import "../search/omni.js"; // "/" or Cmd+K global search palette
 
 const $ = (id) => document.getElementById(id);
 const TZ = Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC";

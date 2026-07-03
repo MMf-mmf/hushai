@@ -11,6 +11,7 @@ import { initTopbar, setLive, setUpdated } from "../nav.js";
 import { toast } from "../toast.js";
 import { Player } from "../player.js";
 import { clock } from "../time.js";
+import "../search/omni.js"; // "/" or Cmd+K global search palette
 
 const $ = (id) => document.getElementById(id);
 const REFRESH_MS = 10_000; // posters, device list, and alert counts all ride this tick
