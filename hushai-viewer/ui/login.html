@@ -13,14 +13,17 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body class="auth-body">
-    <form class="auth-card" method="POST" action="/login" autocomplete="off">
-      <div class="brand"><span class="logo">◉</span> HUSHAI</div>
-      <div class="auth-sub">Admin sign-in</div>
-      <div id="err" class="auth-error">Incorrect password. Try again.</div>
-      <label for="password">Password</label>
-      <input id="password" name="password" type="password" autofocus required />
-      <button type="submit" class="auth-submit">Sign in</button>
-    </form>
+    <!-- <main> landmark wraps the sole content; the grid-centered body centers it. -->
+    <main>
+      <form class="auth-card" method="POST" action="/login" autocomplete="off" aria-label="Sign in">
+        <div class="brand"><span class="logo">◉</span> HUSHAI</div>
+        <div class="auth-sub">Admin sign-in</div>
+        <div id="err" class="auth-error" role="alert">Incorrect password. Try again.</div>
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autofocus required />
+        <button type="submit" class="auth-submit">Sign in</button>
+      </form>
+    </main>
     <script>
       // The server redirects to /login?error=1 on a bad password.
       if (new URLSearchParams(location.search).has("error")) {

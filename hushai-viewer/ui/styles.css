@@ -180,6 +180,14 @@ input[type="date"] {
   cursor: text;
 }
 
+/* Keyboard-focus ring on every interactive element (B5). Component styles must not
+   blanket-suppress outlines — suppress only :focus:not(:focus-visible) so mouse
+   focus stays quiet while Tab focus is always visible. */
+:focus-visible {
+  outline: var(--focus-ring);
+  outline-offset: 2px;
+}
+
 /* ---- workspace split: video stage (left) + chat dock (right) ---- */
 .workspace {
   display: flex;
@@ -1138,8 +1146,11 @@ input[type="date"] {
   font: inherit;
 }
 .chat-input textarea:focus {
-  outline: none;
   border-color: var(--accent-dim);
+}
+/* Quiet outline for pointer focus only — keyboard focus keeps the global ring. */
+.chat-input textarea:focus:not(:focus-visible) {
+  outline: none;
 }
 /* Keep the send button at its natural size — never let the textarea squeeze it
    to nothing or push it past the edge of the dock. */
@@ -1537,7 +1548,9 @@ details.voice-section > summary::marker {
   background: rgba(255, 93, 93, 0.15);
 }
 .pill.unknown {
-  color: var(--unknown);
+  /* --unknown (#79839a) as 10.5px text is < 4.5:1 on the pill tint / --panel2 —
+     keep the token for dots/canvas, use the AA-bumped --muted for the label. */
+  color: var(--muted);
   background: rgba(121, 131, 154, 0.18);
 }
 .dot.up {
@@ -1895,7 +1908,8 @@ details.voice-section > summary::marker {
   font-size: 13px;
 }
 .mgmt-name-input {
-  min-width: 160px;
+  /* 120 (was 160) so the summary row fits phone widths before wrapping. */
+  min-width: 120px;
 }
 .mgmt-ret-input {
   width: 64px;
@@ -1994,6 +2008,27 @@ details.voice-section > summary::marker {
 .usage-export:hover {
   border-color: var(--accent-dim);
 }
+/* Narrow screens: two-line usage row — ☑ date · actions on top, the segment/size
+   numbers underneath (cell order in manage.js: pick, date, seg, bytes, actions). */
+@media (max-width: 720px) {
+  .usage-row {
+    grid-template-columns: 28px 1fr auto;
+    grid-row-gap: 2px;
+  }
+  .usage-row .usage-num:nth-child(3) {
+    grid-row: 2;
+    grid-column: 2;
+    text-align: left;
+  }
+  .usage-row .usage-num:nth-child(4) {
+    grid-row: 2;
+    grid-column: 3;
+  }
+  .usage-row .usage-act {
+    grid-row: 1;
+    grid-column: 3;
+  }
+}
 
 /* Shared confirm dialog (confirm.js). Reuses .modal / .modal-card. */
 .confirm-card {
@@ -2044,7 +2079,9 @@ details.voice-section > summary::marker {
    design system. Severity colors come from the --sev-* tokens. */
 .ev-row {
   display: grid;
-  grid-template-columns: 92px 150px 1fr 150px auto;
+  /* sev · type · subject · device+when · ▶ view; the fixed columns may shrink a
+     little under pressure before the ≤720px card collapse below kicks in. */
+  grid-template-columns: 92px minmax(110px, 150px) 1fr minmax(120px, 150px) auto;
   gap: 10px;
   align-items: center;
   padding: 8px 12px;
@@ -2052,6 +2089,23 @@ details.voice-section > summary::marker {
 }
 .ev-row:hover {
   background: rgba(255, 255, 255, 0.03);
+}
+/* Narrow screens: collapse each event row into a 2-line card —
+   sev · type · ▶ view on the first line, subject and device/when underneath. */
+@media (max-width: 720px) {
+  .ev-row {
+    grid-template-columns: auto 1fr auto;
+    grid-row-gap: 2px;
+  }
+  .ev-row .ev-sub,
+  .ev-row .ev-when {
+    grid-column: 1 / -1;
+  }
+  /* The trailing ▶ view link stays on the head line (auto-flow would wrap it). */
+  .ev-row > :last-child {
+    grid-row: 1;
+    grid-column: 3;
+  }
 }
 .ev-row.clickable {
   cursor: pointer;
@@ -2115,6 +2169,8 @@ details.voice-section > summary::marker {
   gap: 3px;
   font-size: 12px;
   color: var(--muted);
+  /* Share the row and wrap into full-width fields on narrow screens (B4). */
+  flex: 1 1 140px;
 }
 .filters select,
 .filters input,
@@ -2129,7 +2185,8 @@ details.voice-section > summary::marker {
 }
 .rule-form {
   display: grid;
-  grid-template-columns: repeat(2, minmax(220px, 1fr));
+  /* Auto-fit so the form reflows to as many 200px+ columns as fit (1 on phones). */
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
   gap: 12px;
   padding: 12px;
   border: 1px solid rgba(255, 255, 255, 0.1);
@@ -2327,10 +2384,13 @@ a.watch-sighting:hover {
   background: var(--bg);
   border: 1px solid var(--line);
   border-radius: var(--radius-md);
-  outline: none;
 }
 .auth-card input[type="password"]:focus {
   border-color: var(--accent);
+}
+/* Suppress the outline for pointer focus only; keyboard focus keeps the global ring. */
+.auth-card input[type="password"]:focus:not(:focus-visible) {
+  outline: none;
 }
 .auth-submit {
   width: 100%;
@@ -2467,6 +2527,20 @@ a.watch-sighting:hover {
   }
   .skeleton::after {
     animation: none;
+  }
+  /* Remaining movement-based effects (B5 audit). Opacity-only fades (.overlay,
+     .mode-toggle, .srow background) don't move and are deliberately kept. */
+  .toast {
+    transition: opacity 0.2s; /* keep the fade, drop the slide-in */
+  }
+  .card {
+    transition: border-color 0.15s; /* drop the hover-lift transition */
+  }
+  .card.cam:hover {
+    transform: none;
+  }
+  .mgmt-summary::before {
+    transition: none; /* disclosure caret snaps instead of rotating */
   }
 }
 
@@ -2782,10 +2856,13 @@ a.watch-sighting:hover {
   min-width: 0;
   background: transparent;
   border: none;
-  outline: none;
   color: var(--text);
   font: inherit;
   font-size: 15px;
+}
+/* Suppress the outline for pointer focus only; keyboard focus keeps the global ring. */
+.omni-input:focus:not(:focus-visible) {
+  outline: none;
 }
 .omni-results {
   flex: 1;
@@ -2875,5 +2952,85 @@ a.watch-sighting:hover {
 @media (prefers-reduced-motion: reduce) {
   .chat-actions {
     transition: none;
+  }
+}
+
+/* ============================ Responsiveness (B4) ============================ */
+/* Touch: 44px minimum hit targets on the primary controls. Dense inline chrome
+   (timeline bar buttons, in-bubble ghost icons, row pills) is deliberately kept
+   compact — 44px there turns single-line bars/rows into slabs. */
+@media (pointer: coarse) {
+  button,
+  .navlink,
+  select {
+    min-height: 44px;
+  }
+  /* .navlink is an inline <a>; min-height needs a flex box to take effect. */
+  .navlink {
+    display: inline-flex;
+    align-items: center;
+  }
+  .overlay button {
+    min-width: 44px;
+  }
+  /* Match the export bar's download anchor to its (now 44px) Cancel button. */
+  .export-dl {
+    display: inline-flex;
+    align-items: center;
+    min-height: 44px;
+  }
+  /* Keep the compact chrome compact (see note above). */
+  .tl-controls button,
+  .ai-info-btn,
+  .chat-actions button,
+  button.link,
+  .watch-row button.pill {
+    min-height: 0;
+  }
+  /* Roomier per-day rows on the Files page. */
+  .usage-row {
+    padding: 12px;
+  }
+}
+
+/* Phones (≤480px): compact topbar with icon-only navlinks, chat dock gets half
+   the stacked height, timeline controls wrap, and the grids go single-column. */
+@media (max-width: 480px) {
+  .topbar {
+    gap: 10px;
+    padding: 8px 10px;
+  }
+  /* Icon-only navlinks: the label span hides; title/aria-label keep the full name. */
+  .navlink .nav-txt,
+  .brand .muted,
+  #tzLabel {
+    display: none;
+  }
+  /* Viewer: the stacked chat dock (see the 880px rule) grows 45% → 50%. */
+  .chatdock {
+    height: 50%;
+  }
+  .tl-controls {
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
+  .legend .legend-hint {
+    display: none;
+  }
+  /* The volume slider is useless at thumb size — the mute button remains. */
+  .overlay #volume {
+    display: none;
+  }
+  /* Dashboard/Files: tighter KPI tiles; camera + queue cards single-column. */
+  .kpi-row {
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  }
+  .card-grid,
+  .queue-grid {
+    grid-template-columns: 100%;
+  }
+  /* Cameras: one tile per row. */
+  .cam-grid {
+    grid-template-columns: 100%;
   }
 }

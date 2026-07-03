@@ -18,7 +18,7 @@
         <span class="logo">◉</span> HUSHAI <span class="muted">viewer</span>
       </div>
       <div class="device">
-        <label class="lbl">Camera</label>
+        <label class="lbl" for="deviceSelect">Camera</label>
         <select id="deviceSelect"></select>
         <span id="deviceMeta" class="muted small"></span>
       </div>
@@ -43,8 +43,9 @@
           aria-haspopup="dialog" aria-expanded="false">🔔<span id="bellBadge" class="bell-badge" hidden></span></button>
         <div id="bellPop" class="bell-pop" role="dialog" aria-label="Unacknowledged alerts" hidden></div>
       </span>
-      <a class="navlink" href="/dashboard.html" title="System dashboard">▦ System</a>
-      <a class="navlink" href="/manage.html" title="Manage devices &amp; footage (rename, retention, delete)">🗄 Files</a>
+      <a class="navlink" href="/dashboard.html" title="System dashboard" aria-label="System dashboard">▦ <span class="nav-txt">System</span></a>
+      <a class="navlink" href="/manage.html" title="Manage devices &amp; footage (rename, retention, delete)"
+        aria-label="Manage devices and footage">🗄 <span class="nav-txt">Files</span></a>
       <button id="btnCapture" class="ghost" title="Capture from this browser's camera &amp; mic"
         aria-label="Capture from this browser's camera and mic">●</button>
       <button id="btnPeople" class="ghost" title="People &amp; faces" aria-label="People and faces">👤</button>
@@ -64,7 +65,7 @@
             <button id="modeVideo" class="mode-btn active" role="tab" aria-selected="true">Video</button>
             <button id="modeDet" class="mode-btn" role="tab" aria-selected="false">Detections</button>
           </div>
-          <div id="status" class="status" style="display: none">Loading…</div>
+          <div id="status" class="status" role="status" aria-live="polite" style="display: none">Loading…</div>
           <div id="toast" class="toast" role="status" aria-live="polite"></div>
           <div class="overlay">
             <button id="btnPrev" title="Previous recording [" aria-label="Previous recording">⏮</button>
@@ -96,7 +97,7 @@
                 <input type="checkbox" id="aiStatusToggle" checked /> AI status
               </label>
               <button id="aiInfoBtn" class="ai-info-btn" type="button" title="What do the AI colors mean?"
-                aria-haspopup="dialog" aria-expanded="false">ⓘ</button>
+                aria-label="What do the AI colors mean?" aria-haspopup="dialog" aria-expanded="false">ⓘ</button>
               <!-- Click-to-open key for the AI ribbons (kept out of the cramped legend row). -->
               <div id="aiInfoPop" class="ai-pop" role="dialog" aria-label="AI processing status key" hidden>
                 <div class="ai-pop-title">AI processing status</div>
@@ -162,7 +163,7 @@
             <span><i class="sw sess"></i> session start</span>
             <span><span class="sw-ev" aria-hidden="true">◆</span> event</span>
             <span class="spacer"></span>
-            <span>drag the track to scrub (Shift+drag zooms a range) · drag the time labels (or middle-drag) to pan · scroll or pinch to zoom · press ? for all shortcuts</span>
+            <span class="legend-hint">drag the track to scrub (Shift+drag zooms a range) · drag the time labels (or middle-drag) to pan · scroll or pinch to zoom · press ? for all shortcuts</span>
           </div>
         </section>
       </div>
@@ -198,9 +199,9 @@
           <span class="lbl">Voices</span>
           <span class="muted small">search, name &amp; merge the speakers in your recordings</span>
           <span class="spacer"></span>
-          <input id="voicesSearch" type="search" placeholder="Search voices…" />
+          <input id="voicesSearch" type="search" placeholder="Search voices…" aria-label="Search voices" />
           <button id="voicesRefresh" type="button">Refresh</button>
-          <button id="settingsClose" type="button" title="Close">✕</button>
+          <button id="settingsClose" type="button" title="Close" aria-label="Close">✕</button>
         </div>
         <div id="voicesBody" class="modal-body"></div>
       </div>
@@ -213,9 +214,9 @@
           <span class="lbl">People</span>
           <span class="muted small">search, name &amp; merge the faces in your recordings</span>
           <span class="spacer"></span>
-          <input id="peopleSearch" type="search" placeholder="Search people…" />
+          <input id="peopleSearch" type="search" placeholder="Search people…" aria-label="Search people" />
           <button id="peopleRefresh" type="button">Refresh</button>
-          <button id="peopleClose" type="button" title="Close">✕</button>
+          <button id="peopleClose" type="button" title="Close" aria-label="Close">✕</button>
         </div>
         <div id="peopleBody" class="modal-body"></div>
       </div>
@@ -228,9 +229,9 @@
           <span class="lbl">Plates</span>
           <span class="muted small">search, name &amp; merge the license plates in your recordings</span>
           <span class="spacer"></span>
-          <input id="platesSearch" type="search" placeholder="Search plate text…" />
+          <input id="platesSearch" type="search" placeholder="Search plate text…" aria-label="Search plate text" />
           <button id="platesRefresh" type="button">Refresh</button>
-          <button id="platesClose" type="button" title="Close">✕</button>
+          <button id="platesClose" type="button" title="Close" aria-label="Close">✕</button>
         </div>
         <div id="platesBody" class="modal-body"></div>
       </div>
@@ -243,16 +244,16 @@
           <span class="lbl">Capture</span>
           <span class="muted small">stream this browser's camera &amp; mic into hushai</span>
           <span class="spacer"></span>
-          <button id="captureClose" type="button" title="Close">✕</button>
+          <button id="captureClose" type="button" title="Close" aria-label="Close">✕</button>
         </div>
         <div class="modal-body">
           <video id="capturePreview" class="capture-preview" autoplay muted playsinline></video>
           <div class="capture-row">
-            <label class="lbl">Camera</label>
+            <label class="lbl" for="captureCam">Camera</label>
             <select id="captureCam"></select>
           </div>
           <div class="capture-row">
-            <label class="lbl">Microphone</label>
+            <label class="lbl" for="captureMic">Microphone</label>
             <select id="captureMic"></select>
           </div>
           <label class="capture-toggle">

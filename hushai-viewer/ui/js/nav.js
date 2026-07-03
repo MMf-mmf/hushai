@@ -28,7 +28,13 @@ export function initTopbar({ section }) {
   const host = document.querySelector("[data-topbar]");
   if (!host) return;
   const current = SECTIONS.find((s) => s.key === section);
-  const logout = el("button", { id: "btnLogout", class: "ghost", title: "Log out", text: "⎋" });
+  const logout = el("button", {
+    id: "btnLogout",
+    class: "ghost",
+    title: "Log out",
+    "aria-label": "Log out",
+    text: "⎋",
+  });
   wireLogout(logout);
   liveDot = el("span", { id: "liveDot", class: "dot" });
   updatedEl = el("span", { id: "generatedAt", class: "muted small", text: "connecting…" });
@@ -41,7 +47,14 @@ export function initTopbar({ section }) {
       el("span", { class: "muted", text: current ? current.label.toLowerCase() : "" }),
     ),
     ...SECTIONS.filter((s) => s.key !== section).map((s) =>
-      el("a", { class: "navlink", href: s.href, title: s.title }, `${s.icon} ${s.label}`),
+      // The label is a span so ≤480px CSS can collapse the link to its icon;
+      // the aria-label keeps the full name when only the icon is visible.
+      el(
+        "a",
+        { class: "navlink", href: s.href, title: s.title, "aria-label": s.title },
+        `${s.icon} `,
+        el("span", { class: "nav-txt", text: s.label }),
+      ),
     ),
     el("span", { class: "spacer" }),
     el("div", { class: "clock dash-updated" }, liveDot, updatedEl),
