@@ -37,7 +37,12 @@
           <span class="ai-ico"></span><span class="ai-txt"></span>
         </span>
       </div>
-      <a class="navlink" href="/events.html" title="Alerts &amp; event feed">🔔 Events</a>
+      <!-- Alert bell: unacked feed count + dropdown with per-item Ack / view (js/events-overlay.js). -->
+      <span class="bell-wrap">
+        <button id="bellBtn" class="ghost" title="Alerts" aria-label="Alerts"
+          aria-haspopup="dialog" aria-expanded="false">🔔<span id="bellBadge" class="bell-badge" hidden></span></button>
+        <div id="bellPop" class="bell-pop" role="dialog" aria-label="Unacknowledged alerts" hidden></div>
+      </span>
       <a class="navlink" href="/dashboard.html" title="System dashboard">▦ System</a>
       <a class="navlink" href="/manage.html" title="Manage devices &amp; footage (rename, retention, delete)">🗄 Files</a>
       <button id="btnCapture" class="ghost" title="Capture from this browser's camera &amp; mic"
@@ -113,10 +118,13 @@
                 <p class="ai-pop-hint">Hover the strips for per-moment status and counts.</p>
               </div>
             </span>
+            <button id="eventsToggle" title="Show the events drawer" aria-pressed="false">☰ Events</button>
             <button id="btnFit" title="Fit all footage (0)">Fit all</button>
             <button id="zoomOut" title="Zoom out (−)" aria-label="Zoom out">−</button>
             <button id="zoomIn" title="Zoom in (+)" aria-label="Zoom in">+</button>
           </div>
+          <!-- Hover preview: a floating still + timestamp above the scrub bar (js/thumbs.js). -->
+          <div id="tlPreview" hidden><img alt="" hidden /><span class="mono"></span></div>
           <canvas
             id="timeline"
             class="timeline"
@@ -132,11 +140,25 @@
             <span><i class="sw rec"></i> recorded</span>
             <span><i class="sw gap"></i> gap</span>
             <span><i class="sw sess"></i> session start</span>
+            <span><span class="sw-ev" aria-hidden="true">◆</span> event</span>
             <span class="spacer"></span>
             <span>drag the track to scrub (Shift+drag zooms a range) · drag the time labels (or middle-drag) to pan · scroll or pinch to zoom · press ? for all shortcuts</span>
           </div>
         </section>
       </div>
+
+      <!-- Events drawer: browse this camera's (or all cameras') events; a row click jumps
+           the player there. Toggled by the "☰ Events" timeline control (js/events-overlay.js). -->
+      <aside id="eventsDrawer" class="events-drawer" hidden>
+        <div class="ev-drawer-head">
+          <span class="lbl">Events</span>
+          <span id="evCount" class="muted small"></span>
+          <span class="spacer"></span>
+          <button id="eventsDrawerClose" type="button" title="Close" aria-label="Close events drawer">✕</button>
+        </div>
+        <div id="evFilters" class="ev-filters"></div>
+        <div id="evList" class="ev-list"></div>
+      </aside>
 
       <!-- Chat workspace: ask questions over the recordings; citations deep-link the video. -->
       <aside id="chatdock" class="chatdock">

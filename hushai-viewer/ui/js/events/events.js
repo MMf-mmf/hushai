@@ -1,12 +1,15 @@
-// The Events page: the in-app alert feed (acknowledge), the materialized event stream (filter +
-// click-to-jump-the-timeline), and the alert-rule manager (list / enable-disable / delete / create).
+// The Events page: the in-app alert feed (acknowledge / mark-all-read), the watchlist (subjects of
+// interest with inline notes + sightings), the materialized event stream (filter + click-to-jump-
+// the-timeline), and the alert-rule manager (list / enable-disable / edit / delete / create).
 // Vanilla ES module, no build step — mirrors dashboard.js / manage.js. Reads the proxied
-// /v1/events*, /v1/events/feed, /v1/alert-rules* endpoints (see api.js). All user-supplied text
-// (subject labels, plate OCR, rule names) is rendered via textContent — never innerHTML.
+// /v1/events*, /v1/events/feed, /v1/alert-rules*, /v1/watchlist endpoints (see api.js). All
+// user-supplied text (subject labels, plate OCR, rule names) is rendered via textContent — never
+// innerHTML.
 
 import {
   getDevices, getEvents, getEventFeed, ackDelivery,
   getAlertRules, createAlertRule, updateAlertRule, deleteAlertRule,
+  getWatchlist, updateWatch, removeWatch, sampleFaceUrl, samplePlateUrl,
 } from "../api.js";
 import { el, errorState } from "../dom.js";
 import { toast } from "../toast.js";
@@ -19,6 +22,8 @@ const $ = (id) => document.getElementById(id);
 let devices = [];
 let eventsSeq = 0; // monotonic render guards: a stale (slow) response must not clobber a newer render
 let feedSeq = 0;
+let watchSeq = 0;
+let lastFeedItems = []; // what the feed currently shows — the "Mark all read" work list
 
 function deviceName(id) {
   const d = devices.find((x) => x.id === id);
@@ -46,6 +51,15 @@ function eventLink(deviceId, ms) {
   return `/?device=${encodeURIComponent(deviceId)}&t=${Math.floor(ms || 0)}`;
 }
 
+// <input type="date"> value ("YYYY-MM-DD") → ms at LOCAL midnight. new Date("YYYY-MM-DD") would
+// parse as UTC midnight and skew the filter by the tz offset.
+function localDateToMs(v) {
+  if (!v) return undefined;
+  const [y, m, d] = v.split("-").map(Number);
+  if (!isFinite(y) || !isFinite(m) || !isFinite(d)) return undefined;
+  return new Date(y, m - 1, d).getTime();
+}
+
 async function loadDevices() {
   try {
     devices = await getDevices();
@@ -59,12 +73,19 @@ async function loadDevices() {
 }
 
 // ---- alert feed -----------------------------------------------------------------
+// "Unread only" maps to the backend's 'pending' delivery status: feed-channel rows are minted
+// 'pending' and stay there until ack flips them to 'acknowledged' (the sent/failed states belong
+// to the webhook/push retry worker, which skips the feed channel). See events.rs FeedQuery.
+function feedStatusFilter() {
+  return $("feedStatus").value === "all" ? undefined : "pending";
+}
+
 async function renderFeed() {
   const box = $("feed");
   const seq = ++feedSeq;
   let items;
   try {
-    items = await getEventFeed({ limit: 100 });
+    items = await getEventFeed({ status: feedStatusFilter(), limit: 100 });
   } catch (e) {
     if (seq === feedSeq) {
       box.replaceChildren(errorState("Feed error: " + e.message, renderFeed));
@@ -73,12 +94,16 @@ async function renderFeed() {
     return false;
   }
   if (seq !== feedSeq) return true; // superseded by a newer render — don't overwrite
+  lastFeedItems = items;
   const unread = items.filter((i) => !i.acknowledged).length;
   $("feedCount").textContent = `${unread} unread`;
+  $("feedAckAll").disabled = unread === 0;
   if (!items.length) {
     box.replaceChildren(el("div", {
       class: "empty",
-      text: "No alerts yet. Create a rule below — matching events will notify here.",
+      text: $("feedStatus").value === "all"
+        ? "No alerts yet. Create a rule below — matching events will notify here."
+        : "No unread alerts. Switch Show → All to see acknowledged ones.",
     }));
     return true;
   }
@@ -117,6 +142,224 @@ function feedRow(i) {
     view, ackBtn);
 }
 
+// Sequentially ack every unread delivery the feed currently lists. Sequential on purpose: one
+// POST per row keeps the backend's per-row audit/404 semantics and avoids a burst of parallel
+// writes; 100 rows is the feed cap so worst case is quick anyway.
+async function ackAllFeed() {
+  const btn = $("feedAckAll");
+  const targets = lastFeedItems.filter((i) => !i.acknowledged);
+  if (!targets.length) {
+    toast("Nothing unread.");
+    return;
+  }
+  btn.disabled = true;
+  let ok = 0, failed = 0;
+  for (const t of targets) {
+    try {
+      await ackDelivery(t.deliveryId);
+      ok++;
+    } catch {
+      failed++;
+    }
+  }
+  toast(
+    failed ? `Marked ${ok} read · ${failed} failed` : `Marked ${ok} read`,
+    { kind: failed ? "error" : "success" },
+  );
+  await renderFeed(); // re-enables the button via the unread count
+}
+
+// ---- watchlist ------------------------------------------------------------------
+// Subjects of interest (person/plate). Server-side a watch IS a managed alert rule, so the
+// enable/disable pill here flips that rule — rule renders are refreshed alongside. Loaded on
+// init + Refresh only (not the 8s poll): the list changes through user actions, and re-rendering
+// would tear down open sighting expanders and in-progress note edits.
+async function renderWatchlist() {
+  const box = $("watchlist");
+  const seq = ++watchSeq;
+  let rows;
+  try {
+    rows = await getWatchlist();
+  } catch (e) {
+    if (seq === watchSeq) {
+      box.replaceChildren(errorState("Watchlist error: " + e.message, renderWatchlist));
+      $("watchCount").textContent = "—";
+    }
+    return false;
+  }
+  if (seq !== watchSeq) return true;
+  $("watchCount").textContent = `${rows.length}`;
+  if (!rows.length) {
+    box.replaceChildren(el("div", {
+      class: "empty",
+      text: "Nothing on the watchlist. Add people from the People modal (☆ Watch) or plates from the Plates modal.",
+    }));
+    return true;
+  }
+  box.replaceChildren(...rows.map(watchRow));
+  return true;
+}
+
+function watchLabel(w) {
+  return w.current_label || w.label || String(w.subject_id).slice(0, 8);
+}
+
+// Click-to-edit note. Enter/blur saves (blur after Enter is a no-op via the `done` latch),
+// Escape cancels. The backend PATCH COALESCEs an absent reason, so we always send the string —
+// an emptied note saves as "" rather than null (which the backend would ignore).
+function reasonEditor(w) {
+  const span = el("span", {
+    class: "watch-reason" + (w.reason ? "" : " placeholder"),
+    text: w.reason || "Add a note…",
+    title: "Click to edit the note",
+    role: "button",
+    tabindex: "0",
+  });
+  const beginEdit = () => {
+    const input = el("input", {
+      class: "watch-reason-input",
+      type: "text",
+      placeholder: "Why is this on the watchlist?",
+    });
+    input.value = w.reason || "";
+    let done = false;
+    const finish = async (save) => {
+      if (done) return;
+      done = true;
+      const next = input.value.trim();
+      if (!save || next === (w.reason || "")) {
+        input.replaceWith(span);
+        return;
+      }
+      input.disabled = true;
+      try {
+        await updateWatch(w.watch_id, { reason: next });
+        await renderWatchlist();
+      } catch (e) {
+        toast("Note save failed: " + e.message, { kind: "error" });
+        input.replaceWith(span);
+      }
+    };
+    input.addEventListener("keydown", (ev) => {
+      if (ev.key === "Enter") { ev.preventDefault(); finish(true); }
+      else if (ev.key === "Escape") finish(false);
+    });
+    input.addEventListener("blur", () => finish(true));
+    span.replaceWith(input);
+    input.focus();
+    input.select();
+  };
+  span.addEventListener("click", beginEdit);
+  span.addEventListener("keydown", (ev) => {
+    if (ev.key === "Enter" || ev.key === " ") { ev.preventDefault(); beginEdit(); }
+  });
+  return span;
+}
+
+// Compact sighting row (sev · type · camera · when) that deep-links the main viewer.
+function sightingRow(e) {
+  const tag = e.deviceId ? "a" : "div";
+  const props = { class: "watch-sighting" };
+  if (e.deviceId) {
+    props.href = eventLink(e.deviceId, e.startMs);
+    props.title = "Jump to this moment";
+  }
+  return el(tag, props,
+    sevChip(e.severity),
+    el("span", { class: "ev-type", text: e.type }),
+    el("span", { class: "ev-when", text: `${deviceName(e.deviceId)} · ${whenLabel(e.startMs)}` }));
+}
+
+// Lazy expander: sightings are fetched on first open only (kept across open/close toggles).
+function sightingsBlock(w) {
+  const box = el("div", { class: "watch-sightings", hidden: true });
+  let loaded = false;
+  const btn = el("button", {
+    class: "link",
+    type: "button",
+    text: "▸ sightings",
+    onclick: async () => {
+      const opening = box.hidden;
+      box.hidden = !opening;
+      btn.textContent = opening ? "▾ sightings" : "▸ sightings";
+      if (!opening || loaded) return;
+      box.replaceChildren(el("div", { class: "empty", text: "Loading sightings…" }));
+      let evs;
+      try {
+        evs = await getEvents({ subjectId: w.subject_id, limit: 50 });
+      } catch (e) {
+        box.replaceChildren(errorState("Sightings error: " + e.message));
+        return;
+      }
+      loaded = true;
+      box.replaceChildren(...(evs.length
+        ? evs.map(sightingRow)
+        : [el("div", { class: "empty", text: "No sightings recorded yet." })]));
+    },
+  });
+  return { btn, box };
+}
+
+function watchRow(w) {
+  const { btn: sightBtn, box: sightBox } = sightingsBlock(w);
+
+  // Representative crop; the proxy injects the bearer so a plain <img> works. Subjects without a
+  // stored sample 404 — onerror hides the img instead of showing the broken-image glyph.
+  const thumbUrl = w.subject_type === "person" ? sampleFaceUrl(w.subject_id)
+    : w.subject_type === "plate" ? samplePlateUrl(w.subject_id) : null;
+  const thumb = thumbUrl ? el("img", { class: "watch-thumb", src: thumbUrl, alt: "", loading: "lazy" }) : null;
+  if (thumb) thumb.addEventListener("error", () => { thumb.style.display = "none"; });
+
+  const label = watchLabel(w);
+  const toggle = el("button", {
+    class: w.enabled ? "pill on" : "pill off",
+    type: "button",
+    text: w.enabled ? "on" : "off",
+    title: w.enabled ? "Alerts firing — click to pause" : "Paused — click to resume alerts",
+    onclick: async () => {
+      toggle.disabled = true;
+      try {
+        await updateWatch(w.watch_id, { enabled: !w.enabled });
+        // The toggle flips the managed alert rule too — keep both sections truthful.
+        await Promise.all([renderWatchlist(), renderRules()]);
+      } catch (e) {
+        toast("Toggle failed: " + e.message, { kind: "error" });
+        toggle.disabled = false;
+      }
+    },
+  });
+  const unwatch = el("button", {
+    class: "link",
+    type: "button",
+    text: "unwatch",
+    onclick: async () => {
+      const ok = await confirmAction({
+        title: "Remove from watchlist",
+        message: `Stop watching “${label}”? Its managed alert rule is deleted too (past alerts are kept).`,
+        confirmLabel: "Unwatch",
+      });
+      if (!ok) return;
+      try {
+        await removeWatch(w.watch_id);
+        await Promise.all([renderWatchlist(), renderRules()]);
+      } catch (e) {
+        toast("Unwatch failed: " + e.message, { kind: "error" });
+      }
+    },
+  });
+
+  return el("div", { class: "watch-entry" },
+    el("div", { class: "watch-row" },
+      thumb,
+      el("div", { class: "grow" },
+        el("div", {},
+          el("strong", { text: label }),
+          el("span", { class: "watch-tag", text: w.subject_type })),
+        reasonEditor(w)),
+      sightBtn, toggle, unwatch),
+    sightBox);
+}
+
 // ---- event stream ---------------------------------------------------------------
 async function renderEvents() {
   const box = $("events");
@@ -125,6 +368,9 @@ async function renderEvents() {
     deviceId: $("fDevice").value || undefined,
     eventType: $("fType").value || undefined,
     severity: $("fSeverity").value || undefined,
+    subjectType: $("fSubjectType").value || undefined,
+    subjectId: $("fSubjectId").value.trim() || undefined,
+    sinceMs: localDateToMs($("fSince").value),
     limit: 200,
   };
   let evs;
@@ -166,6 +412,9 @@ function eventRow(e) {
 }
 
 // ---- alert rules ----------------------------------------------------------------
+let editingRule = null; // full original rule while the form is in edit mode (null = create mode)
+let editingPrefillDev = ""; // what the camera select was prefilled to, to detect "untouched"
+
 function minToHHMM(m) {
   const h = Math.floor(m / 60), mm = m % 60;
   return `${String(h).padStart(2, "0")}:${String(mm).padStart(2, "0")}`;
@@ -211,11 +460,17 @@ function ruleCard(r) {
     onclick: async () => {
       try {
         await updateAlertRule(r.rule_id, { ...r, enabled: !r.enabled });
-        await renderRules();
+        // Watch-managed rules surface their enabled state as the watchlist pill too.
+        await Promise.all([renderRules(), renderWatchlist()]);
       } catch (e) {
         toast("Toggle failed: " + e.message, { kind: "error" });
       }
     },
+  });
+  const edit = el("button", {
+    class: "link",
+    text: "edit",
+    onclick: () => startEditRule(r),
   });
   const del = el("button", {
     class: "link",
@@ -229,7 +484,8 @@ function ruleCard(r) {
       if (!ok) return;
       try {
         await deleteAlertRule(r.rule_id);
-        await renderRules();
+        if (editingRule?.rule_id === r.rule_id) exitEditMode();
+        await Promise.all([renderRules(), renderWatchlist()]);
       } catch (e) {
         toast("Delete failed: " + e.message, { kind: "error" });
       }
@@ -240,7 +496,54 @@ function ruleCard(r) {
     el("div", { class: "grow" },
       el("div", {}, el("strong", { text: r.name })),
       el("div", { class: "summary", text: ruleSummary(r) })),
-    toggle, del);
+    toggle, edit, del);
+}
+
+// Pre-fill the create form from an existing rule (the reverse of the submit assembly) and flip
+// the form into edit mode. PATCH is a FULL replace server-side, so fields the form can't express
+// (subject scoping, days_of_week, a multi-camera list, non-feed/webhook channels, the original
+// tz) are carried through from the original on save — see submitRule.
+function startEditRule(r) {
+  editingRule = r;
+  $("rName").value = r.name;
+  for (const c of document.querySelectorAll("#rTypes input")) {
+    c.checked = !!r.event_types?.includes(c.value);
+  }
+  // The form offers one camera; prefill the first (fall back to "all" if it's not in the list —
+  // an untouched select keeps the ORIGINAL device_ids on save either way).
+  const dev = r.device_ids?.[0] ?? "";
+  $("rDevice").value = dev;
+  editingPrefillDev = $("rDevice").value; // "" if the option didn't exist
+  $("rSeverity").value = r.min_severity || "info";
+  $("rFrom").value = r.time_start_minutes != null ? minToHHMM(r.time_start_minutes) : "";
+  $("rTo").value = r.time_end_minutes != null ? minToHHMM(r.time_end_minutes) : "";
+  $("rCooldown").value = String(r.cooldown_secs ?? 300);
+  const chans = Array.isArray(r.channels) ? r.channels : [];
+  $("rChFeed").checked = chans.some((c) => c?.type === "feed");
+  $("rChHook").checked = chans.some((c) => c?.type === "webhook");
+  $("rHookUrl").value = chans.find((c) => c?.type === "webhook")?.url || "";
+
+  $("ruleSubmit").textContent = "💾 Save rule";
+  $("ruleCancel").hidden = false;
+  const msg = $("ruleFormMsg");
+  msg.className = "small";
+  msg.textContent = `Editing “${r.name}”`;
+  $("ruleForm").scrollIntoView({ behavior: "smooth", block: "start" });
+  $("rName").focus();
+}
+
+function exitEditMode() {
+  editingRule = null;
+  editingPrefillDev = "";
+  $("ruleForm").reset();
+  $("rSeverity").value = "warning";
+  $("rCooldown").value = "300";
+  $("rChFeed").checked = true;
+  $("ruleSubmit").textContent = "＋ Create rule";
+  $("ruleCancel").hidden = true;
+  const msg = $("ruleFormMsg");
+  msg.className = "small";
+  msg.textContent = "";
 }
 
 function hhmmToMin(v) {
@@ -271,6 +574,10 @@ async function submitRule(ev) {
     }
     channels.push({ type: "webhook", url });
   }
+  // Channel types the form doesn't know (e.g. push) survive an edit round-trip.
+  if (editingRule && Array.isArray(editingRule.channels)) {
+    channels.push(...editingRule.channels.filter((c) => c?.type !== "feed" && c?.type !== "webhook"));
+  }
   if (!channels.length) { msg.textContent = "Pick at least one channel."; msg.className = "small err"; return; }
 
   const from = hhmmToMin($("rFrom").value);
@@ -287,29 +594,49 @@ async function submitRule(ev) {
     return;
   }
   const dev = $("rDevice").value;
+  // An untouched camera select on edit keeps the rule's ORIGINAL device list (which may hold
+  // several ids the single-select can't display); any change replaces it with the new pick.
+  const deviceIds = editingRule && dev === editingPrefillDev
+    ? editingRule.device_ids ?? []
+    : (dev ? [dev] : []);
   const body = {
     name,
-    enabled: true,
+    // Editing must not silently re-enable a paused rule; creation starts enabled.
+    enabled: editingRule ? editingRule.enabled : true,
     event_types: eventTypes,
-    device_ids: dev ? [dev] : [],
+    device_ids: deviceIds,
     min_severity: $("rSeverity").value,
     time_start_minutes: from,
     time_end_minutes: to,
     // The rule's local-time window is evaluated in the operator's tz (the browser's IANA zone).
-    tz: Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC",
+    // On edit we keep the rule's ORIGINAL tz: the prefill showed its minutes as stored, so
+    // swapping tz on save would silently shift the window.
+    tz: editingRule
+      ? (editingRule.tz || "UTC")
+      : (Intl.DateTimeFormat().resolvedOptions().timeZone || "UTC"),
     cooldown_secs: Math.max(0, Number($("rCooldown").value) || 0),
     channels,
   };
+  if (editingRule) {
+    // PATCH full-replaces; omitted fields would be nulled. Carry the scoping the form can't edit
+    // (watch-managed rules live or die by subject_type/subject_ids).
+    body.subject_type = editingRule.subject_type ?? null;
+    body.subject_ids = editingRule.subject_ids ?? [];
+    body.days_of_week = editingRule.days_of_week ?? [];
+  }
   try {
-    await createAlertRule(body);
-    $("ruleForm").reset();
-    $("rSeverity").value = "warning";
-    $("rCooldown").value = "300";
-    $("rChFeed").checked = true;
-    msg.textContent = "Rule created.";
-    await renderRules();
+    if (editingRule) {
+      await updateAlertRule(editingRule.rule_id, body);
+      exitEditMode();
+      toast("Rule saved.", { kind: "success" });
+    } else {
+      await createAlertRule(body);
+      exitEditMode(); // same reset path as create's old inline reset
+      msg.textContent = "Rule created.";
+    }
+    await Promise.all([renderRules(), renderWatchlist()]);
   } catch (err) {
-    msg.textContent = "Create failed: " + err.message;
+    msg.textContent = (editingRule ? "Save failed: " : "Create failed: ") + err.message;
     msg.className = "small err";
   }
 }
@@ -321,14 +648,15 @@ function markLive(allOk) {
 }
 
 async function refreshAll() {
-  const oks = await Promise.all([renderFeed(), renderEvents(), renderRules()]);
+  const oks = await Promise.all([renderFeed(), renderWatchlist(), renderEvents(), renderRules()]);
   $("banner").style.display = "none";
   markLive(oks.every(Boolean));
 }
 
-// Light polling so new alerts/events surface without a manual reload (rules only change through
-// user actions here, which re-render them directly). createPoller supplies the in-flight guard,
-// the hidden-tab pause, and the refocus kick the old hand-rolled loop implemented.
+// Light polling so new alerts/events surface without a manual reload (rules + watchlist only
+// change through user actions here, which re-render them directly — and re-rendering the
+// watchlist on a timer would tear down open expanders/note edits). createPoller supplies the
+// in-flight guard, the hidden-tab pause, and the refocus kick the old hand-rolled loop implemented.
 const poller = createPoller(async () => {
   const oks = await Promise.all([renderFeed(), renderEvents()]);
   markLive(oks.every(Boolean));
@@ -337,9 +665,14 @@ const poller = createPoller(async () => {
 async function main() {
   initTopbar({ section: "events" });
   await loadDevices();
-  $("fApply").addEventListener("click", () => { renderEvents(); renderFeed(); });
-  for (const id of ["fDevice", "fType", "fSeverity"]) $(id).addEventListener("change", renderEvents);
+  $("fApply").addEventListener("click", () => { renderEvents(); renderFeed(); renderWatchlist(); });
+  for (const id of ["fDevice", "fType", "fSeverity", "fSubjectType", "fSubjectId", "fSince"]) {
+    $(id).addEventListener("change", renderEvents);
+  }
+  $("feedStatus").addEventListener("change", renderFeed);
+  $("feedAckAll").addEventListener("click", ackAllFeed);
   $("ruleForm").addEventListener("submit", submitRule);
+  $("ruleCancel").addEventListener("click", exitEditMode);
   await refreshAll();
   poller.start({ immediate: false });
 }
@@ -352,5 +685,10 @@ main().catch((e) => {
 
 // Tiny debug handle for headless verification (localhost-only tool).
 if (["localhost", "127.0.0.1", "::1"].includes(location.hostname)) {
-  window.eventsDebug = { renderFeed, renderEvents, renderRules, refreshAll, get devices() { return devices; } };
+  window.eventsDebug = {
+    renderFeed, renderEvents, renderRules, renderWatchlist, refreshAll, ackAllFeed,
+    startEditRule, exitEditMode,
+    get devices() { return devices; },
+    get editingRule() { return editingRule; },
+  };
 }

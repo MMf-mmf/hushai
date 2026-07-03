@@ -312,6 +312,7 @@ input[type="date"] {
 
 /* ---- timeline ---- */
 .timelinebar {
+  position: relative; /* positioning context for the #tlPreview hover thumbnail */
   background: var(--panel);
   border-top: 1px solid var(--line);
   padding: 8px 16px 12px;
@@ -327,8 +328,9 @@ input[type="date"] {
 }
 .timeline {
   width: 100%;
-  /* tall enough for the coverage track (30..76) + the two labeled AI ribbons (81..111). */
-  height: 118px;
+  /* tall enough for the coverage track (30..76) + the events lane (80..92) + the two
+     labeled AI ribbons (97..127). */
+  height: 134px;
   display: block;
   margin: 6px 0;
   cursor: crosshair;
@@ -467,6 +469,266 @@ input[type="date"] {
 .timeline:focus-visible {
   outline: var(--focus-ring);
   outline-offset: 2px;
+}
+
+/* ---- events layer: legend swatch, hover preview, events drawer, alert bell ---- */
+/* (canvas events-lane colors come from the --sev-* tokens via theme.js severityColors) */
+
+/* Legend swatch for the timeline's event markers (◆ rendered as text, sev-tinted). */
+.legend .sw-ev {
+  color: var(--sev-warning);
+  font-size: 11px;
+  margin-right: 4px;
+}
+
+/* Hover preview thumbnail: floats above the scrub bar at the hover x (js/thumbs.js). */
+#tlPreview {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  width: 168px; /* mirrored by PREVIEW_W in app.js — keep in sync */
+  padding: 3px;
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  pointer-events: none; /* never intercepts the scrub gesture beneath it */
+  z-index: var(--z-overlay);
+  text-align: center;
+}
+#tlPreview[hidden] {
+  display: none;
+}
+#tlPreview img {
+  display: block;
+  width: 160px;
+  height: auto;
+  min-height: 20px;
+  border-radius: 4px;
+  background: #000;
+}
+#tlPreview img[hidden] {
+  display: none;
+}
+#tlPreview .mono {
+  display: block;
+  font-size: 11px;
+  color: var(--text);
+  padding: 3px 0 1px;
+}
+
+/* Events drawer: a collapsible rail between the video stage and the chat dock. */
+.events-drawer {
+  width: 300px;
+  min-width: 240px;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--panel);
+  border-left: 1px solid var(--line);
+}
+.events-drawer[hidden] {
+  display: none;
+}
+.ev-drawer-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--line);
+}
+.ev-drawer-head button {
+  padding: 2px 8px;
+}
+.ev-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  background: var(--panel2);
+  border-bottom: 1px solid var(--line);
+}
+.ev-chip {
+  padding: 3px 10px;
+  border-radius: var(--radius-pill);
+  font-size: 12px;
+  color: var(--muted);
+  background: transparent;
+  border: 1px solid var(--line);
+}
+.ev-chip.active {
+  color: var(--text);
+  border-color: var(--accent);
+  background: rgba(46, 230, 214, 0.08);
+}
+.ev-chip-sep {
+  width: 1px;
+  height: 16px;
+  background: var(--line);
+  margin: 0 2px;
+}
+.ev-list {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+}
+/* Each row is a real <button> (keyboard + focus ring for free), restyled flat. */
+.ev-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  text-align: left;
+  padding: 8px 12px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+  border-radius: 0;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+}
+.ev-item:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+.ev-item .sev {
+  flex-shrink: 0;
+}
+.ev-item-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.ev-item-type {
+  font-weight: 600;
+  font-size: 13px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ev-item-sub,
+.ev-item-dev {
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.ev-item-when {
+  flex-shrink: 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
+/* Alert bell: unacked feed count on the topbar 🔔 + a dropdown panel below it
+   (the downward twin of the .ai-pop pattern). */
+.bell-wrap {
+  position: relative;
+  display: inline-flex;
+}
+.bell-wrap .ghost {
+  position: relative; /* anchors the badge to the button's corner */
+}
+.bell-badge {
+  position: absolute;
+  top: -5px;
+  right: -6px;
+  min-width: 16px;
+  height: 16px;
+  padding: 0 4px;
+  border-radius: var(--radius-pill);
+  background: var(--sev-critical);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 16px;
+  text-align: center;
+  pointer-events: none;
+}
+.bell-pop {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 8px);
+  z-index: var(--z-popover);
+  width: 340px;
+  max-height: 60vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+  overflow: hidden;
+}
+.bell-pop[hidden] {
+  display: none;
+}
+.bell-pop-list {
+  overflow-y: auto;
+}
+.bell-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.bell-item-main {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.bell-item-label {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bell-item-meta {
+  color: var(--muted);
+  font-size: 11px;
+}
+.bell-item button {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  font-size: 12px;
+}
+.bell-empty {
+  padding: 18px 12px;
+  color: var(--muted);
+  text-align: center;
+  font-size: 13px;
+}
+.bell-foot {
+  padding: 8px 12px;
+  border-top: 1px solid var(--line);
+  text-align: center;
+}
+.bell-foot a {
+  color: var(--accent);
+  text-decoration: none;
+  font-size: 12px;
+}
+.bell-foot a:hover {
+  text-decoration: underline;
+}
+
+/* Narrow screens: the workspace stacks (see the 880px rule below), so the drawer
+   becomes a horizontal band under the stage instead of a side rail. */
+@media (max-width: 880px) {
+  .events-drawer {
+    width: auto;
+    min-width: 0;
+    max-height: 40%;
+    border-left: none;
+    border-top: 1px solid var(--line);
+  }
 }
 
 /* ---- LIVE pill (video transport) ---- */
@@ -1775,6 +2037,91 @@ button.link {
   font: inherit;
   padding: 0;
 }
+/* Watchlist rows (events.js watchRow): thumb · label+note · sightings/toggle/unwatch. */
+.watch-entry {
+  border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+.watch-row {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+  padding: 8px 12px;
+}
+.watch-row:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+.watch-row .grow {
+  flex: 1;
+  min-width: 0;
+}
+.watch-thumb {
+  width: 48px;
+  height: 48px;
+  flex: none;
+  border-radius: 8px;
+  object-fit: cover;
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+}
+.watch-tag {
+  margin-left: 8px;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.07);
+  padding: 2px 7px;
+  border-radius: var(--radius-pill);
+  vertical-align: middle;
+}
+/* The on/off pill doubles as the enable button here — undo the button chrome. */
+.watch-row button.pill {
+  border: none;
+  font: inherit;
+  cursor: pointer;
+}
+.watch-reason {
+  display: inline-block;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  color: var(--muted);
+  cursor: pointer;
+  border-bottom: 1px dashed rgba(255, 255, 255, 0.25);
+}
+.watch-reason.placeholder {
+  font-style: italic;
+  opacity: 0.7;
+}
+.watch-reason-input {
+  width: min(340px, 100%);
+  font-size: 12px;
+  background: rgba(255, 255, 255, 0.05);
+  color: inherit;
+  border: 1px solid rgba(255, 255, 255, 0.12);
+  border-radius: var(--radius-sm);
+  padding: 3px 6px;
+}
+/* Lazy sightings expander: compact indented rows under the watch row. */
+.watch-sightings {
+  margin: 0 12px 10px 72px;
+  border-left: 2px solid rgba(255, 255, 255, 0.08);
+}
+.watch-sighting {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 4px 10px;
+  font-size: 12px;
+  color: var(--text);
+  text-decoration: none;
+}
+a.watch-sighting:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
 
 /* ============================ Login (pre-auth) ============================ */
 /* login.html is served past the password gate; /styles.css is deliberately public
@@ -2101,6 +2448,270 @@ button.link {
 @media (prefers-reduced-motion: reduce) {
   .cam-tile,
   .cam-tile .peek-btn {
+    transition: none;
+  }
+}
+
+/* ==== Omni-search + chat upgrades ==== */
+/* Append-only section: new selectors plus a few additive tweaks to the chat toolbar
+   (it grew a Thorough toggle + history button and must wrap instead of overflowing). */
+.chat-toolbar {
+  flex-wrap: wrap;
+}
+.chat-toolbar .chat-scope {
+  max-width: 46%;
+}
+.chat-thorough {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+  cursor: pointer;
+}
+.chat-thorough input {
+  accent-color: var(--accent);
+  margin: 0;
+}
+
+/* 🕘 conversation-history dropdown (built dynamically by chat-pane.js). */
+.chat-hist-wrap {
+  position: relative;
+  flex-shrink: 0;
+}
+.chat-hist-btn {
+  padding: 4px 8px;
+  font-size: 14px;
+  line-height: 1;
+}
+.chat-sessions {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: var(--z-popover);
+  width: min(300px, 80vw);
+  max-height: 320px;
+  overflow-y: auto;
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: var(--radius-md);
+  box-shadow: 0 10px 32px rgba(0, 0, 0, 0.45);
+  padding: 4px;
+}
+.chat-session-row {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  width: 100%;
+  text-align: left;
+  padding: 7px 9px;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  cursor: pointer;
+}
+.chat-session-row:hover {
+  background: rgba(46, 230, 214, 0.08);
+}
+.chat-session-row.is-current {
+  outline: 1px solid var(--accent-dim);
+}
+.chat-session-row .sess-title {
+  font-size: 13px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.chat-session-row .sess-meta {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+  font-size: 11px;
+  color: var(--muted);
+}
+.chat-session-row .sess-agent {
+  padding: 0 6px;
+  border: 1px solid var(--line);
+  border-radius: var(--radius-pill);
+  font-size: 10px;
+}
+.chat-sessions .chat-note {
+  margin: 8px;
+}
+
+/* Per-answer ghost actions (copy / download / read aloud): appear on bubble hover. */
+.chat-actions {
+  display: flex;
+  gap: 2px;
+  margin-top: 6px;
+  opacity: 0;
+  transition: opacity 0.12s;
+}
+.chat-msg:hover .chat-actions,
+.chat-actions:focus-within {
+  opacity: 1;
+}
+.chat-actions button {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-sm);
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  padding: 3px 6px;
+  cursor: pointer;
+}
+.chat-actions button:hover {
+  color: var(--text);
+  border-color: var(--line);
+}
+.chat-actions button[disabled] {
+  opacity: 0.4;
+  cursor: default;
+}
+@media (pointer: coarse) {
+  .chat-actions {
+    opacity: 1; /* no hover on touch — keep the actions visible */
+  }
+}
+
+/* Retry inside a failed bubble (keeps the error's red-on-red palette). */
+.chat-retry {
+  display: block;
+  margin-top: 8px;
+  padding: 3px 12px;
+  font-size: 12px;
+  background: transparent;
+  border: 1px solid currentColor;
+  border-radius: var(--radius-sm);
+  color: inherit;
+  cursor: pointer;
+}
+.chat-retry:hover {
+  background: rgba(255, 154, 154, 0.12);
+}
+
+/* ---- Omni-search palette (js/search/omni.js) ---- */
+/* Reuses the .modal overlay + .modal-card chrome; the palette variant pins the card
+   near the top (12vh) like every command palette, instead of dead-center. */
+.omni-modal {
+  align-items: flex-start;
+  padding-top: 12vh;
+}
+.omni-card {
+  width: min(560px, 92vw);
+  max-height: min(60vh, 520px);
+}
+.omni-input-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 12px 14px;
+  border-bottom: 1px solid var(--line);
+}
+.omni-glyph {
+  color: var(--muted);
+  font-size: 16px;
+}
+.omni-input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--text);
+  font: inherit;
+  font-size: 15px;
+}
+.omni-results {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  padding: 6px;
+}
+.omni-group-title {
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.6px;
+  font-size: 11px;
+  padding: 8px 8px 4px;
+}
+.omni-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 9px;
+  border-radius: var(--radius-sm);
+  cursor: pointer;
+  font-size: 13px;
+}
+.omni-row:hover,
+.omni-row.hi {
+  background: rgba(46, 230, 214, 0.08);
+}
+.omni-row.hi {
+  outline: 1px solid var(--accent-dim);
+}
+.omni-ico {
+  width: 20px;
+  text-align: center;
+  flex: none;
+}
+.omni-thumb {
+  height: 32px;
+  width: auto;
+  max-width: 72px;
+  border-radius: 4px;
+  background: #000;
+  object-fit: cover;
+  flex: none;
+}
+.omni-thumb.is-missing {
+  visibility: hidden;
+}
+.omni-label {
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.omni-sub {
+  color: var(--muted);
+  font-size: 12px;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+}
+.omni-hint {
+  margin-left: auto;
+  color: var(--muted);
+  font-size: 11px;
+  flex: none;
+}
+.omni-empty {
+  padding: 18px 12px;
+  text-align: center;
+  font-size: 13px;
+}
+.omni-foot {
+  display: flex;
+  gap: 14px;
+  padding: 8px 14px;
+  border-top: 1px solid var(--line);
+  font-size: 11px;
+}
+.omni-foot kbd {
+  padding: 1px 5px;
+  border: 1px solid var(--line);
+  border-bottom-width: 2px;
+  border-radius: 4px;
+  background: var(--panel2);
+  font-size: 10px;
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-actions {
     transition: none;
   }
 }

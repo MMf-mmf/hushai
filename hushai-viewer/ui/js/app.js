@@ -3,10 +3,20 @@
 // from the loaded HLS window; we only reload the playlist when a seek lands outside
 // the loaded window. For typical day-sized data the whole device loads as one window.
 
-import { getDevices, getTimeline, getProcessing, masterUrl } from "./api.js";
+import {
+  getDevices,
+  getTimeline,
+  getProcessing,
+  getEvents,
+  getEventFeed,
+  ackDelivery,
+  masterUrl,
+} from "./api.js";
 import { Player } from "./player.js";
 import { Timeline } from "./timeline.js";
 import { Detections } from "./detections.js";
+import { initEventsOverlay, initAlertBell } from "./events-overlay.js";
+import * as thumbs from "./thumbs.js";
 import { clock, clockMs, dateLabel, localDateInput, DAY_MS, tzAbbr, humanDur } from "./time.js";
 import { on, setPlaybackProvider } from "./store.js";
 import { createPoller } from "./poll.js";
@@ -28,6 +38,7 @@ const state = {
   view: { fromMs: 0, toMs: 1 },
   loaded: null,
   timeline: null,
+  events: new Map(), // event id -> event, for the selected camera (lane + drawer share it)
   playing: false,
   rate: 1,
   userMuted: true,
@@ -37,9 +48,17 @@ const state = {
   followLive: false, // LIVE pill engaged: auto-chase newest footage as it lands
 };
 
+const EVENTS_CAP = 3000; // soft cap on the in-memory event map (oldest dropped)
+const PREVIEW_W = 168; // #tlPreview outer width — matches its CSS
+
 let player, timeline, detections, toastTimer, helpModal;
+let eventsOverlay = null,
+  alertBell = null;
 let refreshPoller = null,
   lastDeviceSig = "";
+let evSeq = 0, // stale-response guard for the events fetches (bumped per device switch)
+  eventsMaxCreatedMs = 0, // newest createdMs seen — the incremental fetch's `since`
+  refreshTickN = 0; // the alert feed refreshes on every other auto-refresh tick
 let procSeq = 0, // stale-response guard for the processing-status fetch
   procDebounce = null,
   lastBadgeKey = "",
@@ -55,6 +74,33 @@ async function init() {
     onWindowChange: (from, to) => {
       state.view = { fromMs: from, toMs: to };
       scheduleProcessingRefetch(); // pan/zoom changed the visible window
+    },
+    onHover: (ms) => onTimelineHover(ms), // drives the #tlPreview thumbnail
+    // A marker on the events lane jumps the player to that moment.
+    onEventClick: (ev) => seekTo(ev.startMs, { play: true }),
+  });
+  // Events drawer (rail next to the stage) + topbar alert bell. Data flows from here:
+  // the drawer gets the selected camera's events pushed (shared with the timeline lane)
+  // and only fetches for itself in its all-cameras scope.
+  eventsOverlay = initEventsOverlay({
+    onSeek: (ms) => seekTo(ms, { play: true }),
+    onSelectDevice: (id, ms) => selectDevice(id, { seekMs: ms }),
+    fetchEvents: getEvents,
+  });
+  alertBell = initAlertBell({
+    fetchFeed: () => getEventFeed({ limit: 100 }),
+    ack: ackDelivery,
+    onView: (item) => {
+      if (item.eventStartMs == null) return;
+      if (
+        item.deviceId &&
+        item.deviceId !== state.device?.id &&
+        state.devices.some((d) => d.id === item.deviceId)
+      ) {
+        selectDevice(item.deviceId, { seekMs: item.eventStartMs });
+      } else {
+        seekTo(item.eventStartMs, { play: true });
+      }
     },
   });
   detections = new Detections($("detOverlay"), video);
@@ -99,23 +145,26 @@ async function init() {
         return timeline;
       },
       currentMs: () => (player ? player.currentWallClockMs() : 0),
+      events: () => state.events.size,
     };
   }
   lastDeviceSig = deviceSig(state.devices);
   populateDeviceSelect();
   const usable = state.devices.filter((d) => d.segmentCount > 0 && d.latestMs);
-  // Deep-link from the Events feed: /?device=<id>&t=<ms> opens that camera at that instant.
+  // Deep-link from the Events feed / omni-search: /?device=<id>[&t=<ms>] opens that
+  // camera, at that instant when `t` is given, else at its default landing spot.
   const params = new URLSearchParams(location.search);
   const linkDevice = params.get("device");
   const linkMs = Number(params.get("t"));
-  if (linkDevice && isFinite(linkMs) && linkMs > 0 && state.devices.some((d) => d.id === linkDevice)) {
-    selectDevice(linkDevice, { seekMs: linkMs });
+  if (linkDevice && state.devices.some((d) => d.id === linkDevice)) {
+    selectDevice(linkDevice, { seekMs: isFinite(linkMs) && linkMs > 0 ? linkMs : null });
   } else if (usable.length) {
     const def = usable.slice().sort((a, b) => b.segmentCount - a.segmentCount)[0];
     selectDevice(def.id);
   } else {
     showStatus("No cameras have reported footage yet.");
   }
+  alertBell?.refresh(); // badge appears promptly; the poller keeps it fresh after this
   startAutoRefresh(); // pick up new footage / new cameras on their own, no manual reload
 }
 
@@ -140,6 +189,14 @@ async function selectDevice(id, { seekMs = null } = {}) {
   state.device = d;
   $("deviceSelect").value = id;
   setDeviceMeta(d);
+  // Events belong to the camera: drop the old set immediately (no stale markers while
+  // the new fetch is in flight), then load this camera's recent events.
+  evSeq++;
+  state.events.clear();
+  eventsMaxCreatedMs = 0;
+  pushEvents();
+  eventsOverlay?.setDeviceId(id);
+  refetchEvents();
 
   const earliest = d.earliestMs ?? Date.now();
   const latest = d.latestMs ?? Date.now();
@@ -207,6 +264,66 @@ function scheduleProcessingRefetch() {
   if (!state.aiEnabled) return;
   clearTimeout(procDebounce);
   procDebounce = setTimeout(refetchProcessing, 250);
+}
+
+// ---- events (timeline lane + drawer share state.events) ----------------------
+
+// Fold fetched events into state.events; returns whether anything new landed and
+// advances the incremental-fetch watermark (max createdMs seen).
+function mergeEvents(list) {
+  let changed = false;
+  for (const ev of list) {
+    if (!state.events.has(ev.id)) changed = true;
+    state.events.set(ev.id, ev);
+    if (ev.createdMs > eventsMaxCreatedMs) eventsMaxCreatedMs = ev.createdMs;
+  }
+  // Soft cap: a long-lived tab on a busy camera shouldn't grow without bound.
+  if (state.events.size > EVENTS_CAP) {
+    const sorted = [...state.events.values()].sort((a, b) => a.startMs - b.startMs);
+    for (const ev of sorted.slice(0, state.events.size - EVENTS_CAP)) state.events.delete(ev.id);
+  }
+  return changed;
+}
+
+// One push point: the timeline lane and the events drawer always see the same list.
+function pushEvents() {
+  const list = [...state.events.values()];
+  timeline.setEvents(list);
+  eventsOverlay?.setEvents(list);
+}
+
+// Full fetch on device select (recent 500). Guarded by evSeq so a fast camera switch
+// can't land a stale camera's events.
+async function refetchEvents() {
+  const d = state.device;
+  if (!d) return;
+  const seq = evSeq;
+  try {
+    const list = await getEvents({ deviceId: d.id, limit: 500 });
+    if (seq !== evSeq) return; // superseded by a newer device selection
+    if (mergeEvents(list)) pushEvents();
+  } catch {
+    // transient — the 6s incremental tick doubles as the retry
+  }
+}
+
+// Incremental merge folded into the 6s auto-refresh: only events created since the
+// watermark (or a bounded recent slice when we have nothing yet).
+async function refetchEventsIncremental() {
+  const d = state.device;
+  if (!d) return;
+  const seq = evSeq;
+  try {
+    const list = await getEvents({
+      deviceId: d.id,
+      sinceMs: eventsMaxCreatedMs || undefined,
+      limit: 200,
+    });
+    if (seq !== evSeq) return;
+    if (mergeEvents(list)) pushEvents();
+  } catch {
+    // transient — next tick retries
+  }
 }
 
 function setDeviceMeta(d) {
@@ -308,6 +425,10 @@ function startAutoRefresh() {
       // Always refresh AI status (not gated by the new-footage signature): processing
       // advances as the worker catches up on already-ingested segments.
       await refetchProcessing();
+      // New events for the open camera (incremental since the createdMs watermark).
+      await refetchEventsIncremental();
+      // The alert feed moves slower than footage — every other tick is plenty.
+      if (refreshTickN++ % 2 === 0) await alertBell?.refresh();
     },
     { intervalMs: REFRESH_MS },
   );
@@ -467,6 +588,54 @@ function seekTo(ms, { play = false, exact = false, fromLive = false } = {}) {
       updatePlayBtn();
     }
   }
+}
+
+// ---- hover preview thumbnail --------------------------------------------------
+// Driven by the timeline's onHover: over covered footage on a video-capable camera,
+// float #tlPreview above the bar at the hover x with a HH:MM:SS label and a 2s-bucket
+// still (thumbs.js debounces + caches). Hidden on hover-out, during any drag/pinch
+// gesture, over gaps, and on audio-only cameras.
+
+function hideTimelinePreview() {
+  const box = $("tlPreview");
+  if (box && !box.hidden) box.hidden = true;
+  thumbs.cancel();
+}
+
+function onTimelineHover(ms) {
+  const box = $("tlPreview");
+  if (!box) return;
+  const d = state.device;
+  const show =
+    ms != null &&
+    d != null &&
+    (d.hasVideo || d.hasMuxed) &&
+    !timeline.isDragging() &&
+    timeline.isCovered(ms);
+  if (!show) {
+    hideTimelinePreview();
+    return;
+  }
+  const canvas = $("timeline");
+  const bar = canvas.parentElement; // .timelinebar (the positioning context)
+  const x = canvas.offsetLeft + timeline.xOf(ms);
+  const maxLeft = Math.max(4, bar.clientWidth - PREVIEW_W - 4);
+  box.style.left = `${Math.min(Math.max(x - PREVIEW_W / 2, 4), maxLeft)}px`;
+  box.querySelector("span").textContent = clock(ms);
+  box.hidden = false;
+  thumbs.request(d.id, ms, (url) => {
+    if (box.hidden) return; // hover already left while the still was loading
+    const img = box.querySelector("img");
+    if (url) {
+      if (img.dataset.url !== url) {
+        img.src = url;
+        img.dataset.url = url;
+      }
+      img.hidden = false;
+    } else {
+      img.hidden = true; // no frame there — keep the time label alone
+    }
+  });
 }
 
 // ---- controls ---------------------------------------------------------------

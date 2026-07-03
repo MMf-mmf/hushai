@@ -15,9 +15,12 @@ import {
   mergeSpeakerGroup,
   archiveSpeaker,
   unarchiveSpeaker,
+  reclusterSpeakers,
+  reclusterSpeakersDeep,
 } from "../api.js";
 import { wireModal } from "../modal.js";
 import { toast } from "../toast.js";
+import { confirmAction } from "../confirm.js";
 
 function note(text) {
   const el = document.createElement("div");
@@ -399,6 +402,55 @@ function boot() {
     }
     render(body, speakers || [], dups || [], unattributed || [], ctx);
   }
+
+  // Server-side reclustering, surfaced in the modal head (inserted dynamically so the
+  // markup stays untouched): a fast semantic pass, and — behind a confirm — the slow
+  // deep neural pass over every voiceprint. Both are long-running POSTs: disable both
+  // triggers while one runs, then reload the list to show the regrouped voices.
+  const reclusterBtn = document.createElement("button");
+  reclusterBtn.type = "button";
+  reclusterBtn.textContent = "Recluster";
+  reclusterBtn.title = "Re-run voice clustering to regroup duplicate voices (fast pass)";
+  const deepBtn = document.createElement("button");
+  deepBtn.type = "button";
+  deepBtn.textContent = "Deep recluster";
+  deepBtn.title = "Re-run neural clustering over every voiceprint (slow, thorough)";
+  const head = modal.querySelector(".modal-head");
+  if (head && closeBtn) {
+    head.insertBefore(reclusterBtn, closeBtn);
+    head.insertBefore(deepBtn, closeBtn);
+  }
+
+  async function runRecluster(btn, fn, doneMsg) {
+    reclusterBtn.disabled = true;
+    deepBtn.disabled = true;
+    const prev = btn.textContent;
+    btn.textContent = "Working…";
+    try {
+      await fn();
+      toast(doneMsg, { kind: "success" });
+      await load();
+    } catch {
+      toast("Recluster failed — check that hushai-backend is running.", { kind: "error" });
+    } finally {
+      reclusterBtn.disabled = false;
+      deepBtn.disabled = false;
+      btn.textContent = prev;
+    }
+  }
+
+  reclusterBtn.addEventListener("click", () =>
+    runRecluster(reclusterBtn, reclusterSpeakers, "Recluster complete"),
+  );
+  deepBtn.addEventListener("click", async () => {
+    const ok = await confirmAction({
+      title: "Deep recluster",
+      message:
+        "Re-runs neural clustering over every voiceprint. This can take a while and may regroup existing voices.",
+      confirmLabel: "Run deep recluster",
+    });
+    if (ok) runRecluster(deepBtn, reclusterSpeakersDeep, "Deep recluster complete");
+  });
 
   // Shared modal behavior (backdrop click, Escape, focus trap + restore) lives in modal.js;
   // opening (re)loads the list, closing stops any playing sample.

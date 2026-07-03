@@ -4,6 +4,9 @@
 // shared video player via the store, so chat and scrubbing feel unified.
 
 import { ChatPane } from "./chat-pane.js";
+// Omni-search palette ("/" or Cmd/Ctrl+K) — a side-effect import that installs its own
+// hotkeys + modal. Viewer page only for now; other pages adopt it with this same line.
+import "../search/omni.js";
 
 const AUTO_AGENT = {
   id: "auto",

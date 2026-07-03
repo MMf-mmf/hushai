@@ -19,6 +19,13 @@ export function seekToCitation({ deviceId, ms }) {
   emit("seekToCitation", { deviceId, ms });
 }
 
+/// Hand a question to the AI chat pane: `{ text }`. The omni-search palette's
+/// "Ask: <query>" row publishes; chat-pane.js subscribes (stages the text in its
+/// composer and sends when idle). Pages without a chat pane navigate to /?ask= instead.
+export function chatAsk(text) {
+  emit("chatAsk", { text });
+}
+
 // The pull-model twin of seekToCitation: chat asks "what is the viewer showing right now?"
 // without coupling to app.js internals. app.js registers a provider at init; the chat pane
 // pulls it per send so the backend can scope deictic questions ("who was speaking in this

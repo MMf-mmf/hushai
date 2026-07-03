@@ -5,7 +5,7 @@
 // All times are ms. Two transforms (xOf/tOf) drive everything — nothing is laid out
 // per-segment, so a busy day stays cheap (the backend pre-coalesces to spans).
 
-import { stageColors, cssVar, prefersReducedMotion } from "./theme.js";
+import { stageColors, severityColors, cssVar, prefersReducedMotion } from "./theme.js";
 
 const LADDER = [
   250, 500, 1e3, 2e3, 5e3, 1e4, 15e3, 3e4, 6e4, 12e4, 3e5, 6e5, 9e5, 18e5, 36e5, 72e5, 108e5,
@@ -21,21 +21,35 @@ const PINCH_MIN_DIST = 12; // px floor so pinch scaling can't blow up as the fin
 const MS_TOOLTIP_SPAN = 120_000; // under this visible span the tooltip gains millisecond precision
 const GAP_HATCH_MAX_SPAN = 30 * 60_000; // hatch gap regions only when zoomed in past 30 minutes
 
-// AI processing-status ribbons drawn under the coverage track (audio lane, then vision).
+// Events lane: a thin marker strip between the coverage track and the AI ribbons.
+// Severity glyphs (◆ critical / ▲ warning / • info) at each event's start, a span
+// underline for events wide enough to read as a range, and ×N cluster chips where
+// markers would pile up.
+const EVENTS_Y0 = TRACK_TOP + TRACK_H + 4; // events lane top (=80)
+const EVENTS_H = 12;
+const EVENT_BIN_PX = 12; // cluster bin width: >2 events per bin collapse to one ×N chip
+const EVENT_HIT_SLOP = 6; // ±px mouse hit tolerance on markers (touch uses HIT_SLOP_TOUCH)
+const EVENT_WIDE_PX = 6; // events spanning more than this also draw a 3px underline bar
+const EVENT_LOOKBACK_MS = 3600_000; // catch underlines of events that started before the window
+const EVENT_TOOLTIP_MAX = 3; // tooltip lists at most this many events, then "+N more"
+
+// AI processing-status ribbons drawn under the events lane (audio lane, then vision).
 // Each is a labeled track so the two lanes are always identifiable; a faint base shows the
 // lane even where it has no data, and colored intervals + a left label sit on top.
-const RIBBON_GAP = 5; // breather between track and the first ribbon
+const RIBBON_GAP = 5; // breather between events lane and the first ribbon
 const RIBBON_H = 13; // each lane ribbon (tall enough for a left label + easy hover)
 const RIBBON_PAD = 4; // gap between the two ribbons
-const RIBBON_Y0 = TRACK_TOP + TRACK_H + RIBBON_GAP; // audio ribbon top (=81)
-const RIBBON_Y1 = RIBBON_Y0 + RIBBON_H + RIBBON_PAD; // vision ribbon top (=98)
-const RIBBON_BOTTOM = RIBBON_Y1 + RIBBON_H; // =111
+const RIBBON_Y0 = EVENTS_Y0 + EVENTS_H + RIBBON_GAP; // audio ribbon top (=97)
+const RIBBON_Y1 = RIBBON_Y0 + RIBBON_H + RIBBON_PAD; // vision ribbon top (=114)
+const RIBBON_BOTTOM = RIBBON_Y1 + RIBBON_H; // =127
 
 // Pipeline-stage colors. Deliberately NOT the coverage teal or session amber, so the
 // ribbons never read as "coverage". Separable by lightness (+ motion on processing,
 // + a chip in the tooltip / popover) for colorblind safety. The palette itself lives
 // in the CSS --stage-*/--tl-* tokens (styles.css :root), read once via theme.js.
 const STATUS_COLORS = stageColors();
+const SEV_COLORS = severityColors();
+const SEV_RANK = { info: 0, warning: 1, critical: 2 }; // cluster chips take the worst
 const TRACK_BG = cssVar("--tl-track", "#15171c");
 const TICK_COLOR = cssVar("--tl-tick", "#79839a");
 const COV_HI = cssVar("--tl-cov-hi", "#2ee6d6");
@@ -47,13 +61,14 @@ const LIVE_COLOR = cssVar("--sev-critical", "#ff7a7a");
 const pad = (n) => String(n).padStart(2, "0");
 
 export class Timeline {
-  constructor(canvas, { onSeek, onWindowChange, onHover, onSelectionChange } = {}) {
+  constructor(canvas, { onSeek, onWindowChange, onHover, onSelectionChange, onEventClick } = {}) {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d");
     this.onSeek = onSeek || (() => {});
     this.onWindowChange = onWindowChange || (() => {});
     this.onHover = onHover || (() => {});
     this.onSelectionChange = onSelectionChange || (() => {});
+    this.onEventClick = onEventClick || (() => {});
 
     this.from = 0;
     this.to = 1;
@@ -61,6 +76,9 @@ export class Timeline {
     this.boundsTo = 1;
     this.coverage = [];
     this.sessions = [];
+    this.events = []; // [{id,severity,type,subjectLabel,startMs,endMs,...}] sorted by startMs
+    this._eventClusters = []; // ×N chip hit areas from the last render: [{x0,x1,fromMs,toMs}]
+    this._hoverSlop = EVENT_HIT_SLOP; // widened to HIT_SLOP_TOUCH while a touch pointer hovers
     this.procAudio = []; // [{startMs,endMs,status,lastError,sentences,speakers}]
     this.procVision = []; // [{startMs,endMs,status,lastError,faces,objects}]
     this._procEnabled = true;
@@ -105,6 +123,17 @@ export class Timeline {
   setPlayhead(ms) {
     this.playheadMs = ms;
     this.render();
+  }
+  // Event markers for the events lane. Kept sorted by startMs so rendering/hit-testing
+  // can binary-search the visible slice — thousands of events stay cheap.
+  setEvents(events) {
+    this.events = (events || []).slice().sort((a, b) => a.startMs - b.startMs);
+    this.render();
+  }
+  // Whether a pointer gesture (scrub/pan/selection/pinch) is in flight — the app hides
+  // the hover preview during gestures without reaching into private state.
+  isDragging() {
+    return this._drag != null;
   }
   // Newest-footage cap: a 2px bar + small dot at `ms` (null hides it). The dot pulses
   // via tickAnim; under prefers-reduced-motion it sits static.
@@ -284,6 +313,9 @@ export class Timeline {
     // range selection band (persistent) / zoom-to-selection band (while dragging)
     this._drawSelection();
 
+    // events lane (severity markers + cluster chips), between track and ribbons
+    this._drawEvents();
+
     // AI processing-status ribbons (audio lane, then vision lane)
     if (this._procEnabled) {
       this._drawRibbon(this.procAudio, RIBBON_Y0, "Audio");
@@ -296,7 +328,7 @@ export class Timeline {
     // hover hairline + tooltip
     if (this.hoverX != null && this._drag == null) {
       const ms = this.tOf(this.hoverX);
-      const hairBottom = this._procEnabled ? RIBBON_BOTTOM : TRACK_TOP + TRACK_H;
+      const hairBottom = this._procEnabled ? RIBBON_BOTTOM : EVENTS_Y0 + EVENTS_H;
       ctx.strokeStyle = "rgba(255,255,255,0.25)";
       ctx.beginPath();
       ctx.moveTo(this.hoverX, TRACK_TOP);
@@ -414,6 +446,174 @@ export class Timeline {
     }
   }
 
+  // ---- events lane ------------------------------------------------------------
+
+  // First index in the (startMs-sorted) events array with startMs >= ms.
+  _eventsLo(ms) {
+    let lo = 0,
+      hi = this.events.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (this.events[mid].startMs < ms) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
+  }
+
+  // The events intersecting the visible window, via binary search on startMs. A bounded
+  // lookback catches events that STARTED before the window but whose span underline still
+  // reaches into it (events longer than the lookback are rare enough to accept missing).
+  _visibleEvents() {
+    if (!this.events.length) return [];
+    const out = [];
+    for (let i = this._eventsLo(this.from - EVENT_LOOKBACK_MS); i < this.events.length; i++) {
+      const ev = this.events[i];
+      if (ev.startMs > this.to) break;
+      if (Math.max(ev.startMs, ev.endMs ?? ev.startMs) < this.from) continue;
+      out.push(ev);
+    }
+    return out;
+  }
+
+  // Faint lane base + span underlines + severity glyphs, with >2-per-bin pileups
+  // collapsed into one ×N chip in the worst severity's color. Rebuilds the chip hit
+  // areas (`_eventClusters`) every pass, so click dispatch always matches the pixels.
+  _drawEvents() {
+    const ctx = this.ctx;
+    const W = this.cssW;
+    // faint base so the lane is identifiable even where there are no markers
+    ctx.fillStyle = "rgba(255,255,255,0.045)";
+    ctx.fillRect(0, EVENTS_Y0, W, EVENTS_H);
+    this._eventClusters = [];
+    if (!this.events.length) return;
+    const visible = this._visibleEvents();
+    if (!visible.length) return;
+
+    // 1) span underlines for events wide enough to read as a range (drawn under glyphs)
+    for (const ev of visible) {
+      const x0 = this.xOf(ev.startMs);
+      const x1 = this.xOf(ev.endMs ?? ev.startMs);
+      if (x1 - x0 <= EVENT_WIDE_PX) continue;
+      const a = Math.max(0, x0);
+      const b = Math.min(W, x1);
+      if (b <= a) continue;
+      ctx.save();
+      ctx.globalAlpha = 0.55;
+      ctx.fillStyle = SEV_COLORS[ev.severity] || SEV_COLORS.info;
+      ctx.fillRect(a, EVENTS_Y0 + EVENTS_H - 3, b - a, 3);
+      ctx.restore();
+    }
+
+    // 2) bucket by 12px bin; ≤2 per bin draw individual glyphs, >2 draw one ×N chip
+    const bins = new Map();
+    for (const ev of visible) {
+      const bin = Math.floor(this.xOf(ev.startMs) / EVENT_BIN_PX);
+      const arr = bins.get(bin);
+      if (arr) arr.push(ev);
+      else bins.set(bin, [ev]);
+    }
+    const cy = EVENTS_Y0 + EVENTS_H / 2;
+    for (const [bin, evs] of bins) {
+      const bx = bin * EVENT_BIN_PX;
+      if (bx > W || bx + EVENT_BIN_PX < 0) continue;
+      if (evs.length > 2) this._drawEventCluster(bx, evs);
+      else for (const ev of evs) this._drawEventGlyph(ev, cy);
+    }
+  }
+
+  // One severity glyph at the event's start: ◆ critical / ▲ warning / • info.
+  _drawEventGlyph(ev, cy) {
+    const x = this.xOf(ev.startMs);
+    if (x < -5 || x > this.cssW + 5) return;
+    const ctx = this.ctx;
+    ctx.fillStyle = SEV_COLORS[ev.severity] || SEV_COLORS.info;
+    ctx.beginPath();
+    if (ev.severity === "critical") {
+      // filled diamond
+      ctx.moveTo(x, cy - 4.5);
+      ctx.lineTo(x + 4, cy);
+      ctx.lineTo(x, cy + 4.5);
+      ctx.lineTo(x - 4, cy);
+    } else if (ev.severity === "warning") {
+      // filled triangle
+      ctx.moveTo(x, cy - 4);
+      ctx.lineTo(x + 4.2, cy + 3.5);
+      ctx.lineTo(x - 4.2, cy + 3.5);
+    } else {
+      // 4px dot
+      ctx.arc(x, cy, 2, 0, Math.PI * 2);
+    }
+    ctx.closePath();
+    ctx.fill();
+  }
+
+  // A rounded ×N chip for a pileup bin, colored by the worst severity in it. Registers
+  // its extent in _eventClusters so a click can zoom into the bin instead of guessing.
+  _drawEventCluster(bx, evs) {
+    const ctx = this.ctx;
+    const W = this.cssW;
+    const worst = evs.reduce(
+      (w, e) => ((SEV_RANK[e.severity] ?? 0) > SEV_RANK[w] ? e.severity : w),
+      "info",
+    );
+    ctx.font = "700 9px system-ui, -apple-system, Segoe UI, Roboto, sans-serif";
+    const label = `×${evs.length}`;
+    const w = ctx.measureText(label).width + 8;
+    // centered on the bin, nudged fully into view at the canvas edges
+    const cx = Math.min(Math.max(bx + EVENT_BIN_PX / 2, w / 2 + 1), W - w / 2 - 1);
+    const x0 = cx - w / 2;
+    ctx.fillStyle = SEV_COLORS[worst] || SEV_COLORS.info;
+    roundRect(ctx, x0, EVENTS_Y0 + 0.5, w, EVENTS_H - 1, 5);
+    ctx.fill();
+    ctx.fillStyle = "#0b0d10";
+    ctx.textBaseline = "middle";
+    ctx.fillText(label, x0 + 4, EVENTS_Y0 + EVENTS_H / 2 + 0.5);
+    ctx.textBaseline = "alphabetic";
+    this._eventClusters.push({
+      x0,
+      x1: x0 + w,
+      fromMs: Math.min(...evs.map((e) => e.startMs)),
+      toMs: Math.max(...evs.map((e) => Math.max(e.startMs, e.endMs ?? e.startMs))),
+    });
+  }
+
+  // Events whose marker sits within ±slop of `x`: the glyph at startMs, or — for wide
+  // events — anywhere along the span underline. Feeds the tooltip and click dispatch.
+  _eventsNear(x, slop) {
+    if (!this.events.length) return [];
+    const out = [];
+    for (const ev of this._visibleEvents()) {
+      const x0 = this.xOf(ev.startMs);
+      const x1 = this.xOf(ev.endMs ?? ev.startMs);
+      const wide = x1 - x0 > EVENT_WIDE_PX;
+      if (Math.abs(x - x0) <= slop || (wide && x >= x0 - slop && x <= x1 + slop)) out.push(ev);
+    }
+    return out;
+  }
+
+  // Pointerdown dispatch for the events zone. Returns true when consumed: a ×N cluster
+  // chip (or an ambiguous marker pileup) zooms to the bin extent with ×3 padding; a
+  // single marker fires onEventClick. False = nothing hit, caller falls back to scrub.
+  _eventClickAt(x, slop) {
+    const cluster = this._eventClusters.find((c) => x >= c.x0 - slop && x <= c.x1 + slop);
+    if (cluster) {
+      const span = Math.max(cluster.toMs - cluster.fromMs, 1000);
+      this.fit(cluster.fromMs - span, cluster.toMs + span);
+      return true;
+    }
+    const hits = this._eventsNear(x, slop);
+    if (!hits.length) return false;
+    if (hits.length === 1) {
+      this.onEventClick(hits[0]);
+      return true;
+    }
+    const a = Math.min(...hits.map((e) => e.startMs));
+    const b = Math.max(...hits.map((e) => Math.max(e.startMs, e.endMs ?? e.startMs)));
+    const span = Math.max(b - a, 1000);
+    this.fit(a - span, b + span);
+    return true;
+  }
+
   // One lane ribbon: a faint base track (so the lane is always visible + identifiable),
   // a colored band per status interval, and a left label chip. `processing` gets an
   // animated shimmer so it reads as active. No interval (lane n/a, or a gap) leaves the
@@ -485,6 +685,17 @@ export class Timeline {
       if (st.vision)
         lines.push({ text: `Vision · ${laneSummaryText("vision", st.vision)}`, color: "#cdd6e4", chip: STATUS_COLORS[st.vision.status] });
     }
+    // Event markers near the hover x append their own lines (sev-colored chip each).
+    // Hover-only — the mid-scrub ghost tooltip stays a pure time readout.
+    if (this._drag == null) {
+      const hits = this._eventsNear(x, this._hoverSlop);
+      for (const ev of hits.slice(0, EVENT_TOOLTIP_MAX)) {
+        const text = [ev.type, ev.subjectLabel, fmtFull(ev.startMs)].filter(Boolean).join(" · ");
+        lines.push({ text, color: "#cdd6e4", chip: SEV_COLORS[ev.severity] || SEV_COLORS.info });
+      }
+      if (hits.length > EVENT_TOOLTIP_MAX)
+        lines.push({ text: `+${hits.length - EVENT_TOOLTIP_MAX} more events`, color: "#79839a", chip: null });
+    }
     ctx.font = "11px ui-monospace, SFMono-Regular, Menlo, monospace";
     const lineH = 16;
     const chipW = 14; // reserved left space when a line carries a status chip
@@ -552,11 +763,13 @@ export class Timeline {
     return e.clientX - this.canvas.getBoundingClientRect().left;
   }
   // Which horizontal band `y` (canvas-local px) falls in. Pointer handling dispatches on
-  // this: the labels pan, the track scrubs, the ribbons are hover/tooltip-only.
+  // this: the labels pan, the track scrubs, the events lane clicks markers (else scrubs),
+  // the ribbons are hover/tooltip-only.
   _zoneAt(y) {
     if (y < TRACK_TOP) return "labels";
     if (y >= RIBBON_Y0) return "ribbons";
-    return "track"; // the coverage track, incl. the small breather above the ribbons
+    if (y >= EVENTS_Y0) return "events"; // marker lane, incl. the breather below it
+    return "track"; // the coverage track, incl. the small breather above the events lane
   }
   _onDown(e) {
     const rect = this.canvas.getBoundingClientRect();
@@ -575,8 +788,14 @@ export class Timeline {
     const zone = e.button === 1 ? "labels" : this._zoneAt(y);
     if (zone === "labels") {
       this._drag = { mode: "pan", startX: x, startFrom: this.from, startTo: this.to };
-    } else if (zone === "track") {
+    } else if (zone === "track" || zone === "events") {
       const raw = this.tOf(x);
+      // Event markers win over scrubbing in their lane (plain clicks only — selection
+      // and zoom-select gestures keep their meaning even when started over the lane).
+      if (zone === "events" && !e.shiftKey && !this.selectMode) {
+        const slop = e.pointerType === "touch" ? HIT_SLOP_TOUCH : EVENT_HIT_SLOP;
+        if (this._eventClickAt(x, slop)) return;
+      }
       if (e.shiftKey && !this.selectMode) {
         // Zoom-to-selection: accent band while dragging, fit() on release, Esc cancels.
         this._drag = { mode: "zoomsel", startMs: raw, curMs: raw };
@@ -615,6 +834,7 @@ export class Timeline {
       });
     }
     this.hoverX = x;
+    this._hoverSlop = e.pointerType === "touch" ? HIT_SLOP_TOUCH : EVENT_HIT_SLOP;
     const d = this._drag;
     if (d?.mode === "scrub") {
       this.ghostMs = d.noSnap ? this.tOf(x) : this.snap(this.tOf(x));

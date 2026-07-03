@@ -18,13 +18,30 @@
     <main class="dash">
       <div id="banner" class="dash-banner loading">Loading events…</div>
 
-      <!-- Unacknowledged notifications (the `feed` channel of alert_deliveries). -->
+      <!-- Notifications (the `feed` channel of alert_deliveries). "Unread" maps to the backend's
+           'pending' delivery status; ack flips it to 'acknowledged' (see events.rs FeedQuery). -->
       <section class="dash-section">
         <div class="dash-head">
           <h2>🔔 Alerts</h2>
           <span id="feedCount" class="count-chip"></span>
         </div>
+        <div class="filters">
+          <label>Show
+            <select id="feedStatus">
+              <option value="unacked" selected>Unread only</option>
+              <option value="all">All</option>
+            </select>
+          </label>
+          <button id="feedAckAll" class="ghost" type="button">Mark all read</button>
+        </div>
         <div id="feed" class="status-table"></div>
+      </section>
+
+      <!-- Subjects of interest. Watches are managed alert rules server-side (see watchlist.rs), so
+           the enable/disable toggle here flips the managed rule in the "Alert rules" list below. -->
+      <section class="dash-section">
+        <div class="dash-head"><h2>⭐ Watchlist</h2><span id="watchCount" class="count-chip"></span></div>
+        <div id="watchlist" class="status-table"></div>
       </section>
 
       <!-- The materialized event stream, filterable. Click a row to jump the timeline to it. -->
@@ -52,6 +69,22 @@
               <option value="warning">warning</option>
               <option value="critical">critical</option>
             </select>
+          </label>
+          <!-- subject_type values the worker's events_producer emits (person/plate/object/speaker). -->
+          <label>Subject type
+            <select id="fSubjectType">
+              <option value="">Any subject</option>
+              <option value="person">person</option>
+              <option value="plate">plate</option>
+              <option value="object">object</option>
+              <option value="speaker">speaker</option>
+            </select>
+          </label>
+          <label>Subject id
+            <input id="fSubjectId" type="text" placeholder="subject UUID" size="16" />
+          </label>
+          <label>Since
+            <input id="fSince" type="date" />
           </label>
           <button id="fApply" class="ghost">Refresh</button>
         </div>
@@ -106,7 +139,9 @@
             <input id="rHookUrl" class="hook-url" type="url" placeholder="https://webhook.url" />
           </div>
           <div class="full form-actions">
-            <button type="submit" class="ghost">＋ Create rule</button>
+            <button id="ruleSubmit" type="submit" class="ghost">＋ Create rule</button>
+            <!-- Shown only while editing an existing rule (events.js flips the form into edit mode). -->
+            <button id="ruleCancel" type="button" class="ghost" hidden>Cancel</button>
             <span id="ruleFormMsg" class="small"></span>
           </div>
         </form>
