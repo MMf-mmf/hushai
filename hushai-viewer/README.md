@@ -261,7 +261,12 @@ localizes for display.
 | `GET` | `/hls/{id}/master.m3u8?from&to` | Master playlist (video variant + alt-audio rendition, or a single muxed variant). |
 | `GET` | `/hls/{id}/{video\|audio\|muxed}.m3u8?from&to` | Media playlist (`#EXTINF`, `#EXT-X-PROGRAM-DATE-TIME`, `#EXT-X-DISCONTINUITY`, `#EXT-X-ENDLIST`). |
 | `GET` | `/hls/seg/{sha256}.{video\|audio\|muxed}.ts` | The remuxed TS segment (remux-on-demand, then cached; `Cache-Control: immutable`). |
-| `GET` | `/api/devices/{id}/export.mp4?from&to&kind` | **Footage export** (`export.rs`): streams the window's segments of one `kind` (`muxed` default, or `video`) into a single fragmented-MP4 download (`Content-Disposition: attachment`). Per-segment TS remux (shared cache) piped through one ffmpeg. Used by the Files page's per-day ⬇ MP4 links. |
+| `GET` | `/api/devices/{id}/export.mp4?from&to&kind` | **Footage export** (`export.rs`): streams the window's segments of one `kind` (`muxed` default, or `video`) into a single fragmented-MP4 download (`Content-Disposition: attachment`). Per-segment TS remux (shared cache) piped through one ffmpeg. Used by the Files page's per-day ⬇ MP4 links **and the in-player ✂ clip export**. |
+| `GET` | `/api/devices/{id}/thumb.jpg?t=<ns>` | **Still frame** at wall-clock `t` (`stills.rs`): ffmpeg first-frame extraction (320w) cached content-addressed under `cache/still/`, `ETag`/304. Backs the timeline **hover preview**. |
+| `GET` | `/api/devices/{id}/poster.jpg[?t=]` | Newest frame (480w, `max-age=5` + `ETag`) — the **Cameras grid** tiles. Same cache/ffmpeg machinery as `thumb.jpg`. |
+| `GET` | `/api/devices/{id}/sentiment?from&to` | **Mood ribbon** data (`sentiment.rs`): positive/neutral/negative runs coalesced from `transcript_sentences` at segment grain. Same 6h clamp + `truncated` flag as `/processing`. |
+| `GET` | `/styles.css` | The shared stylesheet, deliberately **public** (pre-auth, still IP-allowlisted) so the login page shares the design system. |
+| `ANY` | `/v1/events*`, `/v1/alert-rules*`, `/v1/watchlist*`, `/v1/audit` | **Reverse-proxied to hushai-backend**: the proactive layer behind the timeline events lane, the events drawer + alert bell, the **🔔 Alerts center** (feed ack, rule CRUD/edit), the **⭐ Watchlist**, and the System page's **audit trail**. |
 | `ANY` | `/v1/rag/*`, `/v1/tts` | **Reverse-proxied to hushai-rag** (`RAG_BASE_URL`): chat (`POST /v1/rag/chat` SSE, `GET /v1/rag/agents`, `GET /v1/rag/chat/sessions[/{id}/messages]`), plus the existing `/v1/rag/query` + `/v1/tts`. `RAG_TOKEN` injected server-side; body streamed unbuffered (SSE). |
 | `ANY` | `/v1/speakers*` | **Reverse-proxied to hushai-backend** (`BACKEND_BASE_URL`): the speaker-admin surface behind the **Voices** page — `GET /v1/speakers`, `PATCH /v1/speakers/{id}`, `GET /v1/speakers/duplicates`, `POST /v1/speakers/{id}/merge`, `POST /v1/speakers/merge-group`, `GET /v1/speakers/{id}/sample-audio`. `BACKEND_TOKEN` injected server-side. |
 | `ANY` | `/v1/persons*` | **Reverse-proxied to hushai-backend**: the person (face) catalog — `GET /v1/persons`, `PATCH /v1/persons/{id}` (name a face), `POST /v1/persons/{id}/merge`, `GET /v1/persons/{id}/sample-face` (cropped JPEG). Same server-side bearer as `/v1/speakers*`. |
@@ -287,6 +292,24 @@ localizes for display.
   Requires the worker's vision pipeline to have populated `person_segments`/`scene_objects`; with no
   detections the overlay is simply empty.
 - **Date navigation** — `‹ ›` to step days, or the date picker to jump.
+- **LIVE pill** — red while following the newest footage (auto-chases as segments land); any manual
+  seek drops back to browsing, click **GO LIVE** (or `Shift+L`) to re-engage. A pulsing cap on the
+  timeline marks the live edge while footage is fresh.
+- **Events lane + drawer + bell** — severity glyphs (◆ critical ▲ warning • info) on their own
+  timeline lane (click to jump; dense spots cluster into ×N chips); **☰ Events** opens a filterable
+  drawer beside the video; the topbar **🔔** badge counts unacked alerts with per-item Ack and
+  jump-to-footage, and links into the full **Alerts center** (`/events.html` — feed, watchlist,
+  event stream, rule editor).
+- **✂ Export** (or `E`) — drag a range on the timeline (grips adjustable, `i`/`o` set in/out at the
+  playhead) and download it as MP4; warns about gaps and the 6h server clamp.
+- **Hover previews + mood** — hovering the bar floats a real frame thumbnail at that instant;
+  a slim **MOOD** lane under Audio/Vision shades positive/neutral/negative stretches of speech.
+- **`/` or `Cmd+K`** — the omni-search palette: cameras, jump-to-time ("yesterday 5pm"), license
+  plates (server-side fuzzy search with crops), people & voices (jump to latest sighting), or hand
+  the query to the AI chat. Available on every page.
+- **📷 Cameras** (`/cameras.html`) — all cameras at a glance: poster tiles refreshing every 10s,
+  live/idle/offline dots, unacked-alert chips, and a one-at-a-time live **peek** player on hover;
+  click a tile to open that camera in the viewer.
 - **Chat (right dock)** — ask questions over the recordings; answers stream and cite the moment
   (click a citation to jump the timeline). Per-conversation controls: a **camera-scope dropdown**
   (default **All cameras**, or limit answers to one camera — independent of the video selector) and
@@ -304,13 +327,20 @@ localizes for display.
 
 ### Keyboard shortcuts
 
+Press **`?`** in the viewer for the built-in cheat sheet.
+
 | Key | Action | Key | Action |
 |-----|--------|-----|--------|
 | `Space` / `K` | play / pause | `[` / `]` | previous / next recorded span |
-| `←` / `→` | seek ∓5s | `J` / `L` | seek ∓10s |
-| `Home` / `End` | earliest / latest footage | `M` | mute |
-| `+` / `−` | zoom timeline in / out | `F` | fullscreen |
-| `1` `2` `3` `4` | speed 1× / 2× / 4× / 8× | | |
+| `←` / `→` | seek ∓5s (`Shift`: ∓60s) | `J` / `L` | seek ∓10s |
+| `,` / `.` | frame step back / forward | `<` / `>` | speed down / up (0.25×–8×) |
+| `Home` / `End` | earliest / latest footage | `Shift+L` | go LIVE (follow the edge) |
+| `+` / `−`, `0` | zoom timeline in / out, fit all | `M` / `F` | mute / fullscreen |
+| `1` `2` `3` `4` | speed 1× / 2× / 4× / 8× | `D` / `A` | detections overlay / AI ribbons |
+| `E`, `i` / `o` | export mode, set in / out point | `/` or `Cmd+K` | omni-search palette |
+| `Alt`+click/drag | precise seek (no gap snap) | `Shift`+drag | zoom to selection |
+
+Touch: one-finger scrub/pan by zone, **two-finger pinch** zooms the bar; middle-drag pans anywhere.
 
 ---
 
@@ -350,10 +380,12 @@ ffmpeg -i "http://127.0.0.1:8070/hls/$DEV/master.m3u8?from=<F>&to=<T>" -t 40 -c 
 ffprobe out.mp4   # expect h264 + aac, ~40s
 ```
 
-**Browser playback** was verified by driving the *real* Google Chrome headlessly (open-source
-Chromium lacks H.264/AAC): `npm i puppeteer-core` and launch with
-`executablePath: "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"`, then assert
-`video.videoWidth > 0` and that `video.currentTime` advances while scrubbing.
+**Browser playback + the whole UI surface** are verified by the committed E2E sweep in
+[`e2e/`](e2e/README.md) — it drives the *real* Google Chrome headlessly (open-source Chromium
+lacks H.264/AAC) through boot/decode, seeking, frame stepping, hover previews, events + bell,
+clip export (a real MP4 fetch), modal focus behavior, the omni palette, the Cameras grid, the
+Alerts center and the audit trail, with a run-wide guard that no native `alert()`/`confirm()`
+ever fires. `cd e2e && npm i && node run.mjs` against a running stack.
 
 ---
 
@@ -368,10 +400,12 @@ is gated by an IP allowlist + password and can serve native TLS (see "Admin acce
 - **More agents** — extra personas/scopes are one registry entry in `hushai-rag/src/agents.rs`;
   the agent-tab UI (`ui/js/chat/agent-picker.js`) already loops over N.
 - **Near-live tailing** — a non-`ENDLIST`, sliding playlist off the newest session. Reuses ~90% of
-  `playlist.rs` / `remux.rs`.
+  `playlist.rs` / `remux.rs`. (The LIVE pill approximates this today by chasing window reloads.)
 - ~~**Auth / LAN exposure**~~ — **done (2026-06-28):** IP allowlist + password gate + native TLS
   (see "Admin access control & TLS"). Future hardening: per-user accounts, hot token revocation.
-- **Hover thumbnails** — a keyframe-JPEG endpoint shown on timeline hover.
+- ~~**Hover thumbnails**~~ — **done (2026-07-02):** `stills.rs` + `thumb.jpg` + the `#tlPreview`
+  hover card (part of the UI overhaul that also added the events lane/drawer/bell, watchlist,
+  clip export, mood ribbon, omni-search, the Cameras grid, and the audit trail).
 - **Retrieval query-condensation across chat turns** — currently retrieval re-anchors on the
   latest message (prior turns inform the LLM only); a future `RAG_CHAT_CONDENSE` flag would
   rewrite the follow-up into a standalone retrieval query.
