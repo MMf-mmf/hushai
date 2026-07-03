@@ -77,6 +77,30 @@ const hasVideo = await page.evaluate(() => {
   return !!(d && (d.hasVideo || d.hasMuxed));
 });
 
+// A device can have audio-only stretches: coverage alone doesn't imply video there.
+// Find one wall-clock instant that provably has a video frame (thumb.jpg -> 200) so
+// the preview/export checks aim at real video, not at a correctly-empty spot.
+async function findVideoMs() {
+  const cands = await page.evaluate(() => {
+    const s = window.viewerDebug.state;
+    const cov = window.viewerDebug.timeline.coverage;
+    const out = [];
+    if (s.device?.latestMs) out.push(s.device.latestMs - 10_000);
+    for (const c of [...cov].reverse().slice(0, 8)) out.push((c.startMs + c.endMs) / 2);
+    return { id: s.device.id, cands: out };
+  });
+  for (const ms of cands.cands) {
+    const t = `${Math.floor(ms)}000000`; // ms -> ns
+    const r = await fetch(`${VIEWER_URL}/api/devices/${encodeURIComponent(cands.id)}/thumb.jpg?t=${t}`);
+    if (r.status === 200) {
+      await r.arrayBuffer();
+      return ms;
+    }
+  }
+  return null;
+}
+const videoMs = hasVideo ? await findVideoMs() : null;
+
 await check("video decodes (real H.264 frame)", async () => {
   if (!hasVideo) return { skip: "selected device has no video" };
   await until(page, () => document.getElementById("video")?.videoWidth > 0, { timeout: 20000 });
@@ -123,14 +147,14 @@ await check("frame step pauses and moves one frame", async () => {
 // --- hover preview -------------------------------------------------------------------
 await check("hover preview thumbnail loads", async () => {
   if (!hasVideo) return { skip: "no video" };
-  const box = await page.evaluate(() => {
+  if (videoMs == null) return { skip: "no video-bearing instant found" };
+  const box = await page.evaluate((ms) => {
     const t = window.viewerDebug.timeline;
-    const cov = t.coverage;
-    if (!cov?.length) return null;
-    const mid = (cov[0].startMs + cov[0].endMs) / 2;
+    // Make sure the instant is inside the visible window, then aim the mouse at it.
+    if (ms < t.from || ms > t.to) t.fit(ms - 60_000, ms + 60_000);
     const rect = t.canvas.getBoundingClientRect();
-    return { x: rect.left + t.xOf(mid), y: rect.top + 50 };
-  });
+    return { x: rect.left + t.xOf(ms), y: rect.top + 50 };
+  }, videoMs);
   if (!box) return { skip: "no coverage" };
   await page.mouse.move(box.x, box.y);
   await until(
@@ -171,19 +195,17 @@ await check("alert bell ack decrements the badge", async () => {
 // --- export mode ----------------------------------------------------------------------
 await check("clip export: selection drives the download href", async () => {
   if (!hasVideo) return { skip: "no video" };
-  const r = await page.evaluate(() => {
+  if (videoMs == null) return { skip: "no video-bearing instant found" };
+  const r = await page.evaluate((ms) => {
     const dbg = window.viewerDebug;
     dbg.setExportMode?.(true);
     const t = dbg.timeline;
-    const cov = t.coverage[0];
-    if (!cov) return { skip: "no coverage" };
-    const from = cov.startMs;
-    const to = Math.min(cov.endMs, cov.startMs + 30_000);
+    const from = ms - 10_000;
+    const to = ms + 10_000;
     t.setSelection(from, to);
-    t.onSelectionChange?.(t.getSelection());
     const a = document.querySelector("#exportBar a[download]");
     return { href: a?.getAttribute("href") ?? "", from, to };
-  });
+  }, videoMs);
   if (r.skip) return r;
   const u = new URL(r.href, VIEWER_URL);
   const from = Number(u.searchParams.get("from"));
@@ -202,7 +224,7 @@ await check("clip export: selection drives the download href", async () => {
 // --- modal focus restore ---------------------------------------------------------------
 await check("modal focus returns to opener on Escape", async () => {
   const ok = await page.evaluate(async () => {
-    const opener = document.getElementById("btnVoices") ?? document.querySelector("[aria-haspopup]");
+    const opener = document.getElementById("btnSettings"); // ⚙ Voices modal
     if (!opener) return "no opener";
     opener.focus();
     opener.click();

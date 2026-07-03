@@ -233,14 +233,16 @@ export class Timeline {
   }
 
   // ---- range selection --------------------------------------------------------
-  // Programmatic set (does NOT fire onSelectionChange — that callback narrates user
-  // gestures; a caller setting it already knows). `setSelection(null)` clears.
+  // Programmatic set. Fires onSelectionChange like a gesture would — every consumer
+  // of the selection (the export bar) must see every change, whoever made it, or the
+  // two drift apart. `setSelection(null)` clears.
   setSelection(fromMs, toMs = null) {
     this._sel =
       fromMs == null || toMs == null
         ? null
         : { fromMs: Math.min(fromMs, toMs), toMs: Math.max(fromMs, toMs) };
     this.render();
+    this.onSelectionChange?.(this.getSelection());
   }
   getSelection() {
     return this._sel ? { ...this._sel } : null;
