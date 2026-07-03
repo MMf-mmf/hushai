@@ -33,21 +33,31 @@ const EVENT_WIDE_PX = 6; // events spanning more than this also draw a 3px under
 const EVENT_LOOKBACK_MS = 3600_000; // catch underlines of events that started before the window
 const EVENT_TOOLTIP_MAX = 3; // tooltip lists at most this many events, then "+N more"
 
-// AI processing-status ribbons drawn under the events lane (audio lane, then vision).
-// Each is a labeled track so the two lanes are always identifiable; a faint base shows the
-// lane even where it has no data, and colored intervals + a left label sit on top.
+// AI processing-status ribbons drawn under the events lane (audio lane, then vision),
+// plus the slimmer sentiment "Mood" ribbon beneath them. Each is a labeled track so the
+// lanes are always identifiable; a faint base shows the lane even where it has no data,
+// and colored intervals + a left label sit on top.
 const RIBBON_GAP = 5; // breather between events lane and the first ribbon
-const RIBBON_H = 13; // each lane ribbon (tall enough for a left label + easy hover)
-const RIBBON_PAD = 4; // gap between the two ribbons
+const RIBBON_H = 13; // each status lane ribbon (tall enough for a left label + easy hover)
+const RIBBON_PAD = 4; // gap between ribbons
 const RIBBON_Y0 = EVENTS_Y0 + EVENTS_H + RIBBON_GAP; // audio ribbon top (=97)
 const RIBBON_Y1 = RIBBON_Y0 + RIBBON_H + RIBBON_PAD; // vision ribbon top (=114)
-const RIBBON_BOTTOM = RIBBON_Y1 + RIBBON_H; // =127
+const MOOD_H = 8; // the mood ribbon is slimmer — three flat states need less presence
+const MOOD_Y0 = RIBBON_Y1 + RIBBON_H + RIBBON_PAD; // mood ribbon top (=131)
+const RIBBON_BOTTOM = MOOD_Y0 + MOOD_H; // bottom of the ribbon stack (=139)
 
 // Pipeline-stage colors. Deliberately NOT the coverage teal or session amber, so the
 // ribbons never read as "coverage". Separable by lightness (+ motion on processing,
 // + a chip in the tooltip / popover) for colorblind safety. The palette itself lives
 // in the CSS --stage-*/--tl-* tokens (styles.css :root), read once via theme.js.
 const STATUS_COLORS = stageColors();
+// Sentiment mood colors for the third ribbon. Like the stage palette, the source of
+// truth is the CSS --mood-* tokens (styles.css :root), read once via theme.js.
+const MOOD_COLORS = {
+  positive: cssVar("--mood-positive", "#3fa66a"),
+  neutral: cssVar("--mood-neutral", "#4a5160"),
+  negative: cssVar("--mood-negative", "#b0533f"),
+};
 const SEV_COLORS = severityColors();
 const SEV_RANK = { info: 0, warning: 1, critical: 2 }; // cluster chips take the worst
 const TRACK_BG = cssVar("--tl-track", "#15171c");
@@ -81,6 +91,7 @@ export class Timeline {
     this._hoverSlop = EVENT_HIT_SLOP; // widened to HIT_SLOP_TOUCH while a touch pointer hovers
     this.procAudio = []; // [{startMs,endMs,status,lastError,sentences,speakers}]
     this.procVision = []; // [{startMs,endMs,status,lastError,faces,objects}]
+    this.sentiment = []; // [{startMs,endMs,sentiment,segments}] for the mood ribbon
     this._procEnabled = true;
     this._hasProcessing = false; // any visible 'processing' interval -> drive the shimmer
     this._animPhase = 0;
@@ -151,6 +162,12 @@ export class Timeline {
       this.procVision.some((i) => i.status === "processing");
     this.render();
   }
+  // Sentiment (mood) intervals for the third ribbon. Same lifecycle as setProcessing;
+  // an empty array leaves just the faint labeled base showing.
+  setSentiment(intervals) {
+    this.sentiment = intervals || [];
+    this.render();
+  }
   setProcessingEnabled(on) {
     this._procEnabled = !!on;
     this.render();
@@ -160,6 +177,10 @@ export class Timeline {
   statusAt(ms) {
     const find = (arr) => arr.find((i) => ms >= i.startMs && ms <= i.endMs) || null;
     return { audio: find(this.procAudio), vision: find(this.procVision) };
+  }
+  // The sentiment interval under wall-clock `ms`, or null (no speech / not analyzed there).
+  moodAt(ms) {
+    return this.sentiment.find((i) => ms >= i.startMs && ms <= i.endMs) || null;
   }
   // Advance the shimmer + live-edge pulse. Driven by the app rAF loop; only repaints
   // when something is actually animating, so a paused, fully-processed bar stays cheap.
@@ -330,10 +351,14 @@ export class Timeline {
     // events lane (severity markers + cluster chips), between track and ribbons
     this._drawEvents();
 
-    // AI processing-status ribbons (audio lane, then vision lane)
+    // AI processing-status ribbons (audio lane, then vision lane), then the mood ribbon
     if (this._procEnabled) {
       this._drawRibbon(this.procAudio, RIBBON_Y0, "Audio");
       this._drawRibbon(this.procVision, RIBBON_Y1, "Vision");
+      this._drawRibbon(this.sentiment, MOOD_Y0, "Mood", {
+        h: MOOD_H,
+        colorOf: (iv) => MOOD_COLORS[iv.sentiment] || MOOD_COLORS.neutral,
+      });
     }
 
     // live-edge cap (newest footage): 2px bar + pulsing dot
@@ -629,15 +654,16 @@ export class Timeline {
   }
 
   // One lane ribbon: a faint base track (so the lane is always visible + identifiable),
-  // a colored band per status interval, and a left label chip. `processing` gets an
-  // animated shimmer so it reads as active. No interval (lane n/a, or a gap) leaves the
-  // faint base showing — distinct from the dim-slate 'pending'.
-  _drawRibbon(intervals, y, label) {
+  // a colored band per interval, and a left label chip. `processing` gets an animated
+  // shimmer so it reads as active. No interval (lane n/a, or a gap) leaves the faint
+  // base showing — distinct from the dim-slate 'pending'. The defaults draw a status
+  // lane; `h`/`colorOf` let the slimmer mood lane reuse this with its own palette.
+  _drawRibbon(intervals, y, label, { h = RIBBON_H, colorOf = null } = {}) {
     const ctx = this.ctx;
     const W = this.cssW;
     // faint base so an empty / not-applicable lane still reads as a labeled track
     ctx.fillStyle = "rgba(255,255,255,0.045)";
-    ctx.fillRect(0, y, W, RIBBON_H);
+    ctx.fillRect(0, y, W, h);
     for (const iv of intervals) {
       let x0 = this.xOf(iv.startMs);
       let x1 = this.xOf(iv.endMs);
@@ -645,12 +671,12 @@ export class Timeline {
       x0 = Math.max(0, x0);
       x1 = Math.min(W, x1);
       const w = Math.max(1, x1 - x0);
-      ctx.fillStyle = STATUS_COLORS[iv.status] || STATUS_COLORS.pending;
-      ctx.fillRect(x0, y, w, RIBBON_H);
+      ctx.fillStyle = colorOf ? colorOf(iv) : STATUS_COLORS[iv.status] || STATUS_COLORS.pending;
+      ctx.fillRect(x0, y, w, h);
       if (iv.status === "processing") {
         ctx.save();
         ctx.beginPath();
-        ctx.rect(x0, y, w, RIBBON_H);
+        ctx.rect(x0, y, w, h);
         ctx.clip();
         const period = 44; // px between marching highlight bands
         const shift = this._animPhase * period;
@@ -660,27 +686,28 @@ export class Timeline {
           g.addColorStop(0.5, "rgba(255,255,255,0.34)");
           g.addColorStop(1, "rgba(255,255,255,0)");
           ctx.fillStyle = g;
-          ctx.fillRect(bx, y, period, RIBBON_H);
+          ctx.fillRect(bx, y, period, h);
         }
         ctx.restore();
       }
     }
-    this._laneLabel(label, y);
+    this._laneLabel(label, y, h);
   }
 
-  // A small persistent lane label ("AUDIO"/"VISION") pinned to the left of a ribbon, on a
-  // translucent chip so it stays legible over whatever color is underneath.
-  _laneLabel(label, y) {
+  // A small persistent lane label ("AUDIO"/"VISION"/"MOOD") pinned to the left of a
+  // ribbon, on a translucent chip so it stays legible over whatever color is underneath.
+  _laneLabel(label, y, h = RIBBON_H) {
     const ctx = this.ctx;
-    ctx.font = "600 9px system-ui, -apple-system, Segoe UI, Roboto, sans-serif";
+    // Slim lanes (the 8px mood ribbon) drop to 8px type so the chip text fits the band.
+    ctx.font = `600 ${h < 12 ? 8 : 9}px system-ui, -apple-system, Segoe UI, Roboto, sans-serif`;
     const txt = label.toUpperCase();
     const w = ctx.measureText(txt).width + 12;
     ctx.fillStyle = "rgba(8,10,14,0.7)";
-    roundRect(ctx, 0, y, w, RIBBON_H, 2);
+    roundRect(ctx, 0, y, w, h, 2);
     ctx.fill();
     ctx.fillStyle = "#9aa3b4";
     ctx.textBaseline = "middle";
-    ctx.fillText(txt, 6, y + RIBBON_H / 2 + 0.5);
+    ctx.fillText(txt, 6, y + h / 2 + 0.5);
     ctx.textBaseline = "alphabetic";
   }
 
@@ -698,6 +725,13 @@ export class Timeline {
         lines.push({ text: `Audio · ${laneSummaryText("audio", st.audio)}`, color: "#cdd6e4", chip: STATUS_COLORS[st.audio.status] });
       if (st.vision)
         lines.push({ text: `Vision · ${laneSummaryText("vision", st.vision)}`, color: "#cdd6e4", chip: STATUS_COLORS[st.vision.status] });
+      const mood = this.moodAt(ms);
+      if (mood)
+        lines.push({
+          text: `Mood · ${mood.sentiment} (${plural(mood.segments || 0, "segment")})`,
+          color: "#cdd6e4",
+          chip: MOOD_COLORS[mood.sentiment] || MOOD_COLORS.neutral,
+        });
     }
     // Event markers near the hover x append their own lines (sev-colored chip each).
     // Hover-only — the mid-scrub ghost tooltip stays a pure time readout.

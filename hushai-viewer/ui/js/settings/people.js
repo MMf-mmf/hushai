@@ -1,7 +1,9 @@
 // People settings: name the faces discovered in your recordings, recognize one by sight from a
-// sample-face crop, and merge duplicate faces the matcher over-split. This is the web twin of
-// the Android "People" screen and the visual sibling of the Voices modal. All calls go to
-// hushai-backend's /v1/persons* surface via the viewer proxy (which injects the device bearer).
+// sample-face crop, search the catalog by name, and merge duplicate faces the matcher
+// over-split. This is the web twin of the Android "People" screen and the visual sibling of
+// the Voices modal. All calls go to hushai-backend's /v1/persons* surface via the viewer
+// proxy (which injects the device bearer). The per-person cards and the
+// Known/Unidentified/Archived section layout are shared with Voices/Plates via entity-card.js.
 
 import {
   getPersons, sampleFaceUrl, renamePerson, mergePerson,
@@ -9,6 +11,7 @@ import {
   getWatchlist, addWatch, removeWatch,
 } from "../api.js";
 import { nsToMs } from "../time.js";
+import { entityCard, entitySections, matchesQuery } from "./entity-card.js";
 import { wireModal } from "../modal.js";
 import { toast } from "../toast.js";
 
@@ -16,13 +19,6 @@ function note(text) {
   const el = document.createElement("div");
   el.className = "chat-note";
   el.textContent = text;
-  return el;
-}
-
-function div(className, text) {
-  const el = document.createElement("div");
-  if (className) el.className = className;
-  if (text != null) el.textContent = text;
   return el;
 }
 
@@ -34,36 +30,6 @@ function isIdentified(p) {
   return p.display_name != null && String(p.display_name).trim() !== "";
 }
 
-function sectionTitle(text, count) {
-  const el = div("voice-section-title");
-  el.textContent = text;
-  const c = document.createElement("span");
-  c.className = "muted small";
-  c.textContent = `  (${count})`;
-  el.appendChild(c);
-  return el;
-}
-
-// A collapsed-by-default disclosure ("Known people (N)") wrapping its cards. Already-identified
-// people are tucked away so opening the modal surfaces the unidentified ones (the faces you
-// actually need to name); the known list grows over time and isn't useful on every open.
-function collapsibleSection(text, count, cardEls) {
-  const details = document.createElement("details");
-  details.className = "voice-section";
-  const summary = document.createElement("summary");
-  summary.className = "voice-section-title";
-  summary.textContent = text;
-  const c = document.createElement("span");
-  c.className = "muted small";
-  c.textContent = `  (${count})`;
-  summary.appendChild(c);
-  details.appendChild(summary);
-  const body = div("voice-section-body");
-  for (const el of cardEls) body.appendChild(el);
-  details.appendChild(body);
-  return details;
-}
-
 // Short "last seen" from the most recent of up to 3 sighting timestamps (ns).
 function lastSeenLabel(sightings) {
   if (!sightings || !sightings.length) return "no recent sightings";
@@ -71,57 +37,10 @@ function lastSeenLabel(sightings) {
   return `last seen ${new Date(latestMs).toLocaleString()}`;
 }
 
-// One person: face crop + name (editable) + sample count / last-seen, with Save and "merge into".
-// An archived (disregarded) person renders a reduced card: Watch toggle + Restore only — renaming
-// and merging are noise for something the user chose to tuck away. Watch stays available so a
-// watched+archived person can still be unwatched.
-function personCard(p, others, ctx) {
-  const card = div("voice-card person-card");
-
-  const face = document.createElement("img");
-  face.className = "person-face";
-  face.alt = personLabel(p.display_name, p.person_id);
-  face.loading = "lazy";
-  face.src = sampleFaceUrl(p.person_id);
-  // If no decodable face crop exists yet, hide the broken-image icon.
-  face.addEventListener("error", () => face.classList.add("is-missing"));
-  card.appendChild(face);
-
-  const info = div("person-info");
-  info.appendChild(div("voice-name", personLabel(p.display_name, p.person_id)));
-  // Distinct appearances, not raw per-frame face templates (n_samples over-counts a short clip).
-  // Fall back to n_samples only if talking to an older backend that doesn't send n_sightings.
-  const sightings = p.n_sightings != null ? p.n_sightings : p.n_samples;
-  info.appendChild(
-    div("voice-meta", `${sightings} sighting${sightings === 1 ? "" : "s"} · ${lastSeenLabel(p.sample_sighting_unix_nanos)}`),
-  );
-
-  const actions = div("voice-actions");
-  if (!p.archived) {
-    const input = document.createElement("input");
-    input.type = "text";
-    input.placeholder = "Name this person";
-    input.value = p.display_name || "";
-    const save = document.createElement("button");
-    save.type = "button";
-    save.textContent = "Save";
-    save.addEventListener("click", async () => {
-      const name = input.value.trim();
-      if (!name) return;
-      save.disabled = true;
-      try {
-        await renamePerson(p.person_id, name);
-        await ctx.reload();
-      } catch {
-        save.disabled = false;
-        ctx.flash("Couldn't save that name (Refresh and try again).");
-      }
-    });
-    actions.append(input, save);
-  }
-
-  // ⭐ Watch — "Person of Interest": alert whenever this person is seen. Toggles the backend
-  // watchlist (which auto-manages a scoped alert rule). `ctx.watched` maps person_id → watch_id.
+// ⭐ Watch — "Person of Interest": alert whenever this person is seen. Toggles the backend
+// watchlist (which auto-manages a scoped alert rule). `ctx.watched` maps person_id → watch_id.
+// Stays available on archived cards so a watched+archived person can still be unwatched.
+function watchButton(p, ctx) {
   const watchId = ctx.watched.get(p.person_id);
   const watchBtn = document.createElement("button");
   watchBtn.type = "button";
@@ -141,65 +60,71 @@ function personCard(p, others, ctx) {
       ctx.flash("Couldn't update the watchlist (Refresh and try again).");
     }
   });
-  actions.appendChild(watchBtn);
+  return watchBtn;
+}
 
-  // "Merge into" — fold this face into another person (same human, split across ids).
-  if (!p.archived && others.length) {
-    const merge = document.createElement("select");
-    merge.title = "Merge this person into…";
-    const def = document.createElement("option");
-    def.value = "";
-    def.textContent = "Merge into…";
-    merge.appendChild(def);
-    for (const o of others) {
-      const opt = document.createElement("option");
-      opt.value = o.person_id;
-      opt.textContent = personLabel(o.display_name, o.person_id);
-      merge.appendChild(opt);
-    }
-    merge.addEventListener("change", async () => {
-      const into = merge.value;
-      if (!into) return;
-      merge.disabled = true;
-      try {
-        await mergePerson(p.person_id, into);
-        await ctx.reload();
-      } catch {
-        merge.disabled = false;
-        ctx.flash("Couldn't merge those people (Refresh and try again).");
-      }
-    });
-    actions.appendChild(merge);
-  }
+// One person: face crop + name (editable) + sighting count / last-seen, with Save, Watch, and
+// "merge into", built on the shared entity card (archived people get the reduced
+// Watch + Restore card).
+function personCard(p, others, ctx) {
+  const face = document.createElement("img");
+  face.className = "person-face";
+  face.alt = personLabel(p.display_name, p.person_id);
+  face.loading = "lazy";
+  face.src = sampleFaceUrl(p.person_id);
+  // If no decodable face crop exists yet, hide the broken-image icon.
+  face.addEventListener("error", () => face.classList.add("is-missing"));
 
-  const toggle = document.createElement("button");
-  toggle.type = "button";
-  toggle.textContent = p.archived ? "Restore" : "Disregard";
-  toggle.title = p.archived
-    ? "Bring this person back into the active lists"
-    : "Move to Archived — hides it from these lists; recordings are unaffected.";
-  toggle.addEventListener("click", async () => {
-    toggle.disabled = true;
-    try {
-      if (p.archived) await unarchivePerson(p.person_id);
-      else await archivePerson(p.person_id);
+  // Distinct appearances, not raw per-frame face templates (n_samples over-counts a short clip).
+  // Fall back to n_samples only if talking to an older backend that doesn't send n_sightings.
+  const sightings = p.n_sightings != null ? p.n_sightings : p.n_samples;
+
+  return entityCard({
+    entity: p,
+    cardClass: "voice-card person-card",
+    media: face,
+    label: personLabel(p.display_name, p.person_id),
+    sublabel: `${sightings} sighting${sightings === 1 ? "" : "s"} · ${lastSeenLabel(p.sample_sighting_unix_nanos)}`,
+    archived: !!p.archived,
+    onRename: async (name) => {
+      await renamePerson(p.person_id, name);
       await ctx.reload();
-    } catch {
-      toggle.disabled = false;
-      ctx.flash(p.archived
-        ? "Couldn't restore that person (Refresh and try again)."
-        : "Couldn't disregard that person (Refresh and try again).");
-    }
+    },
+    renamePlaceholder: "Name this person",
+    renameValue: p.display_name || "",
+    extra: watchButton(p, ctx),
+    mergeOptions: others.map((o) => ({
+      value: o.person_id,
+      label: personLabel(o.display_name, o.person_id),
+    })),
+    mergeTitle: "Merge this person into…",
+    onMerge: async (into) => {
+      await mergePerson(p.person_id, into);
+      await ctx.reload();
+    },
+    onArchive: async () => {
+      await archivePerson(p.person_id);
+      await ctx.reload();
+    },
+    onRestore: async () => {
+      await unarchivePerson(p.person_id);
+      await ctx.reload();
+    },
+    archiveTitle: "Move to Archived — hides it from these lists; recordings are unaffected.",
+    restoreTitle: "Bring this person back into the active lists",
+    errors: {
+      rename: "Couldn't save that name (Refresh and try again).",
+      merge: "Couldn't merge those people (Refresh and try again).",
+      archive: "Couldn't disregard that person (Refresh and try again).",
+      restore: "Couldn't restore that person (Refresh and try again).",
+    },
+    flash: ctx.flash,
   });
-  actions.appendChild(toggle);
-
-  info.appendChild(actions);
-  card.appendChild(info);
-  return card;
 }
 
 function render(container, persons, ctx) {
   container.replaceChildren();
+  const q = ctx.query;
 
   if (!persons.length) {
     container.appendChild(
@@ -208,31 +133,43 @@ function render(container, persons, ctx) {
     return;
   }
 
-  // The known (named) people collapse into a closed disclosure; the still-unidentified faces —
-  // the ones you open this modal to name — stay shown. Disregarded people sink into a closed
-  // "Archived" disclosure at the bottom and are never offered as merge targets.
+  const list = q
+    ? persons.filter((p) => matchesQuery(q, p.display_name, p.person_id))
+    : persons;
+  if (!list.length) {
+    container.appendChild(note(`No people match “${q}”.`));
+    return;
+  }
+
+  // The shared three-group layout: known (named) people collapse closed; the
+  // still-unidentified faces — the ones you open this modal to name — stay open;
+  // disregarded people sink into a closed "Archived" disclosure at the bottom and are never
+  // offered as merge targets. Merge targets always come from the full active list, not the
+  // filtered view — a search must not shrink where a person can be merged into.
   const archived = persons.filter((p) => p.archived);
   const active = persons.filter((p) => !p.archived);
   const cardFor = (p) => personCard(p, active.filter((o) => o.person_id !== p.person_id), ctx);
-  const known = active.filter(isIdentified);
-  const unknown = active.filter((p) => !isIdentified(p));
+  const shown = (arr) => (q ? arr.filter((p) => list.includes(p)) : arr);
+  const known = shown(active.filter(isIdentified));
+  const unknown = shown(active.filter((p) => !isIdentified(p)));
 
-  if (known.length) {
-    container.appendChild(collapsibleSection("Known people", known.length, known.map(cardFor)));
-  } else {
-    container.appendChild(sectionTitle("Known people", 0));
-    container.appendChild(note("No faces identified yet — name one below to build your known-people list."));
-  }
-
-  if (unknown.length) {
-    container.appendChild(sectionTitle("Unidentified people", unknown.length));
-    unknown.forEach((p) => container.appendChild(cardFor(p)));
-  }
-
-  if (archived.length) {
-    container.appendChild(
-      collapsibleSection("Archived", archived.length, archived.map((p) => personCard(p, [], ctx))),
-    );
+  for (const el of entitySections({
+    known: {
+      title: "Known people",
+      cards: known.map(cardFor),
+      emptyText: q ? null : "No faces identified yet — name one below to build your known-people list.",
+    },
+    unknown: {
+      title: "Unidentified people",
+      cards: unknown.map(cardFor),
+      emptyText: q ? null : "No unidentified people — every face has a name.",
+    },
+    archived: {
+      title: "Archived",
+      cards: shown(archived).map((p) => personCard(p, [], ctx)),
+    },
+  })) {
+    container.appendChild(el);
   }
 }
 
@@ -241,17 +178,24 @@ function boot() {
   const modal = document.getElementById("peopleModal");
   const closeBtn = document.getElementById("peopleClose");
   const refreshBtn = document.getElementById("peopleRefresh");
+  const searchBox = document.getElementById("peopleSearch");
   const body = document.getElementById("peopleBody");
   if (!openBtn || !modal || !body) return;
 
   const ctx = {
+    query: "",
     reload: () => load(),
     watched: new Map(), // person_id -> watch_id (refreshed each load)
     // Operation failures ("couldn't save/merge/…") surface as page-level error toasts.
     flash: (msg) => toast(msg, { kind: "error" }),
   };
 
+  // Last-fetched list, kept so the search box can re-filter client-side without refetching.
+  let cache = [];
+  const rerender = () => render(body, cache, ctx);
+
   async function load() {
+    ctx.query = searchBox ? searchBox.value.trim() : "";
     body.replaceChildren(note("Loading people…"));
     // Watchlist is best-effort: a failure here must not block listing people.
     try {
@@ -274,7 +218,8 @@ function boot() {
       );
       return;
     }
-    render(body, persons || [], ctx);
+    cache = persons || [];
+    rerender();
   }
 
   // Shared modal behavior (backdrop click, Escape, focus trap + restore) lives in modal.js;
@@ -284,6 +229,18 @@ function boot() {
   openBtn.addEventListener("click", m.open);
   if (closeBtn) closeBtn.addEventListener("click", m.close);
   if (refreshBtn) refreshBtn.addEventListener("click", load);
+  // Client-side name/id filter (plates' search is server-side; this one just re-filters
+  // the cached list), debounced so typing doesn't re-render per keystroke.
+  if (searchBox) {
+    let t;
+    searchBox.addEventListener("input", () => {
+      clearTimeout(t);
+      t = setTimeout(() => {
+        ctx.query = searchBox.value.trim();
+        rerender();
+      }, 250);
+    });
+  }
 }
 
 boot();

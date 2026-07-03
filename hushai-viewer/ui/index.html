@@ -101,12 +101,17 @@
               <div id="aiInfoPop" class="ai-pop" role="dialog" aria-label="AI processing status key" hidden>
                 <div class="ai-pop-title">AI processing status</div>
                 <p class="ai-pop-desc">
-                  The two strips under the timeline show how far the AI has analyzed your footage —
-                  two independent lanes:
+                  The strips under the timeline show how far the AI has analyzed your footage
+                  (two independent lanes) and the mood of the speech it heard:
                 </p>
                 <div class="ai-pop-lanes">
                   <div><span class="ai-lane-tag">Audio</span> speech → text · speakers · sentiment</div>
                   <div><span class="ai-lane-tag">Vision</span> faces · objects</div>
+                  <div><span class="ai-lane-tag">Mood</span>
+                    <span class="mood-key"><i class="mood-chip pos" aria-hidden="true"></i> positive</span>
+                    <span class="mood-key"><i class="mood-chip neu" aria-hidden="true"></i> neutral</span>
+                    <span class="mood-key"><i class="mood-chip neg" aria-hidden="true"></i> negative</span>
+                  </div>
                 </div>
                 <div class="ai-pop-states">
                   <div><span class="ai-badge is-done"><span class="ai-ico">✓</span> done</span> analyzed</div>
@@ -186,13 +191,14 @@
       </aside>
     </div>
 
-    <!-- Voices settings: name & merge the speakers found in your recordings. -->
+    <!-- Voices settings: search, name & merge the speakers found in your recordings. -->
     <div id="settingsModal" class="modal" hidden>
       <div class="modal-card">
         <div class="modal-head">
           <span class="lbl">Voices</span>
-          <span class="muted small">name &amp; merge the speakers in your recordings</span>
+          <span class="muted small">search, name &amp; merge the speakers in your recordings</span>
           <span class="spacer"></span>
+          <input id="voicesSearch" type="search" placeholder="Search voices…" />
           <button id="voicesRefresh" type="button">Refresh</button>
           <button id="settingsClose" type="button" title="Close">✕</button>
         </div>
@@ -200,13 +206,14 @@
       </div>
     </div>
 
-    <!-- People: name & merge the faces found in your recordings (visual twin of Voices). -->
+    <!-- People: search, name & merge the faces found in your recordings (visual twin of Voices). -->
     <div id="peopleModal" class="modal" hidden>
       <div class="modal-card">
         <div class="modal-head">
           <span class="lbl">People</span>
-          <span class="muted small">name &amp; merge the faces in your recordings</span>
+          <span class="muted small">search, name &amp; merge the faces in your recordings</span>
           <span class="spacer"></span>
+          <input id="peopleSearch" type="search" placeholder="Search people…" />
           <button id="peopleRefresh" type="button">Refresh</button>
           <button id="peopleClose" type="button" title="Close">✕</button>
         </div>

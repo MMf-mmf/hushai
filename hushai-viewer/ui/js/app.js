@@ -7,6 +7,7 @@ import {
   getDevices,
   getTimeline,
   getProcessing,
+  getSentiment,
   getEvents,
   getEventFeed,
   ackDelivery,
@@ -259,20 +260,24 @@ async function refetchTimeline() {
   }
 }
 
-// AI processing-status ribbons. Fetched for the *visible* window (cheap) and refreshed on
-// its own — independent of the device-signature short-circuit in refreshDevices(), because
-// processing advances as the worker catches up even when no new footage arrives.
+// AI processing-status ribbons + the sentiment mood ribbon. Fetched for the *visible*
+// window (cheap) and refreshed on their own — independent of the device-signature
+// short-circuit in refreshDevices(), because processing advances as the worker catches
+// up even when no new footage arrives. The two fetches share the debounce/seq guard but
+// fail independently: a sentiment error must never take the status lanes down (the mood
+// lane just goes empty), and vice versa.
 async function refetchProcessing() {
   const d = state.device;
   if (!d || !state.aiEnabled) return;
   const seq = ++procSeq;
-  try {
-    const p = await getProcessing(d.id, state.view.fromMs, state.view.toMs);
-    if (seq !== procSeq) return; // superseded by a newer device/window
-    timeline.setProcessing({ audio: p.audio, vision: p.vision });
-  } catch {
-    // transient (backend restart / window change mid-flight) — next tick retries
-  }
+  const [p, s] = await Promise.all([
+    // transient failure (backend restart / window change mid-flight) — next tick retries
+    getProcessing(d.id, state.view.fromMs, state.view.toMs).catch(() => null),
+    getSentiment(d.id, state.view.fromMs, state.view.toMs).catch(() => null),
+  ]);
+  if (seq !== procSeq) return; // superseded by a newer device/window
+  if (p) timeline.setProcessing({ audio: p.audio, vision: p.vision });
+  timeline.setSentiment(s ? s.intervals : []); // failure leaves the mood lane empty
 }
 
 // Debounce window-change-driven refetches so dragging the scrub bar doesn't spam the API.

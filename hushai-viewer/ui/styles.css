@@ -34,6 +34,11 @@
   --stage-error: #c0473d;
   --stage-skipped: #556058;
 
+  /* sentiment mood (timeline mood ribbon + popover chips; read via theme.js cssVar) */
+  --mood-positive: #3fa66a;
+  --mood-neutral: #4a5160;
+  --mood-negative: #b0533f;
+
   /* timeline canvas chrome */
   --tl-track: #15171c;
   --tl-tick: #79839a;
@@ -335,8 +340,8 @@ input[type="date"] {
 .timeline {
   width: 100%;
   /* tall enough for the coverage track (30..76) + the events lane (80..92) + the two
-     labeled AI ribbons (97..127). */
-  height: 134px;
+     labeled AI ribbons (97..127) + the thin mood ribbon (131..139). */
+  height: 146px;
   display: block;
   margin: 6px 0;
   cursor: crosshair;
@@ -447,6 +452,29 @@ input[type="date"] {
   font-size: 11px;
   font-weight: 600;
   text-align: center;
+}
+/* Mood-lane key inside the popover: three inline sentiment chips. */
+.mood-key {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-right: 6px;
+  white-space: nowrap;
+}
+.mood-chip {
+  display: inline-block;
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+}
+.mood-chip.pos {
+  background: var(--mood-positive);
+}
+.mood-chip.neu {
+  background: var(--mood-neutral);
+}
+.mood-chip.neg {
+  background: var(--mood-negative);
 }
 .ai-pop-states {
   display: flex;

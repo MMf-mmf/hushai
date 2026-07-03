@@ -2,6 +2,9 @@
 // rectified-plate crop, merge duplicates the OCR over-split, and SEARCH the catalog by text
 // ("when did I see plate ABC123"). The vehicle twin of the People modal. All calls go to
 // hushai-backend's /v1/plates* surface via the viewer proxy (which injects the device bearer).
+// The per-plate cards and the Named/Unidentified/Archived section layout are shared with
+// Voices/People via entity-card.js; unlike those two, the search here is server-side
+// (plate text lives in the catalog index, not just display names).
 
 import {
   getPlates, searchPlates, samplePlateUrl, renamePlate, mergePlate,
@@ -9,6 +12,7 @@ import {
   getWatchlist, addWatch, removeWatch,
 } from "../api.js";
 import { nsToMs } from "../time.js";
+import { entityCard, entitySections } from "./entity-card.js";
 import { wireModal } from "../modal.js";
 import { toast } from "../toast.js";
 
@@ -16,13 +20,6 @@ function note(text) {
   const el = document.createElement("div");
   el.className = "chat-note";
   el.textContent = text;
-  return el;
-}
-
-function div(className, text) {
-  const el = document.createElement("div");
-  if (className) el.className = className;
-  if (text != null) el.textContent = text;
   return el;
 }
 
@@ -37,89 +34,15 @@ function isNamed(p) {
   return p.display_name != null && String(p.display_name).trim() !== "";
 }
 
-function sectionTitle(text, count) {
-  const el = div("voice-section-title");
-  el.textContent = text;
-  const c = document.createElement("span");
-  c.className = "muted small";
-  c.textContent = `  (${count})`;
-  el.appendChild(c);
-  return el;
-}
-
-function collapsibleSection(text, count, cardEls) {
-  const details = document.createElement("details");
-  details.className = "voice-section";
-  const summary = document.createElement("summary");
-  summary.className = "voice-section-title";
-  summary.textContent = text;
-  const c = document.createElement("span");
-  c.className = "muted small";
-  c.textContent = `  (${count})`;
-  summary.appendChild(c);
-  details.appendChild(summary);
-  const body = div("voice-section-body");
-  for (const el of cardEls) body.appendChild(el);
-  details.appendChild(body);
-  return details;
-}
-
 function lastSeenLabel(sightings) {
   if (!sightings || !sightings.length) return "no recent sightings";
   const latestMs = Math.max(...sightings.map(nsToMs));
   return `last seen ${new Date(latestMs).toLocaleString()}`;
 }
 
-// One plate: rectified crop + the plate string + an editable display name + sightings/last-seen,
-// with Save and "merge into". An archived (disregarded) plate renders a reduced card: Watch
-// toggle + Restore only — Watch stays available so a watched+archived plate can be unwatched.
-function plateCard(p, others, ctx) {
-  const card = div("voice-card person-card");
-
-  const crop = document.createElement("img");
-  crop.className = "person-face plate-crop";
-  crop.alt = plateLabel(p);
-  crop.loading = "lazy";
-  crop.src = samplePlateUrl(p.plate_id);
-  crop.addEventListener("error", () => crop.classList.add("is-missing"));
-  card.appendChild(crop);
-
-  const info = div("person-info");
-  info.appendChild(div("voice-name", plateLabel(p)));
-  // Show the raw plate string under a human name so you can confirm the OCR read.
-  if (isNamed(p) && p.plate_text) {
-    info.appendChild(div("voice-meta muted small", p.plate_text));
-  }
-  const sightings = p.n_sightings != null ? p.n_sightings : p.n_samples;
-  info.appendChild(
-    div("voice-meta", `${sightings} sighting${sightings === 1 ? "" : "s"} · ${lastSeenLabel(p.sample_sighting_unix_nanos)}`),
-  );
-
-  const actions = div("voice-actions");
-  if (!p.archived) {
-    const input = document.createElement("input");
-    input.type = "text";
-    input.placeholder = "Name this plate (e.g. “Mom’s car”)";
-    input.value = p.display_name || "";
-    const save = document.createElement("button");
-    save.type = "button";
-    save.textContent = "Save";
-    save.addEventListener("click", async () => {
-      const name = input.value.trim();
-      if (!name) return;
-      save.disabled = true;
-      try {
-        await renamePlate(p.plate_id, name);
-        await ctx.reload();
-      } catch {
-        save.disabled = false;
-        ctx.flash("Couldn't save that name (Refresh and try again).");
-      }
-    });
-    actions.append(input, save);
-  }
-
-  // ⭐ Watch — "Plate of Interest": alert whenever this plate is seen (auto-managed alert rule).
+// ⭐ Watch — "Plate of Interest": alert whenever this plate is seen (auto-managed alert rule).
+// Stays available on archived cards so a watched+archived plate can still be unwatched.
+function watchButton(p, ctx) {
   const watchId = ctx.watched.get(p.plate_id);
   const watchBtn = document.createElement("button");
   watchBtn.type = "button";
@@ -139,94 +62,107 @@ function plateCard(p, others, ctx) {
       ctx.flash("Couldn't update the watchlist (Refresh and try again).");
     }
   });
-  actions.appendChild(watchBtn);
+  return watchBtn;
+}
 
-  if (!p.archived && others.length) {
-    const merge = document.createElement("select");
-    merge.title = "Merge this plate into…";
-    const def = document.createElement("option");
-    def.value = "";
-    def.textContent = "Merge into…";
-    merge.appendChild(def);
-    for (const o of others) {
-      const opt = document.createElement("option");
-      opt.value = o.plate_id;
-      opt.textContent = plateLabel(o);
-      merge.appendChild(opt);
-    }
-    merge.addEventListener("change", async () => {
-      const into = merge.value;
-      if (!into) return;
-      merge.disabled = true;
-      try {
-        await mergePlate(p.plate_id, into);
-        await ctx.reload();
-      } catch {
-        merge.disabled = false;
-        ctx.flash("Couldn't merge those plates (Refresh and try again).");
-      }
-    });
-    actions.appendChild(merge);
-  }
+// One plate: rectified crop + the plate string + an editable display name + sightings/last-seen,
+// with Save, Watch, and "merge into", built on the shared entity card (archived plates get the
+// reduced Watch + Restore card).
+function plateCard(p, others, ctx) {
+  const crop = document.createElement("img");
+  crop.className = "person-face plate-crop";
+  crop.alt = plateLabel(p);
+  crop.loading = "lazy";
+  crop.src = samplePlateUrl(p.plate_id);
+  crop.addEventListener("error", () => crop.classList.add("is-missing"));
 
-  const toggle = document.createElement("button");
-  toggle.type = "button";
-  toggle.textContent = p.archived ? "Restore" : "Disregard";
-  toggle.title = p.archived
-    ? "Bring this plate back into the active lists"
-    : "Move to Archived — hides it from these lists; recordings are unaffected.";
-  toggle.addEventListener("click", async () => {
-    toggle.disabled = true;
-    try {
-      if (p.archived) await unarchivePlate(p.plate_id);
-      else await archivePlate(p.plate_id);
+  const sightings = p.n_sightings != null ? p.n_sightings : p.n_samples;
+
+  return entityCard({
+    entity: p,
+    cardClass: "voice-card person-card",
+    media: crop,
+    label: plateLabel(p),
+    sublabel: [
+      // Show the raw plate string under a human name so you can confirm the OCR read.
+      ...(isNamed(p) && p.plate_text ? [{ class: "voice-meta muted small", text: p.plate_text }] : []),
+      `${sightings} sighting${sightings === 1 ? "" : "s"} · ${lastSeenLabel(p.sample_sighting_unix_nanos)}`,
+    ],
+    archived: !!p.archived,
+    onRename: async (name) => {
+      await renamePlate(p.plate_id, name);
       await ctx.reload();
-    } catch {
-      toggle.disabled = false;
-      ctx.flash(p.archived
-        ? "Couldn't restore that plate (Refresh and try again)."
-        : "Couldn't disregard that plate (Refresh and try again).");
-    }
+    },
+    renamePlaceholder: "Name this plate (e.g. “Mom’s car”)",
+    renameValue: p.display_name || "",
+    extra: watchButton(p, ctx),
+    mergeOptions: others.map((o) => ({ value: o.plate_id, label: plateLabel(o) })),
+    mergeTitle: "Merge this plate into…",
+    onMerge: async (into) => {
+      await mergePlate(p.plate_id, into);
+      await ctx.reload();
+    },
+    onArchive: async () => {
+      await archivePlate(p.plate_id);
+      await ctx.reload();
+    },
+    onRestore: async () => {
+      await unarchivePlate(p.plate_id);
+      await ctx.reload();
+    },
+    archiveTitle: "Move to Archived — hides it from these lists; recordings are unaffected.",
+    restoreTitle: "Bring this plate back into the active lists",
+    errors: {
+      rename: "Couldn't save that name (Refresh and try again).",
+      merge: "Couldn't merge those plates (Refresh and try again).",
+      archive: "Couldn't disregard that plate (Refresh and try again).",
+      restore: "Couldn't restore that plate (Refresh and try again).",
+    },
+    flash: ctx.flash,
   });
-  actions.appendChild(toggle);
-
-  info.appendChild(actions);
-  card.appendChild(info);
-  return card;
 }
 
 function render(container, plates, ctx) {
   container.replaceChildren();
+  const q = ctx.query;
 
   if (!plates.length) {
     container.appendChild(
-      note(ctx.query
-        ? `No plates match “${ctx.query}”.`
+      note(q
+        ? `No plates match “${q}”.`
         : "No plates discovered yet. License plates appear here once the vision pipeline processes video of vehicles."),
     );
     return;
   }
 
-  // Disregarded plates sink into a closed "Archived" disclosure at the bottom and are never
-  // offered as merge targets. A text search still surfaces an archived plate (under Archived) —
-  // the right answer to "did I disregard ABC123?".
+  // The shared three-group layout: named plates collapse closed; the still-unnamed plates
+  // stay open; disregarded plates sink into a closed "Archived" disclosure at the bottom and
+  // are never offered as merge targets. A text search still surfaces an archived plate (under
+  // Archived) — the right answer to "did I disregard ABC123?". Section empty-states are
+  // suppressed while searching (an empty group just means no matches there).
   const archivedList = plates.filter((p) => p.archived);
   const active = plates.filter((p) => !p.archived);
   const cardFor = (p) => plateCard(p, active.filter((o) => o.plate_id !== p.plate_id), ctx);
   const named = active.filter(isNamed);
   const unknown = active.filter((p) => !isNamed(p));
 
-  if (named.length) {
-    container.appendChild(collapsibleSection("Named plates", named.length, named.map(cardFor)));
-  }
-  if (unknown.length) {
-    container.appendChild(sectionTitle("Unidentified plates", unknown.length));
-    unknown.forEach((p) => container.appendChild(cardFor(p)));
-  }
-  if (archivedList.length) {
-    container.appendChild(
-      collapsibleSection("Archived", archivedList.length, archivedList.map((p) => plateCard(p, [], ctx))),
-    );
+  for (const el of entitySections({
+    known: {
+      title: "Named plates",
+      cards: named.map(cardFor),
+      emptyText: q ? null : "No plates named yet — name one below to build your named-plates list.",
+    },
+    unknown: {
+      title: "Unidentified plates",
+      cards: unknown.map(cardFor),
+      emptyText: q ? null : "No unnamed plates — every plate has a name.",
+    },
+    archived: {
+      title: "Archived",
+      cards: archivedList.map((p) => plateCard(p, [], ctx)),
+    },
+  })) {
+    container.appendChild(el);
   }
 }
 
