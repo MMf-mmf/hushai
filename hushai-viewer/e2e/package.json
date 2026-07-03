@@ -1,0 +1,12 @@
+{
+  "name": "hushai-viewer-e2e",
+  "private": true,
+  "type": "module",
+  "description": "Drives the real viewer in real Google Chrome (Chromium lacks H.264/AAC).",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "dependencies": {
+    "puppeteer-core": "^23.0.0"
+  }
+}
