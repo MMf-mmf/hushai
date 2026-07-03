@@ -1,11 +1,13 @@
 // System dashboard: polls /api/dashboard and renders KPI tiles + cameras + background-process
 // status + work queues. Mirrors the app's polling pattern (6s, busy-guard, paused while hidden).
 
-import { getDashboard } from "../api.js";
+import { getDashboard, getAudit } from "../api.js";
 import { chartPalette, cssVar } from "../theme.js";
-import { el, renderBanner } from "../dom.js";
+import { el, renderBanner, emptyState, errorState } from "../dom.js";
 import { createPoller } from "../poll.js";
 import { initTopbar, setLive, setUpdated } from "../nav.js";
+import { clock, startOfLocalDay } from "../time.js";
+import "../search/omni.js"; // "/" or Cmd+K global search palette
 
 const $ = (id) => document.getElementById(id);
 const REFRESH_MS = 6000; // matches the player page's refresh cadence
@@ -387,6 +389,147 @@ function drawLoadtestChart(canvas, lt) {
   }
 }
 
+// ---- audit trail (roadmap C6) ----------------------------------------------
+// Read-only view over the append-only /v1/audit log (newest first). Loaded on init and on
+// Apply/⟳ only — NOT on the 6s poll: an audit list that rewrites itself under the reader
+// (and resets the "Load more" depth) would be unusable. Seq-guarded like events.js so a slow
+// response started under old filters can't clobber a newer render.
+
+const AUDIT_LIMITS = [100, 250, 500, 1000]; // backend clamps at 1000
+let auditLimit = AUDIT_LIMITS[0];
+let auditSeq = 0;
+// Filter vocab accumulated across loads (only grows), so narrowing a filter never strips the
+// datalist/select of the values you'd need to widen it again.
+const auditActors = new Set();
+const auditActions = new Set();
+const auditTargetTypes = new Set();
+
+// <input type="date"> value ("YYYY-MM-DD") → ms at LOCAL midnight. new Date("YYYY-MM-DD")
+// would parse as UTC midnight and skew the filter by the tz offset.
+function localDateToMs(v) {
+  if (!v) return undefined;
+  const [y, m, d] = v.split("-").map(Number);
+  if (!isFinite(y) || !isFinite(m) || !isFinite(d)) return undefined;
+  return new Date(y, m - 1, d).getTime();
+}
+
+// HH:MM:SS for today's entries; prefixed with the date (and year when it differs) otherwise.
+function auditWhen(ms) {
+  const t = clock(ms);
+  if (startOfLocalDay(ms) === startOfLocalDay(Date.now())) return t;
+  const d = new Date(ms);
+  const opts = d.getFullYear() === new Date().getFullYear()
+    ? { month: "short", day: "numeric" }
+    : { year: "numeric", month: "short", day: "numeric" };
+  return `${d.toLocaleDateString(undefined, opts)} ${t}`;
+}
+
+// "type/shortId" (target ids are free text — device names, uuids — so only truncate long ones).
+function auditTargetLabel(r) {
+  if (!r.targetType && !r.targetId) return "—";
+  const id = r.targetId ? (r.targetId.length > 10 ? `${r.targetId.slice(0, 8)}…` : r.targetId) : "";
+  return id ? `${r.targetType || "?"}/${id}` : r.targetType;
+}
+
+// 2xx → up, 4xx/5xx → down, anything else (3xx, or a non-HTTP event with no status) → unknown.
+function auditStatusPill(status) {
+  const cls = status >= 200 && status < 300 ? "up" : status >= 400 ? "down" : "unknown";
+  return el("span", { class: `pill ${cls}`, text: status != null ? String(status) : "—" });
+}
+
+function auditRow(r) {
+  const targetFull = r.targetId ? `${r.targetType || "?"}/${r.targetId}` : r.targetType || "";
+  const reqFull = [r.method, r.path].filter(Boolean).join(" ");
+  // Non-empty detail (JSON) surfaces via the action's tooltip; the row stays one line.
+  const detail = r.detail && typeof r.detail === "object" && Object.keys(r.detail).length
+    ? JSON.stringify(r.detail)
+    : null;
+  return el("div", { class: "srow audit-row" }, [
+    el("span", { class: "audit-when mono", text: auditWhen(r.tsMs), title: new Date(r.tsMs).toLocaleString() }),
+    el("span", { class: "audit-actor", text: r.actor || "—", title: r.actor || "" }),
+    el("span", { class: "audit-ip muted mono", text: r.ip || "" }),
+    el("strong", { class: "audit-action", text: r.action || "—", title: detail }),
+    el("span", { class: "audit-target", text: auditTargetLabel(r), title: targetFull }),
+    el("span", { class: "audit-path muted small", text: reqFull, title: reqFull }),
+    auditStatusPill(r.status),
+  ]);
+}
+
+// Rebuild the actor/action datalists + target-type select from the accumulated vocab. The
+// select keeps its current value (options only ever grow, so it's always still present).
+function refreshAuditFilterOptions() {
+  const fill = (id, values) =>
+    $(id).replaceChildren(...[...values].sort().map((v) => el("option", { value: v })));
+  fill("aActorList", auditActors);
+  fill("aActionList", auditActions);
+  const sel = $("aTargetType");
+  const cur = sel.value;
+  sel.replaceChildren(
+    el("option", { value: "", text: "Any target" }),
+    ...[...auditTargetTypes].sort().map((v) => el("option", { value: v, text: v })),
+  );
+  sel.value = cur; // still present: the vocab set only grows
+}
+
+async function renderAudit() {
+  const box = $("audit");
+  const seq = ++auditSeq;
+  const requested = auditLimit;
+  let rows;
+  try {
+    rows = await getAudit({
+      actor: $("aActor").value.trim() || undefined,
+      action: $("aAction").value.trim() || undefined,
+      targetType: $("aTargetType").value || undefined,
+      sinceMs: localDateToMs($("aSince").value),
+      limit: requested,
+    });
+  } catch (e) {
+    if (seq === auditSeq) {
+      box.replaceChildren(errorState("Audit error: " + e.message, renderAudit));
+      $("auditCount").textContent = "—";
+      $("auditMore").hidden = true;
+    }
+    return;
+  }
+  if (seq !== auditSeq) return; // superseded by a newer render — don't overwrite
+
+  for (const r of rows) {
+    if (r.actor) auditActors.add(r.actor);
+    if (r.action) auditActions.add(r.action);
+    if (r.targetType) auditTargetTypes.add(r.targetType);
+  }
+  refreshAuditFilterOptions();
+
+  // A full page at the requested limit means older entries were cut off — say so with "+".
+  const maybeMore = rows.length >= requested;
+  $("auditCount").textContent = `${rows.length}${maybeMore ? "+" : ""}`;
+  // "Load more" refetches at the next rung of the ladder (the API has no offset). Hidden when
+  // the server returned fewer than requested (we have it all) or the 1000 clamp is reached.
+  $("auditMore").hidden = !maybeMore || requested >= AUDIT_LIMITS[AUDIT_LIMITS.length - 1];
+
+  if (!rows.length) {
+    box.replaceChildren(emptyState("No audit entries match."));
+    return;
+  }
+  box.replaceChildren(...rows.map(auditRow));
+}
+
+function initAudit() {
+  // Apply starts a fresh query → back to the first rung; ⟳ re-reads at the current depth.
+  $("aApply").addEventListener("click", () => {
+    auditLimit = AUDIT_LIMITS[0];
+    renderAudit();
+  });
+  $("auditRefresh").addEventListener("click", renderAudit);
+  $("auditMore").addEventListener("click", () => {
+    const next = AUDIT_LIMITS.indexOf(auditLimit) + 1;
+    if (next < AUDIT_LIMITS.length) auditLimit = AUDIT_LIMITS[next];
+    renderAudit();
+  });
+  renderAudit();
+}
+
 // ---- poll loop ------------------------------------------------------------
 
 async function refresh() {
@@ -420,4 +563,5 @@ async function refresh() {
 const poller = createPoller(refresh, { intervalMs: REFRESH_MS });
 
 initTopbar({ section: "system" });
+initAudit(); // once on init + Apply/⟳ — the audit trail is NOT on the 6s poll
 poller.start();

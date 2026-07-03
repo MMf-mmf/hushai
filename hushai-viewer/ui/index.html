@@ -118,6 +118,7 @@
                 <p class="ai-pop-hint">Hover the strips for per-moment status and counts.</p>
               </div>
             </span>
+            <button id="exportToggle" title="Export a clip: select a range on the timeline (E)" aria-pressed="false">✂ Export</button>
             <button id="eventsToggle" title="Show the events drawer" aria-pressed="false">☰ Events</button>
             <button id="btnFit" title="Fit all footage (0)">Fit all</button>
             <button id="zoomOut" title="Zoom out (−)" aria-label="Zoom out">−</button>
@@ -125,6 +126,20 @@
           </div>
           <!-- Hover preview: a floating still + timestamp above the scrub bar (js/thumbs.js). -->
           <div id="tlPreview" hidden><img alt="" hidden /><span class="mono"></span></div>
+          <!-- Export bar: floats above the scrub bar while export mode is on (js/export-range.js).
+               Range readout + source picker + inline warnings + the cookie-authed MP4 download. -->
+          <div id="exportBar" role="region" aria-label="Export clip" hidden>
+            <span class="lbl">Export clip</span>
+            <span id="exportRange" class="mono">—</span>
+            <label id="exportKindWrap" class="export-kind" hidden>
+              Source
+              <select id="exportKind" aria-label="Export source"></select>
+            </label>
+            <span id="exportWarn" class="export-warn small" hidden></span>
+            <span class="spacer"></span>
+            <a id="exportDownload" class="export-dl" download>⬇ Download MP4</a>
+            <button id="exportCancel" type="button" title="Exit export mode (Esc)">✕ Cancel</button>
+          </div>
           <canvas
             id="timeline"
             class="timeline"
@@ -280,6 +295,8 @@
             <div class="help-row"><span class="keys"><kbd>0</kbd></span><span>Fit all footage</span></div>
             <div class="help-row"><span class="keys">drag track</span><span>Scrub</span></div>
             <div class="help-row"><span class="keys"><kbd>Shift</kbd>+drag</span><span>Zoom to selection (Esc cancels)</span></div>
+            <div class="help-row"><span class="keys"><kbd>E</kbd></span><span>Export mode — select a clip to download (Esc exits)</span></div>
+            <div class="help-row"><span class="keys"><kbd>I</kbd> <kbd>O</kbd></span><span>Export mode: set clip in / out at the playhead</span></div>
             <div class="help-row"><span class="keys"><kbd>Alt</kbd>+click</span><span>Seek exactly (no gap snap)</span></div>
             <div class="help-row"><span class="keys">drag labels / middle-drag</span><span>Pan</span></div>
             <div class="help-row"><span class="keys">scroll / pinch</span><span>Zoom at cursor</span></div>

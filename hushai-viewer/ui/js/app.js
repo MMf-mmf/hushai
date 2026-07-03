@@ -16,6 +16,7 @@ import { Player } from "./player.js";
 import { Timeline } from "./timeline.js";
 import { Detections } from "./detections.js";
 import { initEventsOverlay, initAlertBell } from "./events-overlay.js";
+import { initExportBar } from "./export-range.js";
 import * as thumbs from "./thumbs.js";
 import { clock, clockMs, dateLabel, localDateInput, DAY_MS, tzAbbr, humanDur } from "./time.js";
 import { on, setPlaybackProvider } from "./store.js";
@@ -46,6 +47,7 @@ const state = {
   aiEnabled: true, // AI processing-status ribbons on the scrub bar
   seekIntent: null, // {ms, at}: optimistic playhead target while a seek is still landing
   followLive: false, // LIVE pill engaged: auto-chase newest footage as it lands
+  exportMode: false, // ✂ clip export: timeline drags select a range, export bar shown
 };
 
 const EVENTS_CAP = 3000; // soft cap on the in-memory event map (oldest dropped)
@@ -53,7 +55,8 @@ const PREVIEW_W = 168; // #tlPreview outer width — matches its CSS
 
 let player, timeline, detections, toastTimer, helpModal;
 let eventsOverlay = null,
-  alertBell = null;
+  alertBell = null,
+  exportBar = null;
 let refreshPoller = null,
   lastDeviceSig = "";
 let evSeq = 0, // stale-response guard for the events fetches (bumped per device switch)
@@ -76,6 +79,8 @@ async function init() {
       scheduleProcessingRefetch(); // pan/zoom changed the visible window
     },
     onHover: (ms) => onTimelineHover(ms), // drives the #tlPreview thumbnail
+    // Export mode: drag-made/adjusted selections feed the export bar's readout + href.
+    onSelectionChange: (sel) => exportBar?.setRange(sel?.fromMs ?? null, sel?.toMs ?? null),
     // A marker on the events lane jumps the player to that moment.
     onEventClick: (ev) => seekTo(ev.startMs, { play: true }),
   });
@@ -86,6 +91,14 @@ async function init() {
     onSeek: (ms) => seekTo(ms, { play: true }),
     onSelectDevice: (id, ms) => selectDevice(id, { seekMs: ms }),
     fetchEvents: getEvents,
+  });
+  // Export bar (floats above the scrub bar): renders the export-mode selection and
+  // hands out the MP4 download link. Same thin coupling as the events overlay — it
+  // only renders; mode + selection live here / in the timeline.
+  exportBar = initExportBar({
+    getDevice: () => state.device,
+    isCovered: (ms) => timeline.isCovered(ms),
+    onExit: () => setExportMode(false),
   });
   alertBell = initAlertBell({
     fetchFeed: () => getEventFeed({ limit: 100 }),
@@ -146,6 +159,8 @@ async function init() {
       },
       currentMs: () => (player ? player.currentWallClockMs() : 0),
       events: () => state.events.size,
+      exportRange: () => timeline.getSelection(),
+      setExportMode,
     };
   }
   lastDeviceSig = deviceSig(state.devices);
@@ -186,6 +201,7 @@ async function selectDevice(id, { seekMs = null } = {}) {
   const d = state.devices.find((x) => x.id === id);
   if (!d) return;
   state.followLive = false; // switching cameras is manual navigation — drop live-follow
+  setExportMode(false); // a selection's times belong to the old camera — don't carry it over
   state.device = d;
   $("deviceSelect").value = id;
   setDeviceMeta(d);
@@ -638,6 +654,86 @@ function onTimelineHover(ms) {
   });
 }
 
+// ---- export mode (✂ button / E key) ------------------------------------------
+// Select a range on the scrub bar, download it as an MP4. The timeline owns the
+// selection gestures (setSelectMode/setSelection); export-range.js owns the bar UI;
+// this section owns the mode itself and the i/o in-out keys.
+
+// Where the UI believes the playhead is: the player's report, or the optimistic seek
+// target / drawn playhead while a far seek is still landing (same fallback as relSeek).
+function uiPlayheadMs() {
+  const ms = player.currentWallClockMs();
+  return Number.isFinite(ms) && ms > 0 ? ms : (state.seekIntent?.ms ?? timeline.playheadMs);
+}
+
+function pushSelectionToBar() {
+  const sel = timeline.getSelection();
+  exportBar?.setRange(sel?.fromMs ?? null, sel?.toMs ?? null);
+}
+
+// Enter/leave export mode. Entering flips the timeline to select gestures and seeds a
+// grabbable selection around the playhead when none exists; leaving clears both the
+// selection and the bar (per-use ranges shouldn't linger into the next session).
+function setExportMode(on) {
+  if (state.exportMode === on) return;
+  state.exportMode = on;
+  const btn = $("exportToggle");
+  if (btn) {
+    btn.classList.toggle("active", on);
+    btn.setAttribute("aria-pressed", String(on));
+  }
+  timeline.setSelectMode(on);
+  if (on) {
+    if (!timeline.getSelection()) {
+      const seed = seedSelection();
+      if (seed) timeline.setSelection(seed.fromMs, seed.toMs);
+    }
+    pushSelectionToBar();
+    exportBar?.setVisible(true);
+  } else {
+    timeline.setSelection(null);
+    exportBar?.setRange(null);
+    exportBar?.setVisible(false);
+  }
+}
+
+// ±30s around the playhead, clamped into the device's footage bounds.
+function seedSelection() {
+  const d = state.device;
+  if (!d) return null;
+  const lo = d.earliestMs ?? timeline.boundsFrom;
+  const hi = d.latestMs ?? timeline.boundsTo;
+  const raw = uiPlayheadMs();
+  const center = Math.min(Math.max(Number.isFinite(raw) ? raw : lo, lo), hi);
+  const fromMs = Math.max(center - 30_000, lo);
+  const toMs = Math.min(center + 30_000, hi);
+  return toMs - fromMs >= 1000 ? { fromMs, toMs } : null;
+}
+
+// i/o (export mode): set the clip's in/out edge at the playhead. With no selection —
+// or when the playhead has crossed the opposite edge — the other end re-anchors 60s
+// away (i → [playhead, +60s], o → [−60s, playhead]), clamped into footage bounds.
+function setSelectionPoint(edge) {
+  const d = state.device;
+  const raw = uiPlayheadMs();
+  if (!d || !Number.isFinite(raw)) return;
+  const lo = d.earliestMs ?? timeline.boundsFrom;
+  const hi = d.latestMs ?? timeline.boundsTo;
+  const ms = Math.min(Math.max(raw, lo), hi);
+  const sel = timeline.getSelection();
+  let fromMs, toMs;
+  if (edge === "in") {
+    fromMs = ms;
+    toMs = sel && sel.toMs > ms ? sel.toMs : Math.min(ms + 60_000, hi);
+  } else {
+    toMs = ms;
+    fromMs = sel && sel.fromMs < ms ? sel.fromMs : Math.max(ms - 60_000, lo);
+  }
+  if (toMs - fromMs < 500) return; // playhead pinned at a footage bound — nothing to select
+  timeline.setSelection(fromMs, toMs);
+  pushSelectionToBar();
+}
+
 // ---- controls ---------------------------------------------------------------
 
 function sortedCoverage() {
@@ -789,6 +885,7 @@ function wireControls() {
   };
   $("btnLive").onclick = goLive;
   $("btnFit").onclick = fitAll;
+  $("exportToggle").onclick = () => setExportMode(!state.exportMode);
   // Shortcut cheat-sheet (?): a static dialog, so wireModal covers Esc/backdrop/focus.
   helpModal = wireModal($("helpModal"));
   $("helpClose").onclick = () => helpModal.close();
@@ -914,6 +1011,20 @@ function wireKeys() {
         break;
       case "a":
         setProcessingEnabled(!state.aiEnabled);
+        break;
+      case "e":
+        setExportMode(!state.exportMode);
+        break;
+      case "i": // export mode: clip in-point at the playhead
+        if (state.exportMode) setSelectionPoint("in");
+        break;
+      case "o": // export mode: clip out-point at the playhead
+        if (state.exportMode) setSelectionPoint("out");
+        break;
+      case "Escape":
+        // Mid-drag, Esc belongs to the timeline (it cancels the gesture — its handler
+        // runs after this one, so the drag is still visible here); otherwise exit.
+        if (state.exportMode && !timeline.isDragging()) setExportMode(false);
         break;
       case "Home":
         if (state.device) seekTo(state.device.earliestMs, { play: true });

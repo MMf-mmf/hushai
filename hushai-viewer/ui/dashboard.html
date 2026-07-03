@@ -41,6 +41,39 @@
         <div id="queues" class="queue-grid"></div>
       </section>
 
+      <!-- Audit trail (roadmap C6): who did what, when, from where, with what outcome. Read-only
+           view over the append-only /v1/audit log. Loaded on init + Apply/⟳ only — deliberately
+           NOT on the 6s poll (an audit page that rewrites itself under the reader is useless).
+           Datalists/target-type options are populated by dashboard.js from the loaded rows. -->
+      <section class="dash-section">
+        <div class="dash-head">
+          <h2>Audit trail</h2>
+          <span id="auditCount" class="count-chip"></span>
+          <button id="auditRefresh" class="ghost" type="button" title="Refresh the audit trail">⟳</button>
+        </div>
+        <div class="filters">
+          <label>Actor
+            <input id="aActor" type="text" list="aActorList" placeholder="any actor" size="14" />
+          </label>
+          <datalist id="aActorList"></datalist>
+          <label>Action
+            <input id="aAction" type="text" list="aActionList" placeholder="any action" size="18" />
+          </label>
+          <datalist id="aActionList"></datalist>
+          <label>Target type
+            <select id="aTargetType"><option value="">Any target</option></select>
+          </label>
+          <label>Since
+            <input id="aSince" type="date" />
+          </label>
+          <button id="aApply" class="ghost" type="button">Apply</button>
+        </div>
+        <div id="audit" class="status-table"></div>
+        <!-- Limit ladder 100→250→500→1000 (backend clamps at 1000); hidden when the server
+             returned fewer rows than requested (i.e. we already have everything). -->
+        <button id="auditMore" class="ghost audit-more" type="button" hidden>Load more</button>
+      </section>
+
       <!-- Capacity / load test (hidden unless hushai-loadtest is publishing live.json). -->
       <section id="loadtestSection" class="dash-section" hidden>
         <div class="dash-head">

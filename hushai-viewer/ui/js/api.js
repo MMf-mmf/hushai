@@ -754,7 +754,7 @@ export async function getAudit({ actor, action, targetType, targetId, sinceMs, l
     id: r.audit_id ?? r.id ?? null,
     tsMs: nsToMs(r.ts_unix_nanos),
     actor: r.actor ?? null,
-    ip: r.ip ?? null,
+    ip: r.actor_ip ?? null, // backend field is actor_ip (audit.rs AuditRow)
     action: r.action ?? null,
     targetType: r.target_type ?? null,
     targetId: r.target_id ?? null,

@@ -224,6 +224,20 @@ export class Timeline {
   getSelection() {
     return this._sel ? { ...this._sel } : null;
   }
+  // Export/select mode: plain track drags create/adjust the persistent selection (edge
+  // grips) instead of scrubbing. Turning it off does NOT clear the selection — the mode's
+  // owner (the export bar) decides that via setSelection(null). A selection drag that is
+  // somehow still in flight when the mode flips off is cancelled (selection restored).
+  setSelectMode(on) {
+    on = !!on;
+    if (this.selectMode === on) return;
+    this.selectMode = on;
+    if (!on && (this._drag?.mode === "selnew" || this._drag?.mode === "seledge")) {
+      this._cancelDrag();
+      return; // _cancelDrag already re-rendered
+    }
+    this.render();
+  }
   // Gesture-driven update: keeps fromMs <= toMs and tells the owner.
   _setSelFromDrag(fromMs, toMs) {
     this._sel =
