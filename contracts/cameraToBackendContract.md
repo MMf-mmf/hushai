@@ -192,6 +192,16 @@ only a promise that the bytes are safely persisted.
 - **`attrs` map** is the cheap escape hatch: a source may attach new optional metadata (e.g.
   `geo`, `orientation`, future multi-camera-fusion keys) **without a schema change**. Fields that
   prove broadly useful can later be promoted to typed fields in the `reserved` range.
+- **Documented `attrs` key family — content hints (`hint.*`)**: a source MAY attach cheap raw
+  content measurements per segment — `hint.v` (schema version, currently `"1"`),
+  `hint.audio_rms` / `hint.audio_peak_rms` (linear PCM RMS in [0,1], s16 samples ÷ 32768;
+  whole-segment and max ~100 ms window respectively), `hint.motion_score` +
+  `hint.motion_fp_side` (mean-subtracted MSE between consecutive low-res grayscale
+  fingerprint tiles of the given side). Values are locale-invariant decimal strings.
+  These are MEASUREMENTS, never decisions: the backend owns all thresholds and MAY use the
+  hints to schedule/deprioritize its AI processing (which is out of scope here, §9), but it
+  MUST fail open — absent, unversioned, or malformed hints mean full normal processing, so
+  a source that sends none conforms unchanged. Storage/acceptance (§6) is never affected.
 - **Conformance corpus:** a shared set of golden valid/invalid manifest byte-vectors is maintained
   alongside the `.proto`; both the Rust (`prost`) and Kotlin (`Wire`) builds must decode/encode it
   identically. This is the guard against the two sides silently drifting.

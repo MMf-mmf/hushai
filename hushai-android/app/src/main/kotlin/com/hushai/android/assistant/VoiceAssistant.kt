@@ -2,6 +2,7 @@ package com.hushai.android.assistant
 
 import android.content.Context
 import com.hushai.android.capture.PcmSink
+import com.hushai.android.net.RagChatClient
 import com.hushai.android.net.RagClient
 import com.hushai.android.net.TtsClient
 import com.hushai.android.util.AssistantBus
@@ -10,6 +11,7 @@ import com.hushai.android.util.HushaiLog
 import org.json.JSONObject
 import org.vosk.Recognizer
 import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
@@ -30,13 +32,22 @@ import java.util.concurrent.TimeUnit
  * locally via [AudioPlayer]; the fetch+play runs on a dedicated speak thread so the
  * worker loop (and its watchdog) stays responsive, and signals `pendingResume` when
  * done. The phone does no speech synthesis.
+ *
+ * Q&A goes to the RICH `/v1/rag/chat` pipeline via [chatClient] (auto-router, sessions +
+ * history, condensation, deterministic identity/recency/roster answers, and the system
+ * context briefing). [voiceSession] carries the session id across spoken turns so follow-ups
+ * condense correctly. The legacy single-shot [ragClient] (`/v1/rag/query`) + on-device
+ * [ReflectionIntent] routing are retained ONLY as the fallback for an older server that 404s
+ * the chat endpoint.
  */
 class VoiceAssistant(
     private val context: Context,
     private val deviceId: String,
     initialWakeWord: String,
+    private val chatClient: RagChatClient,
     private val ragClient: RagClient,
     private val ttsClient: TtsClient,
+    private val voiceSession: VoiceSession,
     initialOwnerEmbedding: FloatArray?,
     private val onEnrollComplete: (FloatArray) -> Unit,
 ) : PcmSink {
@@ -177,7 +188,7 @@ class VoiceAssistant(
                 } else ""
                 if (SpeakerMath.tokens(tail).size >= MIN_QUESTION_WORDS) {
                     // Single utterance: wake + question together — verify on it.
-                    if (verifyOwner(spk)) answer(rec, tail) else reject(rec)
+                    if (verifyOwner(spk)) answer(rec, tail, ownerVerified(spk)) else reject(rec)
                 } else {
                     // Bare wake word: wait for the question (a longer, better voice sample).
                     rec.reset()
@@ -189,31 +200,73 @@ class VoiceAssistant(
             AssistantPhase.AWAIT_QUESTION -> {
                 if (text.isBlank()) return
                 publish { it.copy(lastHeard = text) }
-                if (verifyOwner(spk)) answer(rec, text) else reject(rec)
+                if (verifyOwner(spk)) answer(rec, text, ownerVerified(spk)) else reject(rec)
             }
             else -> {}
         }
     }
 
-    /** Blocks the worker on the RAG call, then speaks the answer (resume on speak-done). */
-    private fun answer(rec: Recognizer, question: String) {
+    /**
+     * Blocks the worker on the RAG-chat call, then speaks the answer (resume on speak-done).
+     * `ownerVerified` is the on-device voice-ID result for this utterance — sent to the server so a
+     * verified owner gets identity-aware answers ("what's my name") and first-person resolution.
+     */
+    private fun answer(rec: Recognizer, question: String, ownerVerified: Boolean) {
         phase = AssistantPhase.THINKING
-        // Introspective questions ("how have I been?") route to the reflection agent; the
-        // backend scopes them to the owner. Everything else uses the default recordings agent.
-        val agentId = ReflectionIntent.agentFor(question)
         publish { it.copy(phase = AssistantPhase.THINKING, lastQuestion = question, note = null) }
-        when (val r = ragClient.ask(question, deviceId, agentId)) {
-            is RagClient.Result.Answer -> {
-                phase = AssistantPhase.SPEAKING
-                speakDeadlineNanos = System.nanoTime() + SPEAK_TIMEOUT_NANOS
-                publish { it.copy(phase = AssistantPhase.SPEAKING, lastAnswer = r.text) }
-                speak(r.text) // resumes LISTENING once playback finishes (pendingResume)
+        val now = System.currentTimeMillis()
+        val tzOffsetSecs = TimeZone.getDefault().getOffset(now) / 1000L
+        when (val r = chatClient.chat(question, voiceSession.currentOrNull(now), ownerVerified, deviceId, tzOffsetSecs)) {
+            is RagChatClient.Result.Answer -> {
+                voiceSession.record(r.sessionId, now)
+                HushaiLog.info("rag chat ok (session=${r.sessionId} routed=${r.routedAgentId})")
+                speakAnswer(r.text)
             }
+            RagChatClient.Result.SessionNotFound -> {
+                // The stored session was pruned / the DB was wiped — forget it and retry once fresh.
+                HushaiLog.info("rag chat session gone — retrying sessionless")
+                voiceSession.reset()
+                when (val retry = chatClient.chat(question, null, ownerVerified, deviceId, tzOffsetSecs)) {
+                    is RagChatClient.Result.Answer -> {
+                        voiceSession.record(retry.sessionId, now)
+                        speakAnswer(retry.text)
+                    }
+                    else -> {
+                        publish { it.copy(note = "RAG error") }
+                        resumeListening(rec)
+                    }
+                }
+            }
+            RagChatClient.Result.EndpointMissing -> {
+                // Older server without /v1/rag/chat — fall back to the single-shot path.
+                HushaiLog.info("rag chat endpoint missing — falling back to /v1/rag/query")
+                fallbackAnswer(rec, question)
+            }
+            is RagChatClient.Result.Error -> {
+                publish { it.copy(note = "RAG error: ${r.reason}") }
+                resumeListening(rec)
+            }
+        }
+    }
+
+    /** Legacy single-shot answer via `/v1/rag/query` + on-device intent routing (older-server fallback). */
+    private fun fallbackAnswer(rec: Recognizer, question: String) {
+        val agentId = ReflectionIntent.agentFor(question)
+        when (val r = ragClient.ask(question, deviceId, agentId)) {
+            is RagClient.Result.Answer -> speakAnswer(r.text)
             is RagClient.Result.Error -> {
                 publish { it.copy(note = "RAG error: ${r.reason}") }
                 resumeListening(rec)
             }
         }
+    }
+
+    /** Transition to SPEAKING and play `text` (resumes LISTENING once playback finishes). */
+    private fun speakAnswer(text: String) {
+        phase = AssistantPhase.SPEAKING
+        speakDeadlineNanos = System.nanoTime() + SPEAK_TIMEOUT_NANOS
+        publish { it.copy(phase = AssistantPhase.SPEAKING, lastAnswer = text) }
+        speak(text) // resumes LISTENING once playback finishes (pendingResume)
     }
 
     private fun verifyOwner(spk: FloatArray?): Boolean {
@@ -228,6 +281,17 @@ class VoiceAssistant(
         val sim = SpeakerMath.cosine(spk, owner)
         HushaiLog.info("speaker cosine=$sim (threshold=$SPEAKER_THRESHOLD)")
         return sim >= SPEAKER_THRESHOLD
+    }
+
+    /**
+     * Whether we can CLAIM this utterance is the verified owner: only when a voiceprint IS enrolled
+     * AND it matches. An unenrolled assistant answers anyone ([verifyOwner] returns true) but must
+     * NOT assert owner identity to the server, so this returns false there.
+     */
+    private fun ownerVerified(spk: FloatArray?): Boolean {
+        val owner = ownerEmbedding ?: return false
+        if (spk == null || spk.isEmpty()) return false
+        return SpeakerMath.cosine(spk, owner) >= SPEAKER_THRESHOLD
     }
 
     private fun reject(rec: Recognizer) {

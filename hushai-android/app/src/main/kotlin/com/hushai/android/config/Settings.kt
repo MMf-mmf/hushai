@@ -31,6 +31,14 @@ class Settings(private val context: Context) {
      *  and battery when the video isn't needed. Chosen before Start. */
     suspend fun audioOnly(): Boolean = context.dataStore.data.map { it[KEY_AUDIO_ONLY] ?: false }.first()
 
+    /** Bake the upright rotation into the encoded PIXELS on-device (GL render pass) instead of
+     *  only stamping the MP4 rotation matrix. Off by default: the matrix path already makes the
+     *  worker/frames and the viewer's re-encode path upright. Enable this (and verify on the
+     *  physical rig — the rotation sign is empirical) so the viewer's fast `-c copy` path plays
+     *  Android footage upright with no re-encode. Falls back to the matrix path if GL init fails.
+     *  Baked at capture START from the mount orientation; a re-mount needs a capture restart. */
+    suspend fun uprightBake(): Boolean = context.dataStore.data.map { it[KEY_UPRIGHT_BAKE] ?: false }.first()
+
     /** Stable per-install id, minted once and persisted (contract §4 device_id). */
     suspend fun deviceId(): String {
         // Mint atomically inside ONE DataStore transaction. A separate read-then-write let two
@@ -76,6 +84,10 @@ class Settings(private val context: Context) {
     fun setAudioOnlyBlocking(value: Boolean) =
         runBlocking { context.dataStore.edit { it[KEY_AUDIO_ONLY] = value } }
 
+    fun uprightBakeBlocking(): Boolean = runBlocking { uprightBake() }
+    fun setUprightBakeBlocking(value: Boolean) =
+        runBlocking { context.dataStore.edit { it[KEY_UPRIGHT_BAKE] = value } }
+
     fun diskCapBytesBlocking(): Long = runBlocking { diskCapBytes() }
     fun setDiskCapBytesBlocking(value: Long) = runBlocking { setDiskCapBytes(value) }
 
@@ -91,6 +103,32 @@ class Settings(private val context: Context) {
         runBlocking { context.dataStore.edit { it[KEY_ASSISTANT_ENABLED] = value } }
     fun setOwnerEmbeddingBlocking(value: String) = runBlocking { edit(KEY_OWNER_EMBEDDING, value) }
 
+    // --- Voice-assistant chat session (continuity across turns; see assistant/VoiceSession) ---
+    /** The persisted `(sessionId, lastTurnAtMillis)`, or null when none has been stored yet.
+     *  DataStore-backed (not memory) so a session survives the assistant being torn down and
+     *  rebuilt (capture stop/start, battery-saver kill, quick process restart). */
+    fun loadVoiceSessionBlocking(): Pair<String, Long>? = runBlocking {
+        context.dataStore.data.map {
+            val id = it[KEY_VOICE_SESSION_ID]
+            val at = it[KEY_VOICE_SESSION_AT] ?: 0L
+            if (id.isNullOrBlank()) null else id to at
+        }.first()
+    }
+
+    fun saveVoiceSessionBlocking(sessionId: String, atMillis: Long) = runBlocking {
+        context.dataStore.edit {
+            it[KEY_VOICE_SESSION_ID] = sessionId
+            it[KEY_VOICE_SESSION_AT] = atMillis
+        }
+    }
+
+    fun clearVoiceSessionBlocking() = runBlocking {
+        context.dataStore.edit {
+            it.remove(KEY_VOICE_SESSION_ID)
+            it.remove(KEY_VOICE_SESSION_AT)
+        }
+    }
+
     private suspend fun edit(key: androidx.datastore.preferences.core.Preferences.Key<String>, value: String) {
         context.dataStore.edit { it[key] = value }
     }
@@ -100,12 +138,15 @@ class Settings(private val context: Context) {
         val KEY_TOKEN = stringPreferencesKey("device_token")
         val KEY_DEVICE_ID = stringPreferencesKey("device_id")
         val KEY_AUDIO_ONLY = booleanPreferencesKey("audio_only")
+        val KEY_UPRIGHT_BAKE = booleanPreferencesKey("upright_bake")
         val KEY_DISK_CAP_BYTES = longPreferencesKey("disk_cap_bytes")
         val KEY_WAKE_WORD = stringPreferencesKey("wake_word")
         val KEY_RAG_URL = stringPreferencesKey("rag_url")
         val KEY_RAG_TOKEN = stringPreferencesKey("rag_token")
         val KEY_ASSISTANT_ENABLED = booleanPreferencesKey("assistant_enabled")
         val KEY_OWNER_EMBEDDING = stringPreferencesKey("owner_embedding")
+        val KEY_VOICE_SESSION_ID = stringPreferencesKey("voice_session_id")
+        val KEY_VOICE_SESSION_AT = longPreferencesKey("voice_session_at_millis")
         // Debug/dev defaults (cleartext over the USB `adb reverse` tunnel / emulator).
         // RELEASE builds forbid cleartext (see src/release/network_security_config.xml),
         // so a release deployment MUST set an `https://<lan-ip>:8080` URL (cert SAN) via

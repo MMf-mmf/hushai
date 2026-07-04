@@ -6,6 +6,8 @@
 //! `POST /v1/persons/{id}/merge`       — fold two ids for the same person into one
 //! `POST /v1/persons/{id}/archive`     — disregard (display-level; matcher still attributes)
 //! `POST /v1/persons/{id}/unarchive`   — restore from the Archived section
+//! `POST /v1/persons/{id}/owner`       — mark this face as the device owner ("This is me")
+//! `POST /v1/persons/{id}/unowner`     — clear the owner mark
 //! `GET  /v1/persons/{id}/sample-face` — a representative cropped face (ID a person by sight)
 //!
 //! Runtime sqlx (`query`/`.bind`/`try_get`), NOT the `query!` macros, for the same reason as
@@ -44,6 +46,9 @@ pub struct PersonSummary {
     /// Disregarded by the operator (0021). Display-level only: clients tuck archived entries
     /// into a collapsed "Archived" section; matching/RAG/watchlist behavior is unchanged.
     pub archived: bool,
+    /// The device owner's face (0023, "This is me"). At most one person carries this;
+    /// hushai-rag's owner resolution consults it before the OWNER_PERSON_* env fallback.
+    pub is_owner: bool,
 }
 
 /// A new "sighting" begins when consecutive detections of the same face are more than this many
@@ -70,6 +75,7 @@ pub async fn list_persons(
                p.display_name,
                p.n_samples,
                p.archived_at IS NOT NULL AS archived,
+               p.is_owner,
                COALESCE(sight.n, 0) AS n_sightings,
                COALESCE(samp.ts, ARRAY[]::bigint[]) AS sample_sightings
         FROM persons p
@@ -117,6 +123,7 @@ pub async fn list_persons(
                 .try_get::<Vec<i64>, _>("sample_sightings")
                 .unwrap_or_default(),
             archived: r.try_get("archived").unwrap_or(false),
+            is_owner: r.try_get("is_owner").unwrap_or(false),
         })
         .collect();
     Ok(Json(out))
@@ -133,6 +140,7 @@ pub struct PersonRow {
     pub display_name: Option<String>,
     pub n_samples: i64,
     pub archived: bool,
+    pub is_owner: bool,
 }
 
 /// `PATCH /v1/persons/{id}` — name a face (idempotent). 404 if the id is unknown.
@@ -150,7 +158,7 @@ pub async fn rename_person(
     let row = sqlx::query(
         "UPDATE persons SET display_name = $1, updated_at = now() \
          WHERE person_id = $2 \
-         RETURNING person_id, display_name, n_samples, archived_at IS NOT NULL AS archived",
+         RETURNING person_id, display_name, n_samples, archived_at IS NOT NULL AS archived, is_owner",
     )
     .bind(name)
     .bind(id)
@@ -169,6 +177,7 @@ fn person_row(row: &sqlx::postgres::PgRow) -> PersonRow {
             .unwrap_or(None),
         n_samples: row.get("n_samples"),
         archived: row.try_get("archived").unwrap_or(false),
+        is_owner: row.try_get("is_owner").unwrap_or(false),
     }
 }
 
@@ -199,7 +208,7 @@ async fn set_person_archived(
         "UPDATE persons \
          SET archived_at = CASE WHEN $1 THEN now() ELSE NULL END, updated_at = now() \
          WHERE person_id = $2 \
-         RETURNING person_id, display_name, n_samples, archived_at IS NOT NULL AS archived",
+         RETURNING person_id, display_name, n_samples, archived_at IS NOT NULL AS archived, is_owner",
     )
     .bind(archived)
     .bind(id)
@@ -207,6 +216,48 @@ async fn set_person_archived(
     .await?
     .ok_or(IngestError::NotFound("person"))?;
 
+    Ok(Json(person_row(&row)))
+}
+
+/// `POST /v1/persons/{id}/owner` — mark this face as the device owner ("This is me").
+/// One transaction: clear any previous owner, set the new one (404 on unknown/archived).
+/// Idempotent; the 0023 partial unique index makes a racing double-set fail loudly.
+pub async fn set_person_owner(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<PersonRow>, IngestError> {
+    let mut tx = st.pool.begin().await?;
+    sqlx::query("UPDATE persons SET is_owner = false, updated_at = now() WHERE is_owner AND person_id <> $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    let row = sqlx::query(
+        "UPDATE persons SET is_owner = true, updated_at = now() \
+         WHERE person_id = $1 AND archived_at IS NULL \
+         RETURNING person_id, display_name, n_samples, archived_at IS NOT NULL AS archived, is_owner",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(IngestError::NotFound("person (unknown or archived)"))?;
+    tx.commit().await?;
+    Ok(Json(person_row(&row)))
+}
+
+/// `POST /v1/persons/{id}/unowner` — clear the owner mark (idempotent). 404 if unknown.
+pub async fn clear_person_owner(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<PersonRow>, IngestError> {
+    let row = sqlx::query(
+        "UPDATE persons SET is_owner = false, updated_at = now() \
+         WHERE person_id = $1 \
+         RETURNING person_id, display_name, n_samples, archived_at IS NOT NULL AS archived, is_owner",
+    )
+    .bind(id)
+    .fetch_optional(&st.pool)
+    .await?
+    .ok_or(IngestError::NotFound("person"))?;
     Ok(Json(person_row(&row)))
 }
 

@@ -215,5 +215,13 @@ fn build_body(q: &ChatQ, base_ns: i64) -> Value {
             body["playback"] = Value::Object(playback);
         }
     }
+    if let Some(c) = &q.caller {
+        let mut caller = serde_json::Map::new();
+        if let Some(k) = &c.kind {
+            caller.insert("kind".into(), json!(k));
+        }
+        caller.insert("owner_verified".into(), json!(c.owner_verified));
+        body["caller"] = Value::Object(caller);
+    }
     body
 }

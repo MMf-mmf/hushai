@@ -27,6 +27,27 @@ pub async fn resolve_name(pool: &PgPool, name: &str) -> anyhow::Result<Vec<Uuid>
         .collect())
 }
 
+/// The owner-marked voice (0023, "This is me"): `(speaker_id, display_name)` of the single
+/// `is_owner` row, or `None` when nobody is marked. Consulted by the owner-resolution
+/// precedence chain BETWEEN request filters and the OWNER_SPEAKER_* env fallback, so a
+/// tap in the Voices UI works without env config and env-configured rigs are unchanged.
+/// Archived voices are excluded (the set-owner endpoint refuses them; belt-and-braces here).
+pub async fn owner(pool: &PgPool) -> anyhow::Result<Option<(Uuid, Option<String>)>> {
+    let row = sqlx::query(
+        "SELECT speaker_id, display_name FROM speakers \
+         WHERE is_owner AND archived_at IS NULL LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| {
+        (
+            r.get::<Uuid, _>("speaker_id"),
+            r.try_get::<Option<String>, _>("display_name")
+                .unwrap_or(None),
+        )
+    }))
+}
+
 /// Map speaker-id strings to display names for prompt attribution. Batched single query;
 /// only named speakers are returned (callers default the rest to "unknown speaker").
 /// `ids` are uuid strings; we cast to `::uuid[]` to compare against the uuid PK column.

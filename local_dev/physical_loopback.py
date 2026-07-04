@@ -199,9 +199,11 @@ def main() -> int:
     print(f"[phys] device={dev}; waiting for processing …")
     deadline = time.time() + 240
     while time.time() < deadline:
-        a = psql(f"SELECT count(*) FILTER (WHERE status='done')||'/'||count(*) FROM "
+        # Terminal = done OR skipped (migration 0022: content gates mark silent/static
+        # segments 'skipped' — a silent clip's audio lane would otherwise never "finish").
+        a = psql(f"SELECT count(*) FILTER (WHERE status IN ('done','skipped'))||'/'||count(*) FROM "
                  f"segment_transcription_status t JOIN segments s USING(segment_id) WHERE s.device_id='{dev}';")
-        v = psql(f"SELECT count(*) FILTER (WHERE status='done')||'/'||count(*) FROM "
+        v = psql(f"SELECT count(*) FILTER (WHERE status IN ('done','skipped'))||'/'||count(*) FROM "
                  f"segment_vision_status t JOIN segments s USING(segment_id) WHERE s.device_id='{dev}';")
         print(f"[phys]   audio {a or '0/0'}  vision {v or '0/0'}")
         done = lambda x: x and x.split('/')[0] == x.split('/')[1] and x.split('/')[1] != '0'

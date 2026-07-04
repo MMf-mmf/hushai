@@ -71,6 +71,31 @@ class ManifestRoundTripTest {
     }
 
     @Test
+    fun content_hint_attrs_survive_roundtrip_alongside_client_tag() {
+        val identity = DeviceIdentity("cam0", "00112233445566778899aabbccddeeff".decodeHex())
+        val hinted = sampleSegment().copy(
+            attrs = mapOf(
+                "hint.v" to "1",
+                "hint.audio_rms" to "0.002310",
+                "hint.audio_peak_rms" to "0.004700",
+            ),
+        )
+        val decoded = SegmentManifest.ADAPTER.decode(SegmentManifestBuilder.build(hinted, identity))
+
+        // Hints ride along AND the fixed client tag is preserved (it wins any collision).
+        assertEquals("hushai-android", decoded.attrs["client"])
+        assertEquals("1", decoded.attrs["hint.v"])
+        assertEquals("0.002310", decoded.attrs["hint.audio_rms"])
+        assertEquals("0.004700", decoded.attrs["hint.audio_peak_rms"])
+
+        // A hint-less segment still carries exactly the legacy attrs (fail-open on the server).
+        val plain = SegmentManifest.ADAPTER.decode(
+            SegmentManifestBuilder.build(sampleSegment(), identity)
+        )
+        assertEquals(mapOf("client" to "hushai-android"), plain.attrs)
+    }
+
+    @Test
     fun device_and_stream_ids_must_be_nonempty() {
         // Mirror of the backend's EmptyField(400) guard — keep these populated.
         val identity = DeviceIdentity("cam0", "00112233445566778899aabbccddeeff".decodeHex())

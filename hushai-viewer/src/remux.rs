@@ -1,5 +1,7 @@
 //! Lazy, content-addressed remux of a stored blob into an MPEG-TS segment that
-//! hls.js can stitch. Stream-copy only (`-c copy`) — no re-encode.
+//! hls.js can stitch. Stream-copy (`-c copy`) by default — EXCEPT a segment whose video
+//! carries a rotation matrix is re-encoded upright (see `probe_rotation` / `needs_upright`),
+//! because MPEG-TS/hls.js/MSE drop the matrix and `-c copy` alone would play sideways.
 //!
 //! Two source conventions (keyed off `container`, never the source — contract §7):
 //!  - `mp4` (Android): self-contained MP4; remux directly. Video needs the AVCC→Annex-B
@@ -224,18 +226,46 @@ async fn remux_to(
     let tmp_out = parent.join(format!(".out-{sha_hex}-{}.ts", Uuid::now_v7()));
     let mut out_guard = TempPath(Some(tmp_out.clone()));
 
+    // Does this segment's video carry a rotation matrix? Android stamps one
+    // (setOrientationHint) so portrait/rotated capture displays upright — but a `-c copy`
+    // remux drops it (MPEG-TS can't carry it; hls.js/MSE ignore it either way), so the
+    // browser would play sideways. When rotated, re-encode the video so ffmpeg autorotate
+    // BAKES the rotation into the pixels; 0°/matrix-less segments keep the fast copy path.
+    // Audio never rotates. Fail open to copy on any probe error (never break playback).
+    let needs_upright = state.cfg.upright_reencode
+        && matches!(variant, Variant::Video | Variant::Muxed)
+        && probe_rotation(&state.cfg.ffprobe_bin, &input_path).await != 0;
+
+    // libx264 re-encode args for the upright path (autorotate is default-on, so do NOT add
+    // `-vf transpose` or `-noautorotate`, and drop `h264_mp4toannexb` — that bsf is only for
+    // copying AVCC into TS; the encoder's Annex-B output goes straight into the mpegts muxer).
+    let crf = state.cfg.reencode_crf.to_string();
+    let preset = state.cfg.reencode_preset.as_str();
+
     let mut cmd = tokio::process::Command::new(&state.cfg.ffmpeg_bin);
     cmd.args(["-hide_banner", "-loglevel", "error", "-nostdin", "-y", "-i"])
         .arg(&input_path);
     match variant {
         Variant::Video => {
-            cmd.args(["-map", "0:v:0", "-c:v", "copy", "-bsf:v", "h264_mp4toannexb"]);
+            cmd.args(["-map", "0:v:0"]);
+            if needs_upright {
+                cmd.args(["-c:v", "libx264", "-preset", preset, "-crf", &crf, "-pix_fmt", "yuv420p"]);
+            } else {
+                cmd.args(["-c:v", "copy", "-bsf:v", "h264_mp4toannexb"]);
+            }
         }
         Variant::Audio => {
             cmd.args(["-map", "0:a:0", "-c:a", "copy"]);
         }
         Variant::Muxed => {
-            cmd.args(["-map", "0", "-c", "copy", "-bsf:v", "h264_mp4toannexb"]);
+            cmd.args(["-map", "0"]);
+            if needs_upright {
+                // Re-encode video upright, keep audio a stream-copy in the one ffmpeg.
+                cmd.args(["-c:v", "libx264", "-preset", preset, "-crf", &crf, "-pix_fmt", "yuv420p"])
+                    .args(["-c:a", "copy"]);
+            } else {
+                cmd.args(["-c", "copy", "-bsf:v", "h264_mp4toannexb"]);
+            }
         }
     }
     // Zero the TS mux start offset (mp4->TS otherwise injects a spurious ~1.4s start
@@ -272,6 +302,58 @@ async fn remux_to(
     Ok(())
 }
 
+/// The video stream's display-matrix rotation in degrees (normalized to (-180, 180]), or 0
+/// when there is none / on any error. ffmpeg 7.x exposes it under stream *side data*
+/// (`"Display Matrix"` → `"rotation"`), NOT the legacy `stream_tags=rotate` (empty on 7.x).
+/// We only need "is it non-zero" — ffmpeg autorotate reads the matrix itself for direction,
+/// so the sign here doesn't matter. Fails open (returns 0 ⇒ fast copy path) on any error.
+async fn probe_rotation(ffprobe_bin: &str, input: &Path) -> i32 {
+    let output = tokio::process::Command::new(ffprobe_bin)
+        .args([
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream_side_data_list",
+            "-of",
+            "json",
+        ])
+        .arg(input)
+        .kill_on_drop(true)
+        .output()
+        .await;
+    let output = match output {
+        Ok(o) if o.status.success() => o,
+        _ => return 0,
+    };
+    rotation_from_ffprobe_json(&output.stdout)
+}
+
+/// Pure parse of `ffprobe -show_entries stream_side_data_list -of json` output → the video
+/// display-matrix rotation normalized to (-180, 180], or 0 when absent/malformed. Split out
+/// so it can be unit-tested without spawning ffprobe.
+fn rotation_from_ffprobe_json(bytes: &[u8]) -> i32 {
+    let Ok(json) = serde_json::from_slice::<serde_json::Value>(bytes) else {
+        return 0;
+    };
+    // { "streams": [ { "side_data_list": [ { "side_data_type": "Display Matrix",
+    //   "rotation": -90 }, ... ] } ] }  — rotation may be a number or a string.
+    let rot = json["streams"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s["side_data_list"].as_array())
+        .flatten()
+        .find_map(|sd| match &sd["rotation"] {
+            serde_json::Value::Number(n) => n.as_i64(),
+            serde_json::Value::String(s) => s.trim().parse::<f64>().ok().map(|f| f as i64),
+            _ => None,
+        })
+        .unwrap_or(0);
+    ((rot.rem_euclid(360) + 180).rem_euclid(360) - 180) as i32
+}
+
 /// Stage a blob as a seekable ffmpeg input (shared with stills.rs). `fmp4` blobs are bare
 /// `moof`+`mdat` fragments — prepend `codec_init_data` (`ftyp`+`moov`) into a temp mp4
 /// beside `parent`; `mp4` blobs pass through untouched. The returned guard removes any
@@ -298,4 +380,98 @@ pub(crate) async fn stage_input(
         .await
         .context("staging fmp4 input for ffmpeg")?;
     Ok((tmp.clone(), TempPath(Some(tmp))))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{probe_rotation, rotation_from_ffprobe_json};
+
+    fn side_data(rotation: &str) -> String {
+        format!(
+            r#"{{"streams":[{{"side_data_list":[{{"side_data_type":"Display Matrix","rotation":{rotation}}}]}}]}}"#
+        )
+    }
+
+    #[test]
+    fn parses_numeric_rotation() {
+        // The exact shape ffprobe 7.1 emits for an Android-rotated segment.
+        assert_eq!(rotation_from_ffprobe_json(side_data("90").as_bytes()), 90);
+        assert_eq!(rotation_from_ffprobe_json(side_data("-90").as_bytes()), -90);
+        assert_eq!(rotation_from_ffprobe_json(side_data("270").as_bytes()), -90);
+    }
+
+    #[test]
+    fn parses_string_rotation() {
+        // Some ffmpeg builds serialize rotation as a quoted string.
+        assert_eq!(rotation_from_ffprobe_json(side_data(r#""90""#).as_bytes()), 90);
+        assert_eq!(
+            rotation_from_ffprobe_json(side_data(r#""-180""#).as_bytes()),
+            -180
+        );
+    }
+
+    #[test]
+    fn one_eighty_is_nonzero() {
+        // 180 must still trigger the upright re-encode (upside-down), normalized to -180.
+        assert_eq!(rotation_from_ffprobe_json(side_data("180").as_bytes()), -180);
+    }
+
+    #[test]
+    fn zero_and_multiples_of_360_are_zero() {
+        assert_eq!(rotation_from_ffprobe_json(side_data("0").as_bytes()), 0);
+        assert_eq!(rotation_from_ffprobe_json(side_data("360").as_bytes()), 0);
+    }
+
+    #[test]
+    fn no_side_data_is_zero() {
+        // No matrix (the common landscape/0° case) → fast copy path.
+        assert_eq!(
+            rotation_from_ffprobe_json(br#"{"streams":[{}]}"#),
+            0
+        );
+        assert_eq!(rotation_from_ffprobe_json(br#"{"streams":[]}"#), 0);
+    }
+
+    #[test]
+    fn malformed_json_fails_open_to_zero() {
+        assert_eq!(rotation_from_ffprobe_json(b"not json"), 0);
+        assert_eq!(rotation_from_ffprobe_json(b""), 0);
+    }
+
+    // Real ffmpeg/ffprobe round-trip: a landscape clip re-stamped with a 90° display matrix
+    // (exactly what Android's setOrientationHint produces) must probe non-zero, while the
+    // untouched landscape clip probes zero (fast copy path). Gated `#[ignore]` because it
+    // spawns ffmpeg/ffprobe — run with `cargo test -p hushai-viewer -- --ignored probe_rotation`.
+    #[tokio::test]
+    #[ignore = "spawns ffmpeg/ffprobe; run with --ignored"]
+    async fn probe_rotation_on_real_fixtures() {
+        use std::process::Command;
+        let dir = std::env::temp_dir().join(format!("hushai-rot-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let land = dir.join("land.mp4");
+        let rot = dir.join("rot.mp4");
+
+        let ok = Command::new("ffmpeg")
+            .args(["-y", "-hide_banner", "-loglevel", "error", "-f", "lavfi", "-i"])
+            .arg("testsrc2=size=1280x720:rate=30:duration=1")
+            .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+            .arg(&land)
+            .status()
+            .expect("run ffmpeg");
+        assert!(ok.success(), "ffmpeg landscape fixture failed");
+        // Stamp a 90° matrix without touching pixels (mimics MediaMuxer.setOrientationHint).
+        let ok = Command::new("ffmpeg")
+            .args(["-y", "-hide_banner", "-loglevel", "error", "-display_rotation", "90", "-i"])
+            .arg(&land)
+            .args(["-c", "copy"])
+            .arg(&rot)
+            .status()
+            .expect("run ffmpeg");
+        assert!(ok.success(), "ffmpeg rotate-stamp failed");
+
+        assert_ne!(probe_rotation("ffprobe", &rot).await, 0, "rotated clip must probe non-zero");
+        assert_eq!(probe_rotation("ffprobe", &land).await, 0, "landscape clip must probe zero");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

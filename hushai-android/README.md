@@ -51,7 +51,24 @@ ignored; capture/upload unaffected throughout.
   the **oldest** segment and sets `gap_before=true` on the next surviving segment of that
   stream (an honest gap, never a silent loss).
 - **Compose UI** + **headless Intent-extra control** (`url`/`token`/`rag_url`/`autostart`/
-  `stop`/`audio_only`).
+  `stop`/`audio_only`/`upright_bake`).
+- **Upright video regardless of mount orientation.** `OrientationTracker` reads the phone's
+  *physical* orientation (accelerometer — works screen-off, unlike `Display.rotation`) and
+  computes the clockwise angle that makes the frame upright. Two strategies:
+  - **Default (rotation matrix):** each segment stamps that angle into its MP4 rotation matrix
+    (`SegmentMuxer.setOrientationHint`). Re-decode consumers autorotate on it — the worker's
+    vision frames, the backend face/plate JPEGs, **and the viewer's upright re-encode** all
+    come out upright. (The viewer's *fast* `-c copy` path can't honor a matrix, so it re-encodes
+    rotated clips — see `hushai-viewer`.)
+  - **Opt-in bake (`Settings.uprightBake`, experimental):** a GLES pass
+    (`capture/gl/` + `GlVideoPipeline`) rotates the *pixels* on-device so the encoded H.264 is
+    physically upright and the matrix is 0 — then even the viewer's fast `-c copy` plays upright
+    with no re-encode. Baked from the mount orientation at capture start (portrait swaps the
+    encoder to 720×1280); live self-corrects a 0↔180 flip. **Falls back** to the matrix path if
+    GL/EGL init fails (capture never depends on GL). Enable headlessly for rig testing:
+    `am start-foreground-service … --ez upright_bake true` (Stop → Start to apply). ⚠️ The GL
+    rotation *sign* is empirical — verify all four orientations on the physical rig and flip the
+    sign in `CameraGlRenderer.buildTexMatrix` if a frame comes out rotated the wrong way.
 
 ### 2. Live camera preview (this session)
 
@@ -94,17 +111,31 @@ wake word  →  owner voice-ID  →  question (STT)  →  RAG answer  →  spoke
   ignored. Enrollment is a one-time "talk for a few seconds" flow.
 - **Question STT** — the utterance after the wake word is transcribed by the same Vosk
   recognizer.
-- **RAG answer** — the question is `POST`ed to `../hushai-rag` `/v1/rag/query`, scoped
-  to this device's `device_id`, so answers are grounded in the owner's own recordings.
+- **RAG answer** — the question goes to `../hushai-rag` **`/v1/rag/chat`** (SSE) via
+  `net/RagChatClient.kt`, so the voice assistant gets the SAME rich pipeline the web chat
+  uses: the server **auto-router** (picks recordings / people / objects / plates / events /
+  reflection per question — replacing the old on-device `ReflectionIntent` keyword check),
+  DB-backed **sessions + history** with follow-up **condensation**, deterministic answers
+  for identity ("what's my name"), recency ("what did we last discuss"), and speaker
+  rosters, plus a system **context briefing** (date, known voices/people, cameras) and
+  cross-modal grounding. The request carries `caller:{kind:"voice", owner_verified}` — the
+  on-device voiceprint result, so a verified owner gets identity-aware answers — the phone's
+  real timezone, and **no device filter** (voice searches ALL cameras, not just this phone).
+  `assistant/VoiceSession.kt` keeps the `session_id` (DataStore, 15-min idle window) so
+  spoken follow-ups continue the conversation. The legacy single-shot `/v1/rag/query`
+  (`RagClient` + `ReflectionIntent`) is retained ONLY as a fallback for an older server that
+  doesn't have the chat endpoint.
 - **Spoken reply** — the answer is synthesized on the **backend** (`hushai-rag`
   `POST /v1/tts`, Kokoro-82M neural voice) and the returned WAV is played here via
   `AudioTrack` (`assistant/AudioPlayer.kt`). The phone does no speech synthesis —
-  it just plays the audio. (Was Android `TextToSpeech`, which sounded robotic.)
+  it just plays the audio. (Was Android `TextToSpeech`, which sounded robotic.) The server
+  trims voice answers to a few plain spoken sentences (no markdown) so they read aloud well.
 
 Wake word + STT + speaker-ID still run on-device (Vosk); the RAG answer and its
-spoken audio come from the local backend. A planned follow-up moves wake-word/STT/
-speaker-ID server-side too, making the phone a pure audio/video gateway. Full spec +
-acceptance criteria: `../Issues/voice-assistant-wakeword-rag.md`.
+spoken audio come from the local backend. Mark your own voice as the owner via the Voices
+screen's **"This is me"** button so identity + reflection answers work. A planned follow-up
+moves wake-word/STT/speaker-ID server-side too, making the phone a pure audio/video gateway.
+Full spec + acceptance criteria: `../Issues/voice-assistant-wakeword-rag.md`.
 
 ### 5. Audio-only capture mode (this session)
 
@@ -164,6 +195,10 @@ on-device owner voice-ID used by the assistant (§ Speaker verification below). 
   sample count, a few sample utterances) and **plays a sample-audio snippet** (`GET /v1/speakers/{id}/sample-audio`)
   so you can recognize a voice by ear.
 - **Name a voice** — a name field → `PATCH /v1/speakers/{id}`.
+- **"This is me" (2026-07)** — mark a voice as the device owner → `POST /v1/speakers/{id}/owner`
+  (`SpeakersClient.setOwner`; the card shows "• You" and a clear toggle). This is what lets the
+  assistant answer "what's my name", resolve first-person questions, and scope reflection to you —
+  no `OWNER_*` env config needed on the server.
 - **Merge a duplicate** — per-voice "Merge into…" → `POST /v1/speakers/{loser}/merge`.
 - **Clean up voices (2026-06-26)** — a section at the top surfaces backend-suggested duplicate
   groups (`GET /v1/speakers/duplicates`) and merges them in one tap: **"Merge group"** /
@@ -314,6 +349,9 @@ app/src/main/kotlin/com/hushai/android/
     PcmSink.kt                 interface for mic consumers                                           [new]
     CameraController.kt        Camera2 open + (re)configurable session (encoder + optional preview)  [+preview]
     VideoEncoder.kt            H.264 MediaCodec, keyframe-aligned ~2s cutting, CSD capture
+    OrientationTracker.kt      accelerometer -> upright clockwise angle (screen-off safe)
+    GlVideoPipeline.kt         opt-in upright-BAKE: camera -> GL rotate -> encoder (matrix=0)         [new]
+    gl/{EglCore,OesTextureProgram,CameraGlRenderer}.kt   EGL14/GLES2 rotation render pass            [new]
     AudioEncoder.kt            push-based PcmSink: own worker thread, AAC ~2s cutting, CSD capture    [refactored]
     SegmentMuxer / Segment / SegmentManifestBuilder / CaptureNotification   (capture v1)
     DurableSegmentBuffer.kt    crash-durable, disk-byte-bounded store-and-forward (sidecar manifests   [new]
@@ -332,7 +370,7 @@ app/src/main/kotlin/com/hushai/android/
     NetworkMonitor.kt          ConnectivityManager callback (validated link up/down)                 [new]
     ConnectivityState.kt       fuses link + upload outcomes + probe -> offline/draining/online       [new]
     Uploader / UploadOutcome / Reachability / Http.kt   (Http.kt adds a long-timeout `rag` client)  [+rag]
-  config/{Settings,DeviceIdentity}.kt   DataStore: url/token/device_id + audio_only + disk_cap_bytes (live) + wake_word/rag_url/enabled/owner_embedding
+  config/{Settings,DeviceIdentity}.kt   DataStore: url/token/device_id + audio_only + upright_bake + disk_cap_bytes (live) + wake_word/rag_url/enabled/owner_embedding
   util/{AssistantBus,Status,HushaiLog,Uuid7,Sha,Format}.kt    status buses; HUSHAI_TX logging; UUIDv7; SHA-256; byte/duration formatting
 app/src/main/res/xml/device_admin.xml   force-lock policy
 app/src/main/assets/vosk/{model-en,model-spk}/   Vosk models (GITIGNORED; fetch via script)

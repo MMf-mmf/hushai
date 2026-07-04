@@ -82,8 +82,20 @@ pub struct QueueStats {
     pub pending: i64,
     pub processing: i64,
     pub error: i64,
-    /// `done` rows whose `updated_at` is within the last 24h (throughput signal).
+    /// `done` rows whose `updated_at` is within the last 24h (throughput signal). Since
+    /// migration 0022 this means ACTUALLY processed — content-gate skips are `skipped`, not `done`.
     pub done_recent: i64,
+    /// `skipped` rows (static video / silent audio — ingest hint gate or worker backstop gate)
+    /// updated within the last 24h. High skipped + low done on an idle camera is HEALTHY.
+    pub skipped_recent: i64,
+    /// Of `skipped_recent`, how many were decided at ingest from device hints
+    /// (`skip_reason LIKE '%_hint'`) vs by the worker's own gate (the remainder).
+    pub skipped_by_hint_recent: i64,
+    /// Hint-audit verdicts recorded in the last 24h: samples where the device's hints said
+    /// "skip" but the segment was processed anyway to grade them. A rising `disagree` count
+    /// means the device hints are miscalibrated (or lying) and hint-skips may be losing content.
+    pub audit_agree_recent: i64,
+    pub audit_disagree_recent: i64,
     pub oldest_pending_age_secs: i64,
     pub max_updated_age_secs: i64,
     /// The most recent error rows (newest first, capped) so the dashboard can show *what* failed,
@@ -296,20 +308,28 @@ async fn build_cameras(
 /// `table` is a compile-time constant (one of the two `segment_*_status` tables, never user input),
 /// so wrapping the formatted SQL in `AssertSqlSafe` after this audit is sound.
 async fn queue_stats(pool: &PgPool, table: &str) -> ViewerResult<QueueStats> {
-    let row: (i64, i64, i64, i64, i64, i64) = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        r#"
+    let row: (i64, i64, i64, i64, i64, i64, i64, i64, i64, i64) =
+        sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            r#"
         SELECT
             count(*) FILTER (WHERE status = 'pending')    AS pending,
             count(*) FILTER (WHERE status = 'processing') AS processing,
             count(*) FILTER (WHERE status = 'error')      AS error,
             count(*) FILTER (WHERE status = 'done' AND updated_at > now() - interval '24 hours') AS done_recent,
+            count(*) FILTER (WHERE status = 'skipped' AND updated_at > now() - interval '24 hours') AS skipped_recent,
+            count(*) FILTER (WHERE status = 'skipped' AND skip_reason LIKE '%\_hint'
+                               AND updated_at > now() - interval '24 hours') AS skipped_by_hint_recent,
+            count(*) FILTER (WHERE audit_verdict = 'agree'
+                               AND updated_at > now() - interval '24 hours') AS audit_agree_recent,
+            count(*) FILTER (WHERE audit_verdict = 'disagree'
+                               AND updated_at > now() - interval '24 hours') AS audit_disagree_recent,
             COALESCE(EXTRACT(EPOCH FROM now() - min(updated_at) FILTER (WHERE status = 'pending')), 0)::bigint AS oldest_pending_age_secs,
             COALESCE(EXTRACT(EPOCH FROM now() - max(updated_at)), 0)::bigint AS max_updated_age_secs
         FROM {table}
         "#
-    )))
-    .fetch_one(pool)
-    .await?;
+        )))
+        .fetch_one(pool)
+        .await?;
 
     // Only pay for the detail query when there's something to show.
     let recent_errors = if row.2 > 0 {
@@ -323,8 +343,12 @@ async fn queue_stats(pool: &PgPool, table: &str) -> ViewerResult<QueueStats> {
         processing: row.1,
         error: row.2,
         done_recent: row.3,
-        oldest_pending_age_secs: row.4,
-        max_updated_age_secs: row.5,
+        skipped_recent: row.4,
+        skipped_by_hint_recent: row.5,
+        audit_agree_recent: row.6,
+        audit_disagree_recent: row.7,
+        oldest_pending_age_secs: row.8,
+        max_updated_age_secs: row.9,
         recent_errors,
     })
 }
@@ -645,6 +669,47 @@ mod tests {
         assert_eq!(mine.last_error, "whisper OOM");
         assert_eq!(mine.attempts, 5);
         assert!(mine.age_secs >= 0);
+
+        cleanup(&pool, &device).await;
+    }
+
+    /// `skipped` rows (migration 0022) surface in the 24h skip counters — split by decider —
+    /// and audit verdicts are tallied; none of them leak into pending/error/done.
+    #[tokio::test]
+    async fn queue_stats_counts_skipped_and_audit() {
+        let Some(pool) = pool().await else {
+            eprintln!("skipping queue_stats_counts_skipped_and_audit: DATABASE_URL unset");
+            return;
+        };
+        let device = format!("test-dash-skip-{}", Uuid::now_v7());
+        let ingest_skip = insert_fixture_segment(&pool, &device).await;
+        let worker_skip = insert_fixture_segment(&pool, &device).await;
+        let audited = insert_fixture_segment(&pool, &device).await;
+
+        let before = queue_stats(&pool, "segment_transcription_status").await.unwrap();
+
+        sqlx::query(
+            "INSERT INTO segment_transcription_status (segment_id, status, skip_reason) \
+             VALUES ($1,'skipped','silent_hint')",
+        )
+        .bind(ingest_skip).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO segment_transcription_status (segment_id, status, skip_reason, measured_rms) \
+             VALUES ($1,'skipped','silent_gate',0.002)",
+        )
+        .bind(worker_skip).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO segment_transcription_status (segment_id, status, hint_audit, audit_verdict) \
+             VALUES ($1,'done',true,'disagree')",
+        )
+        .bind(audited).execute(&pool).await.unwrap();
+
+        // `>=`: the live rig (when tests run against it) bumps these concurrently.
+        let after = queue_stats(&pool, "segment_transcription_status").await.unwrap();
+        assert!(after.skipped_recent - before.skipped_recent >= 2);
+        assert!(after.skipped_by_hint_recent - before.skipped_by_hint_recent >= 1);
+        assert!(after.audit_disagree_recent - before.audit_disagree_recent >= 1);
+        assert!(after.done_recent - before.done_recent >= 1, "audited row is real work: done");
 
         cleanup(&pool, &device).await;
     }

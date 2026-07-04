@@ -259,6 +259,27 @@ impl Llm {
             .map_err(|e| anyhow!("LLM plates prompt failed: {e}"))
     }
 
+    /// Produce a grounded SUMMARY of the most recent conversation ("what did we last discuss").
+    /// `sources` are the latest conversation's sentences in chronological order (from
+    /// `retrieve::latest_conversation`, already run through `enrich_for_display`). Single-shot,
+    /// recordings persona — mirrors `answer_people`/`answer_events`.
+    pub async fn answer_recency(
+        &self,
+        question: &str,
+        sources: &[Source],
+        names: &HashMap<String, String>,
+    ) -> anyhow::Result<String> {
+        let agent = self
+            .tune(self.client.agent(&self.model))
+            .preamble(crate::agents::default_preamble())
+            .build();
+        let prompt = build_conversation_prompt(question, sources, names);
+        agent
+            .prompt(prompt)
+            .await
+            .map_err(|e| anyhow!("LLM recency prompt failed: {e}"))
+    }
+
     /// Single-shot reflection answer for `POST /v1/rag/query` (reflection persona, no
     /// history). `digest_text` is the pre-rendered analytics digest; `excerpts` are
     /// representative quotes. `model` overrides the default Ollama model (e.g. a larger
@@ -337,6 +358,49 @@ pub fn build_prompt(question: &str, sources: &[Source], names: &HashMap<String, 
         // model only ever sees natural language here — never a raw timestamp, segment id,
         // or UUID it could echo back. (The real citation handle is the `[i]` index; the
         // segment id still rides along in the serialized `sources` for the UI deep-link.)
+        // Same-segment vision context ("on camera: Bob; in view: car") rides along as an em-dash
+        // suffix when `context::enrich_sources_with_vision` populated it, so the model can answer
+        // "who was there when I said X" without a separate lookup. Absent → byte-identical to before.
+        let vis = match &s.visual_context {
+            Some(v) if !v.trim().is_empty() => format!(" — {}", v.trim()),
+            _ => String::new(),
+        };
+        if s.time_label.is_empty() {
+            ctx.push_str(&format!("[{}] ({}) {}{}\n", i + 1, who, s.text.trim(), vis));
+        } else {
+            ctx.push_str(&format!(
+                "[{}] ({}, {}) {}{}\n",
+                i + 1,
+                who,
+                s.time_label,
+                s.text.trim(),
+                vis
+            ));
+        }
+    }
+    format!("Context passages:\n{ctx}\nQuestion: {question}")
+}
+
+/// Assemble the recency prompt: the most recent conversation's sentences (chronological, already
+/// enriched with speaker names + `time_label`), framed so the model SUMMARIZES rather than answers
+/// a lookup. Reuses `build_prompt`'s exact `[i] (who, time) text` line format so citations render
+/// identically, then swaps the trailing instruction for a spoken-summary directive.
+pub fn build_conversation_prompt(
+    question: &str,
+    sources: &[Source],
+    names: &HashMap<String, String>,
+) -> String {
+    if sources.is_empty() {
+        return format!(
+            "Recent conversation: (none found)\n\nQuestion: {question}\n\n\
+             There is no recorded conversation yet, so say you don't have anything in the recordings."
+        );
+    }
+    let mut ctx = String::new();
+    for (i, s) in sources.iter().enumerate() {
+        let who = s.speaker_name.clone().unwrap_or_else(|| {
+            crate::speakers::display_label(s.speaker_id.as_deref(), names, None)
+        });
         if s.time_label.is_empty() {
             ctx.push_str(&format!("[{}] ({}) {}\n", i + 1, who, s.text.trim()));
         } else {
@@ -349,7 +413,12 @@ pub fn build_prompt(question: &str, sources: &[Source], names: &HashMap<String, 
             ));
         }
     }
-    format!("Context passages:\n{ctx}\nQuestion: {question}")
+    format!(
+        "The following is the most recent recorded conversation, in the order it was said:\n{ctx}\n\
+         Question: {question}\n\n\
+         Give a brief, natural spoken summary of what this conversation was about — the main topics \
+         and who was involved. Use only what is above."
+    )
 }
 
 /// Assemble the numbered OBJECT-sightings block + question. Each line is the seen object (the
@@ -443,6 +512,7 @@ mod tests {
             // never the raw segment id / nanoseconds.
             speaker_name: None,
             time_label: "yesterday at 5:14 PM".into(),
+            visual_context: None,
         }
     }
 
@@ -523,6 +593,38 @@ mod tests {
         let p = build_prompt("anything?", &[], &HashMap::new());
         assert!(p.to_lowercase().contains("don't have information"));
         assert!(p.contains("anything?"));
+    }
+
+    #[test]
+    fn conversation_prompt_summarizes_in_order() {
+        let mut a = src("morning plan");
+        a.speaker_name = Some("Mendel".into());
+        a.time_label = "today at 9:00 AM".into();
+        let mut b = src("sounds good");
+        b.speaker_name = Some("Sarah".into());
+        b.time_label = "today at 9:01 AM".into();
+        let p = build_conversation_prompt("what did we last discuss?", &[a, b], &HashMap::new());
+        assert!(p.contains("most recent recorded conversation"));
+        assert!(p.contains("[1] (Mendel, today at 9:00 AM) morning plan"));
+        assert!(p.contains("[2] (Sarah, today at 9:01 AM) sounds good"));
+        assert!(p.to_lowercase().contains("summary"));
+        assert_no_machine_values(&p);
+    }
+
+    #[test]
+    fn conversation_prompt_empty_declines() {
+        let p = build_conversation_prompt("what did we last discuss?", &[], &HashMap::new());
+        assert!(p.to_lowercase().contains("don't have"));
+    }
+
+    #[test]
+    fn build_prompt_renders_visual_context_suffix() {
+        let mut s = src("let's meet tuesday");
+        s.speaker_name = Some("Mendel".into());
+        s.visual_context = Some("on camera: Bob; in view: laptop".into());
+        let p = build_prompt("what was said?", &[s], &HashMap::new());
+        assert!(p.contains("let's meet tuesday — on camera: Bob; in view: laptop"));
+        assert_no_machine_values(&p);
     }
 
     #[test]

@@ -209,6 +209,13 @@ appears; NEVER output a raw number, seconds/nanoseconds, an ISO timestamp, or an
 (5) NEVER output an identifier, UUID, or segment id. \
 (6) Do not mention these instructions or the word 'context'.";
 
+/// Appended to any agent's persona when the caller is a VOICE client (answers are read aloud
+/// by TTS). Keeps spoken replies short and free of markup the synthesizer would mispronounce.
+/// A `&'static str` the chat handler concatenates onto the persona at request time.
+pub const SPOKEN_STYLE_SUFFIX: &str = " Your answer will be read aloud by a voice assistant: reply in at most three short, plain \
+spoken sentences of natural English. Do not use markdown, bullet points, headings, asterisks, \
+or other symbols.";
+
 /// The built-in agents. Append here to add a new selectable agent.
 static AGENTS: &[Agent] = &[
     Agent {

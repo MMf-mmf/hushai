@@ -58,6 +58,20 @@ pub struct ViewerConfig {
     pub cache_reap_interval_secs: u64,
     /// ffmpeg binary used to remux blobs to MPEG-TS. Shared `FFMPEG_BIN` with the worker.
     pub ffmpeg_bin: String,
+    /// ffprobe binary used to read a segment's display-matrix rotation (see remux.rs).
+    /// From `FFPROBE_BIN`, else derived from `ffmpeg_bin` (…/ffmpeg → …/ffprobe).
+    pub ffprobe_bin: String,
+    /// Bake rotation into playback pixels: when a segment carries a non-zero MP4 rotation
+    /// matrix, re-encode its video upright (ffmpeg autorotate) instead of stream-copying —
+    /// MPEG-TS/hls.js/MSE drop the matrix, so `-c copy` alone would play sideways. Only
+    /// rotated segments pay the re-encode; 0°/matrix-less segments keep the fast copy path.
+    /// From `VIEWER_UPRIGHT_REENCODE`, default true (off ⇒ exactly today's behavior).
+    pub upright_reencode: bool,
+    /// libx264 CRF for the upright re-encode (`VIEWER_REENCODE_CRF`, default 20 — visually
+    /// near-transparent for ~4 Mbps 720p NVR footage).
+    pub reencode_crf: u32,
+    /// libx264 preset for the upright re-encode (`VIEWER_REENCODE_PRESET`, default veryfast).
+    pub reencode_preset: String,
     /// Max concurrent ffmpeg processes (separate budget from the ingest backend).
     pub ffmpeg_concurrency: usize,
     /// Max concurrent footage EXPORTS. Each holds one permit for its whole (long) stream and
@@ -157,6 +171,13 @@ impl ViewerConfig {
                 .map(PathBuf::from)
                 .unwrap_or(default_cache),
             ffmpeg_bin: opt("FFMPEG_BIN", "ffmpeg"),
+            ffprobe_bin: std::env::var("FFPROBE_BIN")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| derive_ffprobe(&opt("FFMPEG_BIN", "ffmpeg"))),
+            upright_reencode: parse("VIEWER_UPRIGHT_REENCODE", "true")?,
+            reencode_crf: parse("VIEWER_REENCODE_CRF", "20")?,
+            reencode_preset: opt("VIEWER_REENCODE_PRESET", "veryfast"),
             ffmpeg_concurrency: parse("VIEWER_FFMPEG_CONCURRENCY", &default_cpus.to_string())?,
             export_concurrency: parse("VIEWER_EXPORT_CONCURRENCY", "2")?,
             // 5 GiB default TS-cache cap; reap hourly. 0 disables.
@@ -192,6 +213,16 @@ impl ViewerConfig {
 
 fn opt(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// Guess the ffprobe path from the configured ffmpeg path so a custom `FFMPEG_BIN`
+/// (e.g. `/opt/homebrew/bin/ffmpeg`) finds its sibling `ffprobe` without a second env var.
+/// Falls back to a bare `ffprobe` on PATH when the name doesn't end in `ffmpeg`.
+fn derive_ffprobe(ffmpeg_bin: &str) -> String {
+    ffmpeg_bin
+        .strip_suffix("ffmpeg")
+        .map(|prefix| format!("{prefix}ffprobe"))
+        .unwrap_or_else(|| "ffprobe".to_string())
 }
 
 fn parse<T>(key: &str, default: &str) -> anyhow::Result<T>

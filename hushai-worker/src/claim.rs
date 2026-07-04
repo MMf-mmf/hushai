@@ -11,6 +11,15 @@
 //!   double-process. A `processing` row whose claim is older than the lease is
 //!   considered crashed and re-leased (crash-safe / resumable).
 //!
+//! Statuses are `pending | processing | done | error | skipped`. `skipped` is a
+//! TERMINAL no-work verdict (static video / silent audio) written either by the
+//! backend's ingest hint gate (`skip_reason='silent_hint'/'static_hint'`) or by the
+//! worker's own backstop gates (`'silent_gate'/'static_gate'`). It is deliberately
+//! absent from every claimable set here AND from `reconcile_missing_speaker_segments`
+//! (which matches `done` only), so skipped rows are never claimed and never
+//! resurrected on restart. Re-evaluation after a calibration change is an explicit
+//! operator action: flip `skipped` rows back to `pending` (see AGENTS.md).
+//!
 //! Only AUDIO (`media_type=1`) and MUXED (`media_type=3`) segments are ever
 //! processed here — this worker has no video pipeline, and feeding a VIDEO-only
 //! blob to ffmpeg audio extraction just fails ("Output file does not contain any
@@ -24,7 +33,8 @@ use uuid::Uuid;
 /// Returns the number of newly-tracked segments. VIDEO-only segments are skipped (no
 /// audio to transcribe or embed).
 pub async fn ensure_status_rows(pool: &PgPool) -> sqlx::Result<u64> {
-    let res = sqlx::query(
+    execute_backfill_with_retry(
+        pool,
         r#"
         INSERT INTO segment_transcription_status (segment_id)
         SELECT segment_id FROM segments
@@ -32,9 +42,27 @@ pub async fn ensure_status_rows(pool: &PgPool) -> sqlx::Result<u64> {
         ON CONFLICT (segment_id) DO NOTHING
         "#,
     )
-    .execute(pool)
-    .await?;
-    Ok(res.rows_affected())
+    .await
+}
+
+/// Run a backfill `INSERT … SELECT` with a bounded retry on FK violations (23503).
+/// The SELECT reads the statement snapshot while the FK check runs against current data,
+/// so a segment deleted mid-statement (footage/device delete, retention) raises 23503 even
+/// though the statement is "atomic". A retry re-snapshots without the vanished row; deletes
+/// are rare + bounded, so this converges — and worker STARTUP depends on it not failing
+/// spuriously (`run()` aborts on a backfill error).
+async fn execute_backfill_with_retry(pool: &PgPool, sql: &'static str) -> sqlx::Result<u64> {
+    let mut last_err: Option<sqlx::Error> = None;
+    for _ in 0..3 {
+        match sqlx::query(sql).execute(pool).await {
+            Ok(res) => return Ok(res.rows_affected()),
+            Err(sqlx::Error::Database(db)) if db.code().as_deref() == Some("23503") => {
+                last_err = Some(sqlx::Error::Database(db));
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Err(last_err.expect("loop ran"))
 }
 
 /// Re-queue every AUDIO/MUXED segment that is `done` but has no `speaker_segments`
@@ -89,15 +117,17 @@ pub async fn clear_reject_tombstones(pool: &PgPool) -> sqlx::Result<u64> {
     Ok(res.rows_affected())
 }
 
-/// Atomically claim the oldest processable segment, returning its id, or `None`
-/// when nothing is claimable. Re-leases crashed `processing` claims older than
-/// `lease_secs`. `max_attempts` caps retries of `error` rows.
+/// Atomically claim the oldest processable segment, returning its id plus its
+/// `hint_audit` flag (true = the ingest hint gate would have skipped this segment but
+/// enqueued it as an audit sample; the pipeline records agree/disagree after its own
+/// gate runs), or `None` when nothing is claimable. Re-leases crashed `processing`
+/// claims older than `lease_secs`. `max_attempts` caps retries of `error` rows.
 pub async fn claim_one(
     pool: &PgPool,
     max_attempts: i32,
     lease_secs: f64,
-) -> sqlx::Result<Option<Uuid>> {
-    let row: Option<(Uuid,)> = sqlx::query_as(
+) -> sqlx::Result<Option<(Uuid, bool)>> {
+    let row: Option<(Uuid, bool)> = sqlx::query_as(
         r#"
         WITH next AS (
             SELECT s.segment_id
@@ -118,14 +148,42 @@ pub async fn claim_one(
                updated_at = now()
           FROM next
          WHERE t.segment_id = next.segment_id
-        RETURNING t.segment_id
+        RETURNING t.segment_id, t.hint_audit
         "#,
     )
     .bind(max_attempts)
     .bind(lease_secs)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|r| r.0))
+    Ok(row)
+}
+
+/// Persist the audio gate's measured inputs (calibration telemetry) and, for audit rows,
+/// the hint-vs-gate verdict, onto an already-terminal status row. Best-effort side channel:
+/// runs OUTSIDE the transcript tx (a crash between the two loses telemetry, never data).
+pub async fn record_audio_gate_telemetry(
+    pool: &PgPool,
+    segment_id: Uuid,
+    measured_rms: Option<f32>,
+    measured_speech_secs: Option<f32>,
+    audit_verdict: Option<&str>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE segment_transcription_status
+           SET measured_rms         = COALESCE($2, measured_rms),
+               measured_speech_secs = COALESCE($3, measured_speech_secs),
+               audit_verdict        = COALESCE($4, audit_verdict)
+         WHERE segment_id = $1
+        "#,
+    )
+    .bind(segment_id)
+    .bind(measured_rms)
+    .bind(measured_speech_secs)
+    .bind(audit_verdict)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 // ---- Vision work queue (segment_vision_status) ----
@@ -135,7 +193,8 @@ pub async fn claim_one(
 
 /// Insert a `pending` vision-status row for every VIDEO/MUXED segment without one. Idempotent.
 pub async fn ensure_vision_status_rows(pool: &PgPool) -> sqlx::Result<u64> {
-    let res = sqlx::query(
+    execute_backfill_with_retry(
+        pool,
         r#"
         INSERT INTO segment_vision_status (segment_id)
         SELECT segment_id FROM segments
@@ -143,19 +202,18 @@ pub async fn ensure_vision_status_rows(pool: &PgPool) -> sqlx::Result<u64> {
         ON CONFLICT (segment_id) DO NOTHING
         "#,
     )
-    .execute(pool)
-    .await?;
-    Ok(res.rows_affected())
+    .await
 }
 
-/// Atomically claim the oldest processable VIDEO/MUXED segment for the vision pipeline, or `None`.
+/// Atomically claim the oldest processable VIDEO/MUXED segment for the vision pipeline
+/// (returning its id + `hint_audit` flag, see [`claim_one`]), or `None`.
 /// Same `FOR UPDATE SKIP LOCKED` lease + crash re-lease semantics as [`claim_one`].
 pub async fn claim_one_vision(
     pool: &PgPool,
     max_attempts: i32,
     lease_secs: f64,
-) -> sqlx::Result<Option<Uuid>> {
-    let row: Option<(Uuid,)> = sqlx::query_as(
+) -> sqlx::Result<Option<(Uuid, bool)>> {
+    let row: Option<(Uuid, bool)> = sqlx::query_as(
         r#"
         WITH next AS (
             SELECT s.segment_id
@@ -176,22 +234,69 @@ pub async fn claim_one_vision(
                updated_at = now()
           FROM next
          WHERE t.segment_id = next.segment_id
-        RETURNING t.segment_id
+        RETURNING t.segment_id, t.hint_audit
         "#,
     )
     .bind(max_attempts)
     .bind(lease_secs)
     .fetch_optional(pool)
     .await?;
-    Ok(row.map(|r| r.0))
+    Ok(row)
 }
 
-/// Mark a vision segment `done`.
-pub async fn mark_vision_done(pool: &PgPool, segment_id: Uuid) -> sqlx::Result<()> {
+/// Mark a vision segment `done`, persisting the motion gate's measured distance (calibration
+/// telemetry; `None` when the gate didn't run or had no baseline) and, for audit rows, the
+/// hint-vs-gate verdict.
+pub async fn mark_vision_done(
+    pool: &PgPool,
+    segment_id: Uuid,
+    measured_motion_distance: Option<f32>,
+    audit_verdict: Option<&str>,
+) -> sqlx::Result<()> {
     sqlx::query(
-        "UPDATE segment_vision_status SET status = 'done', updated_at = now() WHERE segment_id = $1",
+        r#"
+        UPDATE segment_vision_status
+           SET status = 'done',
+               measured_motion_distance = COALESCE($2, measured_motion_distance),
+               audit_verdict            = COALESCE($3, audit_verdict),
+               updated_at = now()
+         WHERE segment_id = $1
+        "#,
     )
     .bind(segment_id)
+    .bind(measured_motion_distance)
+    .bind(audit_verdict)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Terminal `skipped` mark for the vision lane: the motion gate decided the scene is static, so
+/// no inference ran and no rows were written. Never re-claimed (see module docs); flip back to
+/// `pending` manually to re-evaluate after a calibration change.
+pub async fn mark_vision_skipped(
+    pool: &PgPool,
+    segment_id: Uuid,
+    reason: &str,
+    measured_motion_distance: Option<f32>,
+    audit_verdict: Option<&str>,
+) -> sqlx::Result<()> {
+    sqlx::query(
+        r#"
+        UPDATE segment_vision_status
+           SET status = 'skipped',
+               skip_reason = $2,
+               last_error  = NULL,
+               measured_motion_distance = COALESCE($3, measured_motion_distance),
+               audit_verdict            = COALESCE($4, audit_verdict),
+               updated_at = now()
+         WHERE segment_id = $1
+        "#,
+    )
+    .bind(segment_id)
+    .bind(reason)
+    .bind(measured_motion_distance)
+    .bind(audit_verdict)
     .execute(pool)
     .await?;
     Ok(())

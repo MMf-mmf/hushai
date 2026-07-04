@@ -37,6 +37,18 @@
           "mendel"
         ],
         "reference_answer": "You're searching across all cameras, so I'm not sure which video you mean. Pick a camera and ask again."
+      },
+      {
+        "ask": "What did we last discuss?",
+        "filters": {
+          "device_id": "eval-clip-roster"
+        },
+        "expect_routed_agent": "recordings",
+        "must_not_contain": [
+          "don't have"
+        ],
+        "min_citations": 1,
+        "reference_answer": "Your most recent conversation was about reaching the moon and the planets beyond."
       }
     ]
   }

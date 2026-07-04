@@ -26,6 +26,25 @@ pub async fn resolve_name(pool: &PgPool, name: &str) -> anyhow::Result<Vec<Uuid>
         .collect())
 }
 
+/// The owner-marked face (0023, "This is me"): `(person_id, display_name)` of the single
+/// `is_owner` row, or `None` when nobody is marked. Mirror of `speakers::owner`; consulted
+/// by `resolve_owner_person` between request filters and the OWNER_PERSON_* env fallback.
+pub async fn owner(pool: &PgPool) -> anyhow::Result<Option<(Uuid, Option<String>)>> {
+    let row = sqlx::query(
+        "SELECT person_id, display_name FROM persons \
+         WHERE is_owner AND archived_at IS NULL LIMIT 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.map(|r| {
+        (
+            r.get::<Uuid, _>("person_id"),
+            r.try_get::<Option<String>, _>("display_name")
+                .unwrap_or(None),
+        )
+    }))
+}
+
 /// Resolve named persons whose display name appears as a substring of free-text `query`
 /// ("when did I see Bob" with no explicit filter). Case-insensitive; only names of length >= 2 so a
 /// 1-char name can't match everything. Returns the union of matching ids (empty if none mentioned).

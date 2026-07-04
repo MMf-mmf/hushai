@@ -680,6 +680,7 @@ async fn fetch_excerpts(
             speaker_id: r.try_get::<Option<String>, _>("speaker_id")?,
             speaker_name: None,
             time_label: String::new(),
+            visual_context: None,
         });
     }
     Ok(out)
@@ -1158,6 +1159,7 @@ mod tests {
                 speaker_id: None,
                 speaker_name: None,
                 time_label: String::new(),
+                visual_context: None,
             }],
             limits: LIMITS,
         };

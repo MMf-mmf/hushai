@@ -191,7 +191,27 @@ ffmpeg -i <blob> -map 0:a:0 -c:a copy \
 # Muxed fMP4 segment: prepend codec_init_data (ftyp+moov) to the bare fragment first, then:
 ffmpeg -i <tmp> -map 0 -c copy -bsf:v h264_mp4toannexb \
        -muxdelay 0 -muxpreload 0 -output_ts_offset <capture_start_s> -f mpegts out.ts
+
+# Upright re-encode (only when the source carries a rotation matrix — see below):
+# swap `-c:v copy -bsf:v h264_mp4toannexb` for a libx264 re-encode so ffmpeg autorotate
+# BAKES the rotation into the pixels (audio still `-c:a copy` for the muxed case).
+ffmpeg -i <blob> -map 0:v:0 -c:v libx264 -preset veryfast -crf 20 -pix_fmt yuv420p \
+       -muxdelay 0 -muxpreload 0 -output_ts_offset <capture_start_s> -f mpegts out.ts
 ```
+
+> **Why rotated capture is re-encoded (upright playback).** Android stamps an MP4 rotation
+> matrix (`MediaMuxer.setOrientationHint`) so portrait/rotated capture is meant to display
+> upright — and ffmpeg autorotate honors it for the vision worker + face/plate JPEG frames.
+> But a `-c copy` remux to MPEG-TS **drops the matrix** (TS can't carry it) and hls.js/MSE
+> ignore container rotation anyway, so the browser would play sideways. So `remux.rs` first
+> `ffprobe`s the video's display-matrix rotation (`stream_side_data_list` — the ffmpeg-7.x
+> location; legacy `tags.rotate` is empty there); when non-zero it re-encodes the video with
+> libx264 (autorotate default-on → **no** `-vf transpose`/`-noautorotate`, and drop the
+> `h264_mp4toannexb` bsf), baking upright pixels (720×1280 for a 90° source). 0°/matrix-less
+> segments keep the fast copy path. This also fixes detection-overlay alignment on rotated
+> footage, generalizes to any matrix-bearing source (iOS/fMP4), and covers already-recorded
+> footage. Toggle with `VIEWER_UPRIGHT_REENCODE=false`. **Purge `cache/ts/` once on deploy** so
+> any previously-cached sideways TS regenerates upright.
 
 > **Why `-output_ts_offset <capture_start_s>` matters (the one non-obvious detail).** Each segment
 > is remuxed independently, so each TS would otherwise restart its PTS at 0. Serving separate video +
@@ -215,6 +235,10 @@ Viewer-specific knobs (all optional, with defaults):
 | `VIEWER_UI_DIR` | `hushai-viewer/ui` | Directory of the static UI (relative to CWD). |
 | `VIEWER_CACHE_DIR` | `{BLOB_DIR}/viewer-cache` | Where remuxed `.ts` segments are cached. |
 | `FFMPEG_BIN` | `ffmpeg` | ffmpeg binary (shared with the worker). |
+| `FFPROBE_BIN` | _(derived from `FFMPEG_BIN`)_ | ffprobe binary used to read a segment's rotation. Defaults to the `ffprobe` sibling of `FFMPEG_BIN`. |
+| `VIEWER_UPRIGHT_REENCODE` | `true` | Re-encode rotated segments upright (bake pixels) so HLS/MSE playback isn't sideways. `false` ⇒ stream-copy everything (today's behavior). |
+| `VIEWER_REENCODE_CRF` | `20` | libx264 CRF for the upright re-encode (lower = higher quality). |
+| `VIEWER_REENCODE_PRESET` | `veryfast` | libx264 preset for the upright re-encode. |
 | `VIEWER_FFMPEG_CONCURRENCY` | # CPUs | Max concurrent ffmpeg remuxes. |
 | `VIEWER_DEFAULT_WINDOW_NANOS` | `3600000000000` (1h) | Default window when the client omits `from`/`to`. |
 | `VIEWER_MAX_WINDOW_NANOS` | `21600000000000` (6h) | Hard cap on a *playable* window so a playlist can't blow up. |

@@ -33,6 +33,14 @@ class VideoEncoder(
     // Returns the current upright-rotation hint (0/90/180/270) for the NEXT segment, sampled at each
     // ~2s boundary so rotating the phone mid-capture self-corrects. Default 0 = no rotation.
     private val rotationProvider: () -> Int = { 0 },
+    // Stamp the sampled rotation into the MP4 rotation matrix (setOrientationHint). True for the
+    // default path (metadata rotation). FALSE when a GL pass already baked upright PIXELS
+    // (GlVideoPipeline) — the matrix must then be 0 so downstream doesn't double-rotate.
+    private val stampMatrix: Boolean = true,
+    // Returns-and-resets the max motion score observed since the last call (MotionHintAnalyzer.take),
+    // sampled at each segment finalize -> the segment's `hint.motion_score` manifest attr.
+    // Default/null = no analysis stream -> no motion hint (backend fails open to full processing).
+    private val motionScoreProvider: () -> Float? = { null },
 ) {
     private val codec = MediaCodec.createEncoderByType(MIME)
     val inputSurface: Surface
@@ -144,8 +152,9 @@ class VideoEncoder(
     private fun openSegment(format: MediaFormat, startPtsUs: Long) {
         val file = File(segmentDir, "video-${fileCounter++}.mp4")
         // Sample the device orientation now so this segment records upright for the phone's CURRENT
-        // pose (a mid-capture rotation self-corrects on the next segment).
-        val rotation = runCatching { rotationProvider() }.getOrDefault(0)
+        // pose (a mid-capture rotation self-corrects on the next segment). When a GL pass already
+        // baked upright pixels, stamp 0 instead so the matrix doesn't re-apply the rotation.
+        val rotation = if (stampMatrix) runCatching { rotationProvider() }.getOrDefault(0) else 0
         val muxer = SegmentMuxer(
             file, STREAM_ID, MediaType.VIDEO.value, "h264", format, csd,
             orientationHintDegrees = rotation,
@@ -159,13 +168,28 @@ class VideoEncoder(
     private fun finalizeCurrent() {
         val muxer = current ?: return
         current = null
+        // Sample (and reset) the analyzer's window even when the segment aborts, so a
+        // discarded window never leaks into the next segment's score.
+        val attrs = motionHintAttrs()
         if (!muxer.hasSamples()) {
             muxer.abort()
             return
         }
         runCatching {
-            onSegment(muxer.finish(sequencer.getAndIncrement()))
+            onSegment(muxer.finish(sequencer.getAndIncrement()).copy(attrs = attrs))
         }.onFailure { HushaiLog.error("video segment finalize failed", it) }
+    }
+
+    /** The segment's content-hint attrs; empty when no motion measurement exists (fail open). */
+    private fun motionHintAttrs(): Map<String, String> {
+        val score = runCatching { motionScoreProvider() }.getOrNull() ?: return emptyMap()
+        // Locale.ROOT is load-bearing: a comma decimal separator would read as malformed
+        // server-side and (correctly) fail open.
+        return mapOf(
+            "hint.v" to "1",
+            "hint.motion_score" to String.format(java.util.Locale.ROOT, "%.4f", score),
+            "hint.motion_fp_side" to MotionHintAnalyzer.FP_SIDE.toString(),
+        )
     }
 
     /** Nudge an IDR slightly before the boundary so the cut lands near ~2s. */

@@ -130,10 +130,18 @@ async fn run_case(
         }
         // `settled` only means "terminal for polling" — a segment that exhausted its retries counts
         // as settled but NOT done, and lands in `poll.errors`. Never SCORE a run with permanently-
-        // errored segments (or a done-count below injected): surviving segments might happen to cover
-        // the ground-truth windows and mask real pipeline breakage — exactly what inconclusive/exit-2
-        // exists to surface. Fail closed to inconclusive.
-        let fully_done = poll.audio_done.max(poll.vision_done) >= poll.injected as i64;
+        // errored segments (or a completion count below injected): surviving segments might happen to
+        // cover the ground-truth windows and mask real pipeline breakage — exactly what inconclusive/
+        // exit-2 exists to surface. Fail closed to inconclusive.
+        //
+        // `skipped` (migration 0022: silent-audio / static-video content gates) counts as SUCCESSFUL
+        // completion here: the pipeline finished and decided there was nothing to infer — for a silent
+        // fixture that IS the correct outcome (e.g. `silence_no_speech` must skip everything and mint 0
+        // speakers). If a skip is ever wrong, the fixture's own metric assertions catch it (a skipped
+        // segment produces no transcript/detections), which is a scoreable FAIL, not infrastructure.
+        let audio_complete = poll.audio_done + poll.audio_skipped;
+        let vision_complete = poll.vision_done + poll.vision_skipped;
+        let fully_done = audio_complete.max(vision_complete) >= poll.injected as i64;
         if !fully_done || !poll.errors.is_empty() {
             return Ok(CaseResult::inconclusive(
                 cid,
@@ -141,15 +149,18 @@ async fn run_case(
                 tier,
                 format!(
                     "processing not fully successful ({}) (would mask real breakage if scored): \
-                     audio_done={} vision_done={} injected={} errors={:?}",
-                    ri.label, poll.audio_done, poll.vision_done, poll.injected, poll.errors
+                     audio_done={} (+{} skipped) vision_done={} (+{} skipped) injected={} errors={:?}",
+                    ri.label, poll.audio_done, poll.audio_skipped, poll.vision_done,
+                    poll.vision_skipped, poll.injected, poll.errors
                 ),
             ));
         }
 
         injected_total += poll.injected;
-        audio_done_total += poll.audio_done;
-        vision_done_total += poll.vision_done;
+        // Completion totals include content-gate skips (successful "nothing to infer" verdicts),
+        // so the report's processed/injected reads complete for silent/static fixtures.
+        audio_done_total += poll.audio_done + poll.audio_skipped;
+        vision_done_total += poll.vision_done + poll.vision_skipped;
         all_ids.extend(ids);
         devices.insert(ri.device_id.clone());
         win_lo = win_lo.min(ri.base_ns);

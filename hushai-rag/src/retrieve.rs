@@ -33,6 +33,28 @@ pub struct Source {
     /// all show the same phrasing. Empty for citations persisted before this field.
     #[serde(default)]
     pub time_label: String,
+    /// Cross-modal, same-segment vision context ("on camera: Bob; in view: car, backpack"),
+    /// populated by `context::enrich_sources_with_vision` for transcript passages. `None` when
+    /// enrichment is off / the segment had no vision detections / for non-transcript sources.
+    /// `serde(default)` keeps citations persisted before this field (chat_messages.sources) readable.
+    #[serde(default)]
+    pub visual_context: Option<String>,
+}
+
+impl Default for Source {
+    fn default() -> Self {
+        Self {
+            segment_id: Uuid::nil(),
+            device_id: String::new(),
+            text: String::new(),
+            start_unix_nanos: 0,
+            distance: 0.0,
+            speaker_id: None,
+            speaker_name: None,
+            time_label: String::new(),
+            visual_context: None,
+        }
+    }
 }
 
 /// Optional narrowing of the search space.
@@ -162,6 +184,7 @@ pub async fn nearest(
             speaker_id: row.try_get::<Option<String>, _>("speaker_id")?,
             speaker_name: None,
             time_label: String::new(),
+            visual_context: None,
         });
     }
     Ok(sources)
@@ -251,6 +274,7 @@ pub async fn list_by_speaker(
             speaker_id: row.try_get::<Option<String>, _>("speaker_id")?,
             speaker_name: None,
             time_label: String::new(),
+            visual_context: None,
         });
     }
     Ok(sources)
@@ -300,6 +324,7 @@ pub async fn list_speakers_in_window(
             speaker_id: row.try_get::<Option<String>, _>("speaker_id")?,
             speaker_name: None,
             time_label: String::new(),
+            visual_context: None,
         });
     }
     sources.sort_by_key(|s| s.start_unix_nanos);
@@ -327,6 +352,151 @@ pub async fn window_has_footage(
     qb.push(")");
     let exists: bool = qb.build_query_scalar().fetch_one(pool).await?;
     Ok(exists)
+}
+
+/// One sentence row for the recency backscan (carries `end` for the gap boundary, which `Source`
+/// doesn't). Internal to [`latest_conversation`] / [`take_latest_conversation`].
+#[derive(Debug, Clone)]
+pub struct ConvoSentence {
+    pub segment_id: Uuid,
+    pub device_id: String,
+    pub text: String,
+    pub start_unix_nanos: i64,
+    pub end_unix_nanos: i64,
+    pub speaker_id: Option<String>,
+}
+
+/// The most recent recorded CONVERSATION, chronologically — the "what did we last discuss" path.
+/// Semantic top-k is wrong for a recency question (it returns keyword-similar 2s snippets from
+/// anywhere in the archive); this instead ANCHORS on the newest transcript sentence (within the
+/// optional device / time-window filters), scans back over that device's timeline, and keeps the
+/// trailing run of sentences with no silence gap longer than `gap_nanos` — the same conversation
+/// boundary rule as `analytics::fetch_convos`. Bounded by `max_sentences` / `max_chars` so the
+/// spoken summary and the small-model context stay small. `distance` is 0.0 (survives the caller's
+/// threshold retain). Empty when nothing was recorded in scope.
+///
+/// When a time window is given (`after`/`before` from `timeparse`), the anchor is the newest
+/// sentence INSIDE it, so "what did we discuss yesterday" summarizes yesterday's last conversation.
+#[allow(clippy::too_many_arguments)]
+pub async fn latest_conversation(
+    pool: &PgPool,
+    device_id: Option<&str>,
+    after: Option<i64>,
+    before: Option<i64>,
+    gap_nanos: i64,
+    scan_limit: i64,
+    max_sentences: usize,
+    max_chars: usize,
+) -> anyhow::Result<Vec<Source>> {
+    // 1. Anchor: the newest sentence with text, honoring the caller's filters. Its device pins the
+    //    timeline (a conversation lives on one device); its start caps the backscan.
+    let mut anchor_qb: QueryBuilder<Postgres> = QueryBuilder::new(
+        "SELECT device_id, start_unix_nanos FROM transcript_sentences \
+         WHERE text IS NOT NULL",
+    );
+    if let Some(d) = device_id {
+        anchor_qb.push(" AND device_id = ").push_bind(d.to_string());
+    }
+    if let Some(a) = after {
+        anchor_qb.push(" AND start_unix_nanos >= ").push_bind(a);
+    }
+    if let Some(b) = before {
+        anchor_qb.push(" AND start_unix_nanos < ").push_bind(b);
+    }
+    anchor_qb.push(" ORDER BY start_unix_nanos DESC LIMIT 1");
+    let Some(anchor) = anchor_qb.build().fetch_optional(pool).await? else {
+        return Ok(vec![]);
+    };
+    let anchor_device: String = anchor
+        .try_get::<Option<String>, _>("device_id")?
+        .unwrap_or_default();
+    let anchor_start: i64 = anchor.try_get("start_unix_nanos")?;
+
+    // 2. Backscan that device's timeline at/before the anchor (respect an explicit `after` floor),
+    //    newest first, capped at scan_limit rows.
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
+        "SELECT segment_id, device_id, text, start_unix_nanos, end_unix_nanos, speaker_id \
+         FROM transcript_sentences \
+         WHERE text IS NOT NULL AND device_id = ",
+    );
+    qb.push_bind(anchor_device);
+    qb.push(" AND start_unix_nanos <= ").push_bind(anchor_start);
+    if let Some(a) = after {
+        qb.push(" AND start_unix_nanos >= ").push_bind(a);
+    }
+    qb.push(" ORDER BY start_unix_nanos DESC LIMIT ")
+        .push_bind(scan_limit.max(1));
+
+    let rows = qb.build().fetch_all(pool).await?;
+    let desc: Vec<ConvoSentence> = rows
+        .into_iter()
+        .map(|row| {
+            Ok::<_, sqlx::Error>(ConvoSentence {
+                segment_id: row.try_get("segment_id")?,
+                device_id: row
+                    .try_get::<Option<String>, _>("device_id")?
+                    .unwrap_or_default(),
+                text: row.try_get::<Option<String>, _>("text")?.unwrap_or_default(),
+                start_unix_nanos: row.try_get("start_unix_nanos")?,
+                end_unix_nanos: row
+                    .try_get::<Option<i64>, _>("end_unix_nanos")?
+                    .unwrap_or_else(|| row.try_get("start_unix_nanos").unwrap_or(0)),
+                speaker_id: row.try_get::<Option<String>, _>("speaker_id")?,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
+    Ok(take_latest_conversation(&desc, gap_nanos, max_sentences, max_chars))
+}
+
+/// Pure core of [`latest_conversation`]: given sentences in DESC start order, keep the trailing
+/// contiguous conversation (walking back until a silence gap > `gap_nanos`), bounded by
+/// `max_sentences` and cumulative `max_chars`, then return them chronologically as `Source`s.
+/// Split out so the gap/cap logic is unit-testable without a database.
+pub fn take_latest_conversation(
+    desc: &[ConvoSentence],
+    gap_nanos: i64,
+    max_sentences: usize,
+    max_chars: usize,
+) -> Vec<Source> {
+    let mut kept: Vec<&ConvoSentence> = Vec::new();
+    let mut chars = 0usize;
+    let mut prev_start: Option<i64> = None; // the newer (already-kept) sentence's start
+    for s in desc {
+        if let Some(newer_start) = prev_start {
+            // Silence between this (older) sentence's end and the newer sentence's start.
+            let gap = newer_start - s.end_unix_nanos;
+            if gap > gap_nanos {
+                break; // conversation boundary — everything older belongs to a prior convo
+            }
+        }
+        if kept.len() >= max_sentences {
+            break;
+        }
+        let add = s.text.trim().chars().count();
+        // Always keep at least the anchor sentence, even if it alone exceeds max_chars.
+        if !kept.is_empty() && chars + add > max_chars {
+            break;
+        }
+        chars += add;
+        kept.push(s);
+        prev_start = Some(s.start_unix_nanos);
+    }
+    // Kept is newest→oldest; emit chronological.
+    kept.reverse();
+    kept.into_iter()
+        .map(|s| Source {
+            segment_id: s.segment_id,
+            device_id: s.device_id.clone(),
+            text: s.text.clone(),
+            start_unix_nanos: s.start_unix_nanos,
+            distance: 0.0,
+            speaker_id: s.speaker_id.clone(),
+            speaker_name: None,
+            time_label: String::new(),
+            visual_context: None,
+        })
+        .collect()
 }
 
 /// Open-vocabulary OBJECT retrieval (Phase B query side): the `top_k` nearest `scene_objects` rows
@@ -413,6 +583,7 @@ pub async fn nearest_objects(
             speaker_id: None,
             speaker_name: None,
             time_label: String::new(),
+            visual_context: None,
         });
         if sources.len() as i64 >= top_k {
             break;
@@ -469,6 +640,7 @@ pub async fn list_by_object_class(
             speaker_id: None,
             speaker_name: None,
             time_label: String::new(),
+            visual_context: None,
         });
     }
     sources.sort_by_key(|s| s.start_unix_nanos);
@@ -571,6 +743,7 @@ pub async fn list_by_plate(
             speaker_id: Some(plate_id.to_string()),
             speaker_name: None,
             time_label: String::new(),
+            visual_context: None,
         });
     }
     sources.sort_by_key(|s| s.start_unix_nanos);
@@ -644,6 +817,7 @@ pub async fn list_co_occurring_persons(
             speaker_id: Some(person_id.to_string()),
             speaker_name: None,
             time_label: String::new(),
+            visual_context: None,
         });
     }
     Ok(sources)
@@ -695,6 +869,7 @@ pub async fn list_recent_persons(
             speaker_id: Some(person_id.to_string()),
             speaker_name: None,
             time_label: String::new(),
+            visual_context: None,
         });
     }
     Ok(sources)
@@ -808,6 +983,7 @@ pub async fn list_events(
             speaker_id: None,
             speaker_name: None,
             time_label: String::new(),
+            visual_context: None,
         });
     }
     Ok(sources)
@@ -830,7 +1006,82 @@ fn person_rows_to_sources(rows: Vec<sqlx::postgres::PgRow>) -> anyhow::Result<Ve
             speaker_id: Some(person_id.to_string()),
             speaker_name: None,
             time_label: String::new(),
+            visual_context: None,
         });
     }
     Ok(sources)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A sentence at [start, start+dur) with the given text (1s = 1e9 ns).
+    fn sent(start_secs: i64, dur_secs: i64, text: &str) -> ConvoSentence {
+        ConvoSentence {
+            segment_id: Uuid::now_v7(),
+            device_id: "cam-A".into(),
+            text: text.into(),
+            start_unix_nanos: start_secs * 1_000_000_000,
+            end_unix_nanos: (start_secs + dur_secs) * 1_000_000_000,
+            speaker_id: None,
+        }
+    }
+
+    const GAP: i64 = 300 * 1_000_000_000; // 5 min, the default conversation gap
+
+    #[test]
+    fn keeps_single_contiguous_conversation_in_chronological_order() {
+        // Three sentences 2s apart (well within GAP) — one conversation. Input is DESC.
+        let desc = vec![sent(100, 2, "third"), sent(96, 2, "second"), sent(92, 2, "first")];
+        let out = take_latest_conversation(&desc, GAP, 40, 4000);
+        let texts: Vec<&str> = out.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["first", "second", "third"], "chronological");
+        assert!(out.iter().all(|s| s.distance == 0.0));
+    }
+
+    #[test]
+    fn stops_at_a_silence_gap_larger_than_threshold() {
+        // Newest two are one convo; the third is 10 min earlier (a prior conversation).
+        let desc = vec![
+            sent(1000, 2, "latest"),
+            sent(996, 2, "latest-1"),
+            sent(300, 2, "old-convo"), // gap 996s-ish >> 5 min
+        ];
+        let out = take_latest_conversation(&desc, GAP, 40, 4000);
+        let texts: Vec<&str> = out.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["latest-1", "latest"], "only the trailing conversation");
+    }
+
+    #[test]
+    fn caps_by_sentence_count() {
+        let desc: Vec<ConvoSentence> = (0..10)
+            .rev()
+            .map(|i| sent(1000 + i * 2, 2, "x"))
+            .collect(); // 10 contiguous, DESC
+        let out = take_latest_conversation(&desc, GAP, 3, 4000);
+        assert_eq!(out.len(), 3, "sentence cap honored");
+    }
+
+    #[test]
+    fn caps_by_chars_but_always_keeps_the_anchor() {
+        // Each sentence is 10 chars; max_chars 15 keeps only the anchor (adding a 2nd would hit 20).
+        let desc = vec![
+            sent(100, 2, "0123456789"),
+            sent(96, 2, "abcdefghij"),
+        ];
+        let out = take_latest_conversation(&desc, GAP, 40, 15);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].text, "0123456789", "the anchor (newest) survives the char cap");
+
+        // A single oversized anchor is still kept (never return empty when data exists).
+        let big = vec![sent(100, 2, &"z".repeat(100))];
+        let out = take_latest_conversation(&big, GAP, 40, 15);
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn empty_input_yields_empty() {
+        assert!(take_latest_conversation(&[], GAP, 40, 4000).is_empty());
+    }
 }

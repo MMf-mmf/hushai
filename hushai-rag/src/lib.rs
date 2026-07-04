@@ -11,6 +11,7 @@ pub mod analytics;
 pub mod chat;
 pub mod clip_text;
 pub mod config;
+pub mod context;
 pub mod embed;
 pub mod humanize;
 pub mod llm;
@@ -21,6 +22,7 @@ pub mod retrieve;
 pub mod routes;
 pub mod speakers;
 pub mod state;
+pub mod timeparse;
 pub mod tts;
 
 use std::sync::Arc;

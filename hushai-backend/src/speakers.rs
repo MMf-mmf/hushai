@@ -5,6 +5,8 @@
 //! `POST /v1/speakers/{id}/merge`     — merge two ids for the same person
 //! `POST /v1/speakers/{id}/archive`   — disregard (display-level; matcher still attributes)
 //! `POST /v1/speakers/{id}/unarchive` — restore from the Archived section
+//! `POST /v1/speakers/{id}/owner`     — mark this voice as the device owner ("This is me")
+//! `POST /v1/speakers/{id}/unowner`   — clear the owner mark
 //! `GET /v1/speakers/{id}/sample-audio` — a representative segment's audio (ID a voice by ear)
 //!
 //! These use RUNTIME sqlx (`query`/`query_as`/`query_scalar` + `.bind`/`try_get`), NOT the
@@ -44,6 +46,9 @@ pub struct SpeakerSummary {
     /// Disregarded by the operator (0021). Display-level only: clients tuck archived entries
     /// into a collapsed "Archived" section; matching/RAG/watchlist behavior is unchanged.
     pub archived: bool,
+    /// The device owner's voice (0023, "This is me"). At most one speaker carries this;
+    /// hushai-rag's owner resolution consults it before the OWNER_SPEAKER_* env fallback.
+    pub is_owner: bool,
 }
 
 /// `GET /v1/speakers` — the global (cross-device) catalog with up to 3 sample utterances
@@ -57,6 +62,7 @@ pub async fn list_speakers(
                s.display_name,
                s.n_samples,
                s.archived_at IS NOT NULL AS archived,
+               s.is_owner,
                COALESCE(samp.utts, ARRAY[]::text[]) AS sample_utterances
         FROM speakers s
         LEFT JOIN LATERAL (
@@ -88,6 +94,7 @@ pub async fn list_speakers(
                 .try_get::<Vec<String>, _>("sample_utterances")
                 .unwrap_or_default(),
             archived: r.try_get("archived").unwrap_or(false),
+            is_owner: r.try_get("is_owner").unwrap_or(false),
         })
         .collect();
     Ok(Json(out))
@@ -104,6 +111,7 @@ pub struct SpeakerRow {
     pub display_name: Option<String>,
     pub n_samples: i64,
     pub archived: bool,
+    pub is_owner: bool,
 }
 
 /// `PATCH /v1/speakers/{id}` — name a voice (idempotent). 404 if the id is unknown.
@@ -121,7 +129,7 @@ pub async fn rename_speaker(
     let row = sqlx::query(
         "UPDATE speakers SET display_name = $1, updated_at = now() \
          WHERE speaker_id = $2 \
-         RETURNING speaker_id, display_name, n_samples, archived_at IS NOT NULL AS archived",
+         RETURNING speaker_id, display_name, n_samples, archived_at IS NOT NULL AS archived, is_owner",
     )
     .bind(name)
     .bind(id)
@@ -140,6 +148,7 @@ fn speaker_row(row: &sqlx::postgres::PgRow) -> SpeakerRow {
             .unwrap_or(None),
         n_samples: row.get("n_samples"),
         archived: row.try_get("archived").unwrap_or(false),
+        is_owner: row.try_get("is_owner").unwrap_or(false),
     }
 }
 
@@ -170,7 +179,7 @@ async fn set_speaker_archived(
         "UPDATE speakers \
          SET archived_at = CASE WHEN $1 THEN now() ELSE NULL END, updated_at = now() \
          WHERE speaker_id = $2 \
-         RETURNING speaker_id, display_name, n_samples, archived_at IS NOT NULL AS archived",
+         RETURNING speaker_id, display_name, n_samples, archived_at IS NOT NULL AS archived, is_owner",
     )
     .bind(archived)
     .bind(id)
@@ -178,6 +187,49 @@ async fn set_speaker_archived(
     .await?
     .ok_or(IngestError::NotFound("speaker"))?;
 
+    Ok(Json(speaker_row(&row)))
+}
+
+/// `POST /v1/speakers/{id}/owner` — mark this voice as the device owner ("This is me").
+/// One transaction: clear any previous owner, set the new one (404 on unknown/archived —
+/// a disregarded voice can't be the owner). Idempotent; at most one owner exists at a time
+/// (the 0023 partial unique index makes a racing double-set fail loudly).
+pub async fn set_speaker_owner(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<SpeakerRow>, IngestError> {
+    let mut tx = st.pool.begin().await?;
+    sqlx::query("UPDATE speakers SET is_owner = false, updated_at = now() WHERE is_owner AND speaker_id <> $1")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    let row = sqlx::query(
+        "UPDATE speakers SET is_owner = true, updated_at = now() \
+         WHERE speaker_id = $1 AND archived_at IS NULL \
+         RETURNING speaker_id, display_name, n_samples, archived_at IS NOT NULL AS archived, is_owner",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(IngestError::NotFound("speaker (unknown or archived)"))?;
+    tx.commit().await?;
+    Ok(Json(speaker_row(&row)))
+}
+
+/// `POST /v1/speakers/{id}/unowner` — clear the owner mark (idempotent). 404 if unknown.
+pub async fn clear_speaker_owner(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<SpeakerRow>, IngestError> {
+    let row = sqlx::query(
+        "UPDATE speakers SET is_owner = false, updated_at = now() \
+         WHERE speaker_id = $1 \
+         RETURNING speaker_id, display_name, n_samples, archived_at IS NOT NULL AS archived, is_owner",
+    )
+    .bind(id)
+    .fetch_optional(&st.pool)
+    .await?
+    .ok_or(IngestError::NotFound("speaker"))?;
     Ok(Json(speaker_row(&row)))
 }
 
@@ -1375,6 +1427,7 @@ pub async fn name_unattributed(
         display_name: Some(name.to_string()),
         n_samples,
         archived: false,
+        is_owner: false,
     }))
 }
 

@@ -33,6 +33,10 @@ class CameraController(
     private val context: Context,
     private val cameraId: String,
     private val encoderSurface: Surface,
+    // Optional low-res analysis output (MotionHintAnalyzer). BEST-EFFORT: if the device
+    // rejects the wider stream combination (LIMITED hardware level), the session retries
+    // WITHOUT it — capture must never fail because of a hint stream.
+    private val analysisSurface: Surface? = null,
 ) {
     private val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
     // @Volatile: written on [handler] (open/(re)configure) but ALSO read+closed by stop() on the
@@ -53,6 +57,10 @@ class CameraController(
     // onto a camera we've already closed. @Volatile because stop() flips it from the
     // caller's thread while the posts read it on [handler].
     @Volatile private var closed = false
+    // Dropped to false (permanently, for this controller) the first time a session
+    // configure fails while the analysis surface was a target — the retry-without-it
+    // fallback. Touched only on [handler].
+    private var analysisEnabled = analysisSurface != null
     private val thread = HandlerThread("hushai-camera").apply { start() }
     private val handler = Handler(thread.looper)
 
@@ -111,6 +119,7 @@ class CameraController(
         val targets = buildList {
             add(encoderSurface)
             previewSurface?.let { add(it) }
+            if (analysisEnabled) analysisSurface?.let { add(it) }
         }
         val generation = ++configGeneration
 
@@ -143,6 +152,17 @@ class CameraController(
 
                     override fun onConfigureFailed(failed: CameraCaptureSession) {
                         if (generation != configGeneration) return
+                        if (analysisEnabled && analysisSurface != null) {
+                            // The extra analysis output likely exceeded the device's supported
+                            // stream combination — retry once without it. Capture > hints.
+                            HushaiLog.warn(
+                                "camera session configure failed with analysis stream " +
+                                    "(targets=${targets.size}); retrying without motion hints",
+                            )
+                            analysisEnabled = false
+                            device?.let { createSession(it) }
+                            return
+                        }
                         HushaiLog.error("camera session configure failed (targets=${targets.size})")
                     }
                 },

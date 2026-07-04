@@ -50,6 +50,14 @@ class AudioEncoder(
     private var totalFramesRead = 0L
     private var fileCounter = 0
 
+    // Content-hint accumulators (pump thread only, like everything below): whole-window
+    // sum-of-squares/count + the max per-chunk (~100ms mic read) RMS. Snapshotted + reset at
+    // each segment finalize. Boundary skew vs the codec's PTS-based cut is tens of ms on a 2s
+    // segment — irrelevant for a hint the server thresholds conservatively.
+    private var hintSumSquares = 0.0
+    private var hintSampleCount = 0L
+    private var hintPeakRms = 0f
+
     init {
         val format = MediaFormat.createAudioFormat(MIME, sampleRate, channelCount).apply {
             setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
@@ -100,6 +108,7 @@ class AudioEncoder(
     }
 
     private fun feed(data: ByteArray) {
+        accumulateHints(data)
         var offset = 0
         while (offset < data.size) {
             val inIndex = codec.dequeueInputBuffer(TIMEOUT_US)
@@ -175,13 +184,56 @@ class AudioEncoder(
     private fun finalizeCurrent() {
         val muxer = current ?: return
         current = null
+        val attrs = takeHintAttrs()
         if (!muxer.hasSamples()) {
             muxer.abort()
             return
         }
         runCatching {
-            onSegment(muxer.finish(sequencer.getAndIncrement()))
+            onSegment(muxer.finish(sequencer.getAndIncrement()).copy(attrs = attrs))
         }.onFailure { HushaiLog.error("audio segment finalize failed", it) }
+    }
+
+    /** Accumulate hint stats over one mic chunk (s16le, normalized /32768). Pump thread only. */
+    private fun accumulateHints(data: ByteArray) {
+        var sumSq = 0.0
+        var n = 0
+        var i = 0
+        while (i + 1 < data.size) {
+            // little-endian s16
+            val s = ((data[i + 1].toInt() shl 8) or (data[i].toInt() and 0xFF)).toShort()
+            val f = s / 32768.0
+            sumSq += f * f
+            n++
+            i += 2
+        }
+        if (n == 0) return
+        val chunkRms = kotlin.math.sqrt(sumSq / n).toFloat()
+        if (chunkRms > hintPeakRms) hintPeakRms = chunkRms
+        hintSumSquares += sumSq
+        hintSampleCount += n
+    }
+
+    /** Snapshot + reset the per-segment hint accumulators into manifest attrs. */
+    private fun takeHintAttrs(): Map<String, String> {
+        val count = hintSampleCount
+        if (count == 0L) {
+            hintPeakRms = 0f
+            hintSumSquares = 0.0
+            return emptyMap()
+        }
+        val rms = kotlin.math.sqrt(hintSumSquares / count).toFloat()
+        val peak = hintPeakRms
+        hintSumSquares = 0.0
+        hintSampleCount = 0
+        hintPeakRms = 0f
+        // Locale.ROOT is load-bearing: the default locale would format 0.005 as "0,005" in
+        // many regions and the backend would (correctly) treat it as malformed + fail open.
+        return mapOf(
+            "hint.v" to "1",
+            "hint.audio_rms" to String.format(java.util.Locale.ROOT, "%.6f", rms),
+            "hint.audio_peak_rms" to String.format(java.util.Locale.ROOT, "%.6f", peak),
+        )
     }
 
     companion object {

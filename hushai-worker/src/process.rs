@@ -27,12 +27,23 @@ use crate::vad::{self, SpeakerQuality};
 /// indices into the segment PCM) to absolute capture nanos.
 const NANOS_PER_SAMPLE: i64 = 1_000_000_000 / vad::SAMPLE_RATE as i64;
 
-/// Run the full pipeline for one claimed segment. Returns the number of sentences written.
+/// How one audio segment resolved. The worker loop only logs/meters on this — the terminal
+/// status row is already written by the time `process_segment` returns (`write_transcript`
+/// marks `done`, `write_skip` marks `skipped`).
+pub enum AudioOutcome {
+    Processed { sentences: usize },
+    SkippedSilent,
+}
+
+/// Run the full pipeline for one claimed segment. `hint_audit` marks an ingest-gate audit
+/// sample: the device's hints said "silent" but the segment was enqueued anyway so the worker's
+/// own gate can record an `agree`/`disagree` verdict (the hint-trust calibration signal).
 ///
 /// Instrumented so every log emitted during processing — including the best-effort warnings deeper
 /// in the call tree (VAD/quality/sentiment/event production) — carries `segment_id` and `lane`,
 /// making one segment's path filterable in production logs. Each fallible stage is `.context`-tagged
 /// so the top-level "segment failed" error names the stage that failed.
+#[allow(clippy::too_many_arguments)]
 #[tracing::instrument(
     skip_all,
     fields(segment_id = %segment_id, lane = "audio"),
@@ -46,7 +57,8 @@ pub async fn process_segment(
     voice_detector: &VoiceDetector,
     cfg: &WorkerConfig,
     segment_id: Uuid,
-) -> anyhow::Result<usize> {
+    hint_audit: bool,
+) -> anyhow::Result<AudioOutcome> {
     // Whole-pipeline wall-clock for `hushai_worker_segment_seconds` (recorded at the success path
     // below). Stage timers (`hushai_worker_stage_seconds`) wrap each step so the load-test can
     // attribute per-camera cost; their overhead is a single `Instant` read each (negligible).
@@ -72,8 +84,17 @@ pub async fn process_segment(
     // fault never silently drops real audio. Skipping leaves the segment's blob + status rows
     // intact, so it does NOT remove it from a later segment's speaker window
     // (`build_speaker_window` reads neighbor PCM by sequence, not by transcript) — don't "fix" that.
+    //
+    // `gate_*` capture what the gate measured for calibration telemetry (persisted on both the
+    // skipped AND done marks) and for the audit verdict on `hint_audit` rows. `gate_evaluated`
+    // is true only when the gate reached a definitive pass/skip decision (false on VAD
+    // fail-open), so an unjudgeable segment never records a misleading verdict.
+    let mut gate_rms: Option<f32> = None;
+    let mut gate_speech_secs: Option<f64> = None;
+    let mut gate_evaluated = false;
     if cfg.audio_silence_skip_enabled {
         let level = vad::rms(&pcm_for_speaker);
+        gate_rms = Some(level);
         let verdict = match vad::silence_verdict(
             level,
             None,
@@ -81,7 +102,10 @@ pub async fn process_segment(
             cfg.audio_silence_min_speech_secs,
         ) {
             // Dead air on RMS alone — no need to run the VAD model.
-            Some(reason) => Some((reason, None)),
+            Some(reason) => {
+                gate_evaluated = true;
+                Some((reason, None))
+            }
             // Energy present: let the VAD make the definitive speech/no-speech call.
             None => {
                 let _t = observe::StageTimer::start(
@@ -89,13 +113,17 @@ pub async fn process_segment(
                     &[("lane", "audio"), ("stage", "silence_gate")],
                 );
                 match voice_detector.detect(&pcm_for_speaker).await {
-                    Ok(vr) => vad::silence_verdict(
-                        level,
-                        Some(vr.speech_secs),
-                        cfg.audio_silence_rms_floor,
-                        cfg.audio_silence_min_speech_secs,
-                    )
-                    .map(|reason| (reason, Some(vr.speech_secs))),
+                    Ok(vr) => {
+                        gate_speech_secs = Some(vr.speech_secs);
+                        gate_evaluated = true;
+                        vad::silence_verdict(
+                            level,
+                            Some(vr.speech_secs),
+                            cfg.audio_silence_rms_floor,
+                            cfg.audio_silence_min_speech_secs,
+                        )
+                        .map(|reason| (reason, Some(vr.speech_secs)))
+                    }
                     Err(e) => {
                         tracing::warn!(error = %e, "silence gate: VAD failed; proceeding with ASR");
                         None
@@ -104,27 +132,35 @@ pub async fn process_segment(
             }
         };
         if let Some((reason, speech_secs)) = verdict {
-            // No transcribable speech. Write an empty transcript through the normal path: it
-            // deletes any prior sentences AND writes the `quality='reject'` speaker tombstone
-            // that stops `reconcile_missing_speaker_segments` from re-queueing this segment on
-            // every restart, then marks status `done`. Skips whisper/sentiment/speaker/embed.
+            // No transcribable speech: terminal `skipped` (dashboard-visible, never re-claimed,
+            // and — unlike the old empty-transcript-plus-tombstone `done` — immune to the startup
+            // `reconcile_missing_speaker_segments` re-queue by status alone, so no junk
+            // `speaker_segments` row is written for the always-on silent majority).
+            // Skips whisper/sentiment/speaker/embed.
+            let audit_verdict = if hint_audit {
+                observe::counter("hushai_worker_hint_audit_total", &[("lane", "audio"), ("verdict", "agree")]);
+                Some("agree")
+            } else {
+                None
+            };
             {
                 let _t = observe::StageTimer::start(
                     STAGE,
                     &[("lane", "audio"), ("stage", "write_transcript")],
                 );
-                write_transcript(
+                // skip_reason is the stable decider label ("who skipped and why"-class); the
+                // rms-vs-vad stage detail lives in the skip counter + the measured_* telemetry
+                // (measured_speech_secs NULL == the free RMS stage never needed the VAD model).
+                write_skip(
                     pool,
                     segment_id,
-                    &seg.device_id,
-                    &[],
-                    &[],
-                    embedder.model_name(),
-                    None,
-                    &cfg.speaker_match_cfg(),
+                    "silent_gate",
+                    level,
+                    speech_secs.map(|s| s as f32),
+                    audit_verdict,
                 )
                 .await
-                .context("write_transcript (silent)")?;
+                .context("write_skip (silent)")?;
             }
             observe::counter(
                 "hushai_audio_segments_skipped_silent_total",
@@ -143,7 +179,7 @@ pub async fn process_segment(
                 started.elapsed().as_secs_f64(),
             );
             record_capture_lag("audio", seg.capture_start_unix_nanos);
-            return Ok(0);
+            return Ok(AudioOutcome::SkippedSilent);
         }
     }
 
@@ -241,6 +277,30 @@ pub async fn process_segment(
         }
     }
 
+    // Gate telemetry + audit verdict, best-effort AFTER the transcript tx committed (status is
+    // already `done`; losing this to a crash costs calibration data, never correctness). A
+    // `disagree` here means the device hints called this segment silent but the worker's gate
+    // found speech — the signal the dashboard's hint-trust warning watches.
+    let audit_verdict = if hint_audit && gate_evaluated {
+        observe::counter("hushai_worker_hint_audit_total", &[("lane", "audio"), ("verdict", "disagree")]);
+        Some("disagree")
+    } else {
+        None
+    };
+    if gate_rms.is_some() || audit_verdict.is_some() {
+        if let Err(e) = crate::claim::record_audio_gate_telemetry(
+            pool,
+            segment_id,
+            gate_rms,
+            gate_speech_secs.map(|s| s as f32),
+            audit_verdict,
+        )
+        .await
+        {
+            tracing::warn!(%segment_id, error = %e, "recording gate telemetry failed");
+        }
+    }
+
     // Success-path latency: total per-segment wall-clock, and capture->done lag (incl. queue wait),
     // the "are we keeping up with realtime?" signal the load-test ramps against.
     observe::observe_duration(
@@ -250,7 +310,7 @@ pub async fn process_segment(
     );
     record_capture_lag("audio", seg.capture_start_unix_nanos);
 
-    Ok(sentences.len())
+    Ok(AudioOutcome::Processed { sentences: sentences.len() })
 }
 
 /// Record capture->done end-to-end latency (s) into `hushai_worker_capture_lag_seconds`.
@@ -409,6 +469,53 @@ async fn build_speaker_window(
 /// speaker_id); 11 * 1000 = 11000, well under Postgres' 65535 bind-parameter limit even
 /// for an implausibly long segment.
 const ROWS_PER_INSERT: usize = 1000;
+
+/// Terminal `skipped` write for a silent segment, in one tx: clear any transcript left by a
+/// PRIOR processing run (a reprocess-after-recalibration must not strand stale sentences),
+/// then mark the status `skipped` with the gate's measured inputs as calibration telemetry.
+///
+/// Deliberately does NOT touch `speaker_segments`: no reject tombstone is written (the
+/// `skipped` status itself keeps `reconcile_missing_speaker_segments` away — it matches
+/// `done` only), and any REAL voiceprint row from a prior run is left alone (conservative:
+/// a threshold change shouldn't erase previously-inferred identity data).
+pub async fn write_skip(
+    pool: &PgPool,
+    segment_id: Uuid,
+    reason: &str,
+    measured_rms: f32,
+    measured_speech_secs: Option<f32>,
+    audit_verdict: Option<&str>,
+) -> anyhow::Result<()> {
+    let mut tx = pool.begin().await.context("begin skip tx")?;
+    sqlx::query("DELETE FROM transcript_sentences WHERE segment_id = $1")
+        .bind(segment_id)
+        .execute(&mut *tx)
+        .await
+        .context("clearing prior sentences (skip)")?;
+    sqlx::query(
+        r#"
+        UPDATE segment_transcription_status
+           SET status = 'skipped',
+               skip_reason = $2,
+               last_error  = NULL,
+               measured_rms          = $3,
+               measured_speech_secs  = $4,
+               audit_verdict         = COALESCE($5, audit_verdict),
+               updated_at = now()
+         WHERE segment_id = $1
+        "#,
+    )
+    .bind(segment_id)
+    .bind(reason)
+    .bind(measured_rms)
+    .bind(measured_speech_secs)
+    .bind(audit_verdict)
+    .execute(&mut *tx)
+    .await
+    .context("marking status skipped")?;
+    tx.commit().await.context("commit skip tx")?;
+    Ok(())
+}
 
 /// Record that the speaker stage ran for a segment but resolved no voice. Delete-then-insert
 /// by segment_id (idempotent; the partitioned table can't carry a UNIQUE(segment_id)). The

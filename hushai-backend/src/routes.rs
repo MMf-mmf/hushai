@@ -69,6 +69,11 @@ pub fn router(state: AppState) -> Router {
             "/v1/speakers/{id}/unarchive",
             post(speakers::unarchive_speaker),
         )
+        .route("/v1/speakers/{id}/owner", post(speakers::set_speaker_owner))
+        .route(
+            "/v1/speakers/{id}/unowner",
+            post(speakers::clear_speaker_owner),
+        )
         .route(
             "/v1/speakers/{id}/sample-audio",
             get(speakers::sample_audio),
@@ -86,6 +91,8 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/persons/{id}/merge", post(persons::merge_person))
         .route("/v1/persons/{id}/archive", post(persons::archive_person))
         .route("/v1/persons/{id}/unarchive", post(persons::unarchive_person))
+        .route("/v1/persons/{id}/owner", post(persons::set_person_owner))
+        .route("/v1/persons/{id}/unowner", post(persons::clear_person_owner))
         .route("/v1/persons/{id}/sample-face", get(persons::sample_face))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),

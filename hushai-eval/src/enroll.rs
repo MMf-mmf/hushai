@@ -101,9 +101,11 @@ async fn wait_lane(ctx: &Ctx, table: &str, ids: &[Uuid]) -> Result<()> {
         .bind(ids)
         .fetch_all(&ctx.pool)
         .await?;
+        // `skipped` is terminal too (content gates; migration 0022) — an enrollment clip that
+        // gates out as silent/static will fail enrollment loudly downstream, not hang here.
         let settled = rows
             .iter()
-            .filter(|(s, a)| s == "done" || (s == "error" && *a >= max_attempts))
+            .filter(|(s, a)| s == "done" || s == "skipped" || (s == "error" && *a >= max_attempts))
             .count();
         if !ids.is_empty() && settled == ids.len() {
             return Ok(());

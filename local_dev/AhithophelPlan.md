@@ -241,6 +241,10 @@ errors in the dashboard.html it should also way what the error was in addition w
 - [] is a service is down there should be a button in the UI to restart it...
 
 
+- [] when rotating the mobile app camera, we must make sure that when viewing the actual recording it's not looking sideways or upside down. It should always be straightened out upright. This can probably be done through an update to the app so that it always sends the video in the correct upright orientation and that we shouldn't need to capture the video and landscape mode in order for it to look upright.
+
+- [] the voice assistant still seems pretty dumb when I ask a questions like what did we last discuss in the recordings it kind of has no idea and refers to a two second segment and then when I ask it, what's my name which that for sure it should know since I'm a recognize the voice, it still does not know and tries to refer to some previous chat history overall extremely poor quality and it does not seem to have the right context.
+To actually get this right the chat will need to have lots of context as well as all of the AI available data, such as the different voices, which voices that have already been detected and associated with a given video as well as any image detection data we picket us such as object detection person detection and any type of detection we might add in the future as well would need to be baked in to these improvements.
 
 
 PASSWORD: hushai-dev

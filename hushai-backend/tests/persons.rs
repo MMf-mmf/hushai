@@ -44,6 +44,7 @@ async fn make_state() -> Option<AppState> {
         db_max_connections: 5,
         db_acquire_timeout_secs: 5,
         request_timeout_secs: 30,
+        hint_gate: Default::default(),
     };
     Some(build_state(config).await.expect("build state"))
 }

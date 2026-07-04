@@ -125,6 +125,7 @@ def build_manifest(
     capture_ns: int,
     monotonic_ns: int,
     duration_ns: int,
+    extra_attrs: dict | None = None,
 ) -> bytes:
     m = pb.SegmentManifest()
     m.segment_id = segment_id
@@ -144,6 +145,8 @@ def build_manifest(
     m.byte_len = len(body)
     m.gap_before = False
     m.attrs["feeder"] = "feed_segments.py"
+    for k, v in (extra_attrs or {}).items():
+        m.attrs[k] = v
     return m.SerializeToString()
 
 
@@ -180,7 +183,19 @@ def main() -> int:
                          "Use this for an https:// --url with the self-signed LAN CA.")
     ap.add_argument("--insecure", action="store_true",
                     help="skip TLS certificate verification (testing only; prefer --cacert)")
+    ap.add_argument("--attr", action="append", default=[], metavar="K=V",
+                    help="extra manifest attrs key=value, repeatable — e.g. exercise the ingest "
+                         "hint gate without a phone: --attr hint.v=1 --attr hint.audio_peak_rms=0.0001 "
+                         "--attr hint.motion_score=0.2")
     args = ap.parse_args()
+
+    extra_attrs: dict = {}
+    for kv in args.attr:
+        key, sep, value = kv.partition("=")
+        if not sep or not key:
+            print(f"--attr expects K=V, got {kv!r}", file=sys.stderr)
+            return 2
+        extra_attrs[key] = value
 
     # requests `verify`: False to skip, a CA path to pin, or True for the system store.
     verify = False if args.insecure else (args.cacert or True)
@@ -256,6 +271,7 @@ def main() -> int:
             capture_ns=base_wall + seq * duration_ns,
             monotonic_ns=base_mono + seq * duration_ns,
             duration_ns=duration_ns,
+            extra_attrs=extra_attrs,
         )
 
         sent_body = body

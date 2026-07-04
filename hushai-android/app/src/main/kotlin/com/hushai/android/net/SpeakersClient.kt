@@ -29,6 +29,8 @@ class SpeakersClient(
         val samples: List<String>,
         /** Disregarded by the operator — shown under a collapsed "Archived" section. */
         val archived: Boolean = false,
+        /** Marked as the device owner ("This is me"): unlocks identity + reflection answers. */
+        val isOwner: Boolean = false,
     )
 
     /** One member of a suggested duplicate group. */
@@ -70,11 +72,29 @@ class SpeakersClient(
                         samples = if (s == null) emptyList()
                         else (0 until s.length()).map { s.getString(it) },
                         archived = o.optBoolean("archived", false),
+                        isOwner = o.optBoolean("is_owner", false),
                     )
                 }
             }
         } catch (e: Exception) {
             null
+        }
+    }
+
+    /**
+     * `POST /v1/speakers/{id}/owner|unowner` — mark (or clear) this voice as the device owner
+     * ("This is me"). Marking moves the flag off any previous owner server-side. Idempotent.
+     */
+    fun setOwner(id: String, owner: Boolean): Boolean {
+        val verb = if (owner) "owner" else "unowner"
+        val req = bearer(
+            Request.Builder().url("$base/v1/speakers/$id/$verb")
+                .post(ByteArray(0).toRequestBody(null)),
+        )
+        return try {
+            client.newCall(req).execute().use { it.isSuccessful }
+        } catch (e: Exception) {
+            false
         }
     }
 

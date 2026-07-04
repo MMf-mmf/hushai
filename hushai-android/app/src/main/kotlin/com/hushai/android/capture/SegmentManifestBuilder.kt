@@ -33,7 +33,9 @@ object SegmentManifestBuilder {
             content_sha256 = segment.contentSha256,
             byte_len = segment.byteLen,
             gap_before = segment.gapBefore,
-            attrs = mapOf("client" to "hushai-android"),
+            // Per-segment content hints (Segment.attrs) ride along; the fixed client tag wins
+            // on any key collision by coming last.
+            attrs = segment.attrs + mapOf("client" to "hushai-android"),
         )
         return manifest.encode()
     }

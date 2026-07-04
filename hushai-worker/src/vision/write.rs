@@ -140,8 +140,26 @@ pub struct ObjectWrite {
     pub embedding: Vec<f32>,
 }
 
-/// Process one VIDEO/MUXED segment through the face-identity pipeline. Returns the number of face
-/// observations written. Idempotent (see `face_match::assign_faces`).
+/// How one vision segment resolved. The worker loop maps this onto the terminal status row:
+/// `Processed` -> `done` (+ motion-distance telemetry), `SkippedStatic` -> `skipped`
+/// (`skip_reason='static_gate'`). `audit_verdict` is set only on `hint_audit` rows where the
+/// motion gate reached a real comparison: `agree` = the gate would also skip (the device hint
+/// was right), `disagree` = the gate found motion the hint missed.
+pub enum VisionOutcome {
+    Processed {
+        faces: usize,
+        motion_distance: Option<f32>,
+        audit_verdict: Option<&'static str>,
+    },
+    SkippedStatic {
+        motion_distance: f32,
+        audit_verdict: Option<&'static str>,
+    },
+}
+
+/// Process one VIDEO/MUXED segment through the face-identity pipeline. Returns how the segment
+/// resolved (processed with N face observations written, or skipped as static). Idempotent (see
+/// `face_match::assign_faces`). `hint_audit` marks an ingest-gate audit sample (see [`VisionOutcome`]).
 /// Instrumented so every per-frame warning (face cleanup, plate OCR, object detect) and the
 /// top-level failure carry `segment_id`/`lane`; fallible stages are `.context`-tagged so the
 /// vision worker loop's error log names the stage that failed.
@@ -154,31 +172,45 @@ pub async fn process_vision_segment(
     models: &VisionModels,
     cfg: &WorkerConfig,
     segment_id: Uuid,
-) -> Result<usize> {
+    hint_audit: bool,
+) -> Result<VisionOutcome> {
     // Whole-pipeline wall-clock for `hushai_worker_segment_seconds`; stage timers below attribute
     // per-camera cost (decode, detect, embed, write) for the capacity/load test.
     let started = std::time::Instant::now();
     let seg = media::load_segment(pool, segment_id).await.context("load_segment")?;
-    let frames = {
-        let _t = observe::StageTimer::start(STAGE, &[("lane", "vision"), ("stage", "sample_frames")]);
-        frames::sample_frames(cfg, &seg, cfg.frames_per_segment).await.context("sample_frames")?
-    };
-    if frames.is_empty() {
-        return Ok(0); // no decodable video (e.g. audio-only blob) — clean no-op
-    }
 
     // Skip-static gate: compare this segment's representative frame against the last frame we
     // analyzed for the SAME camera. A near-identical scene (an empty hallway) skips ALL vision
     // inference — the dominant waste on static cameras. Skipping writes NOTHING: presence
     // continuity is preserved by event sessionization (a person seen before/after a static gap
     // coalesces into one event), NOT by fabricating detections that were never inferred (which
-    // would also pollute the k-NN identity-matching substrate). The vision loop still marks the
-    // segment `done` on this `Ok(0)`. The per-camera fingerprint is updated on BOTH branches so a
-    // slow brightness drift re-baselines incrementally and a camera move self-corrects next time.
+    // would also pollute the k-NN identity-matching substrate). The vision loop marks the
+    // segment `skipped` on this outcome. The per-camera fingerprint is updated on BOTH branches
+    // so a slow brightness drift re-baselines incrementally and a camera move self-corrects.
+    //
+    // With the one-frame probe (default on) the gate decodes a SINGLE mid-segment frame first
+    // and only pays the full `frames_per_segment` decode after motion is confirmed — on a static
+    // camera that's ~1/3 of the old decode-to-discard cost. The gate fingerprint is then the
+    // probe frame rather than the last sampled frame; the comparison stays camera-consistent
+    // because BOTH sides of the diff always come through this same path.
+    let mut motion_distance: Option<f32> = None;
+    let mut audit_verdict: Option<&'static str> = None;
+    let mut probed_frames: Option<Vec<frames::DecodedFrame>> = None;
     if cfg.vision_motion_skip_enabled {
         let _t = observe::StageTimer::start(STAGE, &[("lane", "vision"), ("stage", "motion_gate")]);
-        // Most recent pixels in the segment; taken before the by-value loop below consumes `frames`.
-        if let Some(cur) = frames
+        let gate_frames = if cfg.vision_gate_one_frame_probe {
+            frames::sample_frames(cfg, &seg, 1).await.context("sample_frames (probe)")?
+        } else {
+            frames::sample_frames(cfg, &seg, cfg.frames_per_segment)
+                .await
+                .context("sample_frames")?
+        };
+        if gate_frames.is_empty() {
+            // No decodable video (e.g. audio-only blob) — clean no-op.
+            return Ok(VisionOutcome::Processed { faces: 0, motion_distance: None, audit_verdict: None });
+        }
+        // Most recent pixels of the gate sample.
+        if let Some(cur) = gate_frames
             .last()
             .map(|f| motion::fingerprint(&f.image, cfg.vision_motion_fp_side))
         {
@@ -194,7 +226,18 @@ pub async fn process_vision_segment(
             };
             if let Some(prev) = prior {
                 let dist = motion::distance(&prev, &cur);
-                if dist <= cfg.vision_motion_threshold {
+                motion_distance = Some(dist);
+                let would_skip = dist <= cfg.vision_motion_threshold;
+                if hint_audit {
+                    // Audit sample: the ingest hint gate would have skipped this segment. Record
+                    // whether the worker's own gate agrees — the calibration/trust signal.
+                    audit_verdict = Some(if would_skip { "agree" } else { "disagree" });
+                    observe::counter(
+                        "hushai_worker_hint_audit_total",
+                        &[("lane", "vision"), ("verdict", if would_skip { "agree" } else { "disagree" })],
+                    );
+                }
+                if would_skip {
                     observe::counter(
                         "hushai_worker_segments_skipped_static_total",
                         &[("lane", "vision")],
@@ -207,11 +250,27 @@ pub async fn process_vision_segment(
                         "vision: skipped static segment (no inference)"
                     );
                     record_vision_latency(started, seg.capture_start_unix_nanos);
-                    return Ok(0);
+                    return Ok(VisionOutcome::SkippedStatic { motion_distance: dist, audit_verdict });
                 }
             }
             // First segment for this camera (no prior) or motion present: fall through and process.
         }
+        if !cfg.vision_gate_one_frame_probe {
+            probed_frames = Some(gate_frames);
+        }
+    }
+
+    let frames = match probed_frames {
+        // Gate disabled, or the one-frame probe confirmed motion: pay the full decode now.
+        None => {
+            let _t = observe::StageTimer::start(STAGE, &[("lane", "vision"), ("stage", "sample_frames")]);
+            frames::sample_frames(cfg, &seg, cfg.frames_per_segment).await.context("sample_frames")?
+        }
+        Some(f) => f,
+    };
+    if frames.is_empty() {
+        // No decodable video (e.g. audio-only blob) — clean no-op.
+        return Ok(VisionOutcome::Processed { faces: 0, motion_distance, audit_verdict });
     }
 
     let params = FaceEnhanceParams {
@@ -427,7 +486,7 @@ pub async fn process_vision_segment(
     // Nothing to write and no object reconciliation needed — the common always-on no-op.
     if face_writes.is_empty() && !objects_ran && plate_writes.is_empty() {
         record_vision_latency(started, seg.capture_start_unix_nanos);
-        return Ok(0);
+        return Ok(VisionOutcome::Processed { faces: 0, motion_distance, audit_verdict });
     }
 
     // One transaction: advisory-locked match-or-mint into persons/person_segments + the idempotent
@@ -502,7 +561,7 @@ pub async fn process_vision_segment(
         "vision: wrote detections"
     );
     record_vision_latency(started, seg.capture_start_unix_nanos);
-    Ok(face_writes.len())
+    Ok(VisionOutcome::Processed { faces: face_writes.len(), motion_distance, audit_verdict })
 }
 
 /// Clean up + embed ONE detected face. Returns `None` only for a hard-reject (below the absolute

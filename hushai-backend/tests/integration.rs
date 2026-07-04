@@ -77,6 +77,7 @@ async fn ingest_end_to_end() {
         db_max_connections: 5,
         db_acquire_timeout_secs: 5,
         request_timeout_secs: 30,
+        hint_gate: Default::default(),
     };
 
     let state = build_state(config).await.expect("build state");

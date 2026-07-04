@@ -120,6 +120,25 @@ pub struct RagConfig {
     /// License-plate attribution — default number of plate sightings to list per plate query.
     /// (Plates have no "who was I with" owner anchor; resolution is by plate string, not identity.)
     pub plate_top_k_default: i64,
+
+    /// Recency path ("what did we last discuss"): the most recent gap-grouped conversation is
+    /// summarized rather than semantically retrieved. `recency_scan_limit` bounds the DESC
+    /// backscan from the latest sentence; `recency_max_sentences`/`recency_max_chars` cap what
+    /// the LLM summarizes (spoken answers are short, and the small model context is finite).
+    pub recency_scan_limit: i64,
+    pub recency_max_sentences: usize,
+    pub recency_max_chars: usize,
+
+    /// Assistant context layer: a per-turn "Facts (reliable, from the system)" briefing (date,
+    /// owner, known-voice/person rosters, cameras, last-conversation anchor) prepended to the
+    /// answer prompt, plus same-segment vision annotation of retrieved passages. All bounded /
+    /// env-gated so a small local model is never flooded; disabling yields byte-identical prompts.
+    pub context_briefing_enabled: bool,
+    pub context_max_chars: usize,
+    /// Max named entries listed per roster (voices, people) in the briefing.
+    pub context_roster_max: i64,
+    /// Annotate retrieved transcript passages with same-segment vision detections.
+    pub context_vision_enrich_enabled: bool,
 }
 
 impl RagConfig {
@@ -187,6 +206,13 @@ impl RagConfig {
                 .filter(|s| !s.trim().is_empty()),
             person_top_k_default: parse("RAG_PERSON_TOP_K_DEFAULT", "50")?,
             plate_top_k_default: parse("RAG_PLATE_TOP_K_DEFAULT", "50")?,
+            recency_scan_limit: parse("RAG_RECENCY_SCAN_LIMIT", "400")?,
+            recency_max_sentences: parse("RAG_RECENCY_MAX_SENTENCES", "40")?,
+            recency_max_chars: parse("RAG_RECENCY_MAX_CHARS", "4000")?,
+            context_briefing_enabled: parse("RAG_CONTEXT_BRIEFING_ENABLED", "true")?,
+            context_max_chars: parse("RAG_CONTEXT_MAX_CHARS", "1200")?,
+            context_roster_max: parse("RAG_CONTEXT_ROSTER_MAX", "12")?,
+            context_vision_enrich_enabled: parse("RAG_CONTEXT_VISION_ENRICH_ENABLED", "true")?,
         })
     }
 }

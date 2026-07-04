@@ -38,6 +38,8 @@ pub struct Config {
     pub db_acquire_timeout_secs: u64,
     /// Overall per-request timeout (seconds).
     pub request_timeout_secs: u64,
+    /// Ingest-side AI skip gate driven by device content hints (see `crate::hints`).
+    pub hint_gate: crate::hints::HintGateCfg,
 }
 
 impl Config {
@@ -57,6 +59,7 @@ impl Config {
             db_max_connections: parse_opt("DB_MAX_CONNECTIONS", "16")?,
             db_acquire_timeout_secs: parse_opt("DB_ACQUIRE_TIMEOUT_SECS", "2")?,
             request_timeout_secs: parse_opt("REQUEST_TIMEOUT_SECS", "30")?,
+            hint_gate: crate::hints::HintGateCfg::from_env()?,
         })
     }
 }

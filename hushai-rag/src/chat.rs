@@ -33,9 +33,10 @@ use uuid::Uuid;
 use crate::agents::AgentKind;
 use crate::retrieve::{self, Filters, Source, Tuning};
 use crate::routes::{
-    PEOPLE_NO_OWNER, PeopleSources, QueryFilters, REFLECTION_NO_TARGET, check_auth,
-    enrich_persons_for_display, enrich_plates_for_display, internal, resolve_people_sources,
-    resolve_plate_filter, resolve_speaker_filter, resolve_target_speaker,
+    CallerContext, PEOPLE_NO_OWNER, PeopleSources, QueryFilters, REFLECTION_NO_TARGET, check_auth,
+    enrich_persons_for_display, enrich_plates_for_display, internal, is_identity_query,
+    render_identity, resolve_owner_name, resolve_people_sources, resolve_plate_filter,
+    resolve_speaker_filter, resolve_target_speaker,
 };
 use crate::state::AppState;
 
@@ -70,6 +71,11 @@ pub struct ChatRequest {
     /// Absent from old clients / ignored by old servers (serde skips unknown fields).
     #[serde(default)]
     pub playback: Option<PlaybackContext>,
+    /// Who is asking (CONTEXT, never a retrieval filter — same precedent as `playback`). The
+    /// voice client sets `{kind:"voice", owner_verified}`; drives the spoken-style suffix, the
+    /// owner prompt line, and the deterministic "what's my name" answer. See [`CallerContext`].
+    #[serde(default)]
+    pub caller: Option<CallerContext>,
 }
 
 /// The viewer's live playback state: which camera is on screen and where the playhead is.
@@ -173,7 +179,18 @@ pub async fn rag_chat(
     // After condensing, the query is STANDALONE, so the router must classify it ALONE — feeding it the
     // prior turns as well drags it back toward the previous capability (observed: a condensed
     // "How many times did I see a chair?" routed to `recordings` with context but `objects` without).
-    let (message, router_context) = if st.cfg.query_condense && !history.is_empty() {
+    //
+    // NEVER condense a deterministic-intent question (identity / recency / speaker-roster): those are
+    // matched by EXACT phrase on the message text below, and the condenser resolves pronouns
+    // ("what's MY name" → "what is the OWNER'S name?"), which would silently defeat the detector on a
+    // follow-up turn. They're already standalone, so skipping condensation costs nothing.
+    let deterministic_intent = crate::routes::is_identity_query(&message)
+        || crate::routes::is_recency_query(&message)
+        || crate::routes::is_speaker_roster_query(&message);
+    let (message, router_context) = if st.cfg.query_condense
+        && !history.is_empty()
+        && !deterministic_intent
+    {
         let condensed = st
             .llm
             .condense(&message, &recent_context)
@@ -194,7 +211,13 @@ pub async fn rag_chat(
         // recordings agent — the LLM router's "who ..." pattern drifts toward `people` (faces).
         // Same intent-detector idiom as `is_count_intent`; also keeps the eval's
         // `expect_routed_agent` assertion stable.
-        let routed = if crate::routes::is_speaker_roster_query(&message) {
+        let routed = if crate::routes::is_speaker_roster_query(&message)
+            || crate::routes::is_recency_query(&message)
+            || crate::routes::is_identity_query(&message)
+        {
+            // Recordings-agent questions the LLM router mis-routes: a "who" roster drifts to faces,
+            // "what did we last discuss" drifts on keywords, and "what's my name / who am I" drifts
+            // to reflection. Pin them to recordings so the deterministic answers below fire.
             crate::agents::DEFAULT_AGENT_ID
         } else {
             st.llm
@@ -235,16 +258,27 @@ pub async fn rag_chat(
     // Render times in the caller's local civil time (browser offset), falling back to the env default.
     let tz = req.tz_offset_secs.unwrap_or(st.cfg.analysis_tz_offset_secs);
 
+    // Caller context: a spoken client gets the spoken-style suffix; a voice-verified owner
+    // unlocks the identity answer + the owner prompt line. Never touches retrieval filters.
+    let is_voice = req.caller.as_ref().is_some_and(CallerContext::is_voice);
+    let owner_verified = req.caller.as_ref().is_some_and(|c| c.owner_verified);
+
     // For reflection-with-no-target we skip the LLM entirely and stream a setup hint.
     let mut precomputed_answer: Option<String> = None;
     let mut reflection_digest: Option<String> = None;
     let mut sources: Vec<Source>;
     let names;
 
+    // Deterministic caller-identity answer ("what's my name"), before any retrieval/LLM — same
+    // idiom as the roster/clarify precomputes. Only on the grounded default (the auto-router
+    // lands identity questions here); an explicit specialized agent keeps its own behaviour.
+    let identity = agent.kind == AgentKind::Grounded && is_identity_query(&message);
+
     // "This video" with no camera scoped + more than one camera -> ask which one instead of
     // silently answering across everything. Reflection isn't camera-scoped, so it never triggers.
     let scope_is_all = qf.device_id.is_none() && df.device_id.is_none();
-    let clarify_camera = scope_is_all
+    let clarify_camera = !identity
+        && scope_is_all
         && matches!(
             agent.kind,
             AgentKind::People | AgentKind::Objects | AgentKind::Plates | AgentKind::Grounded
@@ -252,7 +286,12 @@ pub async fn rag_chat(
         && crate::routes::is_deictic_video_query(&message)
         && crate::routes::camera_count(&st.pool).await.map_err(internal)? > 1;
 
-    if clarify_camera {
+    if identity {
+        let name = resolve_owner_name(&st).await.map_err(internal)?;
+        precomputed_answer = Some(render_identity(name.as_deref(), owner_verified));
+        sources = vec![];
+        names = std::collections::HashMap::new();
+    } else if clarify_camera {
         precomputed_answer = Some(crate::routes::CAMERA_CLARIFY.to_string());
         sources = vec![];
         names = std::collections::HashMap::new();
@@ -306,6 +345,42 @@ pub async fn rag_chat(
             let device_id = qf.device_id.or_else(|| df.device_id.clone());
             let after = qf.after_unix_nanos.or(df.after_unix_nanos);
             let before = qf.before_unix_nanos.or(df.before_unix_nanos);
+            // Recency ("what did we last discuss"): summarize the most recent gap-grouped
+            // conversation instead of semantic top-k (which returns a lone keyword-similar 2s
+            // snippet — the exact "cites one tiny segment" failure). Window: explicit filters win,
+            // else a natural-language phrase ("yesterday"), else unbounded (the newest activity).
+            // Enriched in-branch since the summary prompt reads speaker names + humanized times.
+            if crate::routes::is_recency_query(&message) {
+                let now = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+                let parsed = crate::timeparse::window_in_query(&message, now, tz);
+                let r_after = after.or(parsed.map(|(a, _)| a));
+                let r_before = before.or(parsed.map(|(_, b)| b));
+                let gap_nanos = st.cfg.conversation_gap_secs.max(1) * 1_000_000_000;
+                let mut s = retrieve::latest_conversation(
+                    &st.pool,
+                    device_id.as_deref(),
+                    r_after,
+                    r_before,
+                    gap_nanos,
+                    st.cfg.recency_scan_limit,
+                    st.cfg.recency_max_sentences,
+                    st.cfg.recency_max_chars,
+                )
+                .await
+                .map_err(internal)?;
+                let ids: Vec<String> = s.iter().filter_map(|x| x.speaker_id.clone()).collect();
+                names = crate::speakers::name_map(&st.pool, &ids)
+                    .await
+                    .map_err(internal)?;
+                retrieve::enrich_for_display(&mut s, &names, now, tz);
+                precomputed_answer = Some(
+                    st.llm
+                        .answer_recency(&message, &s, &names)
+                        .await
+                        .map_err(internal)?,
+                );
+                sources = s;
+            } else
             // Clip-scoped "who was speaking": a roster question over a bounded window is a SET
             // question — answer it deterministically (distinct speakers heard in the window),
             // not by semantic NN (embedding "who was speaking" retrieves nothing useful; that's
@@ -752,13 +827,54 @@ pub async fn rag_chat(
             Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
             tz,
         );
+        // Cross-modal: annotate these transcript passages with same-segment vision (who was on
+        // camera, objects, plates) so the model can fuse "what was said" with "what was seen".
+        // Best-effort + env-gated; only the transcript agents (Grounded/Reflection) reach here.
+        if st.cfg.context_vision_enrich_enabled {
+            if let Err(e) = crate::context::enrich_sources_with_vision(&st.pool, &mut sources, 3).await {
+                tracing::warn!(error = format!("{e:#}"), "vision enrichment skipped");
+            }
+        }
     }
 
     // Everything below runs as the SSE body. Pre-stage errors above already returned a
     // clean HTTP status; in-stream failures surface as `error` events.
     let pool = st.pool.clone();
     let llm = st.llm.clone();
-    let system_prompt = agent.system_prompt; // &'static str
+    // Build the effective system prompt: persona + (voice) spoken-style suffix + (verified owner)
+    // one identity line so the model resolves first-person references without breaking the
+    // no-outside-knowledge rule. Only the streaming path uses it, so the owner-name lookup is
+    // gated on there being no precomputed answer (a precomputed answer skips generation).
+    let mut system_prompt = agent.system_prompt.to_string();
+    if precomputed_answer.is_none() {
+        if is_voice {
+            system_prompt.push_str(crate::agents::SPOKEN_STYLE_SUFFIX);
+        }
+        if owner_verified {
+            if let Some(name) = resolve_owner_name(&st).await.map_err(internal)? {
+                system_prompt.push_str(&format!(
+                    " You are speaking with {name}, the verified owner of these recordings; \
+                     first-person words in their questions (\"I\", \"me\", \"my\") refer to {name}."
+                ));
+            }
+        }
+        // Append the system briefing (date, known voices/people, cameras, last activity). The
+        // permission clause is co-located so it overrides the persona's strict "only the passages"
+        // rule for exactly these world facts — without weakening grounding of what was said/seen.
+        // Env-gated; an empty briefing appends nothing (byte-identical to the pre-feature prompt).
+        if st.cfg.context_briefing_enabled {
+            let now = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+            let briefing = crate::context::assemble_briefing(&st, tz, now).await;
+            if !briefing.trim().is_empty() {
+                system_prompt.push_str(&format!(
+                    "\n\nThe following facts are reliable, provided by the system. You may use them \
+                     for the current date and time, who you are speaking with, and the known people, \
+                     voices, and cameras — but keep grounding everything about what was said or seen \
+                     in the passages you are given.\nFacts:\n{briefing}"
+                ));
+            }
+        }
+    }
     let agent_id_stream = agent_id.clone();
     // The concrete capability the auto-router landed on (or the session's pinned agent). The
     // request `agent_id` may be the synthetic "auto"; this is where the answer actually came from.
@@ -800,14 +916,14 @@ pub async fn rag_chat(
                     reflection_digest.as_deref().unwrap_or_default(),
                     &sources,
                     &names,
-                    system_prompt,
+                    &system_prompt,
                     history,
                     reflection_model.as_deref(),
                 )
                 .await
                 .map(StreamExt::boxed)
             } else {
-                llm.chat_stream(&message, &sources, &names, system_prompt, history)
+                llm.chat_stream(&message, &sources, &names, &system_prompt, history)
                     .await
                     .map(StreamExt::boxed)
             };
@@ -1166,6 +1282,7 @@ mod tests {
             speaker_id: speaker_id.map(str::to_string),
             speaker_name: None,
             time_label: String::new(),
+            visual_context: None,
         }
     }
 

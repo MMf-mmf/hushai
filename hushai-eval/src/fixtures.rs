@@ -247,6 +247,10 @@ pub struct ChatQ {
     /// camera + playhead. Exercises the deictic clip anchor ("who was speaking in this clip").
     #[serde(default)]
     pub playback: Option<ChatPlayback>,
+    /// Simulated caller context (the voice client sends this): `{kind, owner_verified}`. Exercises
+    /// the spoken-style suffix, the owner prompt line, and the deterministic "what's my name" answer.
+    #[serde(default)]
+    pub caller: Option<ChatCaller>,
     #[serde(default)]
     pub top_k: Option<i64>,
 
@@ -304,6 +308,17 @@ pub struct ChatPlayback {
     pub device_id: Option<String>,
     #[serde(default)]
     pub playhead_offset_ns: Option<i64>,
+}
+
+/// Simulated caller context (the voice client's `caller` block). CONTEXT, not a filter.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ChatCaller {
+    /// e.g. "voice" — a spoken client whose answers are read aloud.
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// The on-device owner voice check passed for this turn.
+    #[serde(default)]
+    pub owner_verified: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]

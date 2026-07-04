@@ -37,6 +37,37 @@ pub struct QueryRequest {
     /// falls back to `ANALYSIS_TZ_OFFSET_SECS`. Mirrors `ChatRequest::tz_offset_secs`.
     #[serde(default)]
     pub tz_offset_secs: Option<i64>,
+    /// Who is asking (CONTEXT, never a retrieval filter — the `playback` precedent). Absent
+    /// from old clients / ignored by old servers (serde skips unknown fields).
+    #[serde(default)]
+    pub caller: Option<CallerContext>,
+}
+
+/// Who is asking, as asserted by the client. `owner_verified` is a boolean claim by the
+/// bearer-authenticated device (the Android app sets it only after its on-device voiceprint
+/// check passes against the enrolled owner) — the Vosk speaker space is NOT the backend's
+/// TitaNet space, so no embedding crosses the wire; the claim shares the same trust boundary
+/// as the bearer token itself. It unlocks identity phrasing and the owner prompt line; it is
+/// NEVER merged into retrieval filters.
+#[derive(Debug, Default, Deserialize)]
+pub struct CallerContext {
+    /// Client kind; `"voice"` marks a spoken client whose answers are read aloud by TTS
+    /// (personas get the spoken-style suffix).
+    #[serde(default)]
+    pub kind: Option<String>,
+    /// The on-device owner voice check passed for THIS utterance.
+    #[serde(default)]
+    pub owner_verified: bool,
+    /// The asking device (context for logs/future deictic use; not a filter).
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+impl CallerContext {
+    /// Is this a spoken client (answers go to TTS)?
+    pub(crate) fn is_voice(&self) -> bool {
+        self.kind.as_deref() == Some("voice")
+    }
 }
 
 impl QueryRequest {
@@ -93,6 +124,25 @@ pub async fn rag_query(
         Some(id) => crate::agents::get(id)
             .ok_or((StatusCode::BAD_REQUEST, format!("unknown agent: {id}")))?,
     };
+
+    // Deterministic caller-identity answer ("what's my name"), before any retrieval/LLM. Only on
+    // the grounded default (a specialized agent explicitly chosen keeps its own behaviour); a
+    // stranger (no owner_verified) still gets a graceful, non-confirming reply.
+    if agent.kind == crate::agents::AgentKind::Grounded && is_identity_query(&req.query) {
+        let owner_verified = req.caller.as_ref().is_some_and(|c| c.owner_verified);
+        let name = resolve_owner_name(&st).await.map_err(internal)?;
+        return Ok(Json(QueryResponse {
+            answer: render_identity(name.as_deref(), owner_verified),
+            sources: vec![],
+        }));
+    }
+
+    // Recency ("what did we last discuss") → summarize the latest gap-grouped conversation instead
+    // of semantic top-k. Grounded default only; specialized agents keep their own routing.
+    if agent.kind == crate::agents::AgentKind::Grounded && is_recency_query(&req.query) {
+        return recency_query(&st, &req).await;
+    }
+
     if agent.kind == crate::agents::AgentKind::Reflection {
         return reflection_query(&st, &req.query, req.filters.unwrap_or_default(), agent).await;
     }
@@ -171,6 +221,13 @@ pub async fn rag_query(
         Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX),
         tz,
     );
+    // Same-segment vision annotation (who was on camera / objects / plates) for the citations and
+    // the prompt — env-gated + best-effort, matching the chat path.
+    if st.cfg.context_vision_enrich_enabled {
+        if let Err(e) = crate::context::enrich_sources_with_vision(&st.pool, &mut sources, 3).await {
+            tracing::warn!(error = format!("{e:#}"), "vision enrichment skipped");
+        }
+    }
     let answer = st
         .llm
         .answer(&req.query, &sources, &names)
@@ -490,6 +547,51 @@ async fn people_query(
     Ok(Json(QueryResponse { answer, sources }))
 }
 
+/// Single-shot RECENCY answer (the "what did we last discuss" path). Resolves the window (explicit
+/// filters win, else a `timeparse` phrase like "yesterday", else unbounded → the newest activity),
+/// pulls the most recent gap-grouped conversation via `retrieve::latest_conversation`, enriches for
+/// display (speaker names + humanized time), and has the LLM summarize it. Mirrors `people_query`.
+pub(crate) async fn recency_query(
+    st: &AppState,
+    req: &QueryRequest,
+) -> Result<Json<QueryResponse>, (StatusCode, String)> {
+    let tz = req.tz_offset(&st);
+    let now = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+    let qf = req.filters.as_ref();
+    let device_id = qf.and_then(|f| f.device_id.clone());
+    // Window precedence: explicit filters win; else a natural-language phrase; else unbounded.
+    let parsed = crate::timeparse::window_in_query(&req.query, now, tz);
+    let after = qf.and_then(|f| f.after_unix_nanos).or(parsed.map(|(a, _)| a));
+    let before = qf.and_then(|f| f.before_unix_nanos).or(parsed.map(|(_, b)| b));
+    let gap_nanos = st.cfg.conversation_gap_secs.max(1) * 1_000_000_000;
+
+    let mut sources = retrieve::latest_conversation(
+        &st.pool,
+        device_id.as_deref(),
+        after,
+        before,
+        gap_nanos,
+        st.cfg.recency_scan_limit,
+        st.cfg.recency_max_sentences,
+        st.cfg.recency_max_chars,
+    )
+    .await
+    .map_err(internal)?;
+
+    let ids: Vec<String> = sources.iter().filter_map(|s| s.speaker_id.clone()).collect();
+    let names = crate::speakers::name_map(&st.pool, &ids)
+        .await
+        .map_err(internal)?;
+    retrieve::enrich_for_display(&mut sources, &names, now, tz);
+
+    let answer = st
+        .llm
+        .answer_recency(&req.query, &sources, &names)
+        .await
+        .map_err(internal)?;
+    Ok(Json(QueryResponse { answer, sources }))
+}
+
 /// Person analogue of `retrieve::enrich_for_display`: set `speaker_name` via the PERSON label rules
 /// (`persons::display_label` — "unidentified person N" / "an unrecognized face") and the humanized
 /// `time_label`. (A face row carries `person_id::text` in `speaker_id`.)
@@ -610,6 +712,74 @@ pub(crate) fn is_speaker_roster_query(query: &str) -> bool {
         "who do you hear",
         "who can you hear",
         "who did you hear",
+    ]
+    .iter()
+    .any(|p| q.contains(p))
+}
+
+/// Is the question a CALLER-IDENTITY ask ("what's my name", "who am I")? Deliberately narrow
+/// phrase match, same idiom as [`is_speaker_roster_query`]. Answered deterministically from the
+/// caller context + resolved owner name (before any retrieval/LLM), so a voice-verified owner
+/// gets their name back instead of the persona's "I don't have that in the recordings" decline.
+/// Kept tight so an ordinary content question ("what did I say about my name") never trips it.
+pub(crate) fn is_identity_query(query: &str) -> bool {
+    let q = query.trim().to_lowercase();
+    // These phrases are the whole ask, so `contains` is safe. Deliberately NOT including bare
+    // "say my name" / "my name" — those match content questions ("did anyone say my name
+    // yesterday", "what's the name of that place"), which must stay on the retrieval path.
+    [
+        "what's my name",
+        "whats my name",
+        "what is my name",
+        "who am i",
+        "do you know my name",
+        "do you know who i am",
+        "what am i called",
+        "tell me my name",
+    ]
+    .iter()
+    .any(|p| q.contains(p))
+}
+
+/// Shown to a caller-identity question when NO owner is configured anywhere (no DB "This is me"
+/// mark, no OWNER_* env). Returned verbatim instead of an LLM call, mirroring `REFLECTION_NO_TARGET`.
+pub(crate) const IDENTITY_NO_OWNER: &str = "I don't have your name on file yet. Open the Voices screen, name your own voice, and tap \
+     \"This is me\" — then I'll know who you are.";
+
+/// The caller-identity answer given the resolved owner name and whether the client's on-device
+/// voice check verified the owner for this turn. Deterministic (no LLM): a verified owner is
+/// greeted by name; a known-but-unverified caller is told whose device it is without a false
+/// confirmation; no configured owner returns the setup hint.
+pub(crate) fn render_identity(owner_name: Option<&str>, owner_verified: bool) -> String {
+    match owner_name {
+        Some(name) if owner_verified => format!("Your name is {name}."),
+        Some(name) => format!("This device belongs to {name}, but I can't confirm it's you speaking."),
+        None => IDENTITY_NO_OWNER.to_string(),
+    }
+}
+
+/// Is the question a RECENCY ask ("what did we last discuss", "what were we just talking about")?
+/// Deliberately narrow phrase match, same idiom as [`is_speaker_roster_query`]. Routes to the
+/// gap-grouped `latest_conversation` summarizer instead of semantic top-k (which returns a lone
+/// keyword-similar 2s snippet for a recency question). Kept tight so "when did I LAST see Bob"
+/// (a People/count question) and "who spoke last" (a roster question) do NOT trip it.
+pub(crate) fn is_recency_query(query: &str) -> bool {
+    let q = query.to_lowercase();
+    [
+        "last discuss",
+        "last discussed",
+        "last talk about",
+        "last talked about",
+        "last conversation",
+        "latest conversation",
+        "most recent conversation",
+        "recent conversation",
+        "last chat",
+        "what were we talking about",
+        "what were we just talking about",
+        "what did we talk about last",
+        "what have we been talking about",
+        "what did we just discuss",
     ]
     .iter()
     .any(|p| q.contains(p))
@@ -819,9 +989,14 @@ pub(crate) async fn resolve_plate_filter(
     }
 }
 
-/// Resolve the owner's person id(s) for "who was I with" — `OWNER_PERSON_ID` wins over
-/// `OWNER_PERSON_NAME` (resolved against the catalog). Empty = the caller declines gracefully.
+/// Resolve the owner's person id(s) for "who was I with". Precedence: the DB owner mark
+/// (0023, a "This is me" tap in the People UI — most recent user intent, works without env
+/// config) wins over `OWNER_PERSON_ID`, which wins over `OWNER_PERSON_NAME` (resolved
+/// against the catalog). Empty = the caller declines gracefully.
 pub(crate) async fn resolve_owner_person(st: &AppState) -> anyhow::Result<Vec<String>> {
+    if let Some((id, _)) = crate::persons::owner(&st.pool).await? {
+        return Ok(vec![id.to_string()]);
+    }
     if let Some(id) = &st.cfg.owner_person_id {
         return Ok(vec![id.clone()]);
     }
@@ -899,21 +1074,26 @@ pub(crate) async fn resolve_speaker_filter(
 /// Resolve the reflection target speaker. Precedence: an explicit request speaker (id or
 /// name) wins and SHORT-CIRCUITS — it never silently becomes the owner, so an unknown
 /// requested name resolves to empty (→ a graceful "no data" decline) rather than analyzing
-/// someone else. With no request speaker, fall back to the configured OWNER
-/// (`OWNER_SPEAKER_ID` wins over `OWNER_SPEAKER_NAME`). Empty result = the caller declines.
+/// someone else. With no request speaker, fall back to the OWNER: the DB owner mark (0023,
+/// "This is me") wins over `OWNER_SPEAKER_ID`, which wins over `OWNER_SPEAKER_NAME`.
+/// Empty result = the caller declines.
 pub(crate) async fn resolve_target_speaker(
     st: &AppState,
     speaker_id: Option<Vec<String>>,
     speaker_name: Option<String>,
 ) -> anyhow::Result<Vec<String>> {
+    // An explicit speaker_id SHORT-CIRCUITS — even an empty list (a request that scoped to
+    // "this speaker" and resolved to nobody must decline, NOT silently analyze the owner).
+    // Mirrors `resolve_speaker_filter`'s `Some(_) => Ok(Some(ids))`.
     if let Some(ids) = speaker_id {
-        if !ids.is_empty() {
-            return Ok(ids);
-        }
+        return Ok(ids);
     }
     if let Some(name) = speaker_name {
         let uuids = crate::speakers::resolve_name(&st.pool, &name).await?;
         return Ok(uuids.iter().map(|u| u.to_string()).collect());
+    }
+    if let Some((id, _)) = crate::speakers::owner(&st.pool).await? {
+        return Ok(vec![id.to_string()]);
     }
     if let Some(id) = &st.cfg.owner_speaker_id {
         return Ok(vec![id.clone()]);
@@ -923,6 +1103,36 @@ pub(crate) async fn resolve_target_speaker(
         return Ok(uuids.iter().map(|u| u.to_string()).collect());
     }
     Ok(vec![])
+}
+
+/// The owner's human display name, for caller-identity answers and the owner prompt line.
+/// Precedence mirrors `resolve_target_speaker`'s owner chain (so "what's my name" and reflection
+/// agree on WHO the owner is), then falls through to the person (face) owner as a last resort (a
+/// rig may have named only the face): DB speaker owner name → CURRENT DB name of env
+/// `OWNER_SPEAKER_ID` → env `OWNER_SPEAKER_NAME` → DB person owner name → env `OWNER_PERSON_NAME`.
+/// `OWNER_SPEAKER_ID` (a stable id) is resolved to its live DB name BEFORE the env NAME literal, so
+/// renaming that voice reflects immediately (the env NAME is only a last-resort literal, used when
+/// no id/DB owner links to a current name). `None` = no owner configured anywhere.
+pub(crate) async fn resolve_owner_name(st: &AppState) -> anyhow::Result<Option<String>> {
+    if let Some((_, Some(name))) = crate::speakers::owner(&st.pool).await? {
+        return Ok(Some(name));
+    }
+    if let Some(id) = &st.cfg.owner_speaker_id {
+        let names = crate::speakers::name_map(&st.pool, std::slice::from_ref(id)).await?;
+        if let Some(name) = names.get(id) {
+            return Ok(Some(name.clone()));
+        }
+    }
+    if let Some(name) = &st.cfg.owner_speaker_name {
+        return Ok(Some(name.clone()));
+    }
+    if let Some((_, Some(name))) = crate::persons::owner(&st.pool).await? {
+        return Ok(Some(name));
+    }
+    if let Some(name) = &st.cfg.owner_person_name {
+        return Ok(Some(name.clone()));
+    }
+    Ok(None)
 }
 
 /// Optional bearer auth, enforced only when `RAG_TOKEN` is configured.
@@ -965,8 +1175,8 @@ pub(crate) fn internal(e: anyhow::Error) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_co_occurrence_query, is_deictic_video_query, is_speaker_roster_query,
-        normalize_object_label,
+        IDENTITY_NO_OWNER, is_co_occurrence_query, is_deictic_video_query, is_identity_query,
+        is_recency_query, is_speaker_roster_query, normalize_object_label, render_identity,
     };
 
     #[test]
@@ -988,6 +1198,77 @@ mod tests {
         // non-COCO phrases return None → caller falls back to the semantic path (not empty results)
         assert_eq!(n("a spaceship"), None);
         assert_eq!(n("people walking around"), None);
+    }
+
+    #[test]
+    fn identity_questions_are_detected() {
+        for q in [
+            "What's my name?",
+            "whats my name",
+            "What is my name",
+            "Who am I?",
+            "do you know my name",
+            "Do you know who I am?",
+            "tell me my name",
+            "what am I called",
+        ] {
+            assert!(is_identity_query(q), "should be identity: {q:?}");
+        }
+    }
+
+    #[test]
+    fn content_questions_are_not_identity() {
+        // A content question that merely mentions "name" must NOT trip the identity path.
+        for q in [
+            "what did I say about my name change",
+            "who is Bob",
+            "what's the name of that restaurant",
+            "did anyone say my name yesterday",
+            "what did we last discuss",
+        ] {
+            assert!(!is_identity_query(q), "should not be identity: {q:?}");
+        }
+    }
+
+    #[test]
+    fn identity_answer_depends_on_verification_and_owner() {
+        // Verified + known name -> greeted by name.
+        assert_eq!(render_identity(Some("Mendel"), true), "Your name is Mendel.");
+        // Known name but unverified -> non-confirming reply (no false "you are X").
+        let unverified = render_identity(Some("Mendel"), false);
+        assert!(unverified.contains("Mendel"));
+        assert!(unverified.contains("can't confirm"));
+        // No owner configured -> the setup hint, regardless of verification.
+        assert_eq!(render_identity(None, true), IDENTITY_NO_OWNER);
+        assert_eq!(render_identity(None, false), IDENTITY_NO_OWNER);
+    }
+
+    #[test]
+    fn recency_questions_are_detected() {
+        for q in [
+            "What did we last discuss?",
+            "what did we last talk about",
+            "what were we talking about",
+            "tell me about our last conversation",
+            "what was the most recent conversation about",
+            "what did we just discuss",
+        ] {
+            assert!(is_recency_query(q), "should be recency: {q:?}");
+        }
+    }
+
+    #[test]
+    fn non_recency_questions_are_not_recency() {
+        // "last" appears but the question is a People/count or roster ask, not a recency summary.
+        for q in [
+            "when did I last see Bob",
+            "who spoke last",
+            "what did I say about the invoice",
+            "who was speaking",
+            "how many cars did I see",
+        ] {
+            assert!(!is_recency_query(q), "should not be recency: {q:?}");
+        }
     }
 
     #[test]

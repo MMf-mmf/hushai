@@ -498,12 +498,162 @@ async fn claim_one_never_double_claims() {
     );
     assert_ne!(a, b, "the same segment must never be claimed twice");
 
-    // Our fixtures have the smallest capture_start, so they're claimed first.
-    let mut got = [a.unwrap(), b.unwrap()];
+    // Our fixtures have the smallest capture_start, so they're claimed first. Fixture rows are
+    // plain pending inserts, so their hint_audit flag must be false.
+    let (a_id, a_audit) = a.unwrap();
+    let (b_id, b_audit) = b.unwrap();
+    assert!(!a_audit && !b_audit, "plain pending rows are not audit samples");
+    let mut got = [a_id, b_id];
     got.sort();
     let mut want = [s1, s2];
     want.sort();
     assert_eq!(got, want, "the two oldest claimable rows are our fixtures");
 
+    cleanup(&pool, &device).await;
+}
+
+// ---- `skipped` status semantics (migration 0022) --------------------------------------
+
+/// THE regression that motivated first-class `skipped`: a silent-skipped segment has no
+/// `speaker_segments` row (no tombstone anymore), so it must survive BOTH self-healing
+/// startup passes — `reconcile_missing_speaker_segments` (which re-queues rowless `done`)
+/// and the `ensure_status_rows` backfill — without being resurrected to `pending`.
+#[tokio::test]
+async fn skipped_segment_survives_reconcile_and_backfill() {
+    let Some(pool) = pool().await else {
+        eprintln!("skipping skipped_segment_survives_reconcile_and_backfill: DATABASE_URL unset");
+        return;
+    };
+    let device = format!("test-skip-{}", Uuid::now_v7());
+    let seg = insert_fixture_segment(&pool, &device, 0, i64::MIN + 10).await;
+
+    process::write_skip(&pool, seg, "silent_gate", 0.0021, None, None)
+        .await
+        .expect("write_skip");
+
+    let (status, reason, rms): (String, Option<String>, Option<f32>) = sqlx::query_as(
+        "SELECT status, skip_reason, measured_rms FROM segment_transcription_status WHERE segment_id=$1",
+    )
+    .bind(seg)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "skipped");
+    assert_eq!(reason.as_deref(), Some("silent_gate"));
+    assert!((rms.unwrap() - 0.0021).abs() < 1e-6, "gate telemetry persisted");
+
+    // No junk speaker row for the silent majority.
+    let tombstones: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM speaker_segments WHERE segment_id=$1")
+            .bind(seg)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(tombstones, 0, "silent skip must not write a speaker tombstone");
+
+    // Both startup self-healing passes leave it alone.
+    claim::reconcile_missing_speaker_segments(&pool).await.unwrap();
+    claim::ensure_status_rows(&pool).await.unwrap();
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM segment_transcription_status WHERE segment_id=$1")
+            .bind(seg)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "skipped", "skipped must survive reconcile + backfill");
+
+    // Never claimable: the exact predicate `claim_one` uses must not match a skipped row.
+    let claimable: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM segment_transcription_status s \
+          WHERE s.segment_id=$1 AND (s.status='pending' \
+             OR (s.status='error' AND s.attempts < 5) \
+             OR (s.status='processing' AND s.claimed_at < now() - interval '300 seconds')))",
+    )
+    .bind(seg)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!claimable, "skipped is terminal — never claimable");
+
+    // write_skip is idempotent + clears any stale transcript from a prior processing run.
+    process::write_skip(&pool, seg, "silent_gate", 0.0021, Some(0.05), Some("agree"))
+        .await
+        .expect("write_skip (again)");
+    assert_eq!(count_sentences(&pool, seg).await, 0);
+    let verdict: Option<String> =
+        sqlx::query_scalar("SELECT audit_verdict FROM segment_transcription_status WHERE segment_id=$1")
+            .bind(seg)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(verdict.as_deref(), Some("agree"));
+
+    cleanup(&pool, &device).await;
+}
+
+/// Vision-lane skip mark: status/skip_reason/telemetry/audit columns, and the manual
+/// reprocess escape hatch (skipped -> pending) documented in AGENTS.md.
+#[tokio::test]
+async fn mark_vision_skipped_and_reprocess_flip() {
+    let Some(pool) = pool().await else {
+        eprintln!("skipping mark_vision_skipped_and_reprocess_flip: DATABASE_URL unset");
+        return;
+    };
+    let device = format!("test-vskip-{}", Uuid::now_v7());
+    let seg = insert_fixture_segment(&pool, &device, 0, i64::MIN + 20).await;
+    sqlx::query("INSERT INTO segment_vision_status (segment_id) VALUES ($1) ON CONFLICT DO NOTHING")
+        .bind(seg)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    claim::mark_vision_skipped(&pool, seg, "static_gate", Some(1.25), Some("agree"))
+        .await
+        .expect("mark_vision_skipped");
+    let (status, reason, dist, verdict): (String, Option<String>, Option<f32>, Option<String>) =
+        sqlx::query_as(
+            "SELECT status, skip_reason, measured_motion_distance, audit_verdict \
+             FROM segment_vision_status WHERE segment_id=$1",
+        )
+        .bind(seg)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(status, "skipped");
+    assert_eq!(reason.as_deref(), Some("static_gate"));
+    assert!((dist.unwrap() - 1.25).abs() < 1e-6);
+    assert_eq!(verdict.as_deref(), Some("agree"));
+
+    // `done` mark persists telemetry too (calibration data on every processed segment).
+    claim::mark_vision_done(&pool, seg, Some(9.5), Some("disagree")).await.unwrap();
+    let (status, dist): (String, Option<f32>) = sqlx::query_as(
+        "SELECT status, measured_motion_distance FROM segment_vision_status WHERE segment_id=$1",
+    )
+    .bind(seg)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(status, "done");
+    assert!((dist.unwrap() - 9.5).abs() < 1e-6);
+
+    // The operator escape hatch: flip skipped -> pending for re-evaluation.
+    claim::mark_vision_skipped(&pool, seg, "static_gate", None, None).await.unwrap();
+    sqlx::query(
+        "UPDATE segment_vision_status SET status='pending', attempts=0, skip_reason=NULL, \
+         claimed_at=NULL, updated_at=now() WHERE segment_id=$1 AND status='skipped'",
+    )
+    .bind(seg)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM segment_vision_status WHERE segment_id=$1")
+            .bind(seg)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "pending");
+
+    // cleanup: vision status rows cascade from segments
     cleanup(&pool, &device).await;
 }

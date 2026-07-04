@@ -548,16 +548,33 @@ async fn vision_worker_loop(
             continue;
         }
         match claim::claim_one_vision(&pool, cfg.max_attempts, cfg.lease_timeout_secs).await {
-            Ok(Some(segment_id)) => {
-                match crate::vision::write::process_vision_segment(&pool, &models, &cfg, segment_id)
+            Ok(Some((segment_id, hint_audit))) => {
+                match crate::vision::write::process_vision_segment(&pool, &models, &cfg, segment_id, hint_audit)
                     .await
                 {
-                    Ok(n) => {
+                    Ok(vision::write::VisionOutcome::Processed { faces, motion_distance, audit_verdict }) => {
                         hushai_backend::observe::counter("hushai_segments_processed_total", &[("lane", "vision"), ("result", "ok")]);
-                        if let Err(e) = claim::mark_vision_done(&pool, segment_id).await {
+                        if let Err(e) =
+                            claim::mark_vision_done(&pool, segment_id, motion_distance, audit_verdict).await
+                        {
                             tracing::warn!(%segment_id, error = %e, "marking vision done failed");
                         }
-                        tracing::debug!(%segment_id, faces = n, "vision segment processed");
+                        tracing::debug!(%segment_id, faces, "vision segment processed");
+                    }
+                    Ok(vision::write::VisionOutcome::SkippedStatic { motion_distance, audit_verdict }) => {
+                        // Static scene: no inference ran, nothing was written. Terminal `skipped`
+                        // (never re-claimed) — dashboard-visible, unlike the old plain `done`.
+                        if let Err(e) = claim::mark_vision_skipped(
+                            &pool,
+                            segment_id,
+                            "static_gate",
+                            Some(motion_distance),
+                            audit_verdict,
+                        )
+                        .await
+                        {
+                            tracing::warn!(%segment_id, error = %e, "marking vision skipped failed");
+                        }
                     }
                     Err(e) => {
                         if !claim::segment_exists(&pool, segment_id).await {
@@ -761,7 +778,7 @@ async fn worker_loop(
             continue;
         }
         match claim::claim_one(&pool, cfg.max_attempts, cfg.lease_timeout_secs).await {
-            Ok(Some(segment_id)) => {
+            Ok(Some((segment_id, hint_audit))) => {
                 match process::process_segment(
                     &pool,
                     &transcriber,
@@ -771,13 +788,17 @@ async fn worker_loop(
                     &voice_detector,
                     &cfg,
                     segment_id,
+                    hint_audit,
                 )
                 .await
                 {
-                    Ok(n) => {
+                    Ok(process::AudioOutcome::Processed { sentences }) => {
                         hushai_backend::observe::counter("hushai_segments_processed_total", &[("lane", "audio"), ("result", "ok")]);
-                        tracing::info!(%segment_id, sentences = n, worker_id, "processed segment");
+                        tracing::info!(%segment_id, sentences, worker_id, "processed segment");
                     }
+                    // Silent skip: status already `skipped` (written inside process_segment); it
+                    // has its own counter, so it no longer inflates processed_total{result=ok}.
+                    Ok(process::AudioOutcome::SkippedSilent) => {}
                     Err(e) => {
                         if !claim::segment_exists(&pool, segment_id).await {
                             // Deleted mid-flight (footage/device delete or retention). The status row

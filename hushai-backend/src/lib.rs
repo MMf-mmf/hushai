@@ -13,6 +13,7 @@ pub mod db;
 pub mod devices;
 pub mod error;
 pub mod events;
+pub mod hints;
 pub mod ingest;
 pub mod logging;
 pub mod observe;

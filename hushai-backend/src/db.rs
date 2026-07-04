@@ -77,11 +77,16 @@ pub async fn readiness(pool: &PgPool) -> Result<(), sqlx::Error> {
 /// Upsert order is FK-safe: devices → sessions → streams → segments. The segment
 /// PK (`segment_id`) is the idempotency key; `ON CONFLICT DO NOTHING` + a digest
 /// re-read closes the duplicate race (equal bytes → accept, different → reject).
+///
+/// `gate` is the ingest hint-gate policy: lanes whose device-reported content hints are
+/// below the floors are queued pre-terminated as `skipped` (see `crate::hints`). Storage
+/// is NEVER gated — every accepted segment is durably persisted regardless of hints.
 pub async fn persist_segment(
     pool: &PgPool,
     m: &DecodedManifest,
     blob_uri: &str,
     storage_backend: &str,
+    gate: &crate::hints::HintGateCfg,
 ) -> Result<Persisted, IngestError> {
     let mut tx = pool.begin().await?;
 
@@ -176,48 +181,122 @@ pub async fn persist_segment(
     };
 
     if inserted {
-        // Queue the new segment for transcription right here instead of relying on the
+        // Queue the new segment for its AI lanes right here instead of relying on the
         // worker's periodic full-table backfill scan, and wake idle workers via
-        // LISTEN/NOTIFY. Both ride this transaction, so they only take effect if the
-        // segment commit succeeds (and roll back with it otherwise).
+        // LISTEN/NOTIFY. Everything rides this transaction, so it only takes effect if the
+        // segment commit succeeds (and rolls back with it otherwise).
         //
+        // The ingest hint gate (crate::hints) may pre-terminate a lane: a segment whose
+        // device-reported hints are below the floors gets its status row born
+        // `status='skipped'` — never claimable, never notified. The row is INSERTED (not
+        // suppressed) deliberately: the worker's startup `ensure_status_rows` backfill
+        // re-adds any MISSING row as `pending`, so only a present terminal row survives it.
+        // Lanes decide independently (a MUXED segment can skip audio and process vision).
+        // Everything here is a runtime query (not the `query!` macro) so the status-table
+        // columns need no `cargo sqlx prepare` — same deliberate choice as `speakers.rs`.
+        let hints = crate::hints::parse(&m.attrs);
+        if hints.malformed {
+            crate::observe::counter("hushai_ingest_hint_malformed_total", &[]);
+        }
+        // Deterministic audit lot: the UUIDv7's final byte is random tail, so `% 100` is a
+        // uniform, reproducible-per-segment roll (no RNG dependency; replays land identically).
+        let audit_roll = m.segment_id.as_bytes()[15] % 100;
+        let mut wake_worker = false;
+
         // Only AUDIO (1) / MUXED (3) carry audio the worker can transcribe + voiceprint;
         // VIDEO-only (2) segments have nothing for it to do (and would just fail ffmpeg
         // audio extraction), so they are never queued or notified.
         if matches!(m.media_type, 1 | 3) {
-            sqlx::query!(
-                r#"
-                INSERT INTO segment_transcription_status (segment_id)
-                VALUES ($1)
-                ON CONFLICT (segment_id) DO NOTHING
-                "#,
-                m.segment_id,
-            )
-            .execute(&mut *tx)
-            .await?;
-            sqlx::query!(
-                r#"SELECT pg_notify('hushai_segment_ingested', $1)"#,
-                m.segment_id.to_string(),
-            )
-            .execute(&mut *tx)
-            .await?;
+            match crate::hints::audio_decision(&hints, gate, audit_roll) {
+                crate::hints::LaneDecision::Skip(reason) => {
+                    sqlx::query(
+                        r#"
+                        INSERT INTO segment_transcription_status (segment_id, status, skip_reason)
+                        VALUES ($1, 'skipped', $2)
+                        ON CONFLICT (segment_id) DO NOTHING
+                        "#,
+                    )
+                    .bind(m.segment_id)
+                    .bind(reason)
+                    .execute(&mut *tx)
+                    .await?;
+                    crate::observe::counter(
+                        "hushai_ingest_segments_skipped_total",
+                        &[("lane", "audio"), ("reason", reason)],
+                    );
+                }
+                decision => {
+                    let audit = decision == crate::hints::LaneDecision::Audit;
+                    sqlx::query(
+                        r#"
+                        INSERT INTO segment_transcription_status (segment_id, hint_audit)
+                        VALUES ($1, $2)
+                        ON CONFLICT (segment_id) DO NOTHING
+                        "#,
+                    )
+                    .bind(m.segment_id)
+                    .bind(audit)
+                    .execute(&mut *tx)
+                    .await?;
+                    if audit {
+                        crate::observe::counter(
+                            "hushai_ingest_hint_audit_enqueued_total",
+                            &[("lane", "audio")],
+                        );
+                    }
+                    wake_worker = true;
+                }
+            }
         }
 
         // VIDEO (2) / MUXED (3) carry frames the vision worker processes (face identity +
         // objects), on a SEPARATE queue (migration 0009). A MUXED segment is queued for BOTH.
-        // Runtime query (not the `query!` macro) so adding the vision table needs no
-        // `cargo sqlx prepare` — same deliberate choice as `speakers.rs`.
         if matches!(m.media_type, 2 | 3) {
-            sqlx::query(
-                r#"
-                INSERT INTO segment_vision_status (segment_id)
-                VALUES ($1)
-                ON CONFLICT (segment_id) DO NOTHING
-                "#,
-            )
-            .bind(m.segment_id)
-            .execute(&mut *tx)
-            .await?;
+            match crate::hints::vision_decision(&hints, gate, audit_roll) {
+                crate::hints::LaneDecision::Skip(reason) => {
+                    sqlx::query(
+                        r#"
+                        INSERT INTO segment_vision_status (segment_id, status, skip_reason)
+                        VALUES ($1, 'skipped', $2)
+                        ON CONFLICT (segment_id) DO NOTHING
+                        "#,
+                    )
+                    .bind(m.segment_id)
+                    .bind(reason)
+                    .execute(&mut *tx)
+                    .await?;
+                    crate::observe::counter(
+                        "hushai_ingest_segments_skipped_total",
+                        &[("lane", "vision"), ("reason", reason)],
+                    );
+                }
+                decision => {
+                    let audit = decision == crate::hints::LaneDecision::Audit;
+                    sqlx::query(
+                        r#"
+                        INSERT INTO segment_vision_status (segment_id, hint_audit)
+                        VALUES ($1, $2)
+                        ON CONFLICT (segment_id) DO NOTHING
+                        "#,
+                    )
+                    .bind(m.segment_id)
+                    .bind(audit)
+                    .execute(&mut *tx)
+                    .await?;
+                    if audit {
+                        crate::observe::counter(
+                            "hushai_ingest_hint_audit_enqueued_total",
+                            &[("lane", "vision")],
+                        );
+                    }
+                    wake_worker = true;
+                }
+            }
+        }
+
+        // One wake-up iff at least one lane actually has claimable work; a fully hint-skipped
+        // segment must not wake idle workers at all.
+        if wake_worker {
             sqlx::query("SELECT pg_notify('hushai_segment_ingested', $1)")
                 .bind(m.segment_id.to_string())
                 .execute(&mut *tx)

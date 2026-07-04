@@ -21,6 +21,8 @@ import com.hushai.android.config.Settings
 import com.hushai.android.net.ConnectivityState
 import com.hushai.android.net.Http
 import com.hushai.android.net.NetworkMonitor
+import com.hushai.android.assistant.VoiceSession
+import com.hushai.android.net.RagChatClient
 import com.hushai.android.net.RagClient
 import com.hushai.android.net.TtsClient
 import com.hushai.android.net.Reachability
@@ -70,6 +72,11 @@ class CaptureService : Service() {
     @Volatile private var uploader: Uploader? = null
     @Volatile private var camera: CameraController? = null
     @Volatile private var video: VideoEncoder? = null
+    // Non-null only when the opt-in upright-BAKE path is active (Settings.uprightBake). It owns
+    // its own VideoEncoder + GL renderer, so `video` stays null in that mode. Exactly one of
+    // {video, glPipeline} is live at a time.
+    @Volatile private var glPipeline: GlVideoPipeline? = null
+    @Volatile private var motionAnalyzer: MotionHintAnalyzer? = null
     @Volatile private var orientationTracker: OrientationTracker? = null
     @Volatile private var audio: AudioEncoder? = null
     @Volatile private var micSource: MicSource? = null
@@ -199,15 +206,25 @@ class CaptureService : Service() {
     private fun buildAssistant(): VoiceAssistant {
         val ragUrl = settings.ragUrlBlocking()
         val ragToken = settings.ragTokenBlocking()
-        val ragClient = RagClient(Http.rag, ragUrl, ragToken)
+        val chatClient = RagChatClient(Http.rag, ragUrl, ragToken)
+        val ragClient = RagClient(Http.rag, ragUrl, ragToken) // older-server fallback
         val ttsClient = TtsClient(Http.rag, ragUrl, ragToken)
         val owner = SpeakerMath.parse(settings.ownerEmbeddingBlocking())
+        // Session state lives in DataStore (not this object), so a rebuilt assistant resumes the
+        // same conversation if still within the idle window.
+        val voiceSession = VoiceSession(
+            load = { settings.loadVoiceSessionBlocking() },
+            save = { id, at -> settings.saveVoiceSessionBlocking(id, at) },
+            clear = { settings.clearVoiceSessionBlocking() },
+        )
         return VoiceAssistant(
             context = applicationContext,
             deviceId = settings.deviceIdBlocking(),
             initialWakeWord = settings.wakeWordBlocking(),
+            chatClient = chatClient,
             ragClient = ragClient,
             ttsClient = ttsClient,
+            voiceSession = voiceSession,
             initialOwnerEmbedding = owner,
             onEnrollComplete = { emb -> settings.setOwnerEmbeddingBlocking(SpeakerMath.format(emb)) },
         )
@@ -262,6 +279,14 @@ class CaptureService : Service() {
             intent.getBooleanExtra(EXTRA_AUDIO_ONLY, false)
         } else {
             settings.audioOnlyBlocking()
+        }
+
+        // Opt-in upright-BAKE (experimental; verify on the rig). No UI toggle yet — persist it
+        // from the intent extra so it can be enabled headlessly:
+        //   adb shell am start-foreground-service -n com.hushai.android/.capture.CaptureService --ez upright_bake true
+        // Takes effect on the next capture start (Stop → Start if already running).
+        if (intent?.hasExtra(EXTRA_UPRIGHT_BAKE) == true) {
+            settings.setUprightBakeBlocking(intent.getBooleanExtra(EXTRA_UPRIGHT_BAKE, false))
         }
 
         desiredRunning = true
@@ -370,15 +395,57 @@ class CaptureService : Service() {
 
             if (selection != null) {
                 // Make every recorded segment UPRIGHT regardless of how the phone is held/mounted:
-                // the tracker reads the physical orientation (accelerometer, works screen-off) and the
-                // encoder stamps each segment's MP4 rotation matrix (worker ffmpeg + browser autorotate).
+                // the tracker reads the physical orientation (accelerometer, works screen-off).
                 val tracker = OrientationTracker(this, selection.sensorOrientation, selection.facingFront)
                     .also { it.enable() }
                 orientationTracker = tracker
-                video = VideoEncoder(
-                    segmentDir, selection.size, VIDEO_BITRATE, FRAME_RATE, SEGMENT_DURATION_US, videoSeq, ::onSegment,
-                    rotationProvider = { tracker.orientationHint() },
-                ).also { it.start() }
+                // Motion-hint analysis stream (best-effort): per-segment `hint.motion_score` so
+                // the backend can pre-skip static video. If it can't be built (or the camera
+                // rejects the extra output — CameraController falls back), hints are simply absent.
+                val analyzer = runCatching { MotionHintAnalyzer() }
+                    .onFailure { HushaiLog.warn("motion hint analyzer unavailable: ${it.message}") }
+                    .getOrNull()
+                motionAnalyzer = analyzer
+
+                // Two upright strategies:
+                //  - default: stamp the MP4 rotation MATRIX; re-decode consumers (worker frames,
+                //    viewer re-encode) autorotate. Robust, no GL.
+                //  - opt-in bake (Settings.uprightBake): a GL pass rotates the PIXELS on-device so
+                //    even the viewer's fast `-c copy` plays upright. Falls back to the matrix path
+                //    (releasing any half-started pipeline) if GL init fails — capture never depends on GL.
+                var pipeline: GlVideoPipeline? = null
+                if (settings.uprightBakeBlocking()) {
+                    val p = runCatching {
+                        GlVideoPipeline(
+                            segmentDir, selection.size, VIDEO_BITRATE, FRAME_RATE, SEGMENT_DURATION_US,
+                            videoSeq, ::onSegment,
+                            bakedRotation = tracker.orientationHint(),
+                            rotationProvider = { tracker.orientationHint() },
+                            motionScoreProvider = { analyzer?.take() },
+                        )
+                    }.onFailure {
+                        HushaiLog.error("upright-bake pipeline build failed; using rotation-matrix path", it)
+                    }.getOrNull()
+                    if (p != null) {
+                        runCatching { p.start() }
+                            .onSuccess { pipeline = p }
+                            .onFailure {
+                                HushaiLog.error("upright-bake GL start failed; using rotation-matrix path", it)
+                                runCatching { p.stop() }
+                            }
+                    }
+                }
+
+                if (pipeline != null) {
+                    glPipeline = pipeline
+                    HushaiLog.info("video pipeline: upright-BAKE (${pipeline!!.outputSize.width}x${pipeline!!.outputSize.height})")
+                } else {
+                    video = VideoEncoder(
+                        segmentDir, selection.size, VIDEO_BITRATE, FRAME_RATE, SEGMENT_DURATION_US, videoSeq, ::onSegment,
+                        rotationProvider = { tracker.orientationHint() },
+                        motionScoreProvider = { analyzer?.take() },
+                    ).also { it.start() }
+                }
             }
 
             // One mic, fanned out: the AAC segment encoder always, plus the voice
@@ -398,7 +465,13 @@ class CaptureService : Service() {
             micSource = MicSource(AUDIO_SAMPLE_RATE, AUDIO_CHANNELS, sinks).also { it.start() }
 
             if (selection != null) {
-                camera = CameraController(this, selection.cameraId, video!!.inputSurface).also {
+                // In bake mode the camera feeds the GL renderer's SurfaceTexture (which draws the
+                // rotated frame into the encoder); otherwise it feeds the encoder input directly.
+                val videoTarget = glPipeline?.cameraTargetSurface ?: video!!.inputSurface
+                camera = CameraController(
+                    this, selection.cameraId, videoTarget,
+                    analysisSurface = motionAnalyzer?.surface,
+                ).also {
                     it.start()
                     // If the Activity is already in the foreground and handed us a preview
                     // surface before capture began, wire it in now (idempotent).
@@ -418,6 +491,8 @@ class CaptureService : Service() {
             runCatching { camera?.stop() }; camera = null
             runCatching { micSource?.stop() }; micSource = null
             runCatching { video?.stop() }; video = null
+            runCatching { glPipeline?.stop() }; glPipeline = null
+            runCatching { motionAnalyzer?.close() }; motionAnalyzer = null
             runCatching { orientationTracker?.disable() }; orientationTracker = null
             runCatching { audio?.stop() }; audio = null
             runCatching { assistant?.stop() }; assistant = null
@@ -730,6 +805,8 @@ class CaptureService : Service() {
         // the consumers (encoder + assistant) without racing onPcm.
         runCatching { micSource?.stop() }; micSource = null
         runCatching { video?.stop() }; video = null
+        runCatching { glPipeline?.stop() }; glPipeline = null
+        runCatching { motionAnalyzer?.close() }; motionAnalyzer = null
         runCatching { orientationTracker?.disable() }; orientationTracker = null
         runCatching { audio?.stop() }; audio = null
         runCatching { assistant?.stop() }; assistant = null
@@ -787,6 +864,7 @@ class CaptureService : Service() {
         const val EXTRA_RAG_URL = "rag_url"
         const val EXTRA_RAG_TOKEN = "rag_token"
         const val EXTRA_AUDIO_ONLY = "audio_only"
+        const val EXTRA_UPRIGHT_BAKE = "upright_bake"
         const val EXTRA_IMPORT_URIS = "import_uris"
 
         /**

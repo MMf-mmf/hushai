@@ -211,6 +211,12 @@ pub struct WorkerConfig {
     /// Fingerprint tile side (NxN grayscale). Larger = more sensitive + slightly more cost; 32 is
     /// the recommended sweet spot (~1 KB/camera).
     pub vision_motion_fp_side: usize,
+    /// One-frame probe (default on): decode a SINGLE mid-segment frame for the motion gate and
+    /// only pay the full `frames_per_segment` decode after motion is confirmed — ~1/3 the
+    /// decode-to-discard cost on a static camera. The gate fingerprint becomes the probe frame
+    /// (still camera-consistent: both sides of the diff come through the same path). Off = legacy
+    /// behavior (decode all frames, gate on the last).
+    pub vision_gate_one_frame_probe: bool,
     /// Face match-or-mint tunables (cosine DISTANCE; mirror the SPEAKER_* set). UNCALIBRATED
     /// starting guesses — calibrate on a real face fixture (see plan "How to Test").
     pub face_match_threshold: f32,
@@ -549,6 +555,7 @@ impl WorkerConfig {
             vision_motion_skip_enabled: parse("VISION_MOTION_SKIP_ENABLED", "true")?,
             vision_motion_threshold: parse("VISION_MOTION_THRESHOLD", "8.0")?,
             vision_motion_fp_side: parse("VISION_MOTION_FP_SIDE", "32")?,
+            vision_gate_one_frame_probe: parse("WORKER_GATE_ONE_FRAME_PROBE", "true")?,
             face_match_threshold: parse("FACE_MATCH_THRESHOLD", "0.5")?,
             face_mint_distance_floor: parse("FACE_MINT_DISTANCE_FLOOR", "0.72")?,
             face_knn_k: parse("FACE_KNN_K", "15")?,

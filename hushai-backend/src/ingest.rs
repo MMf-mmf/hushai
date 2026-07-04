@@ -97,8 +97,14 @@ pub async fn post_segment(
     async move {
         // Durable blob first, then the committed row (durability ordering §6).
         let blob_uri = storage::promote(&state.blob_root, &mut hashed).await?;
-        let outcome =
-            db::persist_segment(&state.pool, &manifest, &blob_uri, STORAGE_BACKEND).await?;
+        let outcome = db::persist_segment(
+            &state.pool,
+            &manifest,
+            &blob_uri,
+            STORAGE_BACKEND,
+            &state.config.hint_gate,
+        )
+        .await?;
 
         let media = match manifest.media_type {
             1 => "audio",

@@ -19,6 +19,11 @@ pub struct PollOutcome {
     pub injected: usize,
     pub audio_done: i64,
     pub vision_done: i64,
+    /// Terminal content-gate skips (migration 0022: silent audio / static video). A skipped
+    /// segment COMPLETED successfully — the pipeline decided there was nothing to infer — so
+    /// completeness checks count done+skipped; only `error` blocks scoring.
+    pub audio_skipped: i64,
+    pub vision_skipped: i64,
     pub event_count: i64,
     pub errors: Vec<String>,
 }
@@ -26,6 +31,7 @@ pub struct PollOutcome {
 struct LaneState {
     settled: i64,
     done: i64,
+    skipped: i64,
     errors: Vec<String>,
 }
 
@@ -54,8 +60,8 @@ pub async fn wait_until_complete(
     let wait_vision = (meta.needs_vision() || meta.modality("events")) && has_video;
 
     let start = Instant::now();
-    let mut audio = LaneState { settled: 0, done: 0, errors: vec![] };
-    let mut vision = LaneState { settled: 0, done: 0, errors: vec![] };
+    let mut audio = LaneState { settled: 0, done: 0, skipped: 0, errors: vec![] };
+    let mut vision = LaneState { settled: 0, done: 0, skipped: 0, errors: vec![] };
 
     // Phase 1: all relevant-lane segments terminal.
     loop {
@@ -79,6 +85,8 @@ pub async fn wait_until_complete(
                 injected: ids.len(),
                 audio_done: audio.done,
                 vision_done: vision.done,
+                audio_skipped: audio.skipped,
+                vision_skipped: vision.skipped,
                 event_count: event_count(ctx, device_id, base_ns).await?,
                 errors,
             });
@@ -111,6 +119,8 @@ pub async fn wait_until_complete(
                 injected: ids.len(),
                 audio_done: audio.done,
                 vision_done: vision.done,
+                audio_skipped: audio.skipped,
+                vision_skipped: vision.skipped,
                 event_count: last,
                 errors,
             });
@@ -125,6 +135,8 @@ pub async fn wait_until_complete(
         injected: ids.len(),
         audio_done: audio.done,
         vision_done: vision.done,
+        audio_skipped: audio.skipped,
+        vision_skipped: vision.skipped,
         event_count: last,
         errors,
     })
@@ -139,11 +151,19 @@ async fn lane_state(ctx: &Ctx, table: &str, ids: &[Uuid], max_attempts: i32) -> 
     .fetch_all(&ctx.pool)
     .await?;
 
-    let mut st = LaneState { settled: 0, done: 0, errors: vec![] };
+    let mut st = LaneState { settled: 0, done: 0, skipped: 0, errors: vec![] };
     for (id, status, attempts) in rows {
         match status.as_str() {
             "done" => {
                 st.done += 1;
+                st.settled += 1;
+            }
+            // Terminal content-gate verdict (static video / silent audio; migration 0022):
+            // a successful completion (counts toward the fully-done gate) but deliberately
+            // NOT `done` — a fixture that expects transcripts/detections from a skipped
+            // segment should fail its assertions, not hang here.
+            "skipped" => {
+                st.skipped += 1;
                 st.settled += 1;
             }
             "error" if attempts >= max_attempts => {

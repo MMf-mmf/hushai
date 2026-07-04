@@ -44,6 +44,19 @@ pub fn humanize_time(start_unix_nanos: i64, now_unix_nanos: i64, tz_offset_secs:
     }
 }
 
+/// Absolute local civil date-and-time, e.g. "Friday, July 3, 2026 at 2:15 PM" — for the
+/// assistant's system briefing so it knows "today" without a raw timestamp. Same fixed-offset
+/// arithmetic as [`humanize_time`]; reuses `clock12`/`ordinal`.
+pub fn absolute_time(now_unix_nanos: i64, tz_offset_secs: i64) -> String {
+    let now: DateTime<Utc> =
+        DateTime::from_timestamp_nanos(now_unix_nanos) + Duration::seconds(tz_offset_secs);
+    let weekday = now.format("%A"); // e.g. "Friday"
+    let month = now.format("%B"); // e.g. "July"
+    let day = ordinal(now.day());
+    let clock = clock12(now.hour(), now.minute());
+    format!("{weekday}, {month} {day}, {} at {clock}", now.year())
+}
+
 /// 12-hour clock with AM/PM, e.g. "5:14 PM", "9:07 AM", "12:00 PM" (noon), "12:00 AM"
 /// (midnight). Built manually rather than via chrono's `%-I`, which isn't portable.
 fn clock12(hour24: u32, minute: u32) -> String {

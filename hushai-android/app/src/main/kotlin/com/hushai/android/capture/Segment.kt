@@ -31,4 +31,10 @@ data class Segment(
     // identity the drain loop carries). Imported files set a FRESH session here so
     // their sequence space is independent of live capture (Workstream 3).
     val sessionId: ByteString? = null,
+    // Extra manifest attrs merged into SegmentManifest.attrs (contract §8 escape hatch).
+    // Carries the device content hints (hint.v / hint.audio_rms / hint.audio_peak_rms /
+    // hint.motion_score): RAW measurements only — the backend owns every threshold. Baked in
+    // here (before the manifest is persisted at DurableSegmentBuffer.offer) so offline
+    // store-and-forward replays the exact same hints.
+    val attrs: Map<String, String> = emptyMap(),
 )

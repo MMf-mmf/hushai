@@ -61,6 +61,9 @@ pub struct LaneSummary {
     pub processing: i64,
     pub done: i64,
     pub error: i64,
+    /// Terminal content-gate verdict (static video / silent audio; migration 0022) — the
+    /// segment is stored and playable, the AI lane just had nothing worth inferring.
+    pub skipped: i64,
 }
 
 impl LaneSummary {
@@ -70,6 +73,7 @@ impl LaneSummary {
             "processing" => self.processing += 1,
             "done" => self.done += 1,
             "error" => self.error += 1,
+            "skipped" => self.skipped += 1,
             _ => {}
         }
     }

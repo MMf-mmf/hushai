@@ -176,6 +176,12 @@ fun VoicesScreen(client: SpeakersClient, onBack: () -> Unit) {
                                 if (ok) reload() else Toast.makeText(ctx, "Couldn't complete that — check your connection and try again.", Toast.LENGTH_LONG).show()
                             }
                         },
+                        onSetOwner = { flag ->
+                            scope.launch {
+                                val ok = withContext(Dispatchers.IO) { client.setOwner(sp.id, flag) }
+                                if (ok) reload() else Toast.makeText(ctx, "Couldn't complete that — check your connection and try again.", Toast.LENGTH_LONG).show()
+                            }
+                        },
                     )
                 }
                 // Identified (named) voices first so the known voices are visible at a glance,
@@ -293,13 +299,15 @@ private fun SpeakerCard(
     onPlay: () -> Unit,
     onMerge: (String) -> Unit,
     onSetArchived: (Boolean) -> Unit,
+    onSetOwner: (Boolean) -> Unit,
 ) {
     var name by remember(speaker.id) { mutableStateOf(speaker.name ?: "") }
     var mergeOpen by remember(speaker.id) { mutableStateOf(false) }
 
     SectionCard {
         Text(
-            speaker.name ?: "Unknown speaker (${speaker.id.take(8)})",
+            (speaker.name ?: "Unknown speaker (${speaker.id.take(8)})") +
+                if (speaker.isOwner) "  • You" else "",
             style = MaterialTheme.typography.titleMedium,
         )
         Text(
@@ -354,6 +362,15 @@ private fun SpeakerCard(
                 }
             }
             OutlinedButton(onClick = { onSetArchived(true) }) { Text("Disregard") }
+        }
+
+        // "This is me": marks this voice as the device owner so the assistant answers "what's my
+        // name", resolves first-person questions, and scopes reflection to the owner.
+        Spacer(Modifier.height(8.dp))
+        if (speaker.isOwner) {
+            OutlinedButton(onClick = { onSetOwner(false) }) { Text("You ✓ — tap to clear") }
+        } else {
+            Button(onClick = { onSetOwner(true) }) { Text("This is me") }
         }
     }
 }
