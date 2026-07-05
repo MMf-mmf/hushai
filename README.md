@@ -4,15 +4,39 @@ A Cargo workspace for the Hushai data-intake + retrieval system.
 
 | crate | role |
 |-------|------|
-| [`hushai-backend`](hushai-backend/) | Durable, idempotent **segment-ingest** server (camera→backend contract v0.1.0). Owns the DB schema. |
-| [`hushai-worker`](hushai-worker/) | Durable, resumable, idempotent **transcription + embedding** worker: drains stored segments → `transcript_sentences`. |
-| [`hushai-rag`](hushai-rag/) | **RAG** service: `POST /v1/rag/query` — grounded Q&A over the transcripts with source citations. |
-| [`hushai-viewer`](hushai-viewer/) | The unified **browser app** (NVR timeline + chat-over-recordings, `127.0.0.1:8070`); reuses `hushai-backend` as a library. Includes a **🗄 Files** page for device & footage management — rename, per-date storage usage, retention, delete, export ([`docs/device-and-footage-management.md`](docs/device-and-footage-management.md)). |
+| [`hushai-backend`](hushai-backend/) | Durable, idempotent **segment-ingest** server (camera→backend contract v0.1.0, `:8080`). Owns the DB schema + the authenticated admin API (speakers/persons/plates/devices/events/watchlist/audit). |
+| [`hushai-worker`](hushai-worker/) | Durable, resumable, idempotent **processing** worker: two SKIP-LOCKED queues — audio (whisper ASR → embeddings → sentiment → speaker ID) and vision (faces → objects → ALPR) — plus event production + alert delivery. |
+| [`hushai-rag`](hushai-rag/) | **RAG** service (`:8090`): grounded Q&A + multi-turn SSE chat over the recordings with auto-routed agents, source citations, and local TTS. |
+| [`hushai-viewer`](hushai-viewer/) | The unified **browser app** (NVR timeline + chat + admin modals + dashboard + Events/Files pages, `127.0.0.1:8070`); reverse-proxies `/v1/*`; reuses `hushai-backend` as a library. |
+| [`hushai-android`](hushai-android/) | Native Kotlin capture client: ~2s segments, live preview, battery-saver, audio-only mode, on-device voice assistant, and Voices/People/Plates/Events screens. |
+| [`hushai-eval`](hushai-eval/) | End-to-end regression harness: inject known clips → wait → score vs ground truth → verdict + exit code. |
+| [`hushai-loadtest`](hushai-loadtest/) | Capacity harness: replay one clip as N synthetic cameras and find the saturation point. |
 
-The worker and RAG service are the **transcription-embedding-and-rag** ticket
-(`Issues/transcription-embedding-and-rag.md`). Both reuse `hushai-backend` as a library
-(DB `Config` + pool) and are **fully local / privacy-first**: ASR via whisper.cpp, embeddings +
-LLM via a local Ollama server — captured media never leaves the machine.
+All crates reuse `hushai-backend` as a library (DB `Config` + pool + shared TLS/observe/logging) and
+are **fully local / privacy-first**: ASR via whisper.cpp, embeddings + LLM via a local Ollama server,
+vision + TTS via local ONNX models — captured media never leaves the machine. See
+[`AGENTS.md`](AGENTS.md) for the full architecture and [`CHANGELOG.md`](CHANGELOG.md) for history.
+
+## Quick start on a new machine
+
+One interactive command takes a clean checkout to a running stack with your device(s)
+streaming live:
+
+```bash
+./local_dev/onboard.sh
+```
+
+It asks what you need (how many devices, USB or WiFi, which AI features), then does the
+rest — installs missing dependencies (asking first), starts Postgres + Ollama, downloads
+the transcription model, writes `.env`, mints a per-device token for each camera, brings
+the whole stack up, and (for USB phones) builds + launches the app so it streams over the
+cable. It ends by printing every URL, token, and password you need, and holds the stack in
+the foreground (Ctrl-C stops everything). Re-running is always safe — it tears down any
+stack left over from a previous run first.
+
+macOS (Apple Silicon) is the tested path; Linux (apt/dnf) is supported best-effort. If you
+already have `.env` + models set up, skip onboarding and use `./local_dev/run_stack.sh`
+directly (see **Run** below).
 
 ## Prerequisites
 
@@ -27,7 +51,8 @@ brew install ffmpeg
 # Local models
 brew install ollama && ollama serve &
 ollama pull mxbai-embed-large    # embeddings, 1024-dim (hard requirement)
-ollama pull llama3.2:3b          # RAG answer LLM (config-driven)
+ollama pull qwen2.5:7b           # RAG answer LLM (RAG_LLM_MODEL; config-driven)
+ollama pull llama3.2:3b          # worker sentiment lane (config-driven)
 
 # whisper.cpp GGML model (local ASR)
 mkdir -p models
@@ -47,9 +72,12 @@ thing down with a single Ctrl-C:
 ```
 
 It preflights the infra deps (Postgres, Ollama), builds the workspace, launches every service,
-health-checks the ports, and prints a URL map. See [`AGENTS.md`](AGENTS.md) "Run the full stack locally"
-for flags (`--with-android`, `--no-build`, `--release`, `--pull`, `--tls`, `--add-camera`, `--down`)
-and the manual per-terminal flow with its gotchas.
+health-checks the ports, and prints a URL map. **On start it first tears down any stack left
+running from a previous run** (its own processes only — an unrelated app on a port makes it stop
+and tell you), so a plain re-run is always clean; you rarely need `--down`. See
+[`AGENTS.md`](AGENTS.md) "Run the full stack locally" for flags (`--with-android`, `--no-build`,
+`--release`, `--pull`, `--tls`, `--add-camera`, `--down`) and the manual per-terminal flow with its
+gotchas.
 
 Run it on a shared network with `--tls` (HTTPS + admin IP-allowlist/password + per-device camera
 tokens — see [`AGENTS.md`](AGENTS.md) "LAN security model"). To onboard a new camera, run

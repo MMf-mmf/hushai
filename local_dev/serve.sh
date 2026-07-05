@@ -1,47 +1,86 @@
 #!/usr/bin/env bash
 #
-# serve.sh — ONE command to serve the viewer at https://hushai.local/ (macOS).
+# serve.sh — ONE command to serve the viewer on the LAN over HTTPS.
 #
-# Does the whole first-run host setup (idempotent), then starts the stack — so a user
-# never types the individual commands:
-#   1. TLS cert (local CA + hushai.local leaf)        → local_dev/gen_certs.sh
-#   2. Trust the CA in the System keychain            → sudo, once
-#   3. Bonjour name `hushai` + pf 443→8070 redirect   → local_dev/setup_hostname.sh (sudo, once)
-#   4. Start the stack bound to the LAN               → local_dev/run_stack.sh --lan
-# Steps already done are detected and skipped, so re-running won't re-prompt for sudo.
+#   macOS: full friendly-URL setup (idempotent), then start the stack — so a user never
+#   types the individual commands:
+#     1. TLS cert (local CA + hushai.local leaf)        → local_dev/gen_certs.sh
+#     2. Trust the CA in the System keychain            → sudo, once
+#     3. Bonjour name `hushai` + pf 443→8070 redirect   → local_dev/setup_hostname.sh (sudo, once)
+#     4. Start the stack bound to the LAN               → local_dev/run_stack.sh --lan
+#   Reachable at https://hushai.local/ (no port). Steps already done are skipped.
+#
+#   Linux: IP-based LAN setup (no Bonjour/pf twin yet — see docs/friendly-url-linux.md):
+#     1. TLS cert (local CA + LAN-IP SAN leaf)          → local_dev/gen_certs.sh
+#     2. Trust the CA in the system store + NSS         → best effort, sudo
+#     3. Start the stack bound to the LAN               → local_dev/run_stack.sh --lan
+#   Reachable at https://<LAN-IP>:8070/ (add other admin IPs via VIEWER_ADMIN_IP_ALLOWLIST).
 #
 #   ./local_dev/serve.sh                # set up (if needed) + serve; Ctrl-C stops the stack
 #   ./local_dev/serve.sh --check        # report setup status only (no changes, no sudo, no start)
 #   ./local_dev/serve.sh --down         # just stop a running stack (no setup)
 #   ./local_dev/serve.sh --release      # any other flags are forwarded to run_stack.sh
 #
-# Undo the host changes (hostname + redirect): ./local_dev/setup_hostname.sh --remove
-# Linux / Windows: see docs/friendly-url-linux.md and docs/friendly-url-windows.md.
+# Undo the macOS host changes (hostname + redirect): ./local_dev/setup_hostname.sh --remove
+# Windows: see docs/friendly-url-windows.md.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=lib_platform.sh
+source "$SCRIPT_DIR/lib_platform.sh"
+
 CERT_DIR="$SCRIPT_DIR/certs"
 CA_CN="Hushai Local CA"
 HOSTNAME_LABEL="${HUSHAI_HOSTNAME:-hushai}"
 ANCHOR=/etc/pf.anchors/hushai
 PLIST=/Library/LaunchDaemons/com.hushai.portredirect.plist
+OS="$(hushai_os)"
 
 log() { echo "[serve] $*"; }
 die() { echo "[serve] ERROR: $*" >&2; exit 1; }
 
-# Non-macOS → point at the platform runbooks (the cross-platform bits — bind 0.0.0.0, IP
-# allowlist, password, TLS env — are identical; only mDNS + port-drop + CA-trust differ).
-if [[ "$(uname -s)" != "Darwin" ]]; then
-  die "this one-command setup is macOS-only. Linux: docs/friendly-url-linux.md · Windows: docs/friendly-url-windows.md"
-fi
-
-# --down: stop without any setup.
+# --down: stop without any setup (OS-independent).
 if [[ "${1:-}" == "--down" ]]; then shift; exec "$SCRIPT_DIR/run_stack.sh" --down "$@"; fi
 
-first_lan_ip() { ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -Ev '^127\.|^169\.254\.' | head -1; }
+have_cert() { [[ -f "$CERT_DIR/server.fullchain.crt" && -f "$CERT_DIR/server.pkcs8.key" && -f "$CERT_DIR/ca.crt" ]]; }
+
+# =====================================================================================
+# Linux — IP-based LAN (the Bonjour name + 443→8070 redirect twin isn't scripted yet).
+# =====================================================================================
+if [[ "$OS" == "linux" ]]; then
+  LAN_IP="$(hushai_first_lan_ip || true)"
+  if [[ "${1:-}" == "--check" ]]; then
+    echo "Setup status for https://${LAN_IP:-<no-LAN-IP>}:8070/ (Linux, IP-based LAN):"
+    have_cert && echo "  [x] TLS cert present  ($CERT_DIR)" || echo "  [ ] TLS cert missing            → gen_certs.sh"
+    echo "  [i] CA trust + firewall are best-effort; see docs/friendly-url-linux.md for the full mDNS setup."
+    exit 0
+  fi
+  if ! have_cert; then
+    log "generating the local CA + LAN-IP TLS cert…"
+    "$SCRIPT_DIR/gen_certs.sh" >/dev/null || die "gen_certs.sh failed."
+  else
+    log "TLS cert present — skipping."
+  fi
+  log "trusting the local CA (system store + NSS; best effort, may prompt for sudo)…"
+  hushai_trust_ca "$CERT_DIR/ca.crt" || log "could not auto-trust the CA — trust $CERT_DIR/ca.crt manually (docs/friendly-url-linux.md)."
+  log "starting the stack → https://${LAN_IP:-<LAN-IP>}:8070/  (admin password from VIEWER_ADMIN_PASSWORD; Ctrl-C stops everything)"
+  log "the friendly name https://$HOSTNAME_LABEL.local/ needs Avahi + nftables — see docs/friendly-url-linux.md."
+  exec "$SCRIPT_DIR/run_stack.sh" --lan "$@"
+fi
+
+# =====================================================================================
+# Windows / unknown — no automation.
+# =====================================================================================
+if [[ "$OS" != "macos" ]]; then
+  die "this one-command setup supports macOS + Linux. Windows: docs/friendly-url-windows.md"
+fi
+
+# =====================================================================================
+# macOS — full friendly-URL setup (unchanged).
+# =====================================================================================
+first_lan_ip() { hushai_first_lan_ip; }
 
 # --- status probes (no side effects, no sudo) ------------------------------
-have_cert()  { [[ -f "$CERT_DIR/server.fullchain.crt" && -f "$CERT_DIR/server.pkcs8.key" && -f "$CERT_DIR/ca.crt" ]]; }
 ca_trusted() { security find-certificate -c "$CA_CN" /Library/Keychains/System.keychain >/dev/null 2>&1; }
 host_ready() {
   local ip; ip="$(first_lan_ip)"

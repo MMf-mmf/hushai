@@ -22,13 +22,16 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 DAYS_CA=3650
 DAYS_LEAF=825   # Apple caps server-leaf validity at 825 days; stay under it.
 
+# shellcheck source=lib_platform.sh
+source "$SCRIPT_DIR/lib_platform.sh"
+
 mkdir -p "$CERT_DIR"
 cd "$CERT_DIR"
 
-# Auto-detect the Mac's LAN IPv4(s) if not provided (skip loopback + link-local).
+# Auto-detect the host's LAN IPv4(s) if not provided (skip loopback + link-local).
+# hushai_lan_ips uses `ifconfig` on macOS and `ip -4 addr` on Linux.
 if [[ -z "${LAN_IPS:-}" ]]; then
-  LAN_IPS="$(ifconfig 2>/dev/null | awk '/inet /{print $2}' \
-            | grep -Ev '^127\.|^169\.254\.' | tr '\n' ' ' || true)"
+  LAN_IPS="$(hushai_lan_ips || true)"
 fi
 echo "[gen_certs] LAN IPs in cert SAN: ${LAN_IPS:-<none detected>}"
 

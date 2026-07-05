@@ -5,9 +5,12 @@ It accepts audio/video **segments** from camera clients over HTTP and persists t
 exactly-once, per the camera→backend contract v0.1.0
 (`../contracts/cameraToBackendContract.md`).
 
-Transcription, embeddings, and vision are **later tickets** — out of scope here. The
-database is created now with the full vector-ready schema so those never require a
-migration.
+This crate owns **ingest, the shared Postgres schema, and the admin/catalog HTTP API**.
+Transcription, embeddings, and vision run in the sibling **worker** crate (which shares
+this schema via a path dep); the backend stores what they produce and serves it back to
+the viewer. The schema was designed vector-ready from the start and has grown by
+forward-only migrations since (see `migrations/README.md`). For the workspace map, see
+`../AGENTS.md`.
 
 ## Architecture: metadata in Postgres, media on a blob store
 
@@ -40,11 +43,11 @@ primary key; a re-POST with identical bytes returns `200` with no new write, and
 
 ## Endpoints
 
+### Ingest — the durable write path (contract v0.1.0)
+
 | Method | Path           | Notes |
 |--------|----------------|-------|
 | POST   | `/v1/segments` | `multipart/form-data`: `manifest` (protobuf) + `body` (opaque media). `Authorization: Bearer <token>`. |
-| GET    | `/healthz`     | Liveness. |
-| GET    | `/readyz`      | DB reachable + blob volume writable with free-space headroom. |
 
 Responses: `200` durable accept / idempotent retry · `400` malformed / missing part ·
 `401` bad token · `409` `(session,stream,sequence)` reused by a new `segment_id` ·
@@ -56,6 +59,31 @@ bytes · `429` overloaded · `507` storage pressure / pool exhausted.
 > can't help), and `413` (oversized) for cases §6 leaves open. These never weaken a §6
 > guarantee: a `200` still means durably accepted, and no non-`200` ever claims acceptance.
 
+### Health & observability (unauthenticated, like the health probes)
+
+| Method | Path       | Notes |
+|--------|------------|-------|
+| GET    | `/healthz` | Liveness. |
+| GET    | `/readyz`  | DB reachable + blob volume writable with free-space headroom. |
+| GET    | `/metrics` | Prometheus scrape target. |
+
+### Admin / catalog API (bearer-authed, proxied through the viewer)
+
+Beyond ingest, the backend hosts the read/admin surface the **viewer** proxies — all
+**bearer-authed** (the same token store as ingest) and reached through the viewer, not
+called directly by cameras. One row per resource group below; see `src/routes.rs` for the
+exact routes and `../AGENTS.md` for what each does.
+
+| Resource | Paths | What |
+|----------|-------|------|
+| Speakers | `GET /v1/speakers`; `PATCH /v1/speakers/{id}` + `/merge`·`/archive`·`/unarchive`·`/owner`·`/unowner`·`/sample-audio`; `/v1/speakers/recluster`·`/recluster-deep`·`/duplicates`·`/merge-group`·`/unattributed` (+`/name`, `/sample-audio`) | Voice-print catalog: rename, merge, archive, owner-tag, recluster/dedup. |
+| Persons  | `GET /v1/persons`; `PATCH /v1/persons/{id}` + `/merge`·`/archive`·`/unarchive`·`/owner`·`/unowner`·`/sample-face` | Face catalog (visual sibling of speakers). |
+| Plates   | `GET /v1/plates`; `/v1/plates/search`; `PATCH /v1/plates/{id}` + `/merge`·`/archive`·`/unarchive`·`/sample-crop` | License-plate (ALPR) catalog. |
+| Devices  | `GET /v1/devices`; `PATCH`/`DELETE /v1/devices/{id}`; `/{id}/usage`; `PUT /{id}/retention`; `DELETE /{id}/footage`; `/{id}/footage/bulk-delete` | Device management + footage deletion + retention policy. (Footage **export** lives in the viewer, not here.) |
+| Events & alerts | `GET /v1/events`; `/v1/events/feed` (+ `/{delivery_id}/ack`); `/v1/alert-rules` (+ `/{rule_id}`) | Materialized event feed, in-app notification feed + ack, alert-rule CRUD. |
+| Watchlist | `/v1/watchlist` (+ `/{watch_id}`) | "Of interest" list. |
+| Audit    | `GET /v1/audit` | Append-only audit-log read surface. |
+
 ## Database
 
 Postgres + pgvector. **Docker isn't required for local dev** — a Homebrew
@@ -64,7 +92,7 @@ Postgres + pgvector. **Docker isn't required for local dev** — a Homebrew
 ```bash
 createdb hushai
 export DATABASE_URL=postgres://localhost/hushai
-sqlx migrate run                 # applies migrations/0001_init.sql
+sqlx migrate run                 # applies migrations/*.sql in order (see migrations/README.md)
 ```
 
 `docker-compose.yml` (image `pgvector/pgvector:pg16`, host port **5433**) is the
@@ -220,25 +248,28 @@ segments):
 Final DB state at hand-off: 11 devices (`cam-A`/`cam-B`/`cam-C`/`cam-D0..7`), 10 segments
 each (110 total), each timeline gapless.
 
-## Where things stand / known limitations (intentional, deferred to later tickets)
+## Where things stand / known limitations
 
-- **Embedding pipeline is out of scope.** The 4 vector tables
-  (`transcript_sentences`, `video_events`, `scene_objects`, `rolling_summaries`) exist and
-  are proven usable, but stay **empty** in phase 1. **No HNSW/IVFFlat indexes yet** — those
-  ship with the embedding-pipeline ticket (indexing empty tables is pointless).
-- **Auth is a single dev `DEVICE_TOKEN` allowlist.** The middleware resolves a token into a
-  `DeviceIdentity` extension — the seam where a real `device_tokens` table / per-device
-  issuance drops in without touching the ingest handler.
-- **Orphan-blob GC is not implemented.** By design, a crash-between-write-and-commit or a
-  rejected `segment_id`-reuse leaves a GC-able orphan blob (the conflict test produced 3).
-  A background sweep (blobs with no referencing row) is a future task.
+- **Embeddings and vector search are live** (no longer deferred). The worker writes
+  transcript, speaker-voiceprint, face, and object embeddings into partitioned pgvector
+  tables, each backed by a per-partition **HNSW** (`vector_cosine_ops`) index — transcript
+  (`0003`), speaker (`0007`), person + objects (`0009`). See `migrations/README.md` for the
+  full table/index list.
+- **Auth is a bearer-token allowlist.** Either a single `DEVICE_TOKEN` (back-compat) or a
+  per-device `DEVICE_TOKENS` map of `label:token` entries (so a lost device can be revoked
+  individually — drop its entry + restart). Tokens are compared in **constant time**
+  (`subtle::ConstantTimeEq`). The middleware resolves a token into a `DeviceIdentity`
+  extension — the seam where a real `device_tokens` table / per-device issuance drops in
+  without touching the handlers. See `src/auth.rs`.
+- **Orphan-blob GC is implemented** (`storage::reclaim_blobs`). After a footage/device
+  delete has *committed*, the reclaimer re-checks each content hash against the live DB and
+  unlinks only blobs no longer referenced by any segment row (skipping files newer than a
+  10-minute grace window, so an in-flight promote is never mistaken for an orphan). A crash
+  between write and commit still only orphans a GC-able blob — reclaimed by a later pass.
 - **Storage backend is local files only.** `storage_backend="file"`; an S3/MinIO backend is
   a future additive change (no schema migration needed).
 - **Docker not installed locally.** Tests ran on Homebrew Postgres; `docker compose up -d
   db` is the documented CI/portable path but was not exercised on this machine.
-- **`.sqlx/` is generated but the repo root is not a git repository.** The offline query
-  metadata is written to disk; "committing" it requires initializing version control
-  (the sibling `Agent Ahithophel/` has its own git; this crate does not yet).
 - **`duration_nanos` in the feeder is nominal** (segment length, last segment shorter than
   the nominal 2 s is not measured); the server stores it opaquely, so this does not affect
   correctness.
@@ -285,8 +316,8 @@ All fixes were re-verified: `cargo test` green; live server returns `200` on nor
 ## Crate notes (versions that needed care)
 
 - `prost`/`prost-build` `0.14` exist (0.14.0/0.14.2 are yanked; cargo resolves 0.14.4).
-- `tower` needs features `["util","limit","timeout"]`; `tower-http` needs
-  `["trace","timeout","limit"]`; `TimeoutLayer::new` is deprecated → use
-  `with_status_code`.
+- `tower-http` needs features `["trace","timeout","limit"]`; `TimeoutLayer::new` is
+  deprecated → use `with_status_code`. (The direct `tower` dep was dropped — the layers in
+  use come from `tower-http`; backpressure is a `tokio::sync::Semaphore`, not a tower layer.)
 - `sqlx` needs the `json` feature for `serde_json::Value` ↔ `jsonb`.
 - Python 3.13 has no `uuid.uuid7()`; the feeder hand-rolls an RFC-9562 UUIDv7.

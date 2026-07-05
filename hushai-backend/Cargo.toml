@@ -8,7 +8,6 @@ description = "Hushai data-intake backend: durable, idempotent segment-ingest se
 # HTTP server
 axum = { version = "0.8", features = ["multipart", "macros"] }
 tokio = { version = "1", features = ["full"] }
-tower = { version = "0.5", features = ["util", "limit", "timeout"] }
 tower-http = { version = "0.6", features = ["trace", "timeout", "limit"] }
 
 # Native rustls TLS termination (shared by all three services via `src/tls.rs`).
@@ -26,7 +25,6 @@ sqlx = { version = "0.9", features = [
     "tls-rustls",
     "postgres",
     "uuid",
-    "chrono",
     "json",
     "macros",
     "migrate",
@@ -46,7 +44,6 @@ subtle = "2"
 # Serde / json
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-chrono = { version = "0.4", features = ["serde"] }
 
 # Observability
 tracing = "0.1"

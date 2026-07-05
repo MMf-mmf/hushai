@@ -1,8 +1,16 @@
 **Title:** `[hushai-worker + hushai-backend + hushai-rag + hushai-android] - Face/person identity (anonymous-now, named-later, cross-device) + per-face emotion + activity on the video frames, surfaced in RAG attribution`
 
+> **STATUS (2026-07-05): PARTIALLY SHIPPED — kept open for the emotion/activity gap.**
+> Signal 1, **person identity** (anonymous-now / named-later / cross-device face catalog), is
+> **built + verified** (worker `vision/`, `persons`/`person_segments`, backend `/v1/persons`,
+> Android People screen), as is **RAG person attribution** ("when did I see Bob" / "who was I
+> with") via the `people` agent. See AGENTS.md "Vision" + CHANGELOG (2026-06-26). **Still open:**
+> Signal 2 (**per-face emotion/expression**) and Signal 3 (**activity/scene caption**) — neither
+> is implemented. That remaining scope is why this ticket stays in `unfinished/`.
+
 - **Description**:
 
-  This is the **visual sibling** of `Issues/speaker-identity-sentiment-rag-attribution.md`. That
+  This is the **visual sibling** of `Issues/finished/speaker-identity-sentiment-rag-attribution.md`. That
   ticket discovers, clusters, and labels every **voice** the system hears (anonymous voice ID now,
   human-named later, cross-device) and surfaces it in RAG ("what did Bob say"). This ticket does the
   exact same thing for every **face** the cameras see: build a catalogue of people, identify who was
@@ -513,6 +521,6 @@
   activity captioning (committed fast-follow); at-rest encryption of face templates + consent/notice
   flow (privacy follow-up, flagged higher-priority than voice); fine-grained emotion beyond coarse
   happy/sad/neutral; re-identification across long time gaps / aging; backfilling pre-feature
-  audio-only history. **Depends-on / shares-with:** `Issues/speaker-identity-sentiment-rag-attribution.md`
+  audio-only history. **Depends-on / shares-with:** `Issues/finished/speaker-identity-sentiment-rag-attribution.md`
   (the `ort`/`libonnxruntime` provisioning + the `/v1/speakers` endpoint + RAG-attribution patterns —
   reuse if it lands first, carry them here if not).

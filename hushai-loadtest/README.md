@@ -144,27 +144,10 @@ The new metrics the worker exposes (consumed here, also useful in Grafana): `hus
 ## Cleanup
 
 `cargo run -p hushai-loadtest -- --cleanup` deletes every `source_kind="loadtest_replica"` device via
-the backend API. **Caveat:** `DELETE /v1/devices/{id}` currently returns 500 for a device that already
-has processed segments (a backend FK-cascade bug — see Troubleshooting), so for a device that's been
-analyzed, fall back to an ordered SQL delete:
-
-```sql
--- children first (segment-keyed), then device-keyed, then parents:
-DELETE FROM segment_transcription_status WHERE segment_id IN (SELECT segment_id FROM segments WHERE device_id LIKE 'loadtest-%');
-DELETE FROM segment_vision_status        WHERE segment_id IN (SELECT segment_id FROM segments WHERE device_id LIKE 'loadtest-%');
-DELETE FROM video_events                 WHERE segment_id IN (SELECT segment_id FROM segments WHERE device_id LIKE 'loadtest-%');
-DELETE FROM transcript_sentences WHERE device_id LIKE 'loadtest-%';
-DELETE FROM speaker_segments     WHERE device_id LIKE 'loadtest-%';
-DELETE FROM person_segments      WHERE device_id LIKE 'loadtest-%';
-DELETE FROM scene_objects        WHERE device_id LIKE 'loadtest-%';
-DELETE FROM plate_detections     WHERE device_id LIKE 'loadtest-%';
-DELETE FROM alert_deliveries     WHERE device_id LIKE 'loadtest-%';
-DELETE FROM events               WHERE device_id LIKE 'loadtest-%';
-DELETE FROM segments WHERE device_id LIKE 'loadtest-%';
-DELETE FROM streams  WHERE device_id LIKE 'loadtest-%';
-DELETE FROM sessions WHERE device_id LIKE 'loadtest-%';
-DELETE FROM devices  WHERE source_kind='loadtest_replica';
-```
+the backend API — one `DELETE /v1/devices/{id}` per device, which cascades correctly even for
+fully-analyzed devices: the delete NULLs the `first_seen_device_id` back-refs on speakers/persons/plates,
+then tears down the device's segments → derived child tables → streams → sessions → events in a single
+transaction (`hushai-backend/src/devices.rs`). No manual SQL cleanup is needed.
 
 ---
 
@@ -178,8 +161,6 @@ DELETE FROM devices  WHERE source_kind='loadtest_replica';
 - **GPU%/ANE% are `N/A`** → `powermetrics` needs root; the harness calls it with `sudo -n` (fails fast,
   no prompt) and falls back to `ps` (CPU%/RSS only). Add a NOPASSWD sudoers entry for
   `/usr/bin/powermetrics` to capture GPU/ANE, or accept `--no-powermetrics`.
-- **`--cleanup` leaves some devices** → that's the `DELETE /v1/devices` 500 on populated devices; use
-  the SQL above.
 - **Per-stage latency columns read `N/A`** → the worker predates the `hushai_worker_stage_seconds`
   histograms; rebuild + restart the worker.
 
@@ -199,4 +180,6 @@ Full pipeline (audio + faces; objects/plates not provisioned), `WORKER_CONCURREN
 
 Two stack bugs this run surfaced (independent of the harness): a split-brain `DATABASE_URL` (backend on
 `hushai_test`, worker/viewer on `hushai`), and `DELETE /v1/devices/{id}` returning 500 on populated
-devices (`sessions`/segment-keyed children lack `ON DELETE CASCADE`).
+devices (an FK-cascade gap) — the latter since fixed: the delete now NULLs the identity back-refs, then
+tears down segments → child tables → streams → sessions → events in one transaction
+(`hushai-backend/src/devices.rs`).

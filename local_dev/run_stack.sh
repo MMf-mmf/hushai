@@ -46,6 +46,11 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 LOG_DIR="$SCRIPT_DIR/logs"
 
+# Cross-platform adapters (OS detection, Postgres start, LAN-IP detection, port owners).
+# shellcheck source=lib_platform.sh
+source "$SCRIPT_DIR/lib_platform.sh"
+HUSHAI_OS="$(hushai_os)"
+
 # ---------------------------------------------------------------------------
 # Args
 # ---------------------------------------------------------------------------
@@ -122,9 +127,7 @@ fi
 # bearer token, persists `NAME:token` into hushai-backend/.env's DEVICE_TOKENS,
 # and prints the config card. Full runbook: docs/onboarding-a-camera.md.
 # ---------------------------------------------------------------------------
-detect_lan_ip() {
-  ifconfig 2>/dev/null | awk '/inet /{print $2}' | grep -Ev '^127\.|^169\.254\.' | head -1
-}
+detect_lan_ip() { hushai_first_lan_ip; }
 
 add_camera() {
   local label="$1"
@@ -226,13 +229,51 @@ for opt in ffmpeg curl; do
   command -v "$opt" >/dev/null 2>&1 || log warn "'$opt' not found — worker/viewer remux + health checks need it."
 done
 
-# Port guard: if our ports are already taken, a stack is probably already up.
-port_busy() { lsof -ti "tcp:$1" >/dev/null 2>&1; }
-for p in 8080 8090 8070; do
-  if port_busy "$p"; then
-    die "port $p already in use — is the stack already running? Run '$0 --down' first (or free the port)."
+# Self-heal on start: a previous run may have left our services (or orphans whose pid
+# files were lost) holding 8080/8090/8070. Instead of refusing to start, tear down our
+# OWN prior stack first, then only give up if something UNRELATED still holds a port.
+# (This is why a plain re-run — or onboard.sh — is always safe: no manual `--down`.)
+is_ours() {  # does this command line belong to a Hushai stack binary we launched?
+  case "$1" in
+    *"$PROFILE_DIR/"*|*"$REPO_ROOT/target/"*|\
+    *hushai-backend*|*hushai-worker*|*hushai-rag*|*hushai-viewer*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+reclaim_ports() {
+  local p pid cmd killed=0 foreign=""
+  # 1. TERM everything tracked from the last run (pid files under logs/).
+  stop_from_pidfiles
+  # 2. TERM any still-listening process on our ports that is one of OUR binaries.
+  for p in 8080 8090 8070; do
+    for pid in $(hushai_pids_on_port "$p"); do
+      cmd="$(hushai_pid_command "$pid")"
+      if is_ours "$cmd"; then
+        log down "reclaiming :$p from stale hushai process (pid $pid)"
+        kill -TERM "$pid" 2>/dev/null || true; killed=1
+      fi
+    done
+  done
+  if [[ "$killed" -eq 1 ]]; then sleep 1; fi
+  # 3. Hard-kill any of ours that ignored TERM.
+  for p in 8080 8090 8070; do
+    for pid in $(hushai_pids_on_port "$p"); do
+      cmd="$(hushai_pid_command "$pid")"
+      if is_ours "$cmd"; then kill -KILL "$pid" 2>/dev/null || true; fi
+    done
+  done
+  # 4. Anything still listening is NOT ours → refuse, naming the offender.
+  for p in 8080 8090 8070; do
+    for pid in $(hushai_pids_on_port "$p"); do
+      foreign="$foreign  :$p pid $pid ($(hushai_pid_command "$pid" | awk '{print $1}'))"
+    done
+  done
+  if [[ -n "$foreign" ]]; then
+    die "port(s) held by a non-Hushai process:$foreign"$'\n'"Free them (or stop that app) and re-run."
   fi
-done
+  return 0   # NB: explicit — a bare trailing `&&` would return non-zero and trip `set -e`.
+}
+reclaim_ports
 
 # ---------------------------------------------------------------------------
 # Security: TLS (optional) + admin/rag credentials (always on, dev defaults).
@@ -270,8 +311,7 @@ if [[ "$LAN" -eq 1 ]]; then
   export VIEWER_BIND_ADDR="0.0.0.0:8070"
   export VIEWER_HOSTNAME="hushai.local"   # cosmetic: the viewer's listening-log URL
   if [[ -z "${VIEWER_ADMIN_IP_ALLOWLIST:-}" ]]; then
-    VIEWER_ADMIN_IP_ALLOWLIST="$(ifconfig 2>/dev/null | awk '/inet /{print $2}' \
-      | grep -Ev '^127\.|^169\.254\.' | tr '\n' ',' | sed 's/,$//')"
+    VIEWER_ADMIN_IP_ALLOWLIST="$(hushai_lan_ips | tr ' ' ',' | sed 's/,$//')"
     export VIEWER_ADMIN_IP_ALLOWLIST
   fi
   log infra "LAN mode — viewer binds 0.0.0.0:8070; admin IP allowlist: ${VIEWER_ADMIN_IP_ALLOWLIST:-<none detected>} (+loopback)"
@@ -303,10 +343,8 @@ log infra "checking Postgres on :5432…"
 if pg_isready -q -h localhost -p 5432 2>/dev/null; then
   log infra "Postgres already up"
 else
-  log infra "Postgres down — trying 'brew services start postgresql@16'"
-  brew services start postgresql@16 >/dev/null 2>&1 \
-    || brew services start postgresql >/dev/null 2>&1 \
-    || log warn "could not start Postgres via brew — start it yourself."
+  log infra "Postgres down — attempting to start it ($HUSHAI_OS)…"
+  hushai_pg_start || log warn "could not auto-start Postgres — start it yourself."
   for _ in $(seq 1 40); do pg_isready -q -h localhost -p 5432 2>/dev/null && break; sleep 0.5; done
   pg_isready -q -h localhost -p 5432 2>/dev/null || die "Postgres never became ready on :5432."
   log infra "Postgres up"
@@ -394,7 +432,10 @@ LAST_PID=""   # pid of the most recently launched service (bash 3.2 has no arr[-
 # unrestricted cargo binary directly passes it through.)
 launch() {
   local name="$1" cwd="$2" bin="$3"
-  ( cd "$cwd" && export SQLX_OFFLINE=true DYLD_FALLBACK_LIBRARY_PATH="$DYLD_FB" \
+  # Export the OS-appropriate dynamic-linker search path (DYLD_* on macOS — see the SIP
+  # note above; LD_LIBRARY_PATH on Linux) so sherpa's bundled onnxruntime resolves.
+  local libvar; libvar="$(hushai_lib_path_var)"
+  ( cd "$cwd" && export SQLX_OFFLINE=true "$libvar=$DYLD_FB" \
       && exec "$PROFILE_DIR/$bin" ) >"$LOG_DIR/$name.log" 2>&1 &
   local pid=$!
   SVC_NAMES+=("$name"); SVC_PIDS+=("$pid"); LAST_PID="$pid"

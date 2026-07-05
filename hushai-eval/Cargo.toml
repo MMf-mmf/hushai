@@ -15,7 +15,6 @@ sqlx = { version = "0.9", features = [
     "tls-rustls",
     "postgres",
     "uuid",
-    "chrono",
     "json",
 ] }
 # HTTP: read APIs (/v1/speakers|persons|plates|events), RAG (/v1/rag/query), enroll PATCH.
@@ -29,9 +28,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
 uuid = { version = "1", features = ["v5", "v7", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
 sha2 = "0.10"          # config-hash + model-file / env-manifest fingerprints
 hex = "0.4"
 strsim = "0.11"        # token/char Levenshtein for WER, similarity, plate edit-distance
-tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }

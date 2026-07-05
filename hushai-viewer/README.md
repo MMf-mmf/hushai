@@ -123,7 +123,7 @@ system is no-egress). Files under [`ui/`](ui/):
 | `ui/js/timeline.js` | The canvas scrub bar — spans/gaps/ticks/playhead, hover tooltip, click-to-seek with gap snapping, wheel-zoom, drag-pan. |
 | `ui/js/detections.js` | The **Detections** overlay: fetches `/api/devices/{id}/detections`, indexes frames by timestamp, and draws labeled bounding boxes on a canvas over the `<video>`, synced to playback via the app's rAF ticker (binary-search to the nearest sampled frame; letterbox-aware scaling against `video.videoWidth/Height`). |
 | `ui/js/app.js` | Orchestration: device list, state, controls, keyboard, window/seek logic, and the **Video\|Detections** mode toggle (wires `detections.js` into the ticker). |
-| `ui/js/chat/*` | Chat dock: `workspace.js` (agent tabs), `chat-pane.js` (one conversation — message list, composer, **camera-scope dropdown**, **New chat**), `citation.js`. |
+| `ui/js/chat/*` | Chat dock: `workspace.js` (mounts the **single auto-routed** chat bound to the `auto` agent), `chat-pane.js` (one conversation — message list, composer, **camera-scope dropdown**, **New chat**), `citation.js`. (`agent-picker.js` is retained but unused — routing is server-side.) |
 | `ui/js/settings/voices.js` | The **⚙ Voices** modal: list/name/merge speakers + play sample audio (mirrors the Android Voices screen). |
 | `ui/manage.html` + `ui/js/manage/manage.js` | The **🗄 Files** page (sibling of the System dashboard): per-device + per-date storage usage, inline **rename**, **retention** ("keep last N days"), **delete** footage by date / in bulk / a whole device, and per-date **⬇ MP4 export**. All mutations proxy to hushai-backend's `/v1/devices*`. |
 | `ui/js/confirm.js` | Shared destructive-action confirm dialog — shows impact (segments + size); **type-to-confirm** (the device name) for whole-device / entire-history deletes. |
@@ -417,12 +417,13 @@ ever fires. `cd e2e && npm i && node run.mjs` against a running stack.
 
 **In scope (this version):** recorded/historical browsing + **multi-turn chat over the
 recordings** (SSE-streamed, DB-backed conversations, citations that deep-link the timeline,
-one default "Recordings" agent with the registry ready for more). **LAN-ready:** the whole app
+a single **auto-routed** chat box — the server classifier dispatches each message to the right
+agent: Recordings / Reflection / Objects / People / Plates / Events). **LAN-ready:** the whole app
 is gated by an IP allowlist + password and can serve native TLS (see "Admin access control & TLS").
 
 **Deliberately deferred (clean follow-ups):**
-- **More agents** — extra personas/scopes are one registry entry in `hushai-rag/src/agents.rs`;
-  the agent-tab UI (`ui/js/chat/agent-picker.js`) already loops over N.
+- **More agents** — extra personas/scopes are one registry entry in `hushai-rag/src/agents.rs`; the
+  server auto-router picks them up automatically (no UI change; `agent-picker.js` is unused).
 - **Near-live tailing** — a non-`ENDLIST`, sliding playlist off the newest session. Reuses ~90% of
   `playlist.rs` / `remux.rs`. (The LIVE pill approximates this today by chasing window reloads.)
 - ~~**Auth / LAN exposure**~~ — **done (2026-06-28):** IP allowlist + password gate + native TLS

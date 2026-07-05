@@ -456,8 +456,12 @@ returns adbd to USB-only listening afterward.
 - **Enrollment uses a single utterance's x-vector** by default — averaging several
   separated utterances (raise `ENROLL_TARGET`, prompt for pauses) would harden the
   centroid; `SPEAKER_THRESHOLD` (0.50) is the accept/reject knob.
-- **RAG is stateless single-turn** — no conversation memory across questions.
-- **No TLS; `RAG_TOKEN` unset** — fine for local dev, must change for any network use.
+- **Voice Q&A is multi-turn** via `/v1/rag/chat` (`VoiceSession` persists the `session_id`
+  with a 15-min idle window; see Features § voice assistant). The legacy single-shot
+  `/v1/rag/query` remains only as the fallback when the server 404s the chat endpoint.
+- **TLS/auth:** the **debug** build permits cleartext (USB/localhost dev); the **release**
+  build forbids cleartext and trusts the bundled LAN CA, and the assistant presents `RAG_TOKEN`
+  via the `rag_token` Intent extra / Settings (see AGENTS.md "LAN security model").
 - Capture fast-follows still open: Doze/OEM battery hardening, the shared-proto
   golden-vector CI check. (The crash-durable on-disk store-and-forward buffer — with a
   user-configurable, live-adjustable storage cap — is now **done**; see Features § 8.)

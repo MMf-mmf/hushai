@@ -112,6 +112,12 @@ Current corpus — synthetic (macOS `say`, `build_fixtures.sh`) + real public-do
 | `jfk_moon` | train (full) | transcript, **speakers**, events | real JFK speech; WER 0.23; **speaker gate: mints exactly 1 voice** |
 | `fdr_infamy` | train (full) | transcript, events | real 1941 archival audio; WER 0.56 (degraded-audio baseline) |
 | `armstrong_step` | train (full) | transcript, events | real Moon-radio audio; WER 0.43 (noisy baseline) |
+| `car_object` | train (full) | objects | PD Peugeot iOn photo, ken-burns'd; guards the RF-DETR COCO-91 decode (a COCO-80 mislabel turns `car`→`motorcycle`, F1=0) |
+| `face_id` | train (full) | persons | PD Judith Resnik NASA portrait; SCRFD detect + ArcFace identity (`distinct_count: 1`) |
+| `plate_ocr` | train (full) | plates | PD Auckland street plate `EMD774`; full ALPR: RF-DETR ROI → YOLOv9-t plate detect → fast-plate-ocr |
+| `money_talk` | train (full) | transcript, sentiment, **chat** | 2-voice worry/reassure dialogue; RAG money-recall + worried-tone recall + no-hallucination decline |
+| `clip_speaker_roster` | train (full) | transcript, **chat** | voice enrolled as Mendel (JFK window); deictic "who was speaking in this clip" → named answer + attributed citation, plus no-playback fallback + recency path |
+| `repeat_visitor` | train (full) | transcript, **chat** | same voice on 2 cameras a day apart (multi-clip `Meta.injections[]`); RAG recall + routing + no-hallucination decline + a counting probe |
 | `silence_no_speech` | holdout (full) | transcript, speakers | counter-fixture: must mint **0** speakers |
 
 ## The labeling loop (`probe`)
@@ -131,11 +137,21 @@ re-fetchable via `local_dev/fetch_eval_clips.sh`.
 ## Current coverage & known findings
 
 - **Working & baselined:** transcript (WER + normalized similarity + window-phrase containment),
-  events (type/subject/count + severity floor), and the speaker-**count** counter-fixture.
-- **Scorers wired, awaiting inputs:** diarization (Hungarian-mapped purity + named-match), sentiment
-  (allow-set accuracy), persons/faces (count + named), objects (label-set F1), plates (normalized
-  string + read recall + named). They score as soon as a fixture lists the modality and the lane is
-  enabled with weights present.
+  events (type/subject/count + severity floor), the speaker-**count** counter-fixture, sentiment
+  (allow-set accuracy, `money_talk`), and all three vision lanes — objects (label-set F1,
+  `car_object`), persons/faces (count + named, `face_id`), plates (normalized string + read recall +
+  named, `plate_ocr`).
+- **RAG-CHAT ANSWER scoring:** the `chat` (alias `rag`) modality scores the live `/v1/rag/chat` answer
+  itself, not just perception. Per question the harness POSTs to the running RAG, parses the SSE, and
+  scores deterministic-first assertions that survive LLM wording — `must_contain` / `must_not_contain` /
+  `expect_number` / `expect_routed_agent` (vs the SSE `routed_agent_id`) / `min_citations` /
+  `citation_must_attribute` — plus Info-only `reference_answer` cosine + optional LLM-judge (never gate).
+  Multi-clip `Meta.injections[]` stage one subject across days/cameras (`repeat_visitor`, `money_talk`,
+  `clip_speaker_roster`; a question may also carry `playback` for deictic "in this clip" asks). See
+  `RECURSIVE_TESTING.md` §6 (the PI-workflow layer + the harness-driven RAG wins) for the deep playbook.
+- **Scorers wired, awaiting inputs:** diarization (Hungarian-mapped purity + named-match) — staged off
+  `two_speakers.modalities` until the 2-voice merge is fixed; it scores as soon as the fixture lists
+  the modality.
 - **✅ Speaker-lane bug — found AND fixed by this harness (the first recursive-testing win).** The
   harness surfaced that the speaker lane minted **0 speakers** on every clip (TTS *and* real audio:
   a constant ~0.31s post-VAD speech). Root cause: `hushai-worker/src/speaker.rs::detect()` fed the
@@ -147,6 +163,10 @@ re-fetchable via `local_dev/fetch_eval_clips.sh`.
   1 (short 2s-turn TTS + the speaker-window aggregation crossing the turn boundary). Diarization is
   staged off `two_speakers.modalities`; the target (`distinct_count: 2`) is documented in its
   `expected.json`. Enable it once the merge is fixed — **do not** loosen mint/match thresholds to mask it.
-- **Pending (needs weights / your help):** object detection + ALPR fixtures require the RF-DETR /
-  CLIP / plate-detector / plate-OCR weights (Phase 0 provisioning). Face fixtures need source
-  stills. The physical camera tier needs a rig.
+- **✅ Vision lanes provisioned & guarded (2026-07-01):** objects decode COCO-91 (`car_object`),
+  SCRFD is the default face detector + ArcFace identity (`face_id`), and ALPR runs end-to-end —
+  RF-DETR vehicle ROI → YOLOv9-t plate detect → fast-plate-ocr → `EMD774` (`plate_ocr`). All three
+  vision lanes now carry a Tier-1 guard; the decode/detector fixes are in `RECURSIVE_TESTING.md` §6.
+- **Pending:** the physical camera tier (Tier 2, built) still needs a rig; per-deployment
+  ASR-hallucination and speaker-gate calibration on real room audio remain open (both documented in
+  `RECURSIVE_TESTING.md` §6 — do not blind-tune).

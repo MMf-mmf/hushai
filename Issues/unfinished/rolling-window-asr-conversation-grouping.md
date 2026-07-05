@@ -7,7 +7,7 @@
   Two linked pieces, both primarily in `hushai-worker`, plus an additive migration in
   `hushai-backend/migrations/` and a retrieval upgrade in `hushai-rag`.
 
-  This is the **rolling-window assembly ticket** that `Issues/speaker-identity-sentiment-rag-attribution.md`
+  This is the **rolling-window assembly ticket** that `Issues/finished/speaker-identity-sentiment-rag-attribution.md`
   repeatedly defers to as "the committed immediate next ticket … the single biggest accuracy
   lever" (that file, lines 85-87, 383, 407-408, 553). It is a **prerequisite** for good
   diarization: once the worker's job unit is a window (this ticket), the speaker-ID work
@@ -186,7 +186,7 @@
   `CONVERSATION_GAP_SECS` (~90), and any whisper DTW knobs. Thread through `lib.rs:run`.
 
   ### Coordination with the speaker-ID + sentiment ticket (`0005`)
-  `Issues/speaker-identity-sentiment-rag-attribution.md` was written **before** windowing
+  `Issues/finished/speaker-identity-sentiment-rag-attribution.md` was written **before** windowing
   existed and uses **per-segment** ECAPA embeddings as an interim, explicitly naming this
   windowing work as its bigger-lever prerequisite. This ticket changes the worker's **job unit
   to the window**. When both land, diarization + speaker embedding should run on the **window
@@ -310,6 +310,6 @@
 
   ---
 
-  **Migration numbering:** this is `0004`; `Issues/speaker-identity-sentiment-rag-attribution.md`
+  **Migration numbering:** this is `0004`; `Issues/finished/speaker-identity-sentiment-rag-attribution.md`
   is `0005` and builds on it. Keep `AGENTS.md` (the `transcript_sentences` storage section + the
   "video-only segments" fast-follow note) and `REVIEW.md` current in the same change set.

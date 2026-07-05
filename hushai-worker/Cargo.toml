@@ -53,10 +53,8 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 # Logging is initialised centrally by `hushai_backend::logging` (subscriber + JSON/file + panic hook);
 # this crate only emits via `tracing` macros, so it needs no direct `tracing-subscriber` dep.
-serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
-thiserror = "2"
 dotenvy = "0.15"
 uuid = { version = "1", features = ["v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }

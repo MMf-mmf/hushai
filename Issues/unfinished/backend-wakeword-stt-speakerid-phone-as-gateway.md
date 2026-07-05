@@ -43,7 +43,7 @@
     wake-word spotting. Consider a lightweight on-device VAD/wake gate that only opens the stream when
     speech (or a rough wake) is detected — i.e. keep a *tiny* gate on the phone but move the real
     recognition server-side. Quantify battery impact before committing to always-streaming.
-  - Relationship to `Issues/unfinished/speaker-identity-sentiment-rag-attribution.md` and
+  - Relationship to `Issues/finished/speaker-identity-sentiment-rag-attribution.md` and
     `Issues/unfinished/rolling-window-asr-conversation-grouping.md`: that work already pulls
     speaker-ID / ASR server-side for the *recorded* stream; this ticket reuses the same server-side
     models for the *live assistant* path. Coordinate so the speaker x-vector + ASR provisioning is

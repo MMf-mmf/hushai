@@ -11,6 +11,9 @@ target/
 
 # Local data / databases
 hushai-backend/data/
+# Root-level blob/cache dirs created when a service is run from the repo root
+# (real blobs live in hushai-backend/data/; this is a stray runtime scratch dir).
+/data/
 
 # Per-service logs + pid files written by local_dev/run_stack.sh
 local_dev/logs/
@@ -27,6 +30,9 @@ hushai-android/app/src/release/res/raw/hushai_lan_ca.pem
 # Captured test media (regenerable; can be large)
 local_dev/captures/
 
+# Regenerable HLS output written by local_dev/feed_segments.py (segments + sidecars).
+local_dev/.feed_work/
+
 # Synthesized object-lane test fixture (make_object_clip.sh) — regenerable, operator-provisioned.
 object_clip.mp4
 
@@ -40,6 +46,8 @@ hushai-android/app/src/main/assets/vosk/
 # Python
 __pycache__/
 *.pyc
+# Vision export/OCR virtualenv (~448 MB; recreate with local_dev/provision_vision.sh).
+local_dev/.venv*/
 
 # OS cruft
 .DS_Store

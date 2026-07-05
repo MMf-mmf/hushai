@@ -247,4 +247,5 @@ errors in the dashboard.html it should also way what the error was in addition w
 To actually get this right the chat will need to have lots of context as well as all of the AI available data, such as the different voices, which voices that have already been detected and associated with a given video as well as any image detection data we picket us such as object detection person detection and any type of detection we might add in the future as well would need to be baked in to these improvements.
 
 
-PASSWORD: hushai-dev
+PASSWORD: (redacted — dev credentials live in the gitignored `.env`; see AGENTS.md
+"LAN security model". Never commit real secrets to this repo.)
