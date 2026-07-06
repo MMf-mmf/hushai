@@ -140,7 +140,7 @@ Ollama call; set `EMBED_OLLAMA_BASE_URL` (worker + rag query embedding) and/or
 
 Migrations live in `hushai-backend/migrations/` and **auto-apply** on backend/worker startup
 via `sqlx::migrate!`. Full one-line index: [`hushai-backend/migrations/README.md`](hushai-backend/migrations/README.md).
-Current head: **`0023_owner_identity`** (23 migrations, `0001`→`0023`).
+Current head: **`0024_entity_profiles`** (24 migrations, `0001`→`0024`).
 
 ### `transcript_sentences` storage (post-0003 — read before touching RAG/worker writes)
 
@@ -252,6 +252,49 @@ dropped — **media is ALWAYS stored regardless of gating.**
   `duplicates`, `merge-group`, `unattributed`(+`/name`). The worker runs a rate-limited
   going-forward `auto_merge_recent` (worker 0 only, recent speakers only — never mass-collapses
   the backlog). **All `SPEAKER_*`/`VAD_*` thresholds are uncalibrated guesses** — see Known gaps.
+- **Naming is a retro trigger** (2026-07): `rename_speaker` / `set_speaker_owner` (and the ops
+  route `POST /v1/speakers/{id}/retro-attach`) run `retro_attach_pass` — attach NULL-speaker
+  history on MULTI-VECTOR evidence (>=2 distinct raw neighbors each within the existing 0.5
+  match distance; strictly tighter than the online gray-zone attach) + fold ANONYMOUS duplicate
+  ids at the 0.15 auto-heal tightness (never a named<->named fold). The worker repeats the attach
+  going-forward (`auto_attach_unattributed_recent`, beside auto-merge). Attached rows keep
+  `quality='marginal'` so they never feed the clean-only centroid. Tests: `tests/retro_attach.rs`.
+
+### Entity profiles ("running memory", migration 0024)
+
+- `hushai-backend/src/profiles.rs`: one polymorphic `entity_profiles` row per person/speaker —
+  an append-only observation log (one line per coalesced visit/conversation) folded
+  INCREMENTALLY from the already-sessionized `events` table. Deterministic (no LLM in
+  accumulation); the RAG narrates at chat time (`is_profile_query` → "tell me about <name>",
+  the reflection-agent precedent). Anonymous identities accumulate too; naming just records
+  "[date] identified as <name>" (profiles are keyed by id); merges fold via `merge_in_tx`
+  hooks in `persons::merge_person` / `speakers::merge_speaker` / `collapse_cluster`.
+- Drivers: worker drain-time pass (`PROFILES_*` knobs, worker 0) + RAG chat-time
+  `refresh_subject` (`PROFILE_CHAT_REFRESH`, grace `PROFILE_GRACE_SECS` — eval pins 0).
+  Watermark = `events.updated_at` wall clock with a settle grace >= 2x the 30s session bucket;
+  DERIVED/rebuildable data (deleting a row only forgets the narrative).
+- Known gap (documented): merges don't repoint `events.subject_id`, so loser events not yet
+  consumed at merge time never fold in (bounded to the grace window).
+
+### Chat correctness (2026-07 overhaul — the "executive chat" fixes)
+
+- **Visit coalescing:** `presence.rs` counts VISITS (gap-coalesced continuous appearances,
+  `PRESENCE_VISIT_GAP_SECS`), never raw per-2s-segment sightings (the "seen 62 times" bug). The
+  citation list stays per-segment (video deep-links) — visit count != citation count by design.
+- **Distinct-people counts:** `is_people_count_query` → deterministic roster enumeration
+  (`render_people_count`), never the single-person frequency rollup.
+- **Footage stats:** `is_footage_stats_query` → `hushai-rag/src/stats.rs` SUM over `segments`
+  with window clamping; deterministic pre-route + precomputed answer (the LLM never narrates
+  the numbers).
+- **Window summary:** `is_window_summary_query` ("what have we spoken about today") →
+  `retrieve::conversations_in_window` (per-device gap grouping) + `answer_window_summary`;
+  the bare form defaults to the local TODAY.
+- **Session hygiene:** the viewer session pointer is per-tab (`sessionStorage`) + a 60-min
+  auto-restore staleness guard; server `load_history` age-filters the LLM-visible turns
+  (`RAG_CHAT_HISTORY_MAX_AGE_SECS`) BEFORE the condenser; the voice client honors spoken
+  "new chat"/"start over" (`VoiceSession.isResetCommand`) without sending it to the server.
+- **Natural-language windows** ("last 10 minutes", "today") now apply to the People/Objects/
+  Plates/Events arms too (`timeparse::window_in_query`, incl. a relative last/past-N parser).
 
 ### Vision: faces / objects / ALPR → [`docs/vision-image-cleanup-and-alpr.md`](docs/vision-image-cleanup-and-alpr.md), [`docs/perception-hardening.md`](docs/perception-hardening.md)
 

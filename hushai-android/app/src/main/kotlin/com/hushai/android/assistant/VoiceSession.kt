@@ -60,5 +60,32 @@ class VoiceSession(
 
     companion object {
         const val IDLE_WINDOW_MILLIS = 15L * 60L * 1000L // 15 minutes
+
+        // Spoken commands that discard the current conversation. Matched against the whole
+        // (normalized) question so "start over the recording from monday" is NOT a reset.
+        private val RESET_PHRASES = setOf(
+            "new chat",
+            "new conversation",
+            "start a new chat",
+            "start a new conversation",
+            "start over",
+            "start fresh",
+            "forget that",
+        )
+
+        /**
+         * Whether a spoken question is a session-reset command ("new chat", "start over", …).
+         * Handled on-device: the assistant resets the session and acknowledges — the phrase is
+         * never sent to the server, so it can't pollute the (old or new) conversation history.
+         */
+        fun isResetCommand(question: String): Boolean {
+            val norm = question
+                .lowercase(java.util.Locale.US)
+                .replace(Regex("[^a-z ]"), " ")
+                .split(" ")
+                .filter { it.isNotBlank() }
+                .joinToString(" ")
+            return norm.removePrefix("please ").trim() in RESET_PHRASES
+        }
     }
 }

@@ -48,14 +48,16 @@ class VoiceAssistant(
     private val ragClient: RagClient,
     private val ttsClient: TtsClient,
     private val voiceSession: VoiceSession,
-    initialOwnerEmbedding: FloatArray?,
-    private val onEnrollComplete: (FloatArray) -> Unit,
+    initialOwnerProfile: SpeakerMath.OwnerProfile?,
+    /** Persist the SERIALIZED multi-vector profile (SpeakerMath.formatProfile). Called on a
+     *  verified enrollment commit and on each guarded adaptation append. */
+    private val onEnrollComplete: (String) -> Unit,
 ) : PcmSink {
 
     @Volatile var wakeWord: String = SpeakerMath.normalizeWord(initialWakeWord)
         set(value) { field = SpeakerMath.normalizeWord(value) }
 
-    @Volatile private var ownerEmbedding: FloatArray? = initialOwnerEmbedding
+    @Volatile private var ownerProfile: SpeakerMath.OwnerProfile? = initialOwnerProfile
 
     private val queue = ArrayBlockingQueue<ByteArray>(QUEUE_CAPACITY)
     @Volatile private var running = false
@@ -72,12 +74,17 @@ class VoiceAssistant(
     @Volatile private var pendingEnroll = false
     @Volatile private var pendingResume = false
 
+    // Guided-enrollment state (worker thread only): accepted core samples, the current prompt
+    // index, reject strikes, whether we're at the final self-verification step, and whether
+    // that step already burned its one retry.
     private val enrollVectors = ArrayList<FloatArray>()
     private var enrolling = false
+    private var enrollVerifying = false
+    private var enrollVerifyRetried = false
+    private var enrollStrikes = 0
     private var awaitDeadlineNanos = 0L
     private var speakDeadlineNanos = 0L
-    private var enrollDeadlineNanos = 0L
-    private var enrollStartNanos = 0L
+    private var enrollStepDeadlineNanos = 0L
 
     fun start() {
         if (running) return
@@ -87,7 +94,7 @@ class VoiceAssistant(
     }
 
     private fun init() {
-        publish { it.copy(enabled = true, phase = AssistantPhase.LISTENING, enrolled = ownerEmbedding != null) }
+        publish { it.copy(enabled = true, phase = AssistantPhase.LISTENING, enrolled = ownerProfile != null) }
         val models = try {
             VoiceModels.load(context)
         } catch (e: Exception) {
@@ -112,7 +119,7 @@ class VoiceAssistant(
         recognizer = rec
         publish { it.copy(ready = true) }
         worker = Thread({ loop() }, "hushai-va").apply { start() }
-        HushaiLog.info("voice assistant ready (wake='$wakeWord' enrolled=${ownerEmbedding != null})")
+        HushaiLog.info("voice assistant ready (wake='$wakeWord' enrolled=${ownerProfile != null})")
     }
 
     override fun onPcm(data: ByteArray, length: Int) {
@@ -143,17 +150,10 @@ class VoiceAssistant(
                 HushaiLog.warn("speak did not finish in time — resuming")
                 resumeListening(rec)
             }
-            // Enrollment deadline: finish with whatever voiceprints we have (≥1), else fail.
-            if (enrolling && enrollDeadlineNanos > 0L && now >= enrollDeadlineNanos) {
-                if (enrollVectors.isNotEmpty()) {
-                    finishEnroll()
-                } else {
-                    enrolling = false
-                    enrollDeadlineNanos = 0
-                    rec.reset()
-                    phase = AssistantPhase.LISTENING
-                    publish { it.copy(phase = AssistantPhase.LISTENING, note = "didn't catch your voice — try again, speak clearly") }
-                }
+            // Per-step enrollment deadline: no usable utterance for this prompt in time
+            // counts as a strike (three strikes aborts, old profile untouched).
+            if (enrolling && enrollStepDeadlineNanos > 0L && now >= enrollStepDeadlineNanos) {
+                enrollStrike(rec, "didn't hear that — let's try the phrase again")
             }
             val chunk = queue.poll(150, TimeUnit.MILLISECONDS) ?: continue
             val isFinal = runCatching { rec.acceptWaveForm(chunk, chunk.size) }
@@ -173,7 +173,10 @@ class VoiceAssistant(
     }
 
     private fun handleFinal(rec: Recognizer, text: String, spk: FloatArray?) {
-        if (enrolling) { collectEnrollment(spk); return }
+        if (enrolling) {
+            if (enrollVerifying) collectVerify(rec, spk) else collectEnrollment(rec, text, spk)
+            return
+        }
         when (phase) {
             AssistantPhase.LISTENING -> {
                 val wake = SpeakerMath.tokens(wakeWord)
@@ -212,6 +215,16 @@ class VoiceAssistant(
      * verified owner gets identity-aware answers ("what's my name") and first-person resolution.
      */
     private fun answer(rec: Recognizer, question: String, ownerVerified: Boolean) {
+        // "New chat" / "start over" is handled on-device: drop the session so the next spoken
+        // question opens a fresh conversation (no stale history/condensation), acknowledge out
+        // loud, and never send the phrase to the server.
+        if (VoiceSession.isResetCommand(question)) {
+            voiceSession.reset()
+            HushaiLog.info("voice session reset by spoken command")
+            publish { it.copy(lastQuestion = question) }
+            speakAnswer("Okay, starting fresh.")
+            return
+        }
         phase = AssistantPhase.THINKING
         publish { it.copy(phase = AssistantPhase.THINKING, lastQuestion = question, note = null) }
         val now = System.currentTimeMillis()
@@ -270,17 +283,22 @@ class VoiceAssistant(
     }
 
     private fun verifyOwner(spk: FloatArray?): Boolean {
-        val owner = ownerEmbedding ?: run {
+        val owner = ownerProfile ?: run {
             publish { it.copy(note = "not enrolled — responding to anyone") }
             return true
         }
         if (spk == null || spk.isEmpty()) {
+            HushaiLog.info("speaker verify: no voiceprint captured")
             publish { it.copy(note = "couldn't capture a voiceprint") }
             return false
         }
-        val sim = SpeakerMath.cosine(spk, owner)
+        val sim = SpeakerMath.topKMeanSim(spk, owner.all())
         HushaiLog.info("speaker cosine=$sim (threshold=$SPEAKER_THRESHOLD)")
-        return sim >= SPEAKER_THRESHOLD
+        if (sim >= SPEAKER_THRESHOLD) {
+            maybeAdapt(spk, sim)
+            return true
+        }
+        return false
     }
 
     /**
@@ -289,15 +307,32 @@ class VoiceAssistant(
      * NOT assert owner identity to the server, so this returns false there.
      */
     private fun ownerVerified(spk: FloatArray?): Boolean {
-        val owner = ownerEmbedding ?: return false
+        val owner = ownerProfile ?: return false
         if (spk == null || spk.isEmpty()) return false
-        return SpeakerMath.cosine(spk, owner) >= SPEAKER_THRESHOLD
+        return SpeakerMath.topKMeanSim(spk, owner.all()) >= SPEAKER_THRESHOLD
+    }
+
+    /**
+     * Guarded adaptation: append this utterance's vector as an ADAPTED slot only on a
+     * high-confidence match (>= [ADAPT_FLOOR], far above the accept gate — never adapt in the
+     * [SPEAKER_THRESHOLD, ADAPT_FLOOR) band, so a borderline impostor can't poison the
+     * profile). Capped ring of adapted slots; the guided core samples are never evicted.
+     * Handles slow acoustic drift (new room, new distance) across sessions.
+     */
+    private fun maybeAdapt(spk: FloatArray, sim: Float) {
+        if (sim < ADAPT_FLOOR) return
+        val owner = ownerProfile ?: return
+        val next = owner.withAdapted(spk)
+        ownerProfile = next
+        onEnrollComplete(SpeakerMath.formatProfile(next))
+        HushaiLog.info("owner profile adapted (cosine=$sim, adapted=${next.adapted.size}/${SpeakerMath.MAX_ADAPTED})")
     }
 
     private fun reject(rec: Recognizer) {
         rec.reset()
         phase = AssistantPhase.LISTENING
         awaitDeadlineNanos = 0
+        HushaiLog.info("speaker rejected (cosine below threshold)")
         publish { it.copy(phase = AssistantPhase.LISTENING, note = "speaker not recognized — ignoring") }
     }
 
@@ -327,7 +362,16 @@ class VoiceAssistant(
         publish { it.copy(phase = AssistantPhase.LISTENING, note = note) }
     }
 
-    // --- Enrollment -------------------------------------------------------------
+    // --- Guided enrollment --------------------------------------------------------
+    //
+    // Six prompted samples (varied phrases; the last two ask for a different distance /
+    // background), each gated by SpeakerMath.enrollGate (real voiceprint, enough speech,
+    // consistent with the samples already accepted), then a MANDATORY held-out
+    // self-verification that must clear VERIFY_FLOOR before anything is stored. The previous
+    // profile stays active until the replacement passes — an interrupted or failed enrollment
+    // can no longer wipe a working profile (the old flow committed a possibly-single-sample
+    // centroid unconditionally, which is exactly the "works sometimes, forgets my voice"
+    // failure the owner reported).
 
     /** Request enrollment; the worker picks it up (keeps recognizer single-threaded). */
     fun startEnrollment() { pendingEnroll = true }
@@ -335,49 +379,93 @@ class VoiceAssistant(
     private fun beginEnroll(rec: Recognizer) {
         enrollVectors.clear()
         enrolling = true
-        val now = System.nanoTime()
-        enrollStartNanos = now
-        enrollDeadlineNanos = now + ENROLL_TIMEOUT_NANOS
+        enrollVerifying = false
+        enrollVerifyRetried = false
+        enrollStrikes = 0
         phase = AssistantPhase.ENROLLING
         rec.reset()
         queue.clear()
         HushaiLog.info("enroll: started")
-        publish { it.copy(phase = AssistantPhase.ENROLLING, enrollProgress = 0, note = "keep talking for a few seconds…") }
+        promptEnrollStep(null)
     }
 
-    private fun collectEnrollment(spk: FloatArray?) {
-        if (spk != null && spk.isNotEmpty()) {
-            enrollVectors.add(spk)
-            HushaiLog.info("enroll: captured voiceprint #${enrollVectors.size} (dim=${spk.size})")
-            val progress = (enrollVectors.size * 100 / ENROLL_TARGET).coerceAtMost(99)
-            publish { it.copy(enrollProgress = progress) }
+    /** Publish the current prompt (sample N of TOTAL, or the verify phrase) + step deadline. */
+    private fun promptEnrollStep(note: String?) {
+        enrollStepDeadlineNanos = System.nanoTime() + ENROLL_STEP_TIMEOUT_NANOS
+        val prompt = if (enrollVerifying) VERIFY_PROMPT else ENROLL_PROMPTS[enrollVectors.size]
+        val step = enrollVectors.size
+        publish {
+            it.copy(
+                phase = AssistantPhase.ENROLLING,
+                enrollStep = step,
+                enrollTotal = ENROLL_TARGET,
+                enrollPrompt = prompt,
+                enrollProgress = (step * 100 / (ENROLL_TARGET + 1)).coerceAtMost(99),
+                note = note,
+            )
+        }
+    }
+
+    private fun collectEnrollment(rec: Recognizer, text: String, spk: FloatArray?) {
+        when (val g = SpeakerMath.enrollGate(spk, SpeakerMath.tokens(text).size, enrollVectors)) {
+            is SpeakerMath.GateResult.Reject -> enrollStrike(rec, g.reason)
+            SpeakerMath.GateResult.Accept -> {
+                enrollVectors.add(spk!!)
+                enrollStrikes = 0
+                HushaiLog.info("enroll: captured voiceprint #${enrollVectors.size}/$ENROLL_TARGET (dim=${spk.size})")
+                if (enrollVectors.size >= ENROLL_TARGET) {
+                    enrollVerifying = true
+                    HushaiLog.info("enroll: verification step")
+                }
+                rec.reset()
+                promptEnrollStep(if (enrollVerifying) "great — one last check" else "got it ✓")
+            }
+        }
+    }
+
+    /** The held-out self-verification: the new profile must recognize its own owner NOW. */
+    private fun collectVerify(rec: Recognizer, spk: FloatArray?) {
+        val score = if (spk == null || spk.isEmpty()) -1f
+        else SpeakerMath.topKMeanSim(spk, enrollVectors)
+        HushaiLog.info("enroll: verify cosine=$score (floor=$VERIFY_FLOOR)")
+        if (score >= VERIFY_FLOOR) {
+            val profile = SpeakerMath.OwnerProfile(core = enrollVectors.toList(), adapted = emptyList())
+            ownerProfile = profile
+            onEnrollComplete(SpeakerMath.formatProfile(profile))
+            endEnroll(rec)
+            HushaiLog.info("enroll: complete (${profile.core.size} sample(s), verified)")
+            publish { it.copy(phase = AssistantPhase.LISTENING, enrolled = true, enrollProgress = 100, enrollPrompt = null, note = "enrolled ✓ (voice check passed)") }
+        } else if (!enrollVerifyRetried) {
+            enrollVerifyRetried = true
+            rec.reset()
+            promptEnrollStep("hmm, that didn't match — one more try")
         } else {
-            HushaiLog.info("enroll: utterance had no voiceprint (spk null) — keep talking")
-        }
-        // Done when we have enough samples, OR at least one after a few seconds of
-        // audio (handles a single continuous utterance with no pauses).
-        val elapsed = System.nanoTime() - enrollStartNanos
-        if (enrollVectors.size >= ENROLL_TARGET ||
-            (enrollVectors.isNotEmpty() && elapsed >= MIN_ENROLL_NANOS)
-        ) {
-            finishEnroll()
+            endEnroll(rec)
+            HushaiLog.info("enroll: failed verification — previous profile kept")
+            publish { it.copy(phase = AssistantPhase.LISTENING, enrolled = ownerProfile != null, enrollPrompt = null, note = "enrollment didn't pass the voice check — your previous profile is unchanged; try again somewhere quieter") }
         }
     }
 
-    private fun finishEnroll() {
-        val centroid = SpeakerMath.centroid(enrollVectors)
+    /** A rejected/missed sample: strike, re-prompt, or abort after three strikes. */
+    private fun enrollStrike(rec: Recognizer, reason: String) {
+        enrollStrikes++
+        if (enrollStrikes >= ENROLL_MAX_STRIKES) {
+            endEnroll(rec)
+            HushaiLog.info("enroll: aborted after $ENROLL_MAX_STRIKES strikes — previous profile kept")
+            publish { it.copy(phase = AssistantPhase.LISTENING, enrolled = ownerProfile != null, enrollPrompt = null, note = "enrollment cancelled — try again in a quieter spot") }
+        } else {
+            rec.reset()
+            promptEnrollStep(reason)
+        }
+    }
+
+    private fun endEnroll(rec: Recognizer) {
         enrolling = false
-        enrollDeadlineNanos = 0
+        enrollVerifying = false
+        enrollStepDeadlineNanos = 0
         phase = AssistantPhase.LISTENING
-        recognizer?.reset()
-        if (centroid != null) {
-            ownerEmbedding = centroid
-            onEnrollComplete(centroid)
-            HushaiLog.info("enroll: complete (${enrollVectors.size} sample(s))")
-            publish { it.copy(phase = AssistantPhase.LISTENING, enrolled = true, enrollProgress = 100, note = "enrolled ✓") }
-        } else {
-            publish { it.copy(phase = AssistantPhase.LISTENING, note = "enrollment failed — try again") }
-        }
+        rec.reset()
+        queue.clear()
     }
 
     fun stop() {
@@ -409,13 +497,33 @@ class VoiceAssistant(
     companion object {
         private const val SAMPLE_RATE = 16_000
         private const val QUEUE_CAPACITY = 64
+        // The accept gate. UNCHANGED on purpose (cardinal rule: never loosen a gate) — the
+        // multi-vector top-2-mean scoring raises the OWNER's score across environments while
+        // measured stranger scores (~0.41-0.42 per vector) stay under it.
         private const val SPEAKER_THRESHOLD = 0.5f
-        private const val ENROLL_TARGET = 2 // separate utterances; 1 + enough audio also completes
-        private const val MIN_ENROLL_NANOS = 5_000_000_000L // 1 voiceprint after ~5s of audio is enough
         private const val MIN_QUESTION_WORDS = 2
         private const val QUESTION_TIMEOUT_NANOS = 8_000_000_000L
         // Watchdog backstop covering backend synthesis + network + playback.
         private const val SPEAK_TIMEOUT_NANOS = 60_000_000_000L
-        private const val ENROLL_TIMEOUT_NANOS = 20_000_000_000L // finish with what we have after 20s
+
+        // Guided enrollment: six prompted samples + a held-out verification.
+        private const val ENROLL_TARGET = 6
+        private const val ENROLL_STEP_TIMEOUT_NANOS = 15_000_000_000L
+        private const val ENROLL_MAX_STRIKES = 3
+        // The new profile must pass its own voice check with margin above the accept gate
+        // before it replaces anything.
+        private const val VERIFY_FLOOR = 0.55f
+        // Adaptation only far above the gate — a borderline match must never write the profile.
+        private const val ADAPT_FLOOR = 0.70f
+        private val ENROLL_PROMPTS = listOf(
+            "Say: the quick brown fox jumps over the lazy dog",
+            "Say: my voice is my passport, please verify me",
+            "Say: I am teaching this assistant to know my voice",
+            "Say: seven green apples fell from the old oak tree",
+            "Step a few feet back, then say: I am speaking from across the room",
+            "In your normal voice, say: this is how I usually talk every day",
+        )
+        private const val VERIFY_PROMPT =
+            "Last check — say: it's really me, open up"
     }
 }

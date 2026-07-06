@@ -22,6 +22,13 @@ pub fn window_in_query(query: &str, now_unix_nanos: i64, tz_offset_secs: i64) ->
     let today = now_local.date_naive();
     let yesterday = today.pred_opt()?;
 
+    // Relative durations first ("last 10 minutes", "past 2 hours", "last hour"): they're the
+    // narrowest ask and purely now-anchored, so no civil-time arithmetic applies. Checked before
+    // the calendar phrases so "in the last 10 minutes today" gets the 10-minute window.
+    if let Some(win) = relative_window(&q, now_unix_nanos) {
+        return Some(win);
+    }
+
     // Part-of-day and "last night" first — they're narrower than the day/week windows and their
     // key words ("morning", "night") don't collide with the broader phrases.
     if q.contains("this morning") {
@@ -61,6 +68,41 @@ pub fn window_in_query(query: &str, now_unix_nanos: i64, tz_offset_secs: i64) ->
             civil_to_utc_nanos(this_monday.and_hms_opt(0, 0, 0)?, tz_offset_secs),
             civil_to_utc_nanos(next_monday.and_hms_opt(0, 0, 0)?, tz_offset_secs),
         ));
+    }
+    None
+}
+
+/// "last/past N minutes|hours|days" (or a bare "last minute/hour/day" = 1 unit) as a
+/// `[now - N·unit, now)` window. Same closed-set philosophy as the calendar phrases: only
+/// minute/hour/day units — "last week"/"last night" stay with their calendar handlers, and
+/// anything else after last/past ("last time I saw Bob") is no match.
+fn relative_window(q: &str, now_unix_nanos: i64) -> Option<(i64, i64)> {
+    let words: Vec<&str> = q
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|w| !w.is_empty())
+        .collect();
+    for (i, w) in words.iter().enumerate() {
+        if *w != "last" && *w != "past" {
+            continue;
+        }
+        let (n, unit_word) = match words.get(i + 1) {
+            Some(next) => match next.parse::<i64>() {
+                Ok(n) if (1..=100_000).contains(&n) => (n, words.get(i + 2).copied()),
+                Ok(_) => continue,
+                // Bare unit: "the last hour" / "the past minute" = one of that unit.
+                Err(_) => (1, Some(*next)),
+            },
+            None => continue,
+        };
+        let unit_secs = match unit_word {
+            Some("minute") | Some("minutes") | Some("min") | Some("mins") => 60,
+            Some("hour") | Some("hours") | Some("hr") | Some("hrs") => 3600,
+            Some("day") | Some("days") => 86_400,
+            _ => continue,
+        };
+        let span = n.saturating_mul(unit_secs).saturating_mul(NANOS_PER_SEC);
+        return Some((now_unix_nanos.saturating_sub(span), now_unix_nanos));
     }
     None
 }
@@ -185,6 +227,49 @@ mod tests {
         // "last week" must win over "this week" (the substring order guard).
         let (a, _) = window_in_query("last week's meeting", now(), 0).unwrap();
         assert_eq!(civil(a, 0), (2026, 6, 22, 0, 0));
+    }
+
+    #[test]
+    fn relative_durations() {
+        let (a, b) = window_in_query("how many people in the last 10 minutes?", now(), 0).unwrap();
+        assert_eq!(b, now());
+        assert_eq!(a, now() - 10 * 60 * NANOS_PER_SEC);
+
+        let (a, b) = window_in_query("past 2 hours", now(), 0).unwrap();
+        assert_eq!(b, now());
+        assert_eq!(a, now() - 2 * 3600 * NANOS_PER_SEC);
+
+        // Punctuation and short units: "min?" still parses.
+        let (a, _) = window_in_query("anything in the last 10 min?", now(), 0).unwrap();
+        assert_eq!(a, now() - 10 * 60 * NANOS_PER_SEC);
+
+        // Bare unit = one of it.
+        let (a, _) = window_in_query("what happened in the last hour", now(), 0).unwrap();
+        assert_eq!(a, now() - 3600 * NANOS_PER_SEC);
+
+        let (a, _) = window_in_query("deliveries in the last 3 days", now(), 0).unwrap();
+        assert_eq!(a, now() - 3 * 86_400 * NANOS_PER_SEC);
+    }
+
+    #[test]
+    fn relative_duration_beats_calendar_phrase() {
+        // Both "last 10 minutes" and "today" present → the narrower relative window wins.
+        let (a, b) = window_in_query("who came by today in the last 10 minutes", now(), 0).unwrap();
+        assert_eq!((a, b), (now() - 10 * 60 * NANOS_PER_SEC, now()));
+    }
+
+    #[test]
+    fn relative_negatives_fall_through() {
+        // "last week" is a calendar phrase, not a relative-duration match.
+        let (a, _) = window_in_query("last week", now(), 0).unwrap();
+        assert_eq!(civil(a, 0), (2026, 6, 22, 0, 0));
+        // "last night" likewise.
+        let (a, _) = window_in_query("last night", now(), 0).unwrap();
+        assert_eq!(civil(a, 0), (2026, 7, 2, 20, 0));
+        // "last time ..." is no window at all.
+        assert!(window_in_query("when was the last time i saw bob", now(), 0).is_none());
+        // Zero/absurd counts don't match.
+        assert!(window_in_query("last 0 minutes", now(), 0).is_none());
     }
 
     #[test]

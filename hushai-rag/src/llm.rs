@@ -280,6 +280,49 @@ impl Llm {
             .map_err(|e| anyhow!("LLM recency prompt failed: {e}"))
     }
 
+    /// Narrate an entity PROFILE ("tell me about Casey") — the accumulated running-memory
+    /// observation log plus recent sightings/passages as citations. Single-shot, recordings
+    /// persona; the profile is deterministic context (dates reliable), never a citation.
+    pub async fn answer_profile(
+        &self,
+        question: &str,
+        label: &str,
+        profile: &ProfileContext,
+        sources: &[Source],
+        names: &HashMap<String, String>,
+    ) -> anyhow::Result<String> {
+        let agent = self
+            .tune(self.client.agent(&self.model))
+            .preamble(crate::agents::default_preamble())
+            .build();
+        let prompt = build_profile_prompt(question, label, profile, sources, names);
+        agent
+            .prompt(prompt)
+            .await
+            .map_err(|e| anyhow!("LLM profile prompt failed: {e}"))
+    }
+
+    /// Produce a grounded SUMMARY of ALL of a window's conversations ("what have we spoken
+    /// about today"). `convos` are chronological conversations of chronological, enriched
+    /// sentences (from `retrieve::conversations_in_window`). Single-shot, recordings persona —
+    /// mirrors [`Self::answer_recency`], but over the whole window instead of the latest convo.
+    pub async fn answer_window_summary(
+        &self,
+        question: &str,
+        convos: &[Vec<Source>],
+        names: &HashMap<String, String>,
+    ) -> anyhow::Result<String> {
+        let agent = self
+            .tune(self.client.agent(&self.model))
+            .preamble(crate::agents::default_preamble())
+            .build();
+        let prompt = build_window_summary_prompt(question, convos, names);
+        agent
+            .prompt(prompt)
+            .await
+            .map_err(|e| anyhow!("LLM window-summary prompt failed: {e}"))
+    }
+
     /// Single-shot reflection answer for `POST /v1/rag/query` (reflection persona, no
     /// history). `digest_text` is the pre-rendered analytics digest; `excerpts` are
     /// representative quotes. `model` overrides the default Ollama model (e.g. a larger
@@ -418,6 +461,120 @@ pub fn build_conversation_prompt(
          Question: {question}\n\n\
          Give a brief, natural spoken summary of what this conversation was about — the main topics \
          and who was involved. Use only what is above."
+    )
+}
+
+/// The accumulated profile handed to [`Llm::answer_profile`] — pre-humanized (the model never
+/// sees raw nanos; first/last labels come from `humanize_time`).
+#[derive(Debug, Clone, Default)]
+pub struct ProfileContext {
+    pub text: String,
+    pub visit_count: i64,
+    pub first_seen_label: Option<String>,
+    pub last_seen_label: Option<String>,
+}
+
+/// Assemble the profile prompt: the running-memory observation log first (context, not a
+/// citation), then any recent passages in the standard `[i]` format, then a narrate-only-from-
+/// the-above instruction. Unlike `build_prompt`, EMPTY sources do not force a decline — the
+/// profile itself is the answer material.
+pub fn build_profile_prompt(
+    question: &str,
+    label: &str,
+    profile: &ProfileContext,
+    sources: &[Source],
+    names: &HashMap<String, String>,
+) -> String {
+    let mut out = format!(
+        "Accumulated profile of {label} (built from prior recordings; dates are reliable):\n{}\n",
+        profile.text.trim()
+    );
+    let mut facts: Vec<String> = Vec::new();
+    if let Some(f) = &profile.first_seen_label {
+        facts.push(format!("first seen {f}"));
+    }
+    if let Some(l) = &profile.last_seen_label {
+        facts.push(format!("most recently {l}"));
+    }
+    if profile.visit_count > 0 {
+        facts.push(format!(
+            "{} visit{} in total",
+            profile.visit_count,
+            if profile.visit_count == 1 { "" } else { "s" }
+        ));
+    }
+    if !facts.is_empty() {
+        out.push_str(&format!("({}.)\n", facts.join("; ")));
+    }
+    if !sources.is_empty() {
+        out.push_str("\nRecent passages:\n");
+        for (i, s) in sources.iter().enumerate() {
+            let who = s.speaker_name.clone().unwrap_or_else(|| {
+                crate::speakers::display_label(s.speaker_id.as_deref(), names, None)
+            });
+            if s.time_label.is_empty() {
+                out.push_str(&format!("[{}] ({}) {}\n", i + 1, who, s.text.trim()));
+            } else {
+                out.push_str(&format!("[{}] ({}, {}) {}\n", i + 1, who, s.time_label, s.text.trim()));
+            }
+        }
+    }
+    out.push_str(&format!(
+        "\nQuestion: {question}\n\n\
+         Give a brief, natural spoken rundown of {label} using ONLY the profile and passages \
+         above — when they first and most recently appeared, how often, and anything notable. \
+         Do not invent details."
+    ));
+    out
+}
+
+/// Assemble the window-summary prompt: every kept conversation as its own section, with GLOBAL
+/// `[i]` numbering continuing across sections — the flattened conversations are exactly the
+/// `sources` array the SSE stream carries, so citation indices line up. Reuses `build_prompt`'s
+/// `[i] (who, time) text` line format; the section header carries the conversation's start time.
+pub fn build_window_summary_prompt(
+    question: &str,
+    convos: &[Vec<Source>],
+    names: &HashMap<String, String>,
+) -> String {
+    if convos.iter().all(|c| c.is_empty()) {
+        return format!(
+            "Recorded conversations: (none found)\n\nQuestion: {question}\n\n\
+             Nothing was recorded in that period, so say you don't have anything in the recordings for it."
+        );
+    }
+    let mut ctx = String::new();
+    let mut i = 0usize;
+    for (ci, convo) in convos.iter().enumerate() {
+        if convo.is_empty() {
+            continue;
+        }
+        let when = convo
+            .first()
+            .map(|s| s.time_label.clone())
+            .filter(|t| !t.is_empty())
+            .map(|t| format!(" ({t})"))
+            .unwrap_or_default();
+        ctx.push_str(&format!("Conversation {}{}:\n", ci + 1, when));
+        for s in convo {
+            i += 1;
+            let who = s.speaker_name.clone().unwrap_or_else(|| {
+                crate::speakers::display_label(s.speaker_id.as_deref(), names, None)
+            });
+            if s.time_label.is_empty() {
+                ctx.push_str(&format!("[{}] ({}) {}\n", i, who, s.text.trim()));
+            } else {
+                ctx.push_str(&format!("[{}] ({}, {}) {}\n", i, who, s.time_label, s.text.trim()));
+            }
+        }
+        ctx.push('\n');
+    }
+    format!(
+        "The following are the recorded conversations from the period the question asks about, \
+         oldest first:\n{ctx}\
+         Question: {question}\n\n\
+         Give a brief, natural spoken overview of what was discussed — the main topics of each \
+         conversation and who was involved. Use only what is above; do not invent details."
     )
 }
 

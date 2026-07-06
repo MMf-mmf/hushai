@@ -294,8 +294,32 @@ class MainActivity : ComponentActivity() {
         } else {
             settings.audioOnlyBlocking()
         }
+        // Opt-in upright-BAKE (experimental): persist the extra so the next startCapture reads it
+        // from Settings. Forwarded here because CaptureService.startIntent doesn't carry it, and a
+        // direct start-foreground-service is blocked on some OEMs — the Activity autostart is the
+        // supported headless path. (See CaptureService.EXTRA_UPRIGHT_BAKE.)
+        if (intent.hasExtra(CaptureService.EXTRA_UPRIGHT_BAKE)) {
+            settings.setUprightBakeBlocking(intent.getBooleanExtra(CaptureService.EXTRA_UPRIGHT_BAKE, false))
+        }
+        // Headless assistant enable (`--ez assistant true`): persist BEFORE the autostart
+        // branch — CaptureService builds the assistant at capture start when the setting is
+        // on, so persist-then-autostart is sufficient (no binder round-trip needed). Also
+        // pushed live when already bound (assistant toggled without a restart).
+        if (intent.hasExtra(EXTRA_ASSISTANT)) {
+            val on = intent.getBooleanExtra(EXTRA_ASSISTANT, false)
+            settings.setAssistantEnabledBlocking(on)
+            captureBinder?.setAssistantEnabled(on)
+        }
         if (intent.getBooleanExtra(EXTRA_AUTOSTART, false)) {
             requestStart(url ?: settings.urlBlocking(), token ?: settings.tokenBlocking(), audioOnly)
+        }
+        // Headless enrollment trigger (`--ez enroll true`), for the voice-assistant test
+        // harness (local_dev/voice_assistant_loop.py). The harness sends this only AFTER
+        // logcat shows "voice assistant ready", so the binder is up and the call lands; via
+        // onNewIntent the activity is already bound. `enrollOwner()` is a volatile-flag
+        // request the assistant worker picks up — safe no-op if the assistant is absent.
+        if (intent.getBooleanExtra(EXTRA_ENROLL, false)) {
+            captureBinder?.enrollOwner()
         }
     }
 
@@ -369,6 +393,9 @@ class MainActivity : ComponentActivity() {
     companion object {
         const val EXTRA_AUTOSTART = "autostart"
         const val EXTRA_STOP = "stop"
+        // Headless voice-assistant control (adb harness): enable/disable + trigger enrollment.
+        const val EXTRA_ASSISTANT = "assistant"
+        const val EXTRA_ENROLL = "enroll"
     }
 }
 

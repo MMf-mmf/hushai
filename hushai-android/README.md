@@ -60,15 +60,19 @@ ignored; capture/upload unaffected throughout.
     vision frames, the backend face/plate JPEGs, **and the viewer's upright re-encode** all
     come out upright. (The viewer's *fast* `-c copy` path can't honor a matrix, so it re-encodes
     rotated clips — see `hushai-viewer`.)
-  - **Opt-in bake (`Settings.uprightBake`, experimental):** a GLES pass
-    (`capture/gl/` + `GlVideoPipeline`) rotates the *pixels* on-device so the encoded H.264 is
-    physically upright and the matrix is 0 — then even the viewer's fast `-c copy` plays upright
-    with no re-encode. Baked from the mount orientation at capture start (portrait swaps the
-    encoder to 720×1280); live self-corrects a 0↔180 flip. **Falls back** to the matrix path if
-    GL/EGL init fails (capture never depends on GL). Enable headlessly for rig testing:
-    `am start-foreground-service … --ez upright_bake true` (Stop → Start to apply). ⚠️ The GL
-    rotation *sign* is empirical — verify all four orientations on the physical rig and flip the
-    sign in `CameraGlRenderer.buildTexMatrix` if a frame comes out rotated the wrong way.
+  - **Opt-in bake (`Settings.uprightBake`):** a GLES pass (`capture/gl/` + `GlVideoPipeline`)
+    rotates the *pixels* on-device so the encoded H.264 is physically upright and the matrix is 0 —
+    then even the viewer's fast `-c copy` plays upright with no re-encode. Baked from the mount
+    orientation at capture start (portrait swaps the encoder to 720×1280); live self-corrects a
+    0↔180 flip. **Falls back** to the matrix path if GL/EGL init fails (capture never depends on
+    GL). Enable headlessly: `am start -n com.hushai.android/.MainActivity --ez upright_bake true
+    --ez autostart true` (a direct `start-foreground-service` is blocked on some OEMs — go through
+    the Activity). **Rig-verified on the Galaxy S8** (back cam, SENSOR_ORIENTATION=90): the GL
+    texcoord angle is `rotationDeg - 90` (`CameraGlRenderer.buildTexMatrix`) — the SurfaceTexture
+    transform already applies the sensor rotation, so the displayed orientation equals the texcoord
+    angle. Verified upright for the mounted orientation + confirmed the viewer's `-c copy` fast path
+    plays it upright; the formula generalizes to the other three by construction but those need a
+    physical re-mount to spot-check.
 
 ### 2. Live camera preview (this session)
 
@@ -107,8 +111,10 @@ wake word  →  owner voice-ID  →  question (STT)  →  RAG answer  →  spoke
 - **Always-on wake word** — a user-configurable keyword (default `"computer"`),
   spotted offline by Vosk; runs inside `CaptureService`, so it works screen-off.
 - **Owner voice identification** — on a wake, the speaker is verified against an
-  enrolled owner profile (cosine vs a stored x-vector centroid). A different person is
-  ignored. Enrollment is a one-time "talk for a few seconds" flow.
+  enrolled MULTI-VECTOR owner profile (top-2 mean of per-vector cosines). A different
+  person is ignored. Enrollment is a GUIDED flow: six prompted samples (two in varied
+  conditions) with per-sample quality gates, then a mandatory held-out voice check —
+  the previous profile is untouched until the new one passes.
 - **Question STT** — the utterance after the wake word is transcribed by the same Vosk
   recognizer.
 - **RAG answer** — the question goes to `../hushai-rag` **`/v1/rag/chat`** (SSE) via
@@ -279,7 +285,7 @@ Phases: `LISTENING → AWAIT_QUESTION → THINKING → SPEAKING → LISTENING`, 
 |---|---|---|
 | Question wait | `QUESTION_TIMEOUT_NANOS` = 8 s | bare wake word with no follow-up → back to LISTENING |
 | Speaking | `SPEAK_TIMEOUT_NANOS` = 60 s | if backend synth + network + playback hangs, force-resume |
-| Enrolling | `ENROLL_TIMEOUT_NANOS` = 20 s | finish with whatever voiceprints we have (≥1), else fail |
+| Enrolling | `ENROLL_STEP_TIMEOUT_NANOS` = 15 s/step | a missed prompt is a strike; 3 strikes abort (old profile kept) |
 | Init | try/catch in `init()` | model/recognizer load failure sets `running=false` (no zombie queue) |
 
 Wake detection runs on **final** results (so the `spk` x-vector is available). A single
@@ -302,14 +308,28 @@ moves to AWAIT_QUESTION and verifies on the (longer, better) follow-up.
 
 ### Speaker verification (`assistant/SpeakerMath.kt` — pure + unit-tested)
 
-- **Enrollment**: collect Vosk `spk` x-vectors from a few seconds of speech → L2-mean
-  centroid → persisted as the owner embedding (a CSV string in DataStore).
-- **Verify**: cosine(question-utterance x-vector, owner centroid) ≥ `SPEAKER_THRESHOLD`
-  (**0.50**). Measured on-device: **owner ≈ 0.63–0.80, stranger ≈ 0.41–0.42** — a clean
-  margin around 0.50. If you change the model or see false accepts/rejects, this is the
-  knob to tune.
+- **Guided enrollment (2026-07 overhaul)**: SIX prompted samples (four varied phrases +
+  two varied-condition prompts: across the room / with background noise), each gated by
+  `SpeakerMath.enrollGate` (real x-vector, ≥4 words of speech, and — from sample 2 —
+  cosine ≥ 0.35 vs the accepted centroid, so a second person/TV can't grab a slot). Then
+  a MANDATORY held-out verification: the fresh profile must score ≥ `VERIFY_FLOOR` (0.55)
+  on one more utterance or the enrollment FAILS and the previous profile stays active.
+  (The old flow could commit a single 5-second centroid unconditionally — exactly the
+  "works sometimes, forgets my voice in the next session" failure.)
+- **Profile**: the individual sample vectors are stored (serialized `c|…;a|…` in
+  DataStore; a legacy single-centroid string still parses). Verification scores
+  `topKMeanSim` (top-2 mean of per-vector cosines) ≥ `SPEAKER_THRESHOLD` (**0.50**,
+  UNCHANGED) — multi-vector scoring lifts the owner's score across environments without
+  touching the gate. Measured per-vector on-device: **owner ≈ 0.63–0.80, stranger
+  ≈ 0.41–0.42**.
+- **Guarded adaptation**: a normal-use verification scoring ≥ 0.70 appends its vector as
+  an `adapted` slot (ring of 4; the 6 enrolled core vectors are never evicted) — handles
+  slow acoustic drift without impostor poisoning (never adapts in the 0.50–0.70 band).
 - Not enrolled → "respond to anyone" (with a note). The owner gate only applies once a
   profile exists.
+- **Harness hooks**: `--ez assistant true` (persist the assistant toggle headlessly) and
+  `--ez enroll true` (trigger the guided flow once "voice assistant ready" is in logcat) —
+  used by `local_dev/voice_assistant_loop.py`; rejects/no-voiceprint now log to HUSHAI_TX.
 
 ### RAG client + TTS
 
@@ -419,8 +439,9 @@ OkHttp 4.12, Compose BOM 2024.09.03, **vosk-android 0.3.47**. Tests add `org.jso
 adb reverse tcp:8080 tcp:8080 && adb reverse tcp:8090 tcp:8090
 ```
 
-Then in the app: enable **Voice assistant**, tap **Enroll my voice** and talk ~6–8 s
-(→ "enrolled ✓"), then say **"computer, <question>"**. (The worker must have
+Then in the app: enable **Voice assistant**, tap **Enroll my voice** and follow the six
+on-screen prompts + the final voice check (→ "enrolled ✓ (voice check passed)"), then say
+**"computer, <question>"**. (The worker must have
 transcribed some audio into `transcript_sentences` for RAG to have anything to answer.)
 
 > ⚠️ Long-running `cargo run` dev servers get **reaped when idle** — if the assistant

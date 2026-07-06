@@ -499,6 +499,138 @@ pub fn take_latest_conversation(
         .collect()
 }
 
+/// ALL conversations in a window ("what have we spoken about today"), grouped per device by the
+/// same silence-gap rule as [`take_latest_conversation`], newest conversations preferred, bounded
+/// by `max_convos` / `max_sentences_per` / a global `max_total_chars` budget. Returned OLDEST
+/// conversation first (a day summary reads chronologically); sentences within each conversation
+/// are chronological too. One SQL fetch; empty when nothing was recorded in scope.
+#[allow(clippy::too_many_arguments)]
+pub async fn conversations_in_window(
+    pool: &PgPool,
+    device_id: Option<&str>,
+    after: Option<i64>,
+    before: Option<i64>,
+    gap_nanos: i64,
+    scan_limit: i64,
+    max_convos: usize,
+    max_sentences_per: usize,
+    max_total_chars: usize,
+) -> anyhow::Result<Vec<Vec<Source>>> {
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
+        "SELECT segment_id, device_id, text, start_unix_nanos, end_unix_nanos, speaker_id \
+         FROM transcript_sentences \
+         WHERE text IS NOT NULL",
+    );
+    if let Some(d) = device_id {
+        qb.push(" AND device_id = ").push_bind(d.to_string());
+    }
+    if let Some(a) = after {
+        qb.push(" AND start_unix_nanos >= ").push_bind(a);
+    }
+    if let Some(b) = before {
+        qb.push(" AND start_unix_nanos < ").push_bind(b);
+    }
+    qb.push(" ORDER BY start_unix_nanos DESC LIMIT ")
+        .push_bind(scan_limit.max(1));
+    let rows = qb.build().fetch_all(pool).await?;
+    let desc: Vec<ConvoSentence> = rows
+        .into_iter()
+        .map(|row| {
+            Ok::<_, sqlx::Error>(ConvoSentence {
+                segment_id: row.try_get("segment_id")?,
+                device_id: row
+                    .try_get::<Option<String>, _>("device_id")?
+                    .unwrap_or_default(),
+                text: row.try_get::<Option<String>, _>("text")?.unwrap_or_default(),
+                start_unix_nanos: row.try_get("start_unix_nanos")?,
+                end_unix_nanos: row
+                    .try_get::<Option<i64>, _>("end_unix_nanos")?
+                    .unwrap_or_else(|| row.try_get("start_unix_nanos").unwrap_or(0)),
+                speaker_id: row.try_get::<Option<String>, _>("speaker_id")?,
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(group_conversations(&desc, gap_nanos, max_convos, max_sentences_per, max_total_chars))
+}
+
+/// Pure core of [`conversations_in_window`]: split DESC-ordered sentences into conversations —
+/// per DEVICE (a conversation lives on one camera's timeline; interleaved devices must not
+/// fragment each other), split on silence gaps > `gap_nanos` (the [`take_latest_conversation`]
+/// rule) — then keep the `max_convos` most RECENT conversations across all devices under a
+/// global char budget, and emit them oldest-first with chronological sentences.
+pub fn group_conversations(
+    desc: &[ConvoSentence],
+    gap_nanos: i64,
+    max_convos: usize,
+    max_sentences_per: usize,
+    max_total_chars: usize,
+) -> Vec<Vec<Source>> {
+    // Partition by device, preserving DESC order within each.
+    let mut per_device: std::collections::HashMap<&str, Vec<&ConvoSentence>> =
+        std::collections::HashMap::new();
+    for s in desc {
+        per_device.entry(s.device_id.as_str()).or_default().push(s);
+    }
+    // Gap-split each device timeline into conversations (each newest→oldest internally).
+    let mut convos: Vec<Vec<&ConvoSentence>> = Vec::new();
+    for sentences in per_device.into_values() {
+        let mut current: Vec<&ConvoSentence> = Vec::new();
+        for s in sentences {
+            if let Some(prev) = current.last() {
+                // `prev` is the NEWER sentence (DESC walk); silence between them:
+                let gap = prev.start_unix_nanos - s.end_unix_nanos;
+                if gap > gap_nanos {
+                    convos.push(std::mem::take(&mut current));
+                }
+            }
+            current.push(s);
+        }
+        if !current.is_empty() {
+            convos.push(current);
+        }
+    }
+    // Most recent conversations first (by their newest sentence), keep max_convos.
+    convos.sort_by_key(|c| std::cmp::Reverse(c.first().map(|s| s.start_unix_nanos).unwrap_or(0)));
+    convos.truncate(max_convos.max(1));
+    // Apply the per-convo sentence cap + the global char budget (favouring recent convos, which
+    // are first at this point), then emit oldest conversation first, chronological inside.
+    let mut budget = max_total_chars;
+    let mut out: Vec<Vec<Source>> = Vec::new();
+    for convo in &convos {
+        let mut kept: Vec<&ConvoSentence> = Vec::new();
+        for s in convo.iter().take(max_sentences_per) {
+            let add = s.text.trim().chars().count();
+            // Always keep at least one sentence of the first conversation.
+            if (!kept.is_empty() || !out.is_empty()) && add > budget {
+                break;
+            }
+            budget = budget.saturating_sub(add);
+            kept.push(s);
+        }
+        if kept.is_empty() {
+            break; // out of budget — older conversations are dropped entirely
+        }
+        kept.reverse(); // newest→oldest becomes chronological
+        out.push(
+            kept.into_iter()
+                .map(|s| Source {
+                    segment_id: s.segment_id,
+                    device_id: s.device_id.clone(),
+                    text: s.text.clone(),
+                    start_unix_nanos: s.start_unix_nanos,
+                    distance: 0.0,
+                    speaker_id: s.speaker_id.clone(),
+                    speaker_name: None,
+                    time_label: String::new(),
+                    visual_context: None,
+                })
+                .collect(),
+        );
+    }
+    out.reverse(); // recent-first selection becomes oldest-first narration order
+    out
+}
+
 /// Open-vocabulary OBJECT retrieval (Phase B query side): the `top_k` nearest `scene_objects` rows
 /// to `query_embedding` (a CLIP TEXT-tower vector), closest first, deduped to one sighting per
 /// segment. The "when did I see a car / a red mug" path. The matched `object_label` is carried in
@@ -1083,5 +1215,69 @@ mod tests {
     #[test]
     fn empty_input_yields_empty() {
         assert!(take_latest_conversation(&[], GAP, 40, 4000).is_empty());
+    }
+
+    /// Same as [`sent`] but on a chosen device (group_conversations partitions per device).
+    fn dsent(device: &str, start_secs: i64, dur_secs: i64, text: &str) -> ConvoSentence {
+        ConvoSentence {
+            device_id: device.into(),
+            ..sent(start_secs, dur_secs, text)
+        }
+    }
+
+    #[test]
+    fn groups_split_on_gaps_and_read_oldest_first() {
+        // Two conversations on one device, 10 min of silence between them. Input DESC.
+        let desc = vec![
+            sent(1000, 2, "evening two"),
+            sent(996, 2, "evening one"),
+            sent(100, 2, "morning two"),
+            sent(96, 2, "morning one"),
+        ];
+        let convos = group_conversations(&desc, GAP, 8, 40, 4000);
+        assert_eq!(convos.len(), 2);
+        let texts: Vec<Vec<&str>> = convos
+            .iter()
+            .map(|c| c.iter().map(|s| s.text.as_str()).collect())
+            .collect();
+        // Oldest conversation first; chronological inside each.
+        assert_eq!(texts, vec![vec!["morning one", "morning two"], vec!["evening one", "evening two"]]);
+    }
+
+    #[test]
+    fn groups_do_not_fragment_across_devices() {
+        // Interleaved devices within the same minutes: each device's run is ONE conversation,
+        // not four fragments.
+        let desc = vec![
+            dsent("cam-B", 102, 2, "b two"),
+            dsent("cam-A", 100, 2, "a two"),
+            dsent("cam-B", 98, 2, "b one"),
+            dsent("cam-A", 96, 2, "a one"),
+        ];
+        let convos = group_conversations(&desc, GAP, 8, 40, 4000);
+        assert_eq!(convos.len(), 2, "one conversation per device");
+        for c in &convos {
+            let dev = &c[0].device_id;
+            assert!(c.iter().all(|s| &s.device_id == dev), "no cross-device mixing");
+            assert_eq!(c.len(), 2);
+        }
+    }
+
+    #[test]
+    fn groups_keep_most_recent_convos_and_respect_budget() {
+        // Three conversations; max_convos = 2 keeps the two most recent, narrated oldest-first.
+        let desc = vec![
+            sent(2000, 2, "third"),
+            sent(1000, 2, "second"),
+            sent(100, 2, "first"),
+        ];
+        let convos = group_conversations(&desc, GAP, 2, 40, 4000);
+        let texts: Vec<&str> = convos.iter().map(|c| c[0].text.as_str()).collect();
+        assert_eq!(texts, vec!["second", "third"], "oldest of the kept pair first");
+        // A tiny char budget still keeps at least the newest conversation's first sentence.
+        let convos = group_conversations(&desc, GAP, 3, 40, 1);
+        assert_eq!(convos.len(), 1);
+        assert_eq!(convos[0][0].text, "third");
+        assert!(group_conversations(&[], GAP, 8, 40, 4000).is_empty());
     }
 }

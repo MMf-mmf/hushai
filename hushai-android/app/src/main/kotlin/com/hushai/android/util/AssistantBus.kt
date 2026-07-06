@@ -18,6 +18,9 @@ data class AssistantStatus(
     val lastAnswer: String? = null,
     val note: String? = null,            // errors, rejections, hints
     val enrollProgress: Int = 0,         // 0..100 while enrolling
+    val enrollStep: Int = 0,             // accepted samples so far (guided enrollment)
+    val enrollTotal: Int = 0,            // samples the guided flow asks for
+    val enrollPrompt: String? = null,    // the phrase the user should say right now
 )
 
 /** Process-wide assistant status bus; the service publishes, the UI observes. */

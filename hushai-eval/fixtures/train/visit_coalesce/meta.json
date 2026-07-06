@@ -1,0 +1,39 @@
+{
+  "case_id": "visit_coalesce",
+  "description": "Visit-coalescing probe (the reported 'Mendel was seen 62 times' bug, reproduced deterministically): a 60s continuous-face ken-burns clip (~30 raw per-segment sightings) injected twice, 4h apart, person enrolled as Judith. 'How many times did Judith come by?' must answer 2 VISITS, never the raw sighting count. Also gates the distinct-people count and the person profile. Media via fetch_eval_clips.sh.",
+  "device_id": "eval-visits",
+  "media_file": "clips/visit.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "persons",
+    "chat"
+  ],
+  "tier": "full",
+  "enroll": [
+    {
+      "modality": "person",
+      "name": "Judith",
+      "ref": "clips/visit.mp4"
+    }
+  ],
+  "injections": [
+    {
+      "media_file": "clips/visit.mp4",
+      "device_id": "eval-visits",
+      "capture_start_offset_ns": 0
+    },
+    {
+      "media_file": "clips/visit.mp4",
+      "device_id": "eval-visits",
+      "capture_start_offset_ns": 14400000000000,
+      "seed": "visit2"
+    }
+  ],
+  "poll": {
+    "timeout_secs": 1200,
+    "interval_secs": 3,
+    "quiesce_polls": 2
+  }
+}

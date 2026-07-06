@@ -209,7 +209,8 @@ class CaptureService : Service() {
         val chatClient = RagChatClient(Http.rag, ragUrl, ragToken)
         val ragClient = RagClient(Http.rag, ragUrl, ragToken) // older-server fallback
         val ttsClient = TtsClient(Http.rag, ragUrl, ragToken)
-        val owner = SpeakerMath.parse(settings.ownerEmbeddingBlocking())
+        // Multi-vector profile; a legacy single-centroid string parses as a 1-vector profile.
+        val owner = SpeakerMath.parseProfile(settings.ownerEmbeddingBlocking())
         // Session state lives in DataStore (not this object), so a rebuilt assistant resumes the
         // same conversation if still within the idle window.
         val voiceSession = VoiceSession(
@@ -225,8 +226,9 @@ class CaptureService : Service() {
             ragClient = ragClient,
             ttsClient = ttsClient,
             voiceSession = voiceSession,
-            initialOwnerEmbedding = owner,
-            onEnrollComplete = { emb -> settings.setOwnerEmbeddingBlocking(SpeakerMath.format(emb)) },
+            initialOwnerProfile = owner,
+            // Already serialized (SpeakerMath.formatProfile) — store verbatim.
+            onEnrollComplete = { serialized -> settings.setOwnerEmbeddingBlocking(serialized) },
         )
     }
 

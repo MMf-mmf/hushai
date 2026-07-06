@@ -579,7 +579,15 @@ private fun AssistantCard(
             line("Models", if (status.ready) "ready" else "loading…")
             line("Owner", if (status.enrolled) "enrolled ✓" else "not enrolled")
             if (status.phase == AssistantPhase.ENROLLING) {
-                line("Enrolling", "${status.enrollProgress}% — keep talking")
+                line("Enrolling", "sample ${status.enrollStep + 1} of ${status.enrollTotal + 1}")
+                status.enrollPrompt?.let {
+                    Spacer(Modifier.height(4.dp))
+                    Text(
+                        it,
+                        style = MaterialTheme.typography.titleSmall,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
             }
             status.lastHeard?.let { line("Heard", it) }
             status.lastQuestion?.let { line("Question", it) }

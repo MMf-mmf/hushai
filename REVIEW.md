@@ -49,7 +49,10 @@ A change touching any of these deserves a closer look; a large change touching t
   `vision/plates/plate_match.rs`. The `pg_advisory_xact_lock`s are **GLOBAL** (cross-device) with
   **distinct keys per catalog** — never shard per device, never reuse a key. Match/mint runs inside
   the write txn; delete-by-segment stays idempotent; the mint-guard hysteresis + quality gate must
-  not be loosened to mask a calibration problem (see AGENTS.md "Known gaps").
+  not be loosened to mask a calibration problem (see AGENTS.md "Known gaps"). The OFFLINE retro
+  passes (`speakers.rs::retro_attach_pass` / `auto_attach_unattributed_recent`) must stay STRICTLY
+  TIGHTER than the online matcher (≥2 distinct raw-neighbor agreements within the match distance;
+  attach NULL rows only; never fold a named↔named pair; attached rows keep `quality='marginal'`).
 - **Deletion & blob GC** — `hushai-backend/src/devices.rs` + `storage::reclaim_blobs`. Content-addressed
   blobs can be shared: reclaim must re-check each hash against the live DB AFTER commit. A crash may
   orphan a GC-able blob but must never dangle a row. NULL the NO-ACTION FKs under the identity

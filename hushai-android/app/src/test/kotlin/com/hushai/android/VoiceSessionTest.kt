@@ -68,4 +68,26 @@ class VoiceSessionTest {
         val s = store.session()
         assertNull(s.currentOrNull(123L))
     }
+
+    @Test fun resetCommandsMatchWholePhrase() {
+        for (cmd in listOf(
+            "new chat", "New Chat", "new conversation", "start over", "Start fresh!",
+            "forget that", "please start over", "start a new conversation",
+        )) {
+            org.junit.Assert.assertTrue(cmd, VoiceSession.isResetCommand(cmd))
+        }
+    }
+
+    @Test fun resetCommandsDoNotMatchRealQuestions() {
+        for (q in listOf(
+            "start over the recording from monday",
+            "what did we chat about",
+            "did the new conversation about money happen today",
+            "forget that box, where is the car",
+            "when does the movie start",
+            "",
+        )) {
+            org.junit.Assert.assertFalse(q, VoiceSession.isResetCommand(q))
+        }
+    }
 }

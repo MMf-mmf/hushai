@@ -249,3 +249,35 @@ To actually get this right the chat will need to have lots of context as well as
 
 PASSWORD: (redacted — dev credentials live in the gitignored `.env`; see AGENTS.md
 "LAN security model". Never commit real secrets to this repo.)
+
+
+## NOW?
+- TRY TO CONNECT WITH A COMMANDS AND NOT USE AI TO TRIGGER THE BUILD..
+
+
+- bugs i have noted is that the chat seems to bring up randome history from other chats even after we have selected a new one..
+what asking the chat "how many min of vid do we have today?" it responds I don't have information about that in the recordings.
+Which demonstrates a lack of tool usage and just a all-around very raw experience and unpolished. This chat should know this information and really any other information about the video that we might ask since it is an executive chat.
+
+- Second question i asked that it got it wrong:
+"how many peaple have we seen in the last 10 min?" and it responded with 
+"Mendel was seen 62 times in the recordings. First today at 8:19 PM; most recently today at 8:29 PM. Usually on Sundays around 8 PM.
+
+[1]
+Mendel
+today at 8:29 PM
+(seen on camera)"
+which is incorrect since Mendel has seen in one video just because behind the scenes we clip up each video. It should not be looked at as 60 something different times it should really be seen as once from this time to this time etc. this bug tells us more what's going on in the background. It shows us that the chat does not have a good idea on how to string together the video and audio segments into a straight and clear picture and it's viewing it as standalone bits of information.
+
+One clear piece that I am putting together from this is that we need to build our chat like the flagship chat box do how overtime it gets to know the people it's talking to and the people it deals with by building profiles on the people it comes in contact with so that, for example, it's season an unidentified person and then eventually you were able to identify who that person is you should already have somewhat of a running memory on that unidentified person as soon as we are able to identify that person we should already be able to put together a picture that's just one example another example would be if someone's having a Conversation we should use the most modern tools in the genic AI workflows how to keep up a memory of what's really going on to be able to correctly summarize the conversation conversations and again not to get tunnel vision by the incoming few second segments.
+
+Another horrendous result here was the question "What have we spoken about today? What was going on in the video today?"
+and here is the results:
+"Today at 8:31 PM, an unidentified speaker mentioned a video and audio segment. At 8:32 PM, the same speaker discussed it being related to conversations happening. There was also mention of building a chat around this content. An unattributed voice asked if there were any other questions at 8:30 PM. We don't have information about what specific conversation or video content was discussed in detail."
+
+- another context issue i have noticed is that i clearly identified my voice in previous conversations and the chat still does not know who was speaking I don't know if that's a chat issue or if the voice identification just sucks..
+
+- another issue I've seen is that the voice identification, for the voice assistant clearly does not recognize my previous voices. I have in the past enrolled my voice it identifies it sometimes it works sometimes it doesn't but definitely in another session. It then does not remember my voice, we should create a more thorough on boarding voice on boarding session to identify a users voice before we say yes we know this voice is set for the voice assistant to make sure that it works in all scenarios under different background, noises in different environments, etc..
+
+
+- Based on what we did now we need to add conversa

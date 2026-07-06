@@ -785,6 +785,122 @@ pub(crate) fn is_recency_query(query: &str) -> bool {
     .any(|p| q.contains(p))
 }
 
+/// Is the question "how many PEOPLE (distinct humans) were seen" — a distinct-person count over
+/// the roster — rather than a frequency question about one subject ("how many TIMES did I see
+/// Bob", which stays on the per-person presence rollup)? Same narrow-phrase idiom as
+/// [`is_speaker_roster_query`]. The People arm answers it deterministically from the distinct
+/// roster instead of letting the single-person rollup misfire ("Mendel was seen 62 times").
+pub(crate) fn is_people_count_query(query: &str) -> bool {
+    let q = query.to_lowercase();
+    // Frequency phrasings are about ONE subject, never a distinct-people count.
+    if q.contains("how many times") || q.contains("number of times") || q.contains("how often") {
+        return false;
+    }
+    if !(q.contains("how many") || q.contains("number of")) {
+        return false;
+    }
+    ["people", "persons", "faces", "visitors", "guests", "individuals"]
+        .iter()
+        .any(|n| q.contains(n))
+}
+
+/// Is the question about how MUCH footage exists ("how many minutes of video do we have today",
+/// "how much audio was recorded") — pure segment arithmetic, answered deterministically from the
+/// `segments` table (`stats::footage_stats`), never by semantic retrieval (which has nothing to
+/// retrieve and declines — the observed "I don't have information about that" failure).
+pub(crate) fn is_footage_stats_query(query: &str) -> bool {
+    let q = query.to_lowercase();
+    // "how many times did the video show X" is a frequency question, and "how many people were
+    // on the recording" is a distinct-people count — neither is a footage total.
+    if q.contains("how many times") || q.contains("number of times") || is_people_count_query(query) {
+        return false;
+    }
+    // The footage noun (or a duration unit) must sit RIGHT AFTER the quantity marker —
+    // "how much video", "how many minutes of footage", "total hours of video". A footage
+    // word merely elsewhere in the sentence ("how many packages arrived, according to the
+    // RECORDINGS?") is a content question and must stay on the retrieval path.
+    const NOUNS: &[&str] = &[
+        "video", "videos", "vid", "vids", "footage", "recording", "recordings", "audio",
+        "minute", "minutes", "min", "mins", "hour", "hours", "hr", "hrs",
+    ];
+    let words: Vec<&str> = q
+        .split_whitespace()
+        .map(|w| w.trim_matches(|c: char| !c.is_alphanumeric()))
+        .filter(|w| !w.is_empty())
+        .collect();
+    for (i, pair) in words.windows(2).enumerate() {
+        let qty_len = match pair {
+            ["how", "many"] | ["how", "much"] => 2,
+            [w, _] if *w == "total" => 1,
+            _ => continue,
+        };
+        // The 1-2 tokens after the marker must include a footage noun / duration unit.
+        let start = i + qty_len;
+        if words[start..(start + 2).min(words.len())]
+            .iter()
+            .any(|w| NOUNS.contains(w))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Is the question a WINDOW-SUMMARY ask ("what have we spoken about today", "what was discussed
+/// this morning") — summarize ALL of the window's conversations — as opposed to a recency ask
+/// ("what did we JUST discuss" = only the latest one)? Recency's tight phrases win on overlap so
+/// "what did we talk about last" keeps its existing path. Without this, a broad summary question
+/// falls to semantic top-k over ~2s fragments and answers with disconnected snippet garbage.
+pub(crate) fn is_window_summary_query(query: &str) -> bool {
+    if is_recency_query(query) {
+        return false;
+    }
+    let q = query.to_lowercase();
+    [
+        "what have we spoken about",
+        "what did we speak about",
+        "what have we talked about",
+        "what did we talk about",
+        "what have we discussed",
+        "what did we discuss",
+        "what was discussed",
+        "what was talked about",
+        "what was spoken about",
+        "summarize today",
+        "summarize yesterday",
+        "summarize this morning",
+        "summarize this afternoon",
+        "summarize the day",
+        "summary of today",
+        "summary of the day",
+        "what conversations",
+        "which conversations",
+    ]
+    .iter()
+    .any(|p| q.contains(p))
+}
+
+/// Is the question a PROFILE ask about a specific known person/voice ("tell me about Casey",
+/// "what do you know about Bob", "who is Judith")? Phrase-only — the CALLER must also resolve a
+/// catalog name in the text before acting (so "tell me about our last conversation" never lands
+/// here; recency and roster pre-routes are checked first anyway). Surfaces the accumulated
+/// entity profile ("running memory") alongside normal retrieval.
+pub(crate) fn is_profile_query(query: &str) -> bool {
+    let q = query.to_lowercase();
+    [
+        "tell me about",
+        "what do you know about",
+        "what do we know about",
+        "who is ",
+        "who's ",
+        "describe ",
+        "give me a rundown on",
+        "what's the story with",
+    ]
+    .iter()
+    .any(|p| q.contains(p))
+}
+
 /// Count of registered cameras (devices). Used to decide whether "this video" is ambiguous: with a
 /// single camera there's nothing to clarify. Cheap; the catalog is tiny.
 pub(crate) async fn camera_count(pool: &PgPool) -> anyhow::Result<i64> {
@@ -1175,8 +1291,9 @@ pub(crate) fn internal(e: anyhow::Error) -> (StatusCode, String) {
 #[cfg(test)]
 mod tests {
     use super::{
-        IDENTITY_NO_OWNER, is_co_occurrence_query, is_deictic_video_query, is_identity_query,
-        is_recency_query, is_speaker_roster_query, normalize_object_label, render_identity,
+        IDENTITY_NO_OWNER, is_co_occurrence_query, is_deictic_video_query, is_footage_stats_query,
+        is_identity_query, is_people_count_query, is_recency_query, is_speaker_roster_query,
+        is_window_summary_query, normalize_object_label, render_identity,
     };
 
     #[test]
@@ -1354,6 +1471,90 @@ mod tests {
             "who accompanied me",
         ] {
             assert!(is_co_occurrence_query(q), "should be co-occurrence: {q:?}");
+        }
+    }
+
+    #[test]
+    fn people_count_questions_are_detected() {
+        for q in [
+            "How many people have we seen in the last 10 minutes?",
+            "how many people did you see today",
+            "how many different faces were on camera",
+            "how many visitors came by",
+            "number of people seen this morning",
+        ] {
+            assert!(is_people_count_query(q), "should be people-count: {q:?}");
+        }
+    }
+
+    #[test]
+    fn single_subject_frequency_is_not_a_people_count() {
+        for q in [
+            "how many times did I see Bob",
+            "how often does the mail person come",
+            "number of times that person was here",
+            "who have you seen so far",
+            "how many cars were on camera",
+        ] {
+            assert!(!is_people_count_query(q), "should not be people-count: {q:?}");
+        }
+    }
+
+    #[test]
+    fn footage_stats_questions_are_detected() {
+        for q in [
+            "how many min of vid do we have today?",
+            "How many minutes of video do we have from today?",
+            "how much footage was recorded yesterday",
+            "how much audio do you have",
+            "total hours of video this week",
+            "how many recordings do we have",
+        ] {
+            assert!(is_footage_stats_query(q), "should be footage-stats: {q:?}");
+        }
+    }
+
+    #[test]
+    fn content_questions_are_not_footage_stats() {
+        for q in [
+            "what do the recordings say about money",
+            "how many times did the video show a car",
+            "how many people were on the recording", // people-count wins over the footage noun
+            "what was in the video today",
+            "who was speaking in this clip",
+            // A footage word elsewhere in a CONTENT question must not trip the stats path
+            // (found live: this answered "No footage was recorded for that period").
+            "How many packages arrived this week, according to the recordings?",
+            "how many deliveries were mentioned in the video",
+        ] {
+            assert!(!is_footage_stats_query(q), "should not be footage-stats: {q:?}");
+        }
+    }
+
+    #[test]
+    fn window_summary_questions_are_detected() {
+        for q in [
+            "What have we spoken about today?",
+            "what did we talk about this morning",
+            "what was discussed yesterday",
+            "summarize today",
+            "what conversations happened today",
+            "What did we discuss today?",
+        ] {
+            assert!(is_window_summary_query(q), "should be window-summary: {q:?}");
+        }
+    }
+
+    #[test]
+    fn recency_and_content_questions_are_not_window_summary() {
+        for q in [
+            "what did we last discuss",          // recency wins
+            "what did we just discuss",          // recency wins
+            "what were we talking about",        // recency wins
+            "when did I last see Bob",           // people/count
+            "what do the recordings say about money",
+        ] {
+            assert!(!is_window_summary_query(q), "should not be window-summary: {q:?}");
         }
     }
 }

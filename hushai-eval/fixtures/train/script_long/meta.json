@@ -1,0 +1,20 @@
+{
+  "case_id": "script_long",
+  "description": "Construction-known ~4:00 two-voice clip: budget (0-60s) / deliveries (60-120s) / dishwasher (120-180s) / birthday (180-240s), silence-padded to exact minute slots. Long-corpus recall + counting + window-scoped summary + footage-stats (expect 4 minutes) + decline. Attribution not scored (TTS diarization limitation). Measure first-run wall time, then tighten poll.timeout_secs to ~2x.",
+  "device_id": "eval-script-long",
+  "media_file": "media.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "limit": 130,
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "transcript",
+    "chat"
+  ],
+  "tier": "full",
+  "poll": {
+    "timeout_secs": 3600,
+    "interval_secs": 5,
+    "quiesce_polls": 2
+  }
+}

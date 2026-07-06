@@ -140,10 +140,17 @@ pub async fn rag_chat(
     let agent = crate::agents::get(&agent_id).unwrap_or_else(crate::agents::default);
 
     // Load prior turns BEFORE persisting the new user message (so the just-sent message
-    // isn't double-counted as history). Trailing window bounds the LLM context.
-    let history_rows = load_history(&st.pool, session_id, st.cfg.chat_history_turns * 2)
-        .await
-        .map_err(internal)?;
+    // isn't double-counted as history). Trailing window bounds the LLM context; the age
+    // cutoff keeps a stale session's turns out of the LLM-visible window (and out of the
+    // condenser, which would otherwise rewrite the new question around hours-old context).
+    let history_rows = load_history(
+        &st.pool,
+        session_id,
+        st.cfg.chat_history_turns * 2,
+        st.cfg.chat_history_max_age_secs,
+    )
+    .await
+    .map_err(internal)?;
     // The last turn or two as plain text, for the auto-router (so a follow-up like "Mendel" after
     // a clarifying question routes with context).
     let recent_context: String = history_rows
@@ -186,7 +193,9 @@ pub async fn rag_chat(
     // follow-up turn. They're already standalone, so skipping condensation costs nothing.
     let deterministic_intent = crate::routes::is_identity_query(&message)
         || crate::routes::is_recency_query(&message)
-        || crate::routes::is_speaker_roster_query(&message);
+        || crate::routes::is_speaker_roster_query(&message)
+        || crate::routes::is_footage_stats_query(&message)
+        || crate::routes::is_window_summary_query(&message);
     let (message, router_context) = if st.cfg.query_condense
         && !history.is_empty()
         && !deterministic_intent
@@ -214,10 +223,31 @@ pub async fn rag_chat(
         let routed = if crate::routes::is_speaker_roster_query(&message)
             || crate::routes::is_recency_query(&message)
             || crate::routes::is_identity_query(&message)
+            || crate::routes::is_footage_stats_query(&message)
+            || crate::routes::is_window_summary_query(&message)
         {
             // Recordings-agent questions the LLM router mis-routes: a "who" roster drifts to faces,
             // "what did we last discuss" drifts on keywords, and "what's my name / who am I" drifts
-            // to reflection. Pin them to recordings so the deterministic answers below fire.
+            // to reflection. Footage totals ("how many minutes of video") and window summaries
+            // ("what have we spoken about today") are likewise deterministic recordings-arm
+            // answers. Pin them to recordings so the deterministic answers below fire.
+            crate::agents::DEFAULT_AGENT_ID
+        } else if crate::routes::is_profile_query(&message)
+            && !crate::persons::resolve_names_in_text(&st.pool, &message)
+                .await
+                .map_err(internal)?
+                .is_empty()
+        {
+            // "Tell me about <named face>" → the People arm surfaces the accumulated
+            // running-memory profile; pinning keeps `expect_routed_agent` stable.
+            "people"
+        } else if crate::routes::is_profile_query(&message)
+            && !crate::speakers::resolve_names_in_text(&st.pool, &message)
+                .await
+                .map_err(internal)?
+                .is_empty()
+        {
+            // "Tell me about <named voice>" → the Grounded arm surfaces the voice profile.
             crate::agents::DEFAULT_AGENT_ID
         } else {
             st.llm
@@ -350,6 +380,73 @@ pub async fn rag_chat(
             // snippet — the exact "cites one tiny segment" failure). Window: explicit filters win,
             // else a natural-language phrase ("yesterday"), else unbounded (the newest activity).
             // Enriched in-branch since the summary prompt reads speaker names + humanized times.
+            // Footage totals ("how many minutes of video do we have today?") — pure segment
+            // arithmetic, precomputed with no LLM. Before this branch the question fell to
+            // semantic retrieval, matched nothing, and declined.
+            if crate::routes::is_footage_stats_query(&message) {
+                let now = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+                let parsed = crate::timeparse::window_in_query(&message, now, tz);
+                let s_after = after.or(parsed.map(|(a, _)| a));
+                let s_before = before.or(parsed.map(|(_, b)| b));
+                let rows = crate::stats::footage_stats(&st.pool, device_id.as_deref(), s_after, s_before)
+                    .await
+                    .map_err(internal)?;
+                precomputed_answer = Some(crate::stats::render_footage_stats(
+                    &rows,
+                    crate::stats::wants_audio_lane(&message),
+                    now,
+                    tz,
+                ));
+                sources = vec![];
+                names = std::collections::HashMap::new();
+            } else
+            // Window summary ("what have we spoken about today?"): summarize ALL of the
+            // window's gap-grouped conversations — never semantic top-k over ~2s fragments
+            // (the observed disconnected-snippet failure). A bare ask defaults to today.
+            if crate::routes::is_window_summary_query(&message) {
+                let now = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+                let parsed = crate::timeparse::window_in_query(&message, now, tz);
+                let mut w_after = after.or(parsed.map(|(a, _)| a));
+                let mut w_before = before.or(parsed.map(|(_, b)| b));
+                if w_after.is_none() && w_before.is_none() {
+                    if let Some((a, b)) = crate::timeparse::window_in_query("today", now, tz) {
+                        w_after = Some(a);
+                        w_before = Some(b);
+                    }
+                }
+                let gap_nanos = st.cfg.conversation_gap_secs.max(1) * 1_000_000_000;
+                let mut convos = retrieve::conversations_in_window(
+                    &st.pool,
+                    device_id.as_deref(),
+                    w_after,
+                    w_before,
+                    gap_nanos,
+                    st.cfg.recency_scan_limit,
+                    st.cfg.summary_max_convos,
+                    st.cfg.recency_max_sentences,
+                    st.cfg.summary_max_total_chars,
+                )
+                .await
+                .map_err(internal)?;
+                let ids: Vec<String> = convos
+                    .iter()
+                    .flatten()
+                    .filter_map(|x| x.speaker_id.clone())
+                    .collect();
+                names = crate::speakers::name_map(&st.pool, &ids)
+                    .await
+                    .map_err(internal)?;
+                for c in &mut convos {
+                    retrieve::enrich_for_display(c, &names, now, tz);
+                }
+                precomputed_answer = Some(
+                    st.llm
+                        .answer_window_summary(&message, &convos, &names)
+                        .await
+                        .map_err(internal)?,
+                );
+                sources = convos.into_iter().flatten().collect();
+            } else
             if crate::routes::is_recency_query(&message) {
                 let now = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
                 let parsed = crate::timeparse::window_in_query(&message, now, tz);
@@ -424,6 +521,89 @@ pub async fn rag_chat(
                 precomputed_answer = Some(answer);
                 sources = s;
             } else {
+            // "Tell me about <named voice>": narrate the accumulated running-memory profile
+            // (chat-time freshen keeps it exactly as current as the events table), with the
+            // voice's recent utterances as citations. Falls through to the semantic path when
+            // no single named voice resolves or no profile has accumulated yet.
+            let mut speaker_profile: Option<(String, crate::llm::ProfileContext, Uuid)> = None;
+            if crate::routes::is_profile_query(&message) {
+                let sids = crate::speakers::resolve_names_in_text(&st.pool, &message)
+                    .await
+                    .map_err(internal)?;
+                if sids.len() == 1 {
+                    let sid = sids[0];
+                    if st.cfg.profile_chat_refresh {
+                        let popts = hushai_backend::profiles::ProfileOpts {
+                            visit_gap_secs: st.cfg.presence_visit_gap_secs,
+                            convo_gap_secs: st.cfg.conversation_gap_secs,
+                            grace_secs: st.cfg.profile_grace_secs,
+                            ..Default::default()
+                        };
+                        if let Err(e) = hushai_backend::profiles::refresh_subject(
+                            &st.pool,
+                            "speaker",
+                            sid,
+                            &popts,
+                        )
+                        .await
+                        {
+                            tracing::warn!(error = %e, "speaker profile refresh failed");
+                        }
+                    }
+                    if let Some(p) = hushai_backend::profiles::get_profile(&st.pool, "speaker", sid)
+                        .await
+                        .map_err(internal)?
+                    {
+                        let now = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+                        let nm = crate::speakers::name_map(&st.pool, &[sid.to_string()])
+                            .await
+                            .map_err(internal)?;
+                        let label = nm
+                            .get(&sid.to_string())
+                            .cloned()
+                            .unwrap_or_else(|| "that voice".to_string());
+                        speaker_profile = Some((
+                            label,
+                            crate::llm::ProfileContext {
+                                text: p.profile_text,
+                                visit_count: p.visit_count,
+                                first_seen_label: p
+                                    .first_seen_unix_nanos
+                                    .map(|t| crate::humanize::humanize_time(t, now, tz)),
+                                last_seen_label: p
+                                    .last_seen_unix_nanos
+                                    .map(|t| crate::humanize::humanize_time(t, now, tz)),
+                            },
+                            sid,
+                        ));
+                    }
+                }
+            }
+            if let Some((label, pc, sid)) = speaker_profile {
+                let now = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+                let mut s = retrieve::list_by_speaker(
+                    &st.pool,
+                    std::slice::from_ref(&sid.to_string()),
+                    device_id.as_deref(),
+                    after,
+                    before,
+                    8,
+                )
+                .await
+                .map_err(internal)?;
+                let ids: Vec<String> = s.iter().filter_map(|x| x.speaker_id.clone()).collect();
+                names = crate::speakers::name_map(&st.pool, &ids)
+                    .await
+                    .map_err(internal)?;
+                retrieve::enrich_for_display(&mut s, &names, now, tz);
+                precomputed_answer = Some(
+                    st.llm
+                        .answer_profile(&message, &label, &pc, &s, &names)
+                        .await
+                        .map_err(internal)?,
+                );
+                sources = s;
+            } else {
             let speaker_name = qf.speaker_name.or_else(|| df.speaker_name.clone());
             let speaker_id = resolve_speaker_filter(&st.pool, qf.speaker_id, speaker_name)
                 .await
@@ -474,6 +654,7 @@ pub async fn rag_chat(
                 .map_err(internal)?;
             sources = s;
             }
+            }
         }
         AgentKind::Objects => {
             // Open-vocab object retrieval. Answered synchronously (precomputed) — objects have no
@@ -490,8 +671,11 @@ pub async fn rag_chat(
                 }
                 Some(clip) => {
                     let device_id = qf.device_id.or_else(|| df.device_id.clone());
-                    let after = qf.after_unix_nanos.or(df.after_unix_nanos);
-                    let before = qf.before_unix_nanos.or(df.before_unix_nanos);
+                    // Same natural-language window precedence as the People arm.
+                    let now_ns = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+                    let parsed = crate::timeparse::window_in_query(&message, now_ns, tz);
+                    let after = qf.after_unix_nanos.or(df.after_unix_nanos).or(parsed.map(|(a, _)| a));
+                    let before = qf.before_unix_nanos.or(df.before_unix_nanos).or(parsed.map(|(_, b)| b));
                     let top_k = req
                         .top_k
                         .or(agent.default_top_k)
@@ -516,6 +700,7 @@ pub async fn rag_chat(
                             after,
                             before,
                             tz,
+                            st.cfg.presence_visit_gap_secs.max(0) * 1_000_000_000,
                         )
                         .await
                         .map_err(internal)?;
@@ -582,8 +767,13 @@ pub async fn rag_chat(
             // Person (face) attribution — answered synchronously (precomputed), with its own
             // person-label enrichment (not the speaker enrichment below).
             let device_id = qf.device_id.or_else(|| df.device_id.clone());
-            let after = qf.after_unix_nanos.or(df.after_unix_nanos);
-            let before = qf.before_unix_nanos.or(df.before_unix_nanos);
+            // Natural-language windows ("in the last 10 minutes", "today") count here too —
+            // same precedence as the recency branch: explicit filters win, then the parsed
+            // phrase, else unbounded. Without this, windowed counts scanned ALL time.
+            let now_ns = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+            let parsed = crate::timeparse::window_in_query(&message, now_ns, tz);
+            let after = qf.after_unix_nanos.or(df.after_unix_nanos).or(parsed.map(|(a, _)| a));
+            let before = qf.before_unix_nanos.or(df.before_unix_nanos).or(parsed.map(|(_, b)| b));
             let limit = req
                 .top_k
                 .or(agent.default_top_k)
@@ -628,7 +818,85 @@ pub async fn rag_chat(
                 // LLM to count a top-k-capped sighting list (which undercounts past the cap and
                 // miscounts even within it). The sighting list still rides along as citations.
                 let distinct = distinct_ids(&pids);
-                if crate::presence::is_count_intent(&message) && distinct.len() == 1 {
+                // "Tell me about <named face>": narrate the accumulated running-memory profile
+                // (chat-time freshen keeps it current), with the sightings as citations. Only
+                // when exactly one person resolved AND a profile has accumulated; otherwise the
+                // normal answer paths below run unchanged.
+                let mut person_profile: Option<(String, crate::llm::ProfileContext)> = None;
+                if crate::routes::is_profile_query(&message) && distinct.len() == 1 {
+                    if let Ok(pid) = Uuid::parse_str(&distinct[0]) {
+                        if st.cfg.profile_chat_refresh {
+                            let popts = hushai_backend::profiles::ProfileOpts {
+                                visit_gap_secs: st.cfg.presence_visit_gap_secs,
+                                convo_gap_secs: st.cfg.conversation_gap_secs,
+                                grace_secs: st.cfg.profile_grace_secs,
+                                ..Default::default()
+                            };
+                            if let Err(e) = hushai_backend::profiles::refresh_subject(
+                                &st.pool,
+                                "person",
+                                pid,
+                                &popts,
+                            )
+                            .await
+                            {
+                                tracing::warn!(error = %e, "person profile refresh failed");
+                            }
+                        }
+                        if let Some(p) =
+                            hushai_backend::profiles::get_profile(&st.pool, "person", pid)
+                                .await
+                                .map_err(internal)?
+                        {
+                            let now = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+                            let label = names
+                                .get(&distinct[0])
+                                .cloned()
+                                .unwrap_or_else(|| "that person".to_string());
+                            person_profile = Some((
+                                label,
+                                crate::llm::ProfileContext {
+                                    text: p.profile_text,
+                                    visit_count: p.visit_count,
+                                    first_seen_label: p
+                                        .first_seen_unix_nanos
+                                        .map(|t| crate::humanize::humanize_time(t, now, tz)),
+                                    last_seen_label: p
+                                        .last_seen_unix_nanos
+                                        .map(|t| crate::humanize::humanize_time(t, now, tz)),
+                                },
+                            ));
+                        }
+                    }
+                }
+                if let Some((label, pc)) = person_profile {
+                    precomputed_answer = Some(
+                        st.llm
+                            .answer_profile(&message, &label, &pc, &s, &names)
+                            .await
+                            .map_err(internal)?,
+                    );
+                } else
+                // "How many PEOPLE did you see" is a DISTINCT-people question over the roster —
+                // it must never fall into the single-person frequency rollup below (the observed
+                // "Mendel was seen 62 times" answer to "how many people in the last 10 min").
+                // The roster sources are one row per distinct person; enumerate them verbatim.
+                if crate::routes::is_people_count_query(&message) {
+                    let mut seen = std::collections::BTreeSet::new();
+                    let mut labels: Vec<String> = Vec::new();
+                    for src in &s {
+                        let key = src
+                            .speaker_id
+                            .clone()
+                            .unwrap_or_else(|| src.segment_id.to_string());
+                        if seen.insert(key) {
+                            labels.push(src.speaker_name.clone().unwrap_or_else(|| {
+                                "someone we haven't identified yet".to_string()
+                            }));
+                        }
+                    }
+                    precomputed_answer = Some(crate::presence::render_people_count(&labels));
+                } else if crate::presence::is_count_intent(&message) && distinct.len() == 1 {
                     let now = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
                     let summary = crate::presence::person_presence(
                         &st.pool,
@@ -637,6 +905,7 @@ pub async fn rag_chat(
                         after,
                         before,
                         tz,
+                        st.cfg.presence_visit_gap_secs.max(0) * 1_000_000_000,
                     )
                     .await
                     .map_err(internal)?;
@@ -676,8 +945,11 @@ pub async fn rag_chat(
             // without an owner anchor: no plate filter / no plate token in the message -> no
             // sightings -> the LLM declines.
             let device_id = qf.device_id.or_else(|| df.device_id.clone());
-            let after = qf.after_unix_nanos.or(df.after_unix_nanos);
-            let before = qf.before_unix_nanos.or(df.before_unix_nanos);
+            // Same natural-language window precedence as the People arm.
+            let now_ns = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+            let parsed = crate::timeparse::window_in_query(&message, now_ns, tz);
+            let after = qf.after_unix_nanos.or(df.after_unix_nanos).or(parsed.map(|(a, _)| a));
+            let before = qf.before_unix_nanos.or(df.before_unix_nanos).or(parsed.map(|(_, b)| b));
             let limit = req
                 .top_k
                 .or(agent.default_top_k)
@@ -740,6 +1012,7 @@ pub async fn rag_chat(
                     after,
                     before,
                     tz,
+                    st.cfg.presence_visit_gap_secs.max(0) * 1_000_000_000,
                 )
                 .await
                 .map_err(internal)?;
@@ -764,8 +1037,11 @@ pub async fn rag_chat(
             // (person/object/plate/speech) or to alerts, parsed from the message. Count-intent → a
             // DETERMINISTIC count; otherwise the LLM narrates the pre-fetched list (grounded).
             let device_id = qf.device_id.or_else(|| df.device_id.clone());
-            let after = qf.after_unix_nanos.or(df.after_unix_nanos);
-            let before = qf.before_unix_nanos.or(df.before_unix_nanos);
+            // Same natural-language window precedence as the People arm.
+            let now_ns = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+            let parsed = crate::timeparse::window_in_query(&message, now_ns, tz);
+            let after = qf.after_unix_nanos.or(df.after_unix_nanos).or(parsed.map(|(a, _)| a));
+            let before = qf.before_unix_nanos.or(df.before_unix_nanos).or(parsed.map(|(_, b)| b));
             let limit = req.top_k.or(agent.default_top_k).unwrap_or(50).clamp(1, 200);
             let ml = message.to_lowercase();
             let alerts_only = ["alert", "alarm", "unusual", "suspicious"].iter().any(|k| ml.contains(k));
@@ -1198,18 +1474,24 @@ pub async fn session_agent(pool: &PgPool, session_id: Uuid) -> anyhow::Result<Op
     Ok(row.map(|r| r.get::<String, _>("agent_id")))
 }
 
-/// The trailing `max_messages` turns (role, content) in chronological order.
+/// The trailing `max_messages` turns (role, content) in chronological order. Turns older
+/// than `max_age_secs` are excluded (`0` = no age cutoff): they still exist in the stored
+/// transcript, but a resumed stale session must not feed hours-old context to the LLM.
 pub async fn load_history(
     pool: &PgPool,
     session_id: Uuid,
     max_messages: i64,
+    max_age_secs: i64,
 ) -> anyhow::Result<Vec<(String, String)>> {
     let rows = sqlx::query(
         "SELECT role, content FROM chat_messages \
-         WHERE session_id = $1 ORDER BY seq DESC LIMIT $2",
+         WHERE session_id = $1 \
+           AND ($3 <= 0 OR created_at > now() - make_interval(secs => $3::double precision)) \
+         ORDER BY seq DESC LIMIT $2",
     )
     .bind(session_id)
     .bind(max_messages.max(0))
+    .bind(max_age_secs)
     .fetch_all(pool)
     .await?;
     let mut history: Vec<(String, String)> = rows

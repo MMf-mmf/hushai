@@ -1,0 +1,45 @@
+{
+  "persons": {
+    "distinct_count": 1,
+    "count_tolerance": 0,
+    "min_sightings": 2
+  },
+  "chat": {
+    "similarity_floor": null,
+    "judge_enabled": false,
+    "questions": [
+      {
+        "ask": "How many times did Judith come by on this camera?",
+        "expect_routed_agent": "people",
+        "expect_number": 2,
+        "must_not_contain": [
+          "60",
+          "sixty",
+          "30",
+          "thirty",
+          "don't have"
+        ],
+        "filters": {
+          "device_id": "eval-visits"
+        }
+      },
+      {
+        "ask": "How many people have we seen?",
+        "expect_number": 1,
+        "must_not_contain": [
+          "don't have"
+        ]
+      },
+      {
+        "ask": "Tell me about Judith.",
+        "expect_routed_agent": "people",
+        "must_contain": [
+          "judith"
+        ],
+        "must_not_contain": [
+          "don't have"
+        ]
+      }
+    ]
+  }
+}

@@ -67,10 +67,12 @@ pub async fn rag_up(ctx: &Ctx) -> bool {
 }
 
 /// Fire one question at `POST /v1/rag/chat` and collect the streamed answer. `base_ns` is the
-/// fixture base for turning offset-based filters into absolute nanos.
-pub async fn ask(ctx: &Ctx, q: &ChatQ, base_ns: i64) -> Result<RagAnswer> {
+/// fixture base for turning offset-based filters into absolute nanos. `session_id` continues an
+/// existing chat session (the caller threads it from a prior answer's `session_id` when the
+/// fixture labels questions with `ChatQ.session`); `None` opens a fresh session.
+pub async fn ask(ctx: &Ctx, q: &ChatQ, base_ns: i64, session_id: Option<&str>) -> Result<RagAnswer> {
     let url = format!("{}/v1/rag/chat", ctx.rag_url.trim_end_matches('/'));
-    let body = build_body(q, base_ns);
+    let body = build_body(q, base_ns, session_id);
 
     let mut req = ctx
         .http
@@ -170,12 +172,15 @@ fn handle_block(block: &str, out: &mut RagAnswer) -> bool {
 
 /// Build the `/v1/rag/chat` request body from a question spec. Filter time-bounds are offsets from
 /// the fixture base; `tz_offset_secs: 0` pins relative-time phrasing so `time_label`s are stable.
-fn build_body(q: &ChatQ, base_ns: i64) -> Value {
+fn build_body(q: &ChatQ, base_ns: i64, session_id: Option<&str>) -> Value {
     let mut body = json!({
         "agent_id": q.agent_id,
         "message": q.ask,
         "tz_offset_secs": 0,
     });
+    if let Some(sid) = session_id {
+        body["session_id"] = json!(sid);
+    }
     if let Some(k) = q.top_k {
         body["top_k"] = json!(k);
     }

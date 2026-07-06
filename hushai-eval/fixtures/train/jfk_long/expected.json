@@ -1,0 +1,81 @@
+{
+  "chat": {
+    "similarity_floor": null,
+    "judge_enabled": false,
+    "questions": [
+      {
+        "ask": "What do the recordings say about the moon and the planets?",
+        "expect_routed_agent": "recordings",
+        "must_contain": [
+          "moon"
+        ],
+        "min_citations": 1,
+        "reference_answer": "The recordings talk about looking into space, to the moon and the planets beyond, and a vow that was made."
+      },
+      {
+        "ask": "What was discussed?",
+        "filters": {
+          "device_id": "eval-jfk-long",
+          "after_offset_ns": 30000000000,
+          "before_offset_ns": 50000000000
+        },
+        "must_contain": [
+          "moon"
+        ],
+        "must_not_contain": [
+          "don't have"
+        ]
+      },
+      {
+        "ask": "How many minutes of video do we have from this camera?",
+        "filters": {
+          "device_id": "eval-jfk-long"
+        },
+        "expect_number": 4,
+        "must_not_contain": [
+          "don't have",
+          "no footage"
+        ]
+      },
+      {
+        "ask": "What do the recordings say about cryptocurrency prices?",
+        "must_contain": [
+          "don't have"
+        ],
+        "must_not_contain": [
+          "bitcoin"
+        ]
+      },
+      {
+        "ask": "What did Mendel say about the moon?",
+        "session": "s1",
+        "must_contain": [
+          "moon"
+        ],
+        "min_citations": 1,
+        "citation_must_attribute": [
+          "Mendel"
+        ]
+      },
+      {
+        "ask": "When did he say that?",
+        "session": "s1",
+        "must_not_contain": [
+          "don't have",
+          "who do you mean"
+        ],
+        "min_citations": 1
+      },
+      {
+        "ask": "Tell me about Mendel.",
+        "expect_routed_agent": "recordings",
+        "must_contain": [
+          "mendel"
+        ],
+        "must_not_contain": [
+          "don't have"
+        ]
+      }
+    ]
+  }
+}

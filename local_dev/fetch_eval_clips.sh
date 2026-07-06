@@ -30,6 +30,10 @@ CLIPS=(
   "clip_speaker_roster|https://upload.wikimedia.org/wikipedia/commons/5/50/Jfk_rice_university_we_choose_to_go_to_the_moon.ogg|334|14"
   "fdr_infamy|https://upload.wikimedia.org/wikipedia/commons/7/7e/Roosevelt_Infamy.ogg|0|16"
   "armstrong_step|https://upload.wikimedia.org/wikipedia/commons/d/dd/Armstrong_Small_Step.ogg|0|24"
+  # LONG-CLIP RAG fixture: ~4 min of the same Rice speech (source window 300-540s). The proven
+  # jfk_moon mints-1-voice window (334-348s) sits at clip offsets 34-48s — the known content
+  # anchor its chat questions target. Cache hit: same source file as jfk_moon.
+  "jfk_long|https://upload.wikimedia.org/wikipedia/commons/5/50/Jfk_rice_university_we_choose_to_go_to_the_moon.ogg|300|240"
 )
 
 for row in "${CLIPS[@]}"; do
@@ -42,14 +46,37 @@ for row in "${CLIPS[@]}"; do
     curl -fSL -m 180 -o "$src" "$url"
   fi
   echo "[mux] $case  (ss=$ss t=$t) → $dest/media.mp4"
+  # loudnorm: archival PD audio arrives at wildly varying levels; quiet static-heavy clips
+  # (Armstrong moon radio) fell below the worker's audio VAD skip-silent gate after an encode
+  # drift and got SKIPPED (11/12 segments) — normalize the FIXTURE level (a real camera has
+  # AGC) instead of ever touching the gate.
+  # Exact OUTPUT duration (-t after the maps): the old `-shortest` raced the lavfi black-video
+  # generator against audio EOF, so the container duration varied run-to-run (19.4s vs 20.4s
+  # from identical audio) → a different segment count → different whisper tail hallucinations
+  # → WER drift on regeneration. Output -t pins both streams.
   ffmpeg -y -loglevel error -ss "$ss" -t "$t" -i "$src" \
     -f lavfi -i "color=c=black:s=320x240:r=5" \
-    -map 1:v -map 0:a -shortest \
-    -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac \
+    -map 1:v -map 0:a -t "$t" \
+    -af "loudnorm=I=-20:TP=-3:LRA=11" \
+    -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -b:a 192k \
     "$dest/media.mp4"
 done
 
 echo "[done] regenerated real-audio fixture media under $FX"
+
+# jfk_long's speaker-enrollment ref: the SAME proven mints-exactly-1-voice window jfk_moon /
+# clip_speaker_roster use (identical audio ⇒ the case injection matches the enrolled "Mendel").
+JL="$FX/jfk_long"
+if [[ -d "$JL" ]]; then
+  mkdir -p "$JL/refs"
+  ffmpeg -y -loglevel error -ss 334 -t 14 -i "$CACHE/jfk_long.src" \
+    -f lavfi -i "color=c=black:s=320x240:r=5" \
+    -map 1:v -map 0:a -t 14 \
+    -af "loudnorm=I=-20:TP=-3:LRA=11" \
+    -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -b:a 192k \
+    "$JL/refs/enroll.mp4"
+  echo "[mux] jfk_long enrollment ref → $JL/refs/enroll.mp4"
+fi
 
 # --- VISION (object) fixtures: a still PD photo ken-burns'd into a muxed clip ---
 # case | source image URL (PD, Wikimedia) | duration secs
@@ -76,6 +103,25 @@ for row in "${VISION_CLIPS[@]}"; do
 done
 
 echo "[done] regenerated vision fixture media under $FX"
+
+# --- visit_coalesce: a 60s continuous-face clip (same Judith Resnik portrait as face_id) — the
+# visit-coalescing probe injects it twice, 4h apart. ~30 raw per-segment sightings per injection;
+# the chat answer must be 2 VISITS, never the raw count. Slower zoom than face_id so the face
+# stays large and detectable for the full minute.
+VC="$FX/visit_coalesce"
+if [[ -d "$VC" ]]; then
+  mkdir -p "$VC/clips"
+  vsrc="$CACHE/face_id.jpg"
+  [[ -s "$vsrc" ]] || { echo "[fetch] visit_coalesce ← face_id portrait"; curl -fSL -m 180 -o "$vsrc" "https://commons.wikimedia.org/wiki/Special:FilePath/Judith%20A.%20Resnik,%20official%20portrait%20(cropped).jpg"; }
+  vframes=$(( 60 * FPS ))
+  echo "[kenburns] visit_coalesce (60s) → $VC/clips/visit.mp4"
+  ffmpeg -y -loglevel error -loop 1 -i "$vsrc" -f lavfi -i "anullsrc=r=16000:cl=mono" \
+    -vf "scale=2560:1440:force_original_aspect_ratio=increase,crop=2560:1440,zoompan=z='min(zoom+0.0001,1.15)':d=${vframes}:s=1280x720:fps=${FPS},format=yuv420p" \
+    -t 60 -map 0:v -map 1:a -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -shortest \
+    "$VC/clips/visit.mp4"
+else
+  echo "[skip] visit_coalesce — no fixture dir (ground truth not committed?)"
+fi
 
 # --- PLATE (ALPR) fixture: crop a full car + readable plate from a PD street photo, into a muxed clip.
 # The crop keeps the WHOLE car so RF-DETR boxes it (the plate lane runs inside vehicle ROIs), with the

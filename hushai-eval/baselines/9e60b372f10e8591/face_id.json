@@ -1,0 +1,9 @@
+{
+  "case_id": "face_id",
+  "config_hash": "9e60b372f10e8591",
+  "git_sha": "65019a2",
+  "metrics": {
+    "persons.count_error": 0.0,
+    "persons.distinct_count": 1.0
+  }
+}

@@ -22,6 +22,7 @@ pub mod retrieve;
 pub mod routes;
 pub mod speakers;
 pub mod state;
+pub mod stats;
 pub mod timeparse;
 pub mod tts;
 

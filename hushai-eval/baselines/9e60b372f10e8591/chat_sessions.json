@@ -1,0 +1,21 @@
+{
+  "case_id": "chat_sessions",
+  "config_hash": "9e60b372f10e8591",
+  "git_sha": "65019a2",
+  "metrics": {
+    "chat.q0.citations": 2.0,
+    "chat.q0.contains": 1.0,
+    "chat.q0.errored": 1.0,
+    "chat.q0.routed": 1.0,
+    "chat.q0.similarity": 0.7289278937861428,
+    "chat.q1.citations": 2.0,
+    "chat.q1.clean": 1.0,
+    "chat.q1.errored": 1.0,
+    "chat.q2.clean": 1.0,
+    "chat.q2.errored": 1.0,
+    "chat.q3.clean": 1.0,
+    "chat.q3.errored": 1.0,
+    "transcript.similarity": 0.7411764705882353,
+    "transcript.wer": 0.2857142857142857
+  }
+}

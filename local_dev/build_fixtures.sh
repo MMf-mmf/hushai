@@ -188,6 +188,122 @@ json.dump({
 PY
 
 # ---------------------------------------------------------------------------
+# 2d) chat_sessions (train, FAST) — chat-session correctness on cheap media. Exercises the
+#     harness's ChatQ.session threading: multi-turn coreference (condensation must resolve
+#     "that" against same-session history), cross-session ISOLATION negatives (a fresh session
+#     must not know another session's content — the reported history-bleed bug, pinned), and a
+#     same-session positive control (distinguishes "isolation works" from "history broken
+#     everywhere"). Question ORDER is load-bearing twice over: metric keys are position-indexed
+#     AND session openers must precede their continuations. Append only.
+# ---------------------------------------------------------------------------
+echo "[fixtures] chat_sessions"
+CS_A1="We need to talk about the money for the kitchen renovation. The budget is three thousand dollars."
+CS_B1="That sounds fine. The contractor starts on Thursday morning after breakfast."
+D="$FX/train/chat_sessions"; mkdir -p "$D"
+render "Samantha" "$CS_A1" "$TMP/cs_a1.aiff"
+render "Daniel"   "$CS_B1" "$TMP/cs_b1.aiff"
+ffmpeg -y -loglevel error -i "$TMP/cs_a1.aiff" -i "$TMP/cs_b1.aiff" \
+  -filter_complex "[0:a][1:a]concat=n=2:v=0:a=1" "$TMP/cs.wav"
+mux "$TMP/cs.wav" "$D/media.mp4"
+python3 - "$D" "$BASE_NS" "$CS_A1" "$CS_B1" <<'PY'
+import json,sys
+d,base,a1,b1=sys.argv[1],int(sys.argv[2]),sys.argv[3],sys.argv[4]
+json.dump({
+ "case_id":"chat_sessions",
+ "description":"Session-correctness probe: q1 same-session coreference (the positive control), q2/q3 fresh-session bare follow-ups that must NOT inherit session-a context (the history-bleed pins; a leak would condense them into money questions). Meta-questions (what did I just ask) are deliberately NOT used: the persona declines them and retrieval echoes corpus terms.",
+ "device_id":"eval-chat-sessions","media_file":"media.mp4","media_kind":"muxed","seg_seconds":2,
+ "base_capture_unix_nanos":base,"modalities":["transcript","chat"],"tier":"fast",
+ "poll":{"timeout_secs":120,"interval_secs":2}
+}, open(d+"/meta.json","w"), indent=2)
+json.dump({
+ "transcript":{"full_text":a1+" "+b1,"max_wer":0.35,"min_similarity":0.6},
+ "chat":{
+   "similarity_floor":None,"judge_enabled":False,
+   "questions":[
+     {"ask":"What do the recordings say about money?","session":"a",
+      "expect_routed_agent":"recordings","must_contain":["money"],"min_citations":1,
+      "reference_answer":"The recordings mention money for the kitchen renovation, with a budget of three thousand dollars."},
+     {"ask":"When was that said?","session":"a",
+      "must_not_contain":["don't have","which video"],"min_citations":1},
+     {"ask":"And the week before?","session":"b",
+      "must_not_contain":["money","renovation","three thousand"]},
+     {"ask":"Count them again.","session":"c",
+      "must_not_contain":["money","renovation","three thousand"]}
+   ]}
+}, open(d+"/expected.json","w"), indent=2)
+PY
+
+# ---------------------------------------------------------------------------
+# 2e) script_long (train, full) — a CONSTRUCTION-KNOWN ~4:00 two-voice clip: four topic blocks
+#     (budget / deliveries / dishwasher / birthday) spoken at exact minute boundaries with
+#     silence padding to exactly 240s, so per-topic time windows are exact and free. Exercises
+#     long-corpus recall at different offsets, a counting question, a window-scoped summary,
+#     the footage-stats capability (240s -> "4 minutes"), and the no-hallucination decline.
+#     No attribution/speaker questions (TTS diarization limitation, as in money_talk).
+# ---------------------------------------------------------------------------
+echo "[fixtures] script_long"
+SL_A="Let's go over the kitchen renovation budget one more time. The contractor quoted twelve thousand dollars for the whole job, including the new cabinets, the countertop, and the plumbing work. I think we should set aside another five hundred for surprises, because old houses always hide something behind the walls."
+SL_B="Three packages arrived this week. The first one came on Monday with the new door hinges, the second one on Wednesday had the paint samples, and the third one arrived on Friday with the light fixtures. Everything is stacked in the garage next to the workbench."
+SL_C="The dishwasher broke again this morning. It filled with water and then just stopped, and now there is a puddle under the counter. I called the repair shop and they can send a technician on Tuesday, but honestly it might be time to buy a new machine instead of fixing this one again."
+SL_D="Don't forget the birthday party is on the fourteenth. We still need to order the chocolate cake, pick up the balloons, and send the last few invitations. Grandma is flying in the night before, so someone has to get her from the airport around nine."
+D="$FX/train/script_long"; mkdir -p "$D"
+render "Samantha" "$SL_A" "$TMP/sl_a.aiff"
+render "Daniel"   "$SL_B" "$TMP/sl_b.aiff"
+render "Samantha" "$SL_C" "$TMP/sl_c.aiff"
+render "Daniel"   "$SL_D" "$TMP/sl_d.aiff"
+# Pad each block with silence to a 60s slot (block N starts exactly at N*60s; total 240s).
+for blk in a b c d; do
+  dur=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$TMP/sl_$blk.aiff")
+  pad=$(python3 -c "import sys; d=float(sys.argv[1]); assert d < 58, f'block too long: {d}s'; print(f'{60-d:.3f}')" "$dur")
+  ffmpeg -y -loglevel error -i "$TMP/sl_$blk.aiff" -f lavfi -t "$pad" -i "anullsrc=r=22050:cl=mono" \
+    -filter_complex "[0:a][1:a]concat=n=2:v=0:a=1" "$TMP/sl_${blk}_slot.wav"
+done
+ffmpeg -y -loglevel error -i "$TMP/sl_a_slot.wav" -i "$TMP/sl_b_slot.wav" -i "$TMP/sl_c_slot.wav" -i "$TMP/sl_d_slot.wav" \
+  -filter_complex "[0:a][1:a][2:a][3:a]concat=n=4:v=0:a=1" "$TMP/sl.wav"
+mux "$TMP/sl.wav" "$D/media.mp4"
+python3 - "$D" "$BASE_NS" "$SL_A" "$SL_B" "$SL_C" "$SL_D" <<'PY'
+import json,sys
+d,base,a,b,c,dd=sys.argv[1],int(sys.argv[2]),sys.argv[3],sys.argv[4],sys.argv[5],sys.argv[6]
+SEC=1_000_000_000
+json.dump({
+ "case_id":"script_long",
+ "description":"Construction-known ~4:00 two-voice clip: budget (0-60s) / deliveries (60-120s) / dishwasher (120-180s) / birthday (180-240s), silence-padded to exact minute slots. Long-corpus recall + counting + window-scoped summary + footage-stats (expect 4 minutes) + decline. Attribution not scored (TTS diarization limitation). Measure first-run wall time, then tighten poll.timeout_secs to ~2x.",
+ "device_id":"eval-script-long","media_file":"media.mp4","media_kind":"muxed","seg_seconds":2,
+ "limit":130,
+ "base_capture_unix_nanos":base,"modalities":["transcript","chat"],"tier":"full",
+ "poll":{"timeout_secs":3600,"interval_secs":5,"quiesce_polls":2}
+}, open(d+"/meta.json","w"), indent=2)
+json.dump({
+ "transcript":{"full_text":" ".join([a,b,c,dd]),"max_wer":0.35,"min_similarity":0.6},
+ "chat":{
+   "similarity_floor":None,"judge_enabled":False,
+   "questions":[
+     {"ask":"What do the recordings say about the renovation budget?",
+      "expect_routed_agent":"recordings","must_contain":["cabinets"],"min_citations":1,
+      "reference_answer":"The renovation was quoted at twelve thousand dollars including cabinets, countertop and plumbing, with five hundred extra set aside for surprises."},
+     {"ask":"How many packages did they say arrived?",
+      "expect_routed_agent":"recordings",
+      "expect_number":3,"must_not_contain":["don't have"]},
+     {"ask":"What did they say about the dishwasher?",
+      "expect_routed_agent":"recordings",
+      "must_contain":["dishwasher"],"min_citations":1,
+      "reference_answer":"The dishwasher broke — it filled with water and stopped, leaving a puddle; a technician can come Tuesday but replacing it is being considered."},
+     {"ask":"What was discussed?",
+      "filters":{"device_id":"eval-script-long","after_offset_ns":120000000000,"before_offset_ns":180000000000},
+      "must_contain":["dishwasher"],"must_not_contain":["birthday","packages"]},
+     {"ask":"What do the recordings say about football scores?",
+      "must_contain":["don't have"],"must_not_contain":["goal","touchdown"]},
+     {"ask":"How many minutes of video do we have from this camera?",
+      "filters":{"device_id":"eval-script-long"},
+      "expect_number":4,"must_not_contain":["don't have","no footage"]},
+     {"ask":"What was said about the birthday party?",
+      "must_contain":["birthday"],"min_citations":1,
+      "reference_answer":"The birthday party is on the fourteenth; the chocolate cake, balloons and invitations still need handling, and Grandma arrives the night before."}
+   ]}
+}, open(d+"/expected.json","w"), indent=2)
+PY
+
+# ---------------------------------------------------------------------------
 # 3) silence_no_speech (holdout, full) — counter-fixture: must NOT hallucinate speech/speakers.
 # ---------------------------------------------------------------------------
 echo "[fixtures] silence_no_speech (holdout)"

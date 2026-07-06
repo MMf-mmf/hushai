@@ -188,9 +188,21 @@ async fn run_case(
                 ));
             }
             let mut answers = Vec::with_capacity(chat_gt.questions.len());
+            // Session threading: the first question carrying a `session` label opens the session;
+            // later questions with the same label continue it via the returned session_id. A 404
+            // on a threaded id is a transport error → INCONCLUSIVE (infra drift, not quality).
+            let mut sessions: std::collections::HashMap<String, String> = std::collections::HashMap::new();
             for (qi, q) in chat_gt.questions.iter().enumerate() {
-                match query_rag::ask(ctx, q, base_ns).await {
-                    Ok(a) => answers.push(a),
+                let sid = q.session.as_ref().and_then(|label| sessions.get(label)).cloned();
+                match query_rag::ask(ctx, q, base_ns, sid.as_deref()).await {
+                    Ok(a) => {
+                        if let Some(label) = &q.session {
+                            if !a.session_id.is_empty() {
+                                sessions.entry(label.clone()).or_insert_with(|| a.session_id.clone());
+                            }
+                        }
+                        answers.push(a);
+                    }
                     Err(e) => return Ok(CaseResult::inconclusive(cid, split, tier, format!("rag chat q{qi} transport error: {e:#}"))),
                 }
             }

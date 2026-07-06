@@ -766,6 +766,7 @@ async fn worker_loop(
     // Only worker 0 runs the going-forward auto-merge, so it's never run concurrently and
     // needs no shared state. Initialized to now() so the first pass waits one interval.
     let mut last_autoheal = std::time::Instant::now();
+    let mut last_profiles = std::time::Instant::now();
     while !shutdown.load(Ordering::SeqCst) {
         // Load governor: by default audio is the lane we keep running (vision pauses first), so this
         // only fires when the operator inverted the priority (LOAD_PAUSE_VISION_FIRST=false).
@@ -848,6 +849,60 @@ async fn worker_loop(
                         }
                         Ok(_) => {}
                         Err(e) => tracing::warn!(error = %e, "auto-merge pass failed"),
+                    }
+                    // Going-forward retro-attach: recent unattributed segments fold into
+                    // NAMED/owner voices on multi-vector evidence (each agreeing neighbor
+                    // within the existing match threshold — nothing loosened), so a named
+                    // voice keeps accumulating its marginal utterances automatically.
+                    let ra = hushai_backend::speakers::AutoAttachOpts {
+                        match_distance: cfg.speaker_match_threshold,
+                        min_agree: cfg.speaker_retro_attach_min_agree,
+                        max_segments: cfg.speaker_retro_attach_max_segments,
+                        recent_secs: cfg.speaker_autoheal_recent_secs,
+                    };
+                    match hushai_backend::speakers::auto_attach_unattributed_recent(&pool, ra).await
+                    {
+                        Ok(stats) if stats.segments_attached > 0 => {
+                            tracing::info!(
+                                segments_attached = stats.segments_attached,
+                                "retro-attached unattributed segments to named voices"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "retro-attach pass failed"),
+                    }
+                }
+                // Fold new sessionized events into the entity profiles ("running memory" per
+                // person/speaker). Same drain-time, worker-0-only, interval-gated idiom; the
+                // backend fn serializes on its own advisory lock.
+                if worker_id == 0
+                    && cfg.profiles_enabled
+                    && last_profiles.elapsed().as_secs() >= cfg.profiles_interval_secs
+                {
+                    last_profiles = std::time::Instant::now();
+                    let opts = hushai_backend::profiles::ProfileOpts {
+                        visit_gap_secs: cfg.profiles_visit_gap_secs,
+                        convo_gap_secs: cfg.profiles_convo_gap_secs,
+                        grace_secs: cfg.profiles_grace_secs,
+                        max_events_per_pass: cfg.profiles_max_events_per_pass,
+                        max_chars: cfg.profiles_max_chars,
+                        tz_offset_secs: 0,
+                    };
+                    match hushai_backend::profiles::update_all(&pool, &opts).await {
+                        Ok(stats) if stats.events_consumed > 0 => {
+                            hushai_backend::observe::counter_by(
+                                "hushai_profiles_events_consumed_total",
+                                &[],
+                                stats.events_consumed,
+                            );
+                            tracing::info!(
+                                events = stats.events_consumed,
+                                profiles = stats.profiles_touched,
+                                "entity profiles updated"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "profiles pass failed"),
                     }
                 }
                 // Wait for a new-segment NOTIFY or the poll backstop, whichever comes first.

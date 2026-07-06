@@ -363,6 +363,70 @@ offset from base like `ChatFilters`) — the simulated viewer playback context f
 
 ---
 
+## 6b. The exhaustive campaign runbook (2026-07 chat/voice overhaul)
+
+The ordered loop for the executive-chat + voice-identity campaign (session correctness, long-clip
+interrogation, visit coalescing, footage stats, entity profiles, voice-assistant acoustics).
+Phone needed for F/G only; everything else is pure injection.
+
+```
+A. GREEN GATE      cargo run -p hushai-eval -- run --tier full --fixtures all   → exit 0 required
+B. HARNESS         ChatQ.session threading (additive; no baseline churn) — rerun A
+C. MEDIA           ./local_dev/build_fixtures.sh ; ./local_dev/fetch_eval_clips.sh
+D. NEW CASES       chat_sessions (fast) → script_long → jfk_long → visit_coalesce
+                   per case: run --case <id> → iterate → --update-baseline
+E. FULL GATE       run --tier full --fixtures all  (holdout included)
+F. TIER-2 SPOT     [PHONE] physical_loopback.py --scenario money_talk / chat_sessions
+                   (now on its OWN DB hushai_test_phys + host ports 8081/8091 — see
+                   local_dev/phys.env; phone runs serialize on local_dev/captures/.phone.lock)
+G. VOICE MATRIX    [PHONE] ./local_dev/build_voice_matrix.sh (once) ;
+                   python3 local_dev/voice_assistant_loop.py
+                   → guided enrollment (6 samples + held-out verify) + accept/reject matrix
+                     (owner clean/noisy at SNR 20/10/5, stranger clean/TV) + cross-restart
+                     persistence. Evidence = logcat only. The first run is the MEASUREMENT
+                     run: freeze the report-only SNR rows into hard bars from its cosine CSV.
+H. ITERATE         any red → instrument → fix PRODUCT code → rerun the narrowest failing layer
+                   → rerun A. Never loosen a gate to go green (§4).
+```
+
+Session-correctness fixtures rely on `ChatQ.session` labels (questions sharing a label share ONE
+live chat session; distinct labels are provably distinct sessions). Metric keys are position-
+indexed AND session openers must precede continuations: **never reorder existing questions.**
+
+Long fixtures (`script_long`, `jfk_long`, ~4 min each) set `poll.timeout_secs=3600` +
+`meta.limit=130` (the observe window sizes off `limit`; the 64-segment default would clip a 240s
+clip). Measure the first run's wall time and tighten the timeout to ~2×. Never phrase fixture
+questions with "today/yesterday" — the pinned capture base is not wall-clock now; scope with
+`filters` offsets (invariant 3). The same applies to the bare "what have we spoken about?" form
+of the window-summary capability: it defaults to the wall-clock TODAY, so fixtures must send a
+filters window (live/manual smokes exercise the bare form).
+
+The voice matrix uses say-TTS proxies (Samantha=owner, Daniel=stranger) — it validates the
+enroll/verify plumbing, noise behavior, and cross-restart persistence, NOT human-voice
+discrimination; its cosine CSV is the labeled capture set §4 requires before any
+SPEAKER_THRESHOLD calibration. Re-run with the real owner's recorded voice when available
+(swap the WAVs, same filenames).
+
+**Frozen bars (measurement run 2026-07-06, 48 trials, cosine CSV
+`local_dev/captures/voice_matrix/results.csv`):**
+
+| condition                | measured        | frozen bar        |
+|--------------------------|-----------------|-------------------|
+| owner clean              | 5/5 accept      | **5/5** (hard)    |
+| owner any-bed SNR 20 dB  | 12/12           | **≥2/3 per bed** (hard) |
+| owner any-bed SNR 10 dB  | 10/11           | **≥8/11 total** (hard, was report-only) |
+| owner any-bed SNR 5 dB   | 7/12            | report-only (expected roll-off; misses at cosine 0.27–0.49 vs 0.5 gate) |
+| stranger clean + TV      | 0/6 false accept| **0** (hard)      |
+| cross-restart            | enrolled=true, owner accepted | **required** (hard) |
+
+Separation held everywhere it matters: stranger max cosine 0.40 < 0.5 gate < owner clean
+min 0.67. A red against these bars is a finding to file with the CSV — never a threshold
+change (§4). The assistant's `/v1/rag/chat` calls authenticate with the RAG bearer
+(`--es rag_token` ↔ server `RAG_TOKEN`), NOT the device token — the loop passes it since
+run 2; without it every chat 401s in 0ms and trials degrade to cosine-only evidence.
+
+---
+
 ## 7. Troubleshooting (gotchas hit while building this)
 
 - **exit 2 / `inconclusive` / poll timeout** → worker not running, vision lane waited-for but disabled,

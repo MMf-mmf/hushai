@@ -63,6 +63,10 @@ pub fn router(state: AppState) -> Router {
             get(speakers::sample_audio_segment),
         )
         .route("/v1/speakers/{id}", patch(speakers::rename_speaker))
+        .route(
+            "/v1/speakers/{id}/retro-attach",
+            post(speakers::retro_attach_speaker),
+        )
         .route("/v1/speakers/{id}/merge", post(speakers::merge_speaker))
         .route("/v1/speakers/{id}/archive", post(speakers::archive_speaker))
         .route(

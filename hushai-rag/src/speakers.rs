@@ -27,6 +27,37 @@ pub async fn resolve_name(pool: &PgPool, name: &str) -> anyhow::Result<Vec<Uuid>
         .collect())
 }
 
+/// Resolve named speakers whose display name appears in free-text `query` — the voice-catalog
+/// mirror of `persons::resolve_names_in_text` (same word-boundary rule: every word of the name
+/// must appear as a whole word in the query, so "Cal" never matches "calendar"). Union of
+/// matching ids; empty when no catalog name is mentioned.
+pub async fn resolve_names_in_text(pool: &PgPool, query: &str) -> anyhow::Result<Vec<Uuid>> {
+    let rows = sqlx::query(
+        "SELECT speaker_id, display_name FROM speakers \
+         WHERE display_name IS NOT NULL AND char_length(display_name) >= 2 AND archived_at IS NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    let q = query.to_lowercase();
+    let q_words: std::collections::HashSet<&str> = q
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut ids = Vec::new();
+    for r in rows {
+        let name: String = r.get("display_name");
+        let name_l = name.to_lowercase();
+        let name_words: Vec<&str> = name_l
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if !name_words.is_empty() && name_words.iter().all(|w| q_words.contains(w)) {
+            ids.push(r.get::<Uuid, _>("speaker_id"));
+        }
+    }
+    Ok(ids)
+}
+
 /// The owner-marked voice (0023, "This is me"): `(speaker_id, display_name)` of the single
 /// `is_owner` row, or `None` when nobody is marked. Consulted by the owner-resolution
 /// precedence chain BETWEEN request filters and the OWNER_SPEAKER_* env fallback, so a

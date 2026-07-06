@@ -2,7 +2,8 @@
   "transcript": {
     "full_text": "For the eyes of the world now look into space, to the moon and to the planets beyond, and we have vowed",
     "max_wer": 0.35,
-    "min_similarity": 0.65
+    "min_similarity": 0.65,
+    "relabel_note": "Media recipe hardened 2026-07-06: exact -t duration (no -shortest race), aac 192k, loudnorm I=-20 (archival levels vary; quiet clips fell below the audio skip-silent gate), and feed_segments now stamp-invalidates its split cache so regenerated media actually reaches the pipeline. Measured WER on this chain: 0.318."
   },
   "events": {
     "expected": [

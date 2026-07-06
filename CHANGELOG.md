@@ -7,6 +7,36 @@ Newest first. Dates are when the work landed on the current development branch
 
 ## Unreleased (in-flight)
 
+- **Executive-chat overhaul (2026-07-05)** — fixes for the owner's live-testing bug batch:
+  visit coalescing (`presence.rs` counts continuous VISITS, never per-2s-segment sightings —
+  the "seen 62 times" bug), a deterministic distinct-people count, a footage-stats capability
+  (`hushai-rag/src/stats.rs`: "how many minutes of video today" answered from `segments`
+  arithmetic, the LLM never narrates the numbers), a window conversation summary ("what have
+  we spoken about today" → gap-grouped conversations, not 2s-snippet top-k), natural-language
+  windows ("last 10 minutes") on the People/Objects/Plates/Events arms, and session hygiene
+  (viewer per-tab `sessionStorage` pointer + stale-restore guard; server LLM-visible history
+  age filter `RAG_CHAT_HISTORY_MAX_AGE_SECS`; spoken "new chat"/"start over" reset on the
+  voice client).
+- **Entity profiles ("running memory", migration 0024)** — every person/speaker identity
+  accumulates an append-only observation log (one line per coalesced visit/conversation),
+  folded deterministically from the sessionized `events` table (worker drain pass + RAG
+  chat-time freshen); anonymous identities accumulate too, and naming/merging attaches the
+  history ("tell me about <name>" narrates it). `hushai-backend/src/profiles.rs`.
+- **Speaker retro-attach** — naming/owning a voice (and a worker drain pass) now pulls in its
+  unattributed history on multi-vector evidence (>=2 raw neighbors within the existing 0.5
+  match distance) and folds anonymous duplicates at the 0.15 auto-heal bar; nothing loosened
+  online. `POST /v1/speakers/{id}/retro-attach`; `hushai-backend/tests/retro_attach.rs`.
+- **Guided voice enrollment (Android)** — six prompted samples with per-sample gates + a
+  MANDATORY held-out voice check before the multi-vector profile replaces the old one
+  (top-2-mean verification at the unchanged 0.5 gate; guarded >=0.70 adaptation slots). The
+  old single-5s-centroid unconditional commit was the "forgets my voice next session" bug.
+  Headless harness extras (`--ez assistant/enroll`) + reject logging for the acoustic matrix.
+- **Test campaign plumbing** — `ChatQ.session` threading (multi-turn + cross-session-isolation
+  fixtures), new fixtures `chat_sessions` / `script_long` / `jfk_long` / `visit_coalesce`,
+  physical tier moved to its own `hushai_test_phys` DB + ports (`local_dev/phys.env`) with a
+  phone lockfile, and the voice-assistant acoustic matrix
+  (`local_dev/build_voice_matrix.sh` + `local_dev/voice_assistant_loop.py`).
+
 - **Cross-platform onboarding** — `local_dev/onboard.sh` (interactive fresh-machine front door:
   asks what you're connecting + which AI lanes, installs deps, provisions models, mints per-device
   tokens, launches, connects devices) on top of a new `local_dev/lib_platform.sh` adapter layer

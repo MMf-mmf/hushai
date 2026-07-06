@@ -12,7 +12,7 @@ TRUNCATE
   transcript_sentences, speaker_segments, person_segments, scene_objects, plate_detections,
   speakers, persons, license_plates,
   events, video_events, alert_rules, alert_deliveries, watchlist,
-  rolling_summaries, chat_sessions, chat_messages,
+  rolling_summaries, entity_profiles, chat_sessions, chat_messages,
   segment_transcription_status, segment_vision_status,
   segments, streams, sessions
 RESTART IDENTITY CASCADE";

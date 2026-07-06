@@ -84,13 +84,16 @@ impl Meta {
     pub fn modality(&self, name: &str) -> bool {
         self.modalities.iter().any(|m| m == name)
     }
-    /// True if any scored modality requires the vision lane.
+    /// True if any scored modality requires the vision lane. `chat` counts: RAG answers ride
+    /// on whatever the pipeline perceived, so a chat-only fixture must still wait for the
+    /// lanes to drain (a chat-only fixture used to wait on NOTHING — the poller quiesced at 0
+    /// processed and the case went inconclusive with `audio_done=0 injected=N`).
     pub fn needs_vision(&self) -> bool {
-        ["persons", "faces", "objects", "plates"].iter().any(|m| self.modality(m))
+        ["persons", "faces", "objects", "plates"].iter().any(|m| self.modality(m)) || self.needs_rag()
     }
-    /// True if any scored modality requires the audio lane.
+    /// True if any scored modality requires the audio lane (see `needs_vision` on `chat`).
     pub fn needs_audio(&self) -> bool {
-        ["transcript", "speakers", "sentiment"].iter().any(|m| self.modality(m))
+        ["transcript", "speakers", "sentiment"].iter().any(|m| self.modality(m)) || self.needs_rag()
     }
 
     /// True if this case scores live RAG answers (the `chat` / `rag` modality).
@@ -253,6 +256,16 @@ pub struct ChatQ {
     pub caller: Option<ChatCaller>,
     #[serde(default)]
     pub top_k: Option<i64>,
+    /// Session label. Questions sharing a label share ONE `/v1/rag/chat` session: the first
+    /// labeled question opens it (no `session_id` sent) and the harness threads the returned
+    /// `session_id` into every later question with the same label — multi-turn coreference,
+    /// condensation, and history are exercised for real. Distinct labels are guaranteed-distinct
+    /// sessions (cross-session isolation negatives). Omitted (default) = stateless single-shot,
+    /// byte-identical to the pre-session harness. Labeled questions rely on list ORDER (the
+    /// opener must come first) — and metric keys are position-indexed anyway: never reorder
+    /// existing questions, only append.
+    #[serde(default)]
+    pub session: Option<String>,
 
     // ---- deterministic assertions ----
     /// Every listed string must appear (normalized substring) in the answer.

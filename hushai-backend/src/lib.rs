@@ -19,6 +19,7 @@ pub mod logging;
 pub mod observe;
 pub mod persons;
 pub mod plates;
+pub mod profiles;
 pub mod proto;
 pub mod routes;
 pub mod speakers;

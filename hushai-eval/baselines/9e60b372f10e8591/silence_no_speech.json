@@ -1,0 +1,11 @@
+{
+  "case_id": "silence_no_speech",
+  "config_hash": "9e60b372f10e8591",
+  "git_sha": "65019a2",
+  "metrics": {
+    "speakers.count_error": 0.0,
+    "speakers.distinct_count": 0.0,
+    "transcript.similarity": 1.0,
+    "transcript.wer": 0.0
+  }
+}

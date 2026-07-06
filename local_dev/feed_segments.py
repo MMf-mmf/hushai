@@ -64,11 +64,19 @@ def hexb(b: bytes) -> str:
 
 
 def split_video(video: Path, work: Path, seg_seconds: int) -> tuple[Path, list[Path]]:
-    """Run ffmpeg HLS fMP4 to produce init.mp4 + seg_*.m4s. Returns (init, [segments])."""
+    """Run ffmpeg HLS fMP4 to produce init.mp4 + seg_*.m4s. Returns (init, [segments]).
+
+    The cached split is keyed on the SOURCE file's (mtime_ns, size, seg_seconds) via a marker
+    file — a regenerated fixture clip must invalidate the split, or the pipeline keeps
+    replaying the OLD media forever (found live: fetch_eval_clips.sh regenerations never
+    reached the pipeline; a WER "drift" was actually a stale week-old split)."""
     work.mkdir(parents=True, exist_ok=True)
     init = work / "init.mp4"
+    marker = work / "source.stamp"
+    st = video.stat()
+    stamp = f"{st.st_mtime_ns}:{st.st_size}:{seg_seconds}"
     existing = sorted(work.glob("seg_*.m4s"))
-    if init.exists() and existing:
+    if init.exists() and existing and marker.exists() and marker.read_text() == stamp:
         return init, existing
 
     # Clear any stale output so segment numbering is deterministic.
@@ -100,6 +108,7 @@ def split_video(video: Path, work: Path, seg_seconds: int) -> tuple[Path, list[P
     segs = sorted(work.glob("seg_*.m4s"))
     if not init.exists() or not segs:
         raise SystemExit("ffmpeg produced no init/segments")
+    marker.write_text(stamp)
     return init, segs
 
 

@@ -1,0 +1,18 @@
+{
+  "case_id": "chat_sessions",
+  "description": "Session-correctness probe: q1 same-session coreference (the positive control), q2/q3 fresh-session bare follow-ups that must NOT inherit session-a context (the history-bleed pins; a leak would condense them into money questions). Meta-questions (what did I just ask) are deliberately NOT used: the persona declines them and retrieval echoes corpus terms.",
+  "device_id": "eval-chat-sessions",
+  "media_file": "media.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "transcript",
+    "chat"
+  ],
+  "tier": "fast",
+  "poll": {
+    "timeout_secs": 120,
+    "interval_secs": 2
+  }
+}

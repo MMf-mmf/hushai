@@ -146,6 +146,31 @@ pub struct WorkerConfig {
     pub speaker_autoheal_knn_k: i64,
     /// Minimum seconds between auto-merge passes (only worker 0 runs it, after a drain).
     pub speaker_autoheal_interval_secs: u64,
+    /// Retro-attach (going-forward): distinct raw-neighbor agreements (each within
+    /// `speaker_match_threshold`) required before a recent unattributed segment is attached
+    /// to a NAMED/owner speaker. Multi-vector evidence — strictly tighter than the online
+    /// matcher's single-nearest gray-zone attach; never loosen below 2.
+    pub speaker_retro_attach_min_agree: i64,
+    /// Per-pass budget of unattributed segments the retro-attach may claim.
+    pub speaker_retro_attach_max_segments: i64,
+
+    // --- Entity profiles ("running memory" per person/speaker, migration 0024) ---
+    /// Whether the worker folds new events into entity profiles after a backlog drain
+    /// (worker 0 only, same cadence idiom as the speaker auto-heal).
+    pub profiles_enabled: bool,
+    /// Minimum seconds between profile passes.
+    pub profiles_interval_secs: u64,
+    /// Person sightings closer than this (seconds) are ONE visit in the profile.
+    pub profiles_visit_gap_secs: i64,
+    /// Speech events closer than this (seconds) are ONE conversation in the profile.
+    pub profiles_convo_gap_secs: i64,
+    /// Ignore events updated within this grace window (a 30s session bucket keeps being
+    /// UPSERT-extended while a visit is in progress; ≥2× the bucket lets it settle).
+    pub profiles_grace_secs: i64,
+    /// Per-pass event budget per subject type (bounded backfill; converges over passes).
+    pub profiles_max_events_per_pass: i64,
+    /// Profile text cap (chars); oldest lines are deterministically compacted beyond it.
+    pub profiles_max_chars: usize,
 
     /// On startup, re-queue `done` AUDIO/MUXED segments that have no voiceprint yet
     /// (transcribed while the speaker stage was unavailable) so the pipeline re-runs
@@ -525,6 +550,15 @@ impl WorkerConfig {
             speaker_autoheal_min_links: parse("SPEAKER_AUTOHEAL_MIN_LINKS", "2")?,
             speaker_autoheal_knn_k: parse("SPEAKER_AUTOHEAL_KNN_K", "5")?,
             speaker_autoheal_interval_secs: parse("SPEAKER_AUTOHEAL_INTERVAL_SECS", "300")?,
+            speaker_retro_attach_min_agree: parse("SPEAKER_RETRO_ATTACH_MIN_AGREE", "2")?,
+            speaker_retro_attach_max_segments: parse("SPEAKER_RETRO_ATTACH_MAX_SEGMENTS", "500")?,
+            profiles_enabled: parse("PROFILES_ENABLED", "true")?,
+            profiles_interval_secs: parse("PROFILES_INTERVAL_SECS", "300")?,
+            profiles_visit_gap_secs: parse("PROFILES_VISIT_GAP_SECS", "120")?,
+            profiles_convo_gap_secs: parse("PROFILES_CONVO_GAP_SECS", "300")?,
+            profiles_grace_secs: parse("PROFILES_GRACE_SECS", "90")?,
+            profiles_max_events_per_pass: parse("PROFILES_MAX_EVENTS_PER_PASS", "2000")?,
+            profiles_max_chars: parse("PROFILES_MAX_CHARS", "8000")?,
             speaker_backfill_on_start: parse("SPEAKER_BACKFILL_ON_START", "true")?,
             speaker_reprocess_rejects_on_start: parse(
                 "SPEAKER_REPROCESS_REJECTS_ON_START",

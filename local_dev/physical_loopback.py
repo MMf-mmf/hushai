@@ -26,13 +26,25 @@ import subprocess
 import sys
 import time
 
-PG = os.environ.get("DATABASE_URL", "postgres://mf@localhost:5432/hushai_test")
+# Default: the PHYSICAL tier's own DB (hushai_test_phys) so a physical run can never TRUNCATE
+# the deterministic Tier-1 DB out from under a concurrent `cargo run -p hushai-eval` (the old
+# shared-hushai_test contention). Same `_test` name guard as the eval harness's ctx.rs.
+PG = os.environ.get("DATABASE_URL", "postgres://mf@localhost:5432/hushai_test_phys")
+if "_test" not in PG.rsplit("/", 1)[-1]:
+    raise SystemExit(f"refusing to run against non-test DB: {PG} (name must contain '_test')")
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 ADB = os.path.expanduser(os.environ.get("ADB", "~/Library/Android/sdk/platform-tools/adb"))
 PKG = "com.hushai.android"
 ACTIVITY = f"{PKG}/.MainActivity"
-BACKEND = os.environ.get("HUSHAI_BACKEND_URL", "http://localhost:8080")
-RAG = os.environ.get("HUSHAI_RAG_URL", "http://localhost:8090")
+# Host-side ports the phys stack listens on (local_dev/phys.env: 8081/8091 so it can coexist
+# with the Tier-1 stack). The PHONE keeps localhost:8080/8090 — `adb reverse` maps them here.
+PHYS_BACKEND_PORT = os.environ.get("PHYS_BACKEND_PORT", "8081")
+PHYS_RAG_PORT = os.environ.get("PHYS_RAG_PORT", "8091")
+BACKEND = os.environ.get("HUSHAI_BACKEND_URL", f"http://localhost:{PHYS_BACKEND_PORT}")
+RAG = os.environ.get("HUSHAI_RAG_URL", f"http://localhost:{PHYS_RAG_PORT}")
+# What the PHONE dials: its OWN localhost, which `adb reverse` tunnels to the host ports above.
+PHONE_BACKEND = "http://localhost:8080"
+PHONE_RAG = "http://localhost:8090"
 TOKEN = os.environ.get("DEVICE_TOKEN", "dev-secret-token")
 # The RAG service is token-gated SEPARATELY from the backend (run_stack.sh mints/pins RAG_TOKEN;
 # eval.env pins it to dev-rag-token). The phone uploads with DEVICE_TOKEN, but the /v1/rag/chat
@@ -40,7 +52,8 @@ TOKEN = os.environ.get("DEVICE_TOKEN", "dev-secret-token")
 RAG_TOKEN = os.environ.get("RAG_TOKEN", "dev-rag-token")
 
 RESET_TABLES = ("transcript_sentences, speaker_segments, person_segments, scene_objects, "
-                "plate_detections, speakers, persons, events, video_events, "
+                "plate_detections, speakers, persons, events, video_events, entity_profiles, "
+                "chat_sessions, chat_messages, "
                 "segment_transcription_status, segment_vision_status, segments, streams, sessions")
 
 
@@ -154,6 +167,8 @@ def main() -> int:
     ap.add_argument("--expect-face", action="store_true", help="expect at least one face detected")
     ap.add_argument("--scenario", default="", help="fixture case name: also score its RAG chat "
                     "questions tolerantly against the live capture (routing + presence + no-hallucination)")
+    ap.add_argument("--no-reset", action="store_true",
+                    help="skip the TRUNCATE (accumulate-style sessions on the phys DB)")
     args = ap.parse_args()
 
     scenario_qs = None
@@ -168,8 +183,13 @@ def main() -> int:
         raise SystemExit("no adb device — is the phone plugged in + authorized?")
 
     print(f"[phys] case={args.case} media={args.media} mode={'audio' if args.audio_only else 'video'}")
-    psql(f"TRUNCATE {RESET_TABLES} RESTART IDENTITY CASCADE;")
-    adb("reverse", "tcp:8080", "tcp:8080"); adb("reverse", "tcp:8090", "tcp:8090")
+    if args.no_reset:
+        print("[phys] --no-reset: keeping existing rows")
+    else:
+        psql(f"TRUNCATE {RESET_TABLES} RESTART IDENTITY CASCADE;")
+    # Phone's localhost:8080/8090 → the host phys stack (8081/8091 by default).
+    adb("reverse", "tcp:8080", f"tcp:{PHYS_BACKEND_PORT}")
+    adb("reverse", "tcp:8090", f"tcp:{PHYS_RAG_PORT}")
     adb("shell", "am", "force-stop", PKG)
     adb("logcat", "-c")
 
@@ -178,7 +198,7 @@ def main() -> int:
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
         time.sleep(1.0)
-        adb("shell", "am", "start", "-n", ACTIVITY, "--es", "url", BACKEND, "--es", "rag_url", RAG,
+        adb("shell", "am", "start", "-n", ACTIVITY, "--es", "url", PHONE_BACKEND, "--es", "rag_url", PHONE_RAG,
             "--es", "token", TOKEN, "--ez", "audio_only", "true" if args.audio_only else "false",
             "--ez", "autostart", "true")
         print(f"[phys] capturing {args.duration}s …")
@@ -255,4 +275,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    from phonelock import phone_lock
+
+    # One phone, one screen: serialize against voice_assistant_loop.py (and other loopback runs).
+    with phone_lock():
+        sys.exit(main())

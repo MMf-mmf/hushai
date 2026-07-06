@@ -126,6 +126,7 @@ pub async fn rename_speaker(
             "display_name must not be empty".into(),
         ));
     }
+    let mut tx = st.pool.begin().await?;
     let row = sqlx::query(
         "UPDATE speakers SET display_name = $1, updated_at = now() \
          WHERE speaker_id = $2 \
@@ -133,9 +134,28 @@ pub async fn rename_speaker(
     )
     .bind(name)
     .bind(id)
-    .fetch_optional(&st.pool)
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or(IngestError::NotFound("speaker"))?;
+    // Running memory: record the identification moment — the accumulated anonymous history is
+    // now attached to this name (profiles are keyed by id, so nothing moves).
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    crate::profiles::note_identified_in_tx(&mut tx, "speaker", id, name, now_ns, 0).await?;
+    // Naming is the retro trigger: pull in the voice's unattributed history and fold any
+    // anonymous duplicate ids, so "I named my voice" immediately covers past AND future audio.
+    let stats = retro_attach_pass(&mut tx, id, &RetroAttachOpts::default()).await?;
+    if stats.segments_attached > 0 || stats.duplicates_merged > 0 {
+        tracing::info!(
+            speaker = %id,
+            segments_attached = stats.segments_attached,
+            duplicates_merged = stats.duplicates_merged,
+            "rename retro-attach pass"
+        );
+    }
+    tx.commit().await?;
 
     Ok(Json(speaker_row(&row)))
 }
@@ -212,6 +232,16 @@ pub async fn set_speaker_owner(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(IngestError::NotFound("speaker (unknown or archived)"))?;
+    // "This is me" is a retro trigger too — the owner's voice matters most.
+    let stats = retro_attach_pass(&mut tx, id, &RetroAttachOpts::default()).await?;
+    if stats.segments_attached > 0 || stats.duplicates_merged > 0 {
+        tracing::info!(
+            speaker = %id,
+            segments_attached = stats.segments_attached,
+            duplicates_merged = stats.duplicates_merged,
+            "set-owner retro-attach pass"
+        );
+    }
     tx.commit().await?;
     Ok(Json(speaker_row(&row)))
 }
@@ -316,6 +346,9 @@ pub async fn merge_speaker(
     .bind(into)
     .execute(&mut *tx)
     .await?;
+
+    // Fold the loser's accumulated running-memory profile into the survivor's.
+    crate::profiles::merge_in_tx(&mut tx, "speaker", loser, into).await?;
 
     sqlx::query("DELETE FROM speakers WHERE speaker_id = $1")
         .bind(loser)
@@ -833,6 +866,8 @@ async fn collapse_cluster(
             .bind(loser)
             .execute(&mut **tx)
             .await?;
+        // Fold the loser's accumulated running-memory profile into the canonical identity.
+        crate::profiles::merge_in_tx(tx, "speaker", loser, canon_id).await?;
         removed += 1;
     }
 
@@ -1675,6 +1710,336 @@ async fn reconstruct_segment_file(
     }
     bytes.extend_from_slice(&media);
     Ok(bytes)
+}
+
+// ============================================================================
+// Retro-attach: a NAMED (or owner) voice pulls in its unattributed history.
+//
+// The online matcher is purely embedding-based — naming a voice gives it zero matching
+// benefit, so marginal utterances that landed as speaker_id NULL stay "unattributed audio"
+// forever, and the user reports "I named my voice but new audio is still unidentified".
+// These passes fix that OFFLINE with evidence STRICTLY TIGHTER than the online matcher
+// (cardinal rule: nothing here loosens a gate):
+//   * attach a NULL segment only when >= `min_agree` DISTINCT raw segments of the named
+//     speaker sit within the existing confident-match distance (0.5) — multi-vector
+//     agreement TV audio can't fake; the online gray-zone attach needs just ONE neighbor.
+//   * fold in anonymous duplicate ids only at the existing auto-heal tightness (0.15).
+// Attached rows keep their quality ('marginal' — a NULL outcome is never 'clean'), so they
+// can never drift the worker's clean-only centroid.
+// ============================================================================
+
+/// Options for the retro-attach passes. Defaults mirror the worker's decision constants —
+/// `match_distance` IS `SPEAKER_MATCH_THRESHOLD`; never set it looser.
+#[derive(Debug, Clone, Copy)]
+pub struct RetroAttachOpts {
+    /// Cosine distance bound for an agreeing raw neighbor (the confident-match distance).
+    pub match_distance: f32,
+    /// Distinct raw neighbors of the target required to claim a NULL segment.
+    pub min_agree: i64,
+    /// Per-NULL-segment kNN probe size.
+    pub knn_k: i64,
+    /// Per-pass NULL-segment budget.
+    pub max_segments: i64,
+    /// Only consider NULL segments created within this window (None = whole history — the
+    /// rename/owner trigger; the worker's going-forward pass sets a recent window).
+    pub recent_secs: Option<f64>,
+    /// Clean-segment window for the centroid recompute (mirror of SPEAKER_CENTROID_WINDOW).
+    pub centroid_window: i64,
+    /// Anonymous-duplicate fold tightness (mirror of SPEAKER_AUTOHEAL_DISTANCE) + links + k.
+    pub fold_edge_distance: f32,
+    pub fold_min_links: i64,
+    pub fold_knn_k: i64,
+}
+
+impl Default for RetroAttachOpts {
+    fn default() -> Self {
+        Self {
+            match_distance: 0.5,
+            min_agree: 2,
+            knn_k: 5,
+            max_segments: 500,
+            recent_secs: None,
+            centroid_window: 50,
+            fold_edge_distance: 0.15,
+            fold_min_links: 2,
+            fold_knn_k: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct RetroAttachStats {
+    pub segments_attached: usize,
+    pub duplicates_merged: usize,
+}
+
+/// Recompute a speaker's centroid from its raw segments: mean of the most recent `window`
+/// CLEAN segments (the worker's recompute rule); when the speaker has NO clean rows (e.g. an
+/// identity minted from `name_unattributed`, all marginal) fall back to the mean over ALL raw
+/// embeddings (the `collapse_cluster` behavior) — a weak-but-real centroid beats a stale one.
+/// Also refreshes `n_samples` to the raw segment count.
+async fn recompute_centroid_from_segments(
+    tx: &mut Transaction<'_, Postgres>,
+    speaker_id: Uuid,
+    window: i64,
+) -> Result<(), sqlx::Error> {
+    let row = sqlx::query(
+        "SELECT avg(embedding) AS mean FROM ( \
+            SELECT embedding FROM speaker_segments \
+            WHERE speaker_id = $1 AND embedding IS NOT NULL AND quality = 'clean' \
+            ORDER BY created_at DESC LIMIT $2) t",
+    )
+    .bind(speaker_id)
+    .bind(window.max(1))
+    .fetch_one(&mut **tx)
+    .await?;
+    let mut mean: Option<pgvector::Vector> = row.try_get("mean").unwrap_or(None);
+    if mean.is_none() {
+        let row = sqlx::query(
+            "SELECT avg(embedding) AS mean FROM ( \
+                SELECT embedding FROM speaker_segments \
+                WHERE speaker_id = $1 AND embedding IS NOT NULL \
+                ORDER BY created_at DESC LIMIT $2) t",
+        )
+        .bind(speaker_id)
+        .bind(window.max(1))
+        .fetch_one(&mut **tx)
+        .await?;
+        mean = row.try_get("mean").unwrap_or(None);
+    }
+    if let Some(m) = mean {
+        let mut v = m.to_vec();
+        l2_normalize_vec(&mut v);
+        sqlx::query(
+            "UPDATE speakers SET centroid = $1, \
+               n_samples = (SELECT count(*) FROM speaker_segments WHERE speaker_id = $2), \
+               updated_at = now() \
+             WHERE speaker_id = $2",
+        )
+        .bind(pgvector::Vector::from(v))
+        .bind(speaker_id)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Attach unattributed (speaker_id NULL) segments to ONE named/owner speaker on multi-vector
+/// evidence. Returns the number attached. Caller must hold the SPEAKER_LOCK_KEY advisory lock.
+async fn retro_attach_named(
+    tx: &mut Transaction<'_, Postgres>,
+    speaker_id: Uuid,
+    opts: &RetroAttachOpts,
+) -> Result<usize, sqlx::Error> {
+    // Precondition: only a named or owner identity is ever a retro-attach target.
+    let eligible: Option<bool> = sqlx::query_scalar(
+        "SELECT display_name IS NOT NULL OR is_owner FROM speakers \
+         WHERE speaker_id = $1 AND archived_at IS NULL",
+    )
+    .bind(speaker_id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    if !eligible.unwrap_or(false) {
+        return Ok(0);
+    }
+    // Same GUC setup as the other HNSW passes in this file.
+    sqlx::query("SET LOCAL hnsw.iterative_scan = 'strict_order'")
+        .execute(&mut **tx)
+        .await?;
+    let ef = (opts.knn_k * 4).max(100);
+    sqlx::query(AssertSqlSafe(format!("SET LOCAL hnsw.ef_search = {ef}")))
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("SET LOCAL statement_timeout = 60000")
+        .execute(&mut **tx)
+        .await?;
+
+    // A NULL segment is claimed only when >= min_agree DISTINCT raw segments of the target
+    // fall within match_distance — strictly tighter than the online matcher's single-nearest
+    // gray-zone attach, and immune to a stale centroid (raw-vector evidence only).
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
+        "SELECT a.id, a.segment_id FROM speaker_segments a \
+         CROSS JOIN LATERAL ( \
+             SELECT (s.embedding <=> a.embedding) AS d \
+             FROM speaker_segments s \
+             WHERE s.speaker_id = ",
+    );
+    qb.push_bind(speaker_id)
+        .push(" AND s.embedding IS NOT NULL ORDER BY s.embedding <=> a.embedding LIMIT ")
+        .push_bind(opts.knn_k)
+        .push(") b WHERE a.speaker_id IS NULL AND a.embedding IS NOT NULL AND b.d <= ")
+        .push_bind(opts.match_distance as f64);
+    if let Some(secs) = opts.recent_secs {
+        qb.push(" AND a.created_at >= now() - make_interval(secs => ")
+            .push_bind(secs)
+            .push(")");
+    }
+    qb.push(" GROUP BY a.id, a.segment_id HAVING count(*) >= ")
+        .push_bind(opts.min_agree)
+        .push(" LIMIT ")
+        .push_bind(opts.max_segments.max(1));
+    let rows = qb.build().fetch_all(&mut **tx).await?;
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let row_ids: Vec<i64> = rows.iter().map(|r| r.get::<i64, _>("id")).collect();
+    let seg_ids: Vec<Uuid> = rows.iter().map(|r| r.get::<Uuid, _>("segment_id")).collect();
+
+    // Repoint (quality untouched — NULL outcomes are 'marginal', and must stay out of the
+    // clean-only centroid window). Same two-table contract as `name_unattributed`.
+    sqlx::query(
+        "UPDATE speaker_segments SET speaker_id = $1 WHERE id = ANY($2) AND speaker_id IS NULL",
+    )
+    .bind(speaker_id)
+    .bind(&row_ids)
+    .execute(&mut **tx)
+    .await?;
+    sqlx::query(
+        "UPDATE transcript_sentences SET speaker_id = $1 \
+         WHERE segment_id = ANY($2) AND speaker_id IS NULL",
+    )
+    .bind(speaker_id.to_string())
+    .bind(&seg_ids)
+    .execute(&mut **tx)
+    .await?;
+
+    recompute_centroid_from_segments(tx, speaker_id, opts.centroid_window).await?;
+    Ok(row_ids.len())
+}
+
+/// Fold ANONYMOUS duplicate identities into the (named/owner) target, at the existing
+/// auto-heal tightness — the "clean mint beyond 0.72 that has since converged" case. Never
+/// touches another NAMED identity (the name-conflict rule). Returns ids removed.
+async fn fold_anonymous_duplicates_into(
+    tx: &mut Transaction<'_, Postgres>,
+    target: Uuid,
+    opts: &RetroAttachOpts,
+) -> Result<usize, sqlx::Error> {
+    let edges = compute_edges(
+        tx,
+        opts.fold_edge_distance,
+        opts.fold_knn_k,
+        opts.fold_min_links,
+        None,
+    )
+    .await?;
+    let clusters = build_clusters(&edges);
+    let Some(cluster) = clusters.iter().find(|c| c.members.contains(&target)) else {
+        return Ok(0);
+    };
+    let meta = load_speakers(tx, &cluster.members).await?;
+    // Target + anonymous, non-owner members only.
+    let members: Vec<Uuid> = cluster
+        .members
+        .iter()
+        .copied()
+        .filter(|id| {
+            *id == target
+                || meta
+                    .get(id)
+                    .map(|m| m.name.is_none())
+                    .unwrap_or(false)
+        })
+        .collect();
+    if members.len() < 2 {
+        return Ok(0);
+    }
+    // Owner check for the anonymous members (an owner is never a loser, named or not).
+    let owners: Vec<Uuid> = sqlx::query(
+        "SELECT speaker_id FROM speakers WHERE speaker_id = ANY($1) AND is_owner",
+    )
+    .bind(&members)
+    .fetch_all(&mut **tx)
+    .await?
+    .into_iter()
+    .map(|r| r.get::<Uuid, _>("speaker_id"))
+    .collect();
+    let members: Vec<Uuid> = members
+        .into_iter()
+        .filter(|id| *id == target || !owners.contains(id))
+        .collect();
+    if members.len() < 2 {
+        return Ok(0);
+    }
+    collapse_cluster(tx, target, &members, &meta).await
+}
+
+/// The full retro pass for one identity: attach NULL history, then fold anonymous duplicates.
+/// Takes the advisory lock itself; used by the rename/owner triggers and the ops route.
+pub async fn retro_attach_pass(
+    tx: &mut Transaction<'_, Postgres>,
+    speaker_id: Uuid,
+    opts: &RetroAttachOpts,
+) -> Result<RetroAttachStats, sqlx::Error> {
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(SPEAKER_LOCK_KEY)
+        .execute(&mut **tx)
+        .await?;
+    let segments_attached = retro_attach_named(tx, speaker_id, opts).await?;
+    let duplicates_merged = fold_anonymous_duplicates_into(tx, speaker_id, opts).await?;
+    Ok(RetroAttachStats {
+        segments_attached,
+        duplicates_merged,
+    })
+}
+
+/// `POST /v1/speakers/{id}/retro-attach` — ops/manual re-run of the retro pass (the rename
+/// and set-owner triggers run it automatically).
+pub async fn retro_attach_speaker(
+    State(st): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<RetroAttachStats>, IngestError> {
+    let mut tx = st.pool.begin().await?;
+    let stats = retro_attach_pass(&mut tx, id, &RetroAttachOpts::default()).await?;
+    tx.commit().await?;
+    Ok(Json(stats))
+}
+
+/// Options for the worker's going-forward NULL-attach pass (see
+/// `auto_attach_unattributed_recent`).
+#[derive(Debug, Clone, Copy)]
+pub struct AutoAttachOpts {
+    pub match_distance: f32,
+    pub min_agree: i64,
+    pub max_segments: i64,
+    pub recent_secs: i64,
+}
+
+/// Going-forward: attach RECENT unattributed segments to every named/owner speaker (the
+/// same multi-vector evidence bar as the rename trigger). Called by the worker at drain time
+/// beside `auto_merge_recent`, so a named voice keeps accumulating its marginal utterances
+/// without the user re-triggering anything.
+pub async fn auto_attach_unattributed_recent(
+    pool: &PgPool,
+    opts: AutoAttachOpts,
+) -> anyhow::Result<RetroAttachStats> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)")
+        .bind(SPEAKER_LOCK_KEY)
+        .execute(&mut *tx)
+        .await?;
+    let named: Vec<Uuid> = sqlx::query(
+        "SELECT speaker_id FROM speakers \
+         WHERE (display_name IS NOT NULL OR is_owner) AND archived_at IS NULL",
+    )
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .map(|r| r.get::<Uuid, _>("speaker_id"))
+    .collect();
+    let ra = RetroAttachOpts {
+        match_distance: opts.match_distance,
+        min_agree: opts.min_agree,
+        max_segments: opts.max_segments,
+        recent_secs: Some(opts.recent_secs as f64),
+        ..Default::default()
+    };
+    let mut stats = RetroAttachStats::default();
+    for id in named {
+        stats.segments_attached += retro_attach_named(&mut tx, id, &ra).await?;
+    }
+    tx.commit().await?;
+    Ok(stats)
 }
 
 #[cfg(test)]

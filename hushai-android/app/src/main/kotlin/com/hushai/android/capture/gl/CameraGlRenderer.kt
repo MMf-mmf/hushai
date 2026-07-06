@@ -143,7 +143,11 @@ class CameraGlRenderer(
     private fun buildTexMatrix(rotationDeg: Int) {
         Matrix.setIdentityM(rotMatrix, 0)
         Matrix.translateM(rotMatrix, 0, 0.5f, 0.5f, 0f)
-        Matrix.rotateM(rotMatrix, 0, rotationDeg.toFloat(), 0f, 0f, 1f)
+        // Texcoord angle = rotationDeg - 90. Measured on the rig (Galaxy S8 back cam,
+        // SENSOR_ORIENTATION=90): the SurfaceTexture transform already applies the sensor rotation,
+        // so the displayed image orientation equals the texcoord angle (image_offset = tc). tc = 0
+        // is upright at this mount (orientationHint=90); rotationDeg-90 generalizes to the others.
+        Matrix.rotateM(rotMatrix, 0, (rotationDeg - 90).toFloat(), 0f, 0f, 1f)
         Matrix.translateM(rotMatrix, 0, -0.5f, -0.5f, 0f)
         Matrix.multiplyMM(texMatrix, 0, stMatrix, 0, rotMatrix, 0)
     }

@@ -1,6 +1,8 @@
 // One conversation with one agent: message list + composer + streaming render. The
-// session id is persisted in localStorage so the conversation restores on reload (the
-// server holds the actual history + citations).
+// session id is persisted in sessionStorage — PER TAB, on purpose — so a reload restores
+// the conversation but a new tab starts fresh and two tabs can never share (or clobber)
+// one session pointer, which used to bleed history across "different" chats. The server
+// holds the actual history + citations; older conversations stay one click away in 🕘.
 //
 // Compose extras: a camera scope, a "Thorough" (exhaustive retrieval) toggle, and a 🕘
 // conversation-history dropdown over the server's saved sessions. Completed answers grow
@@ -16,6 +18,10 @@ import { toast } from "../toast.js";
 
 const SESSION_KEY = (agentId) => `hushai.chat.session.${agentId}`;
 const THOROUGH_KEY = "hushai.chat.thorough";
+// Don't auto-restore a conversation whose last message is older than this — a stale
+// morning session reappearing in the afternoon reads as "random history from another
+// chat". Explicitly opening it from the 🕘 dropdown still works (guard bypassed).
+const STALE_RESTORE_MS = 60 * 60_000;
 const PLACEHOLDER =
   "Ask anything about your recordings — who you saw, what was said, things or plates on camera, or how you've been. Answers cite the moment; click a citation to jump the video there.";
 
@@ -37,7 +43,10 @@ function relTime(iso) {
 export class ChatPane {
   constructor(container, agent) {
     this.agent = agent;
-    this.sessionId = localStorage.getItem(SESSION_KEY(agent.id)) || null;
+    // Legacy cleanup: the pointer used to live in localStorage (origin-wide, shared across
+    // tabs). Drop it rather than adopt it — adopting would resurrect the cross-tab bleed once.
+    localStorage.removeItem(SESSION_KEY(agent.id));
+    this.sessionId = sessionStorage.getItem(SESSION_KEY(agent.id)) || null;
     this.busy = false;
     // Which camera to scope answers to. null = search across all cameras.
     this.scope = null;
@@ -175,7 +184,7 @@ export class ChatPane {
   reset() {
     if (this.busy) return;
     this.sessionId = null;
-    localStorage.removeItem(SESSION_KEY(this.agent.id));
+    sessionStorage.removeItem(SESSION_KEY(this.agent.id));
     this.placeholder = this._note(PLACEHOLDER);
     this.log.replaceChildren(this.placeholder);
     this.input.value = "";
@@ -324,10 +333,10 @@ export class ChatPane {
     this._closeHistory();
     if (s.session_id === this.sessionId) return;
     this.sessionId = s.session_id;
-    localStorage.setItem(SESSION_KEY(this.agent.id), this.sessionId);
+    sessionStorage.setItem(SESSION_KEY(this.agent.id), this.sessionId);
     this.placeholder = this._note("Loading conversation…");
     this.log.replaceChildren(this.placeholder);
-    await this._restore();
+    await this._restore(true);
     // An empty (or failed-to-load) session falls back to the standard placeholder.
     if (!this.log.querySelector(".chat-msg")) {
       this.placeholder = this._note(PLACEHOLDER);
@@ -336,17 +345,27 @@ export class ChatPane {
     this.input.focus();
   }
 
-  async _restore() {
+  // `explicitOpen` = the user picked this session from the 🕘 dropdown, so restore it
+  // regardless of age; the staleness guard only applies to silent on-load auto-restores.
+  async _restore(explicitOpen = false) {
     let messages;
     try {
       messages = await getSessionMessages(this.sessionId);
     } catch {
       // Stale/forgotten session id — start fresh.
-      localStorage.removeItem(SESSION_KEY(this.agent.id));
+      sessionStorage.removeItem(SESSION_KEY(this.agent.id));
       this.sessionId = null;
       return;
     }
     if (!messages || !messages.length) return;
+    if (!explicitOpen) {
+      const last = Date.parse(messages[messages.length - 1]?.created_at);
+      if (isFinite(last) && Date.now() - last > STALE_RESTORE_MS) {
+        sessionStorage.removeItem(SESSION_KEY(this.agent.id));
+        this.sessionId = null;
+        return;
+      }
+    }
     for (const m of messages) {
       const { msg, text } = this._bubble(m.role === "assistant" ? "assistant" : "user");
       text.textContent = m.content;
@@ -416,7 +435,7 @@ export class ChatPane {
             case "session":
               if (ev.data?.session_id) {
                 this.sessionId = ev.data.session_id;
-                localStorage.setItem(SESSION_KEY(this.agent.id), this.sessionId);
+                sessionStorage.setItem(SESSION_KEY(this.agent.id), this.sessionId);
               }
               break;
             case "sources":

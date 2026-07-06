@@ -1,0 +1,32 @@
+{
+  "case_id": "jfk_long",
+  "config_hash": "9e60b372f10e8591",
+  "git_sha": "65019a2",
+  "metrics": {
+    "chat.q0.citations": 8.0,
+    "chat.q0.contains": 1.0,
+    "chat.q0.errored": 1.0,
+    "chat.q0.routed": 1.0,
+    "chat.q0.similarity": 0.727259678370447,
+    "chat.q1.clean": 1.0,
+    "chat.q1.contains": 1.0,
+    "chat.q1.errored": 1.0,
+    "chat.q2.clean": 1.0,
+    "chat.q2.count_ok": 1.0,
+    "chat.q2.errored": 1.0,
+    "chat.q3.clean": 1.0,
+    "chat.q3.contains": 1.0,
+    "chat.q3.errored": 1.0,
+    "chat.q4.attribution": 1.0,
+    "chat.q4.citations": 8.0,
+    "chat.q4.contains": 1.0,
+    "chat.q4.errored": 1.0,
+    "chat.q5.citations": 8.0,
+    "chat.q5.clean": 1.0,
+    "chat.q5.errored": 1.0,
+    "chat.q6.clean": 1.0,
+    "chat.q6.contains": 1.0,
+    "chat.q6.errored": 1.0,
+    "chat.q6.routed": 1.0
+  }
+}

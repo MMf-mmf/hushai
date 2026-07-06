@@ -84,7 +84,8 @@ pub const AUTO_AGENT_ID: &str = "auto";
 pub const ROUTER_PREAMBLE: &str = "You route a personal-recordings assistant. Read the user's question (and any recent \
 conversation) and reply with EXACTLY ONE of these category words, lowercase, nothing else: \
 'recordings' = what was SAID/discussed in conversations — topics, summaries, what someone talked about, \
-and WHO was SPEAKING or talking in a recording or clip (voices heard). \
+WHO was SPEAKING or talking in a recording or clip (voices heard), and how MUCH video/footage/audio \
+was recorded (totals — minutes or hours of video, how much footage exists). \
 'reflection' = how the USER themselves has been doing — their mood, social or conversational patterns, \
 self-improvement ('how have I been', 'how can I get better'). \
 'people' = WHO was seen on camera (faces, not voices heard) — 'who did I see', 'who have you seen', \

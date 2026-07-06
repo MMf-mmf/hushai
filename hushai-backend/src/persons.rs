@@ -155,6 +155,7 @@ pub async fn rename_person(
             "display_name must not be empty".into(),
         ));
     }
+    let mut tx = st.pool.begin().await?;
     let row = sqlx::query(
         "UPDATE persons SET display_name = $1, updated_at = now() \
          WHERE person_id = $2 \
@@ -162,9 +163,17 @@ pub async fn rename_person(
     )
     .bind(name)
     .bind(id)
-    .fetch_optional(&st.pool)
+    .fetch_optional(&mut *tx)
     .await?
     .ok_or(IngestError::NotFound("person"))?;
+    // Running memory: record the identification moment — the accumulated anonymous history is
+    // now attached to this name (profiles are keyed by id, so nothing moves).
+    let now_ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0);
+    crate::profiles::note_identified_in_tx(&mut tx, "person", id, name, now_ns, 0).await?;
+    tx.commit().await?;
 
     Ok(Json(person_row(&row)))
 }
@@ -341,6 +350,8 @@ pub async fn merge_person(
     // Keep any "of interest" watch alive across the merge: repoint (or drop) the loser's watch +
     // managed rule to the survivor before the loser id disappears (else the watch silently dies).
     crate::watchlist::reconcile_merge(&mut tx, "person", loser, into).await?;
+    // Fold the loser's accumulated running-memory profile into the survivor's.
+    crate::profiles::merge_in_tx(&mut tx, "person", loser, into).await?;
 
     sqlx::query("DELETE FROM persons WHERE person_id = $1")
         .bind(loser)

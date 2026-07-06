@@ -57,6 +57,27 @@ pub fn absolute_time(now_unix_nanos: i64, tz_offset_secs: i64) -> String {
     format!("{weekday}, {month} {day}, {} at {clock}", now.year())
 }
 
+/// A duration the way a person says it: "42 minutes", "2 hours 10 minutes", "about a minute",
+/// "15 seconds". Sub-minute totals show seconds; everything else rounds to whole minutes
+/// (nobody asks a security system for footage totals to the second).
+pub fn humanize_duration(nanos: i64) -> String {
+    let secs = nanos.max(0) / 1_000_000_000;
+    if secs < 60 {
+        return format!("{secs} second{}", if secs == 1 { "" } else { "s" });
+    }
+    let mins = (secs + 30) / 60; // round to the nearest minute
+    if mins < 60 {
+        return format!("{mins} minute{}", if mins == 1 { "" } else { "s" });
+    }
+    let hours = mins / 60;
+    let rem = mins % 60;
+    let mut out = format!("{hours} hour{}", if hours == 1 { "" } else { "s" });
+    if rem > 0 {
+        out.push_str(&format!(" {rem} minute{}", if rem == 1 { "" } else { "s" }));
+    }
+    out
+}
+
 /// 12-hour clock with AM/PM, e.g. "5:14 PM", "9:07 AM", "12:00 PM" (noon), "12:00 AM"
 /// (midnight). Built manually rather than via chrono's `%-I`, which isn't portable.
 fn clock12(hour24: u32, minute: u32) -> String {
@@ -205,6 +226,20 @@ mod tests {
             humanize_time(start, now(), -5 * 3600),
             "yesterday at 9:00 PM"
         );
+    }
+
+    #[test]
+    fn durations_read_naturally() {
+        const SEC: i64 = 1_000_000_000;
+        assert_eq!(humanize_duration(15 * SEC), "15 seconds");
+        assert_eq!(humanize_duration(1 * SEC), "1 second");
+        assert_eq!(humanize_duration(60 * SEC), "1 minute");
+        assert_eq!(humanize_duration(42 * 60 * SEC), "42 minutes");
+        assert_eq!(humanize_duration((42 * 60 + 29) * SEC), "42 minutes");
+        assert_eq!(humanize_duration((42 * 60 + 31) * SEC), "43 minutes");
+        assert_eq!(humanize_duration(2 * 3600 * SEC + 10 * 60 * SEC), "2 hours 10 minutes");
+        assert_eq!(humanize_duration(3600 * SEC), "1 hour");
+        assert_eq!(humanize_duration(-5), "0 seconds");
     }
 
     #[test]

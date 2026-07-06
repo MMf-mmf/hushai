@@ -30,6 +30,7 @@ forward-only — add a new numbered file, never edit a shipped one. See the head
 | 0021 | `archive_catalog_entities` | `archived_at` on `speakers`/`persons`/`license_plates` — the "Disregard" (archive) labeling action. |
 | 0022 | `skipped_status_and_hints` | `skipped` becomes a first-class TERMINAL status (+ `skip_reason`) on both AI work queues (backs the ingest hint gate + content gates). |
 | 0023 | `owner_identity` | `is_owner` on `speakers`/`persons` + a partial-unique single-owner index — the "This is me" tap. |
+| 0024 | `entity_profiles` | Running-memory profiles per person/speaker: append-only observation log folded incrementally from `events` (worker drain pass + RAG chat-time freshen); merge hooks fold duplicates. DERIVED/rebuildable. |
 
 **Adding one:** create `NNNN_short_name.sql` with a header comment; if it changes a backend `db.rs`
 `query!` macro, re-run `cd hushai-backend && DATABASE_URL=… cargo sqlx prepare -- --lib` and commit

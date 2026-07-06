@@ -1,0 +1,50 @@
+{
+  "transcript": {
+    "full_text": "We need to talk about the money for the kitchen renovation. The budget is three thousand dollars. That sounds fine. The contractor starts on Thursday morning after breakfast.",
+    "max_wer": 0.35,
+    "min_similarity": 0.6
+  },
+  "chat": {
+    "similarity_floor": null,
+    "judge_enabled": false,
+    "questions": [
+      {
+        "ask": "What do the recordings say about money?",
+        "session": "a",
+        "expect_routed_agent": "recordings",
+        "must_contain": [
+          "money"
+        ],
+        "min_citations": 1,
+        "reference_answer": "The recordings mention money for the kitchen renovation, with a budget of three thousand dollars."
+      },
+      {
+        "ask": "When was that said?",
+        "session": "a",
+        "must_not_contain": [
+          "don't have",
+          "which video"
+        ],
+        "min_citations": 1
+      },
+      {
+        "ask": "And the week before?",
+        "session": "b",
+        "must_not_contain": [
+          "money",
+          "renovation",
+          "three thousand"
+        ]
+      },
+      {
+        "ask": "Count them again.",
+        "session": "c",
+        "must_not_contain": [
+          "money",
+          "renovation",
+          "three thousand"
+        ]
+      }
+    ]
+  }
+}

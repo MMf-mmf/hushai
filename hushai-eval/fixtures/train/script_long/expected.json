@@ -1,0 +1,83 @@
+{
+  "transcript": {
+    "full_text": "Let's go over the kitchen renovation budget one more time. The contractor quoted twelve thousand dollars for the whole job, including the new cabinets, the countertop, and the plumbing work. I think we should set aside another five hundred for surprises, because old houses always hide something behind the walls. Three packages arrived this week. The first one came on Monday with the new door hinges, the second one on Wednesday had the paint samples, and the third one arrived on Friday with the light fixtures. Everything is stacked in the garage next to the workbench. The dishwasher broke again this morning. It filled with water and then just stopped, and now there is a puddle under the counter. I called the repair shop and they can send a technician on Tuesday, but honestly it might be time to buy a new machine instead of fixing this one again. Don't forget the birthday party is on the fourteenth. We still need to order the chocolate cake, pick up the balloons, and send the last few invitations. Grandma is flying in the night before, so someone has to get her from the airport around nine.",
+    "max_wer": 0.35,
+    "min_similarity": 0.6
+  },
+  "chat": {
+    "similarity_floor": null,
+    "judge_enabled": false,
+    "questions": [
+      {
+        "ask": "What do the recordings say about the renovation budget?",
+        "expect_routed_agent": "recordings",
+        "must_contain": [
+          "cabinets"
+        ],
+        "min_citations": 1,
+        "reference_answer": "The renovation was quoted at twelve thousand dollars including cabinets, countertop and plumbing, with five hundred extra set aside for surprises."
+      },
+      {
+        "ask": "How many packages did they say arrived?",
+        "expect_number": 3,
+        "must_not_contain": [
+          "don't have"
+        ],
+        "expect_routed_agent": "recordings"
+      },
+      {
+        "ask": "What did they say about the dishwasher?",
+        "must_contain": [
+          "dishwasher"
+        ],
+        "min_citations": 1,
+        "reference_answer": "The dishwasher broke \u2014 it filled with water and stopped, leaving a puddle; a technician can come Tuesday but replacing it is being considered.",
+        "expect_routed_agent": "recordings"
+      },
+      {
+        "ask": "What was discussed?",
+        "filters": {
+          "device_id": "eval-script-long",
+          "after_offset_ns": 120000000000,
+          "before_offset_ns": 180000000000
+        },
+        "must_contain": [
+          "dishwasher"
+        ],
+        "must_not_contain": [
+          "birthday",
+          "packages"
+        ]
+      },
+      {
+        "ask": "What do the recordings say about football scores?",
+        "must_contain": [
+          "don't have"
+        ],
+        "must_not_contain": [
+          "goal",
+          "touchdown"
+        ]
+      },
+      {
+        "ask": "How many minutes of video do we have from this camera?",
+        "filters": {
+          "device_id": "eval-script-long"
+        },
+        "expect_number": 4,
+        "must_not_contain": [
+          "don't have",
+          "no footage"
+        ]
+      },
+      {
+        "ask": "What was said about the birthday party?",
+        "must_contain": [
+          "birthday"
+        ],
+        "min_citations": 1,
+        "reference_answer": "The birthday party is on the fourteenth; the chocolate cake, balloons and invitations still need handling, and Grandma arrives the night before."
+      }
+    ]
+  }
+}

@@ -57,6 +57,12 @@ pub struct RagConfig {
     /// mis-routes. Default on; the rewrite runs at temp 0 (deterministic) and returns the message
     /// unchanged when it's already standalone. Env `RAG_QUERY_CONDENSE`.
     pub query_condense: bool,
+    /// Staleness guard on the LLM-visible history window: turns older than this many seconds
+    /// are excluded from `history`/`recent_context` (and therefore from condensation and the
+    /// router) — a stale morning session must not color an afternoon question, no matter how
+    /// the client manages its session pointer. `0` disables. The persisted transcript is
+    /// untouched. Env `RAG_CHAT_HISTORY_MAX_AGE_SECS`.
+    pub chat_history_max_age_secs: i64,
 
     /// Reflection agent — owner identity for the "how have *I* been" case. `OWNER_SPEAKER_ID`
     /// (a speaker uuid as text) wins; else `OWNER_SPEAKER_NAME` is resolved against the
@@ -69,6 +75,25 @@ pub struct RagConfig {
     /// Conversation segmentation: a silence/gap longer than this (seconds) starts a new
     /// "conversation" when analytics groups sentences into social interactions.
     pub conversation_gap_secs: i64,
+    /// Presence visit coalescing: consecutive sightings of the same subject (person/plate/
+    /// object) closer together than this (seconds) are ONE continuous visit, not N separate
+    /// "seen N times" events — the capture pipeline re-detects every ~2s segment, so raw
+    /// sighting counts are an artifact of segmentation, not of the world.
+    pub presence_visit_gap_secs: i64,
+    /// Chat-time entity-profile freshen: before answering a "tell me about <name>" question,
+    /// fold any settled-but-unconsumed events into that identity's profile so the answer is
+    /// never staler than the events table (and eval runs don't race the worker's interval).
+    pub profile_chat_refresh: bool,
+    /// Grace window (seconds) for the chat-time profile freshen: events updated more recently
+    /// than this are left for a later pass (they may still be UPSERT-extending). The eval
+    /// profile pins this to 0 — injected fixtures are fully settled before questions fire.
+    pub profile_grace_secs: i64,
+    /// Window-summary ("what have we spoken about today"): at most this many of the window's
+    /// most recent conversations are stitched into the summary prompt.
+    pub summary_max_convos: usize,
+    /// Window-summary: total character budget across all stitched conversation excerpts
+    /// (keeps the prompt bounded on a chatty day).
+    pub summary_max_total_chars: usize,
     /// Fixed timezone offset (seconds, e.g. -14400 for EDT) applied before hour-of-day /
     /// weekly bucketing. Nanos are UTC; this is a deterministic offset, NOT full DST.
     pub analysis_tz_offset_secs: i64,
@@ -172,6 +197,7 @@ impl RagConfig {
             chat_history_turns: parse("RAG_CHAT_HISTORY_TURNS", "8")?,
             chat_max_message_chars: parse("RAG_CHAT_MAX_MESSAGE_CHARS", "4000")?,
             query_condense: parse("RAG_QUERY_CONDENSE", "true")?,
+            chat_history_max_age_secs: parse("RAG_CHAT_HISTORY_MAX_AGE_SECS", "3600")?,
             owner_speaker_id: std::env::var("OWNER_SPEAKER_ID")
                 .ok()
                 .filter(|s| !s.trim().is_empty()),
@@ -180,6 +206,11 @@ impl RagConfig {
                 .filter(|s| !s.trim().is_empty()),
             analysis_window_days_default: parse("ANALYSIS_WINDOW_DAYS_DEFAULT", "90")?,
             conversation_gap_secs: parse("CONVERSATION_GAP_SECS", "300")?,
+            presence_visit_gap_secs: parse("PRESENCE_VISIT_GAP_SECS", "120")?,
+            profile_chat_refresh: parse("PROFILE_CHAT_REFRESH", "true")?,
+            profile_grace_secs: parse("PROFILE_GRACE_SECS", "90")?,
+            summary_max_convos: parse("RAG_SUMMARY_MAX_CONVOS", "8")?,
+            summary_max_total_chars: parse("RAG_SUMMARY_MAX_TOTAL_CHARS", "8000")?,
             analysis_tz_offset_secs: parse("ANALYSIS_TZ_OFFSET_SECS", "0")?,
             reflection_llm_model: std::env::var("REFLECTION_LLM_MODEL")
                 .ok()
