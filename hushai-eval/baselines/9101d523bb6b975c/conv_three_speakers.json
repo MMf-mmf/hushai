@@ -1,0 +1,17 @@
+{
+  "case_id": "conv_three_speakers",
+  "config_hash": "9101d523bb6b975c",
+  "git_sha": "37a8372",
+  "metrics": {
+    "chat.q0.count_ok": 1.0,
+    "chat.q0.errored": 1.0,
+    "conversations.count_error": 0.0,
+    "conversations.coverage": 1.0,
+    "conversations.fragmentation": 1.0,
+    "conversations.must_merge.T1-T2": 1.0,
+    "conversations.pairwise_f1": 1.0,
+    "conversations.purity": 1.0,
+    "transcript.similarity": 0.8584070796460177,
+    "transcript.wer": 0.20454545454545456
+  }
+}

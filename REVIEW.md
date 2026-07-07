@@ -39,7 +39,9 @@ diff, read the directly-changed files + their immediate dependencies, form findi
 A change touching any of these deserves a closer look; a large change touching them justifies fan-out.
 
 - **Auth & tokens** — `hushai-backend/src/auth.rs` (`DEVICE_TOKENS` HashMap, constant-time `subtle`
-  compare), `hushai-rag` `RAG_TOKEN`, `hushai-viewer/src/auth.rs` (IP allowlist + argon2 password +
+  compare), `hushai-rag` `RAG_TOKEN`, `hushai-advisor` `ADVISOR_TOKEN` (`routes.rs::check_auth` +
+  the fail-closed non-loopback startup check in `lib.rs` — the advisor archive is the user's most
+  intimate data), `hushai-viewer/src/auth.rs` (IP allowlist + argon2 password +
   HMAC session cookie). Check: constant-time comparison preserved; no token/secret logged; the
   viewer stays the only IP-gated plane (backend/rag see only `127.0.0.1` via the proxy).
 - **Schema migrations** — `hushai-backend/migrations/`. Forward-only (never edit a shipped file);
@@ -67,6 +69,12 @@ A change touching any of these deserves a closer look; a large change touching t
   + invisible to backfill reconcile.
 - **The contract boundary** — `contracts/cameraToBackendContract.md` + `proto/hushai/v1/segment.proto`.
   Behavior keys off `container` / `media_type`, never `source_kind` (unvalidated client free text).
+- **Conversation threader determinism** — `hushai-backend/src/threading.rs` + `conversations.rs`.
+  The pure core must stay deterministic (total tie-breaks, injected minting, no clock/RNG/LLM);
+  every knob must be in `ThreaderCfg` + `config_hash` + the eval `KNOB_PREFIXES`; closed
+  conversations are frozen (append-only late-attach only); the live `write_transcript` path must
+  never touch `conversation_id`; cross-device stays a LINK (`link_group_id`), never a transcript
+  merge. Never loosen the split gate (interleave requirement, size floor) to make a fixture pass.
 
 ## Must-follow patterns
 

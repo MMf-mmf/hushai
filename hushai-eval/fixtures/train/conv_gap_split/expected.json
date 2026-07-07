@@ -1,0 +1,53 @@
+{
+  "transcript": {
+    "full_text": "let us plan the dinner party for saturday. i want to serve roasted salmon and a lemon tart. good idea. i will buy the salmon at the fish market and pick up wine on the way home. perfect. remember the tart needs fresh lemons and we should set the table by six. the car is making a strange rattling noise near the front wheel again. that sounds like the brake pads. we should take it to the mechanic on monday morning. alright. i will book the mechanic appointment and ask about the engine oil as well.",
+    "max_wer": 0.35,
+    "min_similarity": 0.6
+  },
+  "conversations": {
+    "distinct_count": 2,
+    "count_tolerance": 0,
+    "min_pairwise_f1": 0.9,
+    "min_coverage": 0.9,
+    "must_not_merge": [
+      [
+        "A",
+        "B"
+      ]
+    ],
+    "utterances": [
+      {
+        "label": "A",
+        "text_contains": "dinner party",
+        "window_ns": [
+          0,
+          13274966000
+        ]
+      },
+      {
+        "label": "A",
+        "text_contains": "fish market",
+        "window_ns": [
+          0,
+          13274966000
+        ]
+      },
+      {
+        "label": "B",
+        "text_contains": "front wheel",
+        "window_ns": [
+          613274966000,
+          625037506000
+        ]
+      },
+      {
+        "label": "B",
+        "text_contains": "brake pads",
+        "window_ns": [
+          613274966000,
+          625037506000
+        ]
+      }
+    ]
+  }
+}

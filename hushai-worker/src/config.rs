@@ -172,6 +172,52 @@ pub struct WorkerConfig {
     /// Profile text cap (chars); oldest lines are deterministically compacted beyond it.
     pub profiles_max_chars: usize,
 
+    // --- Conversation threading (migration 0025; worker 0 drives hushai_backend::conversations) ---
+    /// Master switch for the interval-gated threading pass on worker 0. Unlike autoheal
+    /// this runs even while the queue is busy (checked BEFORE claiming) so sustained
+    /// ingest can never starve threading.
+    pub threader_enabled: bool,
+    /// Minimum seconds between threading passes.
+    pub threader_interval_secs: u64,
+    /// Sentences younger than this (created_at) are not yet threadable — the lag lets
+    /// speaker attribution / autoheal settle before the threader sees a row.
+    pub threader_min_age_secs: i64,
+    /// Open-tail revision window (capture time). Unassigned sentences older than this
+    /// wait for an explicit backfill.
+    pub threader_lookback_secs: i64,
+    /// Per-pass scan bound (embeddings of the working set are held in RAM).
+    pub threader_max_rows_per_pass: i64,
+    /// Hard temporal conversation boundary in seconds. SHARED TRUTH with the RAG's
+    /// CONVERSATION_GAP_SECS and PROFILES_CONVO_GAP_SECS — read from the same env name.
+    pub conversation_gap_secs: f64,
+    /// A conversation closes (and emits its `conversation` event) when
+    /// now - last speech > gap + this grace.
+    pub convo_close_grace_secs: i64,
+    /// Stage A: consecutive same-speaker sentences closer than this merge into one utterance.
+    pub threader_utterance_merge_max_gap_secs: f64,
+    /// Stage C: reply-shaped adjacency window between different speakers.
+    pub threader_alternation_max_secs: f64,
+    /// Stage C: adjacency counts full weight above this cosine similarity.
+    pub threader_reply_sim_floor: f32,
+    /// Stage C: speaker-pair topic affinity bonus threshold.
+    pub threader_topic_attract_sim: f32,
+    /// Stage C: speaker-pair topic repulsion threshold.
+    pub threader_topic_repel_sim: f32,
+    /// Stage C: minimum edge weight for "these two speakers are conversing".
+    pub threader_speaker_link_min: f32,
+    /// Split gate: minimum utterances per candidate sub-conversation.
+    pub threader_min_cluster_utterances: usize,
+    /// Split gate: maximum mean cross-component similarity for an accepted split.
+    pub threader_split_max_cross_sim: f32,
+    /// When false (default) a block is never split on topic alone without temporal interleave.
+    pub threader_topic_only_split: bool,
+    /// Cross-device conversation LINKING (link_group_id; never a merge).
+    pub threader_link_enabled: bool,
+    /// Fraction of the shorter conversation's span that must overlap to link.
+    pub threader_link_min_overlap_frac: f64,
+    /// One-shot: thread ALL historical NULL-conversation rows on startup (worker 0).
+    pub threader_backfill_on_start: bool,
+
     /// On startup, re-queue `done` AUDIO/MUXED segments that have no voiceprint yet
     /// (transcribed while the speaker stage was unavailable) so the pipeline re-runs
     /// and assigns/mints their speaker. Self-healing + convergent (a no-op once every
@@ -482,6 +528,32 @@ impl WorkerConfig {
             centroid_window: self.speaker_centroid_window,
         }
     }
+
+    /// Bundle the threading knobs for `hushai_backend::conversations`. Every field here
+    /// feeds the threader config-hash (and the eval manifest reads the same env names),
+    /// so a knob change starts a new eval lineage on both sides.
+    pub fn threader_opts(&self) -> hushai_backend::conversations::ThreaderOpts {
+        hushai_backend::conversations::ThreaderOpts {
+            cfg: hushai_backend::threading::ThreaderCfg {
+                gap_secs: self.conversation_gap_secs,
+                utterance_merge_max_gap_secs: self.threader_utterance_merge_max_gap_secs,
+                alternation_max_secs: self.threader_alternation_max_secs,
+                reply_sim_floor: self.threader_reply_sim_floor,
+                topic_attract_sim: self.threader_topic_attract_sim,
+                topic_repel_sim: self.threader_topic_repel_sim,
+                speaker_link_min: self.threader_speaker_link_min,
+                min_cluster_utterances: self.threader_min_cluster_utterances,
+                split_max_cross_sim: self.threader_split_max_cross_sim,
+                topic_only_split: self.threader_topic_only_split,
+            },
+            min_age_secs: self.threader_min_age_secs,
+            lookback_secs: self.threader_lookback_secs,
+            max_rows_per_pass: self.threader_max_rows_per_pass,
+            close_grace_secs: self.convo_close_grace_secs,
+            link_enabled: self.threader_link_enabled,
+            link_min_overlap_frac: self.threader_link_min_overlap_frac,
+        }
+    }
 }
 
 impl WorkerConfig {
@@ -559,6 +631,28 @@ impl WorkerConfig {
             profiles_grace_secs: parse("PROFILES_GRACE_SECS", "90")?,
             profiles_max_events_per_pass: parse("PROFILES_MAX_EVENTS_PER_PASS", "2000")?,
             profiles_max_chars: parse("PROFILES_MAX_CHARS", "8000")?,
+            threader_enabled: parse("THREADER_ENABLED", "true")?,
+            threader_interval_secs: parse("THREADER_INTERVAL_SECS", "30")?,
+            threader_min_age_secs: parse("THREADER_MIN_AGE_SECS", "10")?,
+            threader_lookback_secs: parse("THREADER_LOOKBACK_SECS", "900")?,
+            threader_max_rows_per_pass: parse("THREADER_MAX_ROWS_PER_PASS", "5000")?,
+            conversation_gap_secs: parse("CONVERSATION_GAP_SECS", "300")?,
+            convo_close_grace_secs: parse("CONVO_CLOSE_GRACE_SECS", "120")?,
+            threader_utterance_merge_max_gap_secs: parse(
+                "THREADER_UTTERANCE_MERGE_MAX_GAP_SECS",
+                "1.0",
+            )?,
+            threader_alternation_max_secs: parse("THREADER_ALTERNATION_MAX_SECS", "5.0")?,
+            threader_reply_sim_floor: parse("THREADER_REPLY_SIM_FLOOR", "0.45")?,
+            threader_topic_attract_sim: parse("THREADER_TOPIC_ATTRACT_SIM", "0.60")?,
+            threader_topic_repel_sim: parse("THREADER_TOPIC_REPEL_SIM", "0.35")?,
+            threader_speaker_link_min: parse("THREADER_SPEAKER_LINK_MIN", "2.0")?,
+            threader_min_cluster_utterances: parse("THREADER_MIN_CLUSTER_UTTERANCES", "4")?,
+            threader_split_max_cross_sim: parse("THREADER_SPLIT_MAX_CROSS_SIM", "0.40")?,
+            threader_topic_only_split: parse("THREADER_TOPIC_ONLY_SPLIT", "false")?,
+            threader_link_enabled: parse("THREADER_LINK_ENABLED", "true")?,
+            threader_link_min_overlap_frac: parse("THREADER_LINK_MIN_OVERLAP_FRAC", "0.5")?,
+            threader_backfill_on_start: parse("THREADER_BACKFILL_ON_START", "false")?,
             speaker_backfill_on_start: parse("SPEAKER_BACKFILL_ON_START", "true")?,
             speaker_reprocess_rejects_on_start: parse(
                 "SPEAKER_REPROCESS_REJECTS_ON_START",

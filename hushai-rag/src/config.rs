@@ -164,6 +164,23 @@ pub struct RagConfig {
     pub context_roster_max: i64,
     /// Annotate retrieved transcript passages with same-segment vision detections.
     pub context_vision_enrich_enabled: bool,
+
+    /// Conversation-neighborhood expansion (0025): after the grounded distance prune, hits
+    /// sharing a persisted conversation_id widen into their conversation's surrounding
+    /// sentences and the prompt renders per-conversation sections (never mixing groups).
+    /// Kill switch + budgets so the small model is never flooded; disabled → the exact
+    /// pre-0025 flat prompt.
+    pub expand_enabled: bool,
+    /// Neighbors fetched within ± this window (seconds) around a conversation's hits.
+    pub expand_window_secs: i64,
+    pub expand_max_sentences_per_convo: usize,
+    pub expand_max_total_chars: usize,
+    /// Relative-margin prune on semantic hits: drop hits with `distance > best + margin`.
+    /// The absolute `distance_threshold` alone can't separate "on-topic" from "different
+    /// conversation that happens to sit just under the cutoff" — and one marginal hit is
+    /// enough to drag an entire unrelated conversation into the grounded prompt via
+    /// expansion. Deterministic rows (distance 0.0) always survive. <= 0 disables.
+    pub prune_rel_margin: f64,
 }
 
 impl RagConfig {
@@ -244,6 +261,11 @@ impl RagConfig {
             context_max_chars: parse("RAG_CONTEXT_MAX_CHARS", "1200")?,
             context_roster_max: parse("RAG_CONTEXT_ROSTER_MAX", "12")?,
             context_vision_enrich_enabled: parse("RAG_CONTEXT_VISION_ENRICH_ENABLED", "true")?,
+            expand_enabled: parse("RAG_EXPAND_ENABLED", "true")?,
+            expand_window_secs: parse("RAG_EXPAND_WINDOW_SECS", "120")?,
+            expand_max_sentences_per_convo: parse("RAG_EXPAND_MAX_SENTENCES_PER_CONVO", "30")?,
+            expand_max_total_chars: parse("RAG_EXPAND_MAX_TOTAL_CHARS", "6000")?,
+            prune_rel_margin: parse("RAG_PRUNE_REL_MARGIN", "0.25")?,
         })
     }
 }

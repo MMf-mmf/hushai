@@ -1,0 +1,18 @@
+{
+  "advisor": {
+    "turns": [
+      {
+        "message": "I walked into my house.",
+        "expect_questions": true,
+        "expect_final_answer": false
+      },
+      {
+        "message": "I walked into my house and found my wife in bed with another man. We've been married 12 years, two kids, I run a small business, I'm devastated and don't know what to do."
+      },
+      {
+        "message": "We've been married 12 years, two kids, finances are stable, I want to save the marriage if possible.",
+        "expect_final_answer": true
+      }
+    ]
+  }
+}

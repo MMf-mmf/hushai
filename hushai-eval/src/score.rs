@@ -59,6 +59,11 @@ pub fn score_all(expected: &Expected, obs: &Observed, base_ns: i64, modalities: 
             m.extend(score_sentiment(gt, obs, base_ns));
         }
     }
+    if on("conversations") {
+        if let Some(gt) = &expected.conversations {
+            m.extend(score_conversations(gt, obs, base_ns));
+        }
+    }
     if on("persons") || on("faces") {
         if let Some(gt) = &expected.persons {
             m.extend(score_persons(gt, obs));
@@ -242,6 +247,242 @@ fn best_assignment(
     }
     search(0, labels.len(), obs_ids, cont, &mut used, &mut chosen, 0, &mut best);
     best
+}
+
+// ----- conversations (threading) ----------------------------------------------
+
+/// One GT utterance's observed-conversation evidence: matched sentences (window overlap +
+/// `text_contains`, the `score_speakers` recipe) and their non-NULL `conversation_id` counts.
+struct ConvUttMatch {
+    label: String,
+    id_counts: HashMap<Uuid, usize>,
+    dominant: Option<Uuid>,
+}
+
+fn match_conv_utterances(utts: &[ConvUttGt], sentences: &[Sentence], base_ns: i64) -> Vec<ConvUttMatch> {
+    utts.iter()
+        .map(|u| {
+            let (a, b) = (base_ns + u.window_ns[0], base_ns + u.window_ns[1]);
+            let needle = normalize(&u.text_contains);
+            let mut id_counts: HashMap<Uuid, usize> = HashMap::new();
+            for s in sentences {
+                if overlaps(s.start_ns, s.end_ns, a, b) && (needle.is_empty() || normalize(&s.text).contains(&needle)) {
+                    if let Some(cid) = s.conversation_id {
+                        *id_counts.entry(cid).or_default() += 1;
+                    }
+                }
+            }
+            let dominant = dominant_conv_id(&id_counts);
+            ConvUttMatch { label: u.label.clone(), id_counts, dominant }
+        })
+        .collect()
+}
+
+/// The conversation id with the most matched sentences; ties break to the lexicographically
+/// smaller uuid (Uuid byte order == canonical-string order) so the result is deterministic.
+fn dominant_conv_id(counts: &HashMap<Uuid, usize>) -> Option<Uuid> {
+    let mut v: Vec<(&Uuid, &usize)> = counts.iter().collect();
+    v.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+    v.first().map(|(id, _)| **id)
+}
+
+/// Aggregate dominant id for one GT LABEL: sentence counts summed across every utterance carrying
+/// the label, then the same deterministic dominant pick. `None` when nothing threaded matched.
+fn label_dominant(matches: &[ConvUttMatch], label: &str) -> Option<Uuid> {
+    let mut agg: HashMap<Uuid, usize> = HashMap::new();
+    for mm in matches.iter().filter(|m| m.label == label) {
+        for (id, c) in &mm.id_counts {
+            *agg.entry(*id).or_default() += c;
+        }
+    }
+    dominant_conv_id(&agg)
+}
+
+/// Pairwise clustering (precision, recall, F1) over GT utterances given each utterance's
+/// (label, dominant observed id). NULL dominants are singletons — never "same-observed-id" with
+/// anything. No same-GT-label pairs AND no same-observed-id pairs => vacuously perfect (1.0).
+fn conv_pairwise_f1(utts: &[(String, Option<Uuid>)]) -> (f64, f64, f64) {
+    let mut same_obs = 0usize; // pairs whose dominants are equal and non-NULL
+    let mut same_gt = 0usize; // pairs sharing a GT label
+    let mut both = 0usize;
+    for i in 0..utts.len() {
+        for j in (i + 1)..utts.len() {
+            let so = matches!((&utts[i].1, &utts[j].1), (Some(a), Some(b)) if a == b);
+            let sg = utts[i].0 == utts[j].0;
+            if so {
+                same_obs += 1;
+            }
+            if sg {
+                same_gt += 1;
+            }
+            if so && sg {
+                both += 1;
+            }
+        }
+    }
+    if same_obs == 0 && same_gt == 0 {
+        return (1.0, 1.0, 1.0);
+    }
+    let p = if same_obs == 0 { 1.0 } else { both as f64 / same_obs as f64 };
+    let r = if same_gt == 0 { 1.0 } else { both as f64 / same_gt as f64 };
+    let f1 = if p + r == 0.0 { 0.0 } else { 2.0 * p * r / (p + r) };
+    (p, r, f1)
+}
+
+/// Labels joined by `must_merge` pairs describe ONE ground-truth conversation (the labels only
+/// exist as handles for the merge assertion), so clustering metrics must not count their
+/// cross-label pairs as "should be separate". Maps every utterance label to the
+/// lexicographically-smallest label of its `must_merge`-connected component; labels not in any
+/// pair map to themselves. `must_not_merge` checks keep the raw labels.
+fn canon_conv_labels(gt: &ConversationsGt) -> HashMap<String, String> {
+    let mut canon: HashMap<String, String> = HashMap::new();
+    for u in &gt.utterances {
+        canon.insert(u.label.clone(), u.label.clone());
+    }
+    // Tiny union-find via path-free root lookup — label sets are single digits in practice.
+    fn root(canon: &HashMap<String, String>, mut l: String) -> String {
+        while canon.get(&l).is_some_and(|p| p != &l) {
+            l = canon[&l].clone();
+        }
+        l
+    }
+    for pair in &gt.must_merge {
+        let (ra, rb) = (root(&canon, pair[0].clone()), root(&canon, pair[1].clone()));
+        if ra != rb {
+            let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
+            canon.insert(hi, lo);
+        }
+    }
+    let keys: Vec<String> = canon.keys().cloned().collect();
+    keys.into_iter().map(|k| (k.clone(), root(&canon, k))).collect()
+}
+
+/// Score conversation threading (migration 0025). Assignment-invariant like `score_speakers`:
+/// never keys on minted conversation UUIDs — GT labels map to observed ids via per-utterance
+/// dominant ids + optimal assignment. NULL conversation_id is "no evidence" (coverage catches a
+/// threader that never ran), never a merge/split signal.
+fn score_conversations(gt: &ConversationsGt, obs: &Observed, base_ns: i64) -> Vec<Metric> {
+    // "In-window" sentences: inside the UNION of GT utterance windows when utterances are given,
+    // else every observed sentence in the case window.
+    let wins: Vec<(i64, i64)> =
+        gt.utterances.iter().map(|u| (base_ns + u.window_ns[0], base_ns + u.window_ns[1])).collect();
+    let distinct: HashSet<Uuid> = obs
+        .sentences
+        .iter()
+        .filter(|s| wins.is_empty() || wins.iter().any(|(a, b)| overlaps(s.start_ns, s.end_ns, *a, *b)))
+        .filter_map(|s| s.conversation_id)
+        .collect();
+    let observed_count = distinct.len() as i64;
+    let count_err = (observed_count - gt.distinct_count).abs();
+
+    let mut out = vec![Metric::new(
+        "conversations.count_error",
+        count_err as f64,
+        Direction::LowerBetter,
+        count_err <= gt.count_tolerance,
+        format!("{observed_count} distinct conversations (expected {} ±{})", gt.distinct_count, gt.count_tolerance),
+    )];
+    let fragmentation = observed_count as f64 / gt.distinct_count.max(1) as f64;
+    let frag_detail = format!("{observed_count} observed conversation ids / {} expected", gt.distinct_count.max(1));
+
+    if gt.utterances.is_empty() {
+        out.push(Metric::info("conversations.fragmentation", fragmentation, frag_detail));
+        return out;
+    }
+
+    let matches = match_conv_utterances(&gt.utterances, &obs.sentences, base_ns);
+
+    let covered = matches.iter().filter(|m| !m.id_counts.is_empty()).count();
+    let coverage = covered as f64 / matches.len() as f64;
+    out.push(Metric::new(
+        "conversations.coverage",
+        coverage,
+        Direction::HigherBetter,
+        coverage >= gt.min_coverage,
+        format!("{covered}/{} utterances threaded (any non-NULL conversation_id)", matches.len()),
+    ));
+
+    // Clustering metrics see must_merge-joined labels as ONE cluster (they are one GT
+    // conversation); the merge/no-merge Boolean gates below keep the raw labels.
+    let canon = canon_conv_labels(gt);
+    let clab = |l: &str| canon.get(l).cloned().unwrap_or_else(|| l.to_string());
+    let pairs: Vec<(String, Option<Uuid>)> =
+        matches.iter().map(|m| (clab(&m.label), m.dominant)).collect();
+    let (prec, rec, f1) = conv_pairwise_f1(&pairs);
+    out.push(Metric::new(
+        "conversations.pairwise_f1",
+        f1,
+        Direction::HigherBetter,
+        f1 >= gt.min_pairwise_f1,
+        format!("pairwise P {prec:.3} R {rec:.3} F1 {f1:.3} over {} utterances", matches.len()),
+    ));
+
+    // NULLs never match: only NON-NULL ids can be "shared", so two unthreaded labels don't merge.
+    let ids_of = |lab: &str| -> HashSet<Uuid> {
+        matches.iter().filter(|m| m.label == lab).flat_map(|m| m.id_counts.keys().copied()).collect()
+    };
+    for pair in &gt.must_not_merge {
+        let (la, lb) = (pair[0].as_str(), pair[1].as_str());
+        let (sa, sb) = (ids_of(la), ids_of(lb));
+        let mut shared: Vec<Uuid> = sa.intersection(&sb).copied().collect();
+        shared.sort();
+        let ok = shared.is_empty();
+        out.push(Metric::new(
+            format!("conversations.must_not_merge.{la}-{lb}"),
+            if ok { 1.0 } else { 0.0 },
+            Direction::Boolean,
+            ok,
+            if ok {
+                format!("labels {la}/{lb} share no conversation id")
+            } else {
+                format!("labels {la}/{lb} SHARE conversation id(s) {shared:?}")
+            },
+        ));
+    }
+    for pair in &gt.must_merge {
+        let (la, lb) = (pair[0].as_str(), pair[1].as_str());
+        let (da, db) = (label_dominant(&matches, la), label_dominant(&matches, lb));
+        let ok = matches!((da, db), (Some(x), Some(y)) if x == y);
+        out.push(Metric::new(
+            format!("conversations.must_merge.{la}-{lb}"),
+            if ok { 1.0 } else { 0.0 },
+            Direction::Boolean,
+            ok,
+            format!("dominant ids {la}={da:?} {lb}={db:?} (must be equal and non-NULL)"),
+        ));
+    }
+
+    // purity (Info): best_assignment over (GT label -> dominant conversation id), exactly the
+    // speakers.purity recipe. Info-only — pairwise_f1 is the gating clustering metric.
+    let mut labels: Vec<String> = Vec::new();
+    let mut utt_obs: Vec<(usize, Option<Uuid>)> = Vec::new();
+    for mm in &matches {
+        let cl = clab(&mm.label);
+        let li = match labels.iter().position(|l| l == &cl) {
+            Some(i) => i,
+            None => {
+                labels.push(cl);
+                labels.len() - 1
+            }
+        };
+        utt_obs.push((li, mm.dominant));
+    }
+    let obs_ids: Vec<Uuid> = utt_obs.iter().filter_map(|(_, o)| *o).collect::<HashSet<_>>().into_iter().collect();
+    let mut cont = vec![HashMap::<Uuid, usize>::new(); labels.len()];
+    for (li, o) in &utt_obs {
+        if let Some(id) = o {
+            *cont[*li].entry(*id).or_default() += 1;
+        }
+    }
+    let (_assignment, matched_n) = best_assignment(&labels, &obs_ids, &cont);
+    let purity = matched_n as f64 / matches.len() as f64;
+    out.push(Metric::info(
+        "conversations.purity",
+        purity,
+        format!("{matched_n}/{} utterances on the optimally-mapped conversation", matches.len()),
+    ));
+    out.push(Metric::info("conversations.fragmentation", fragmentation, frag_detail));
+    out
 }
 
 // ----- sentiment -------------------------------------------------------------
@@ -447,11 +688,20 @@ fn severity_rank(s: &str) -> i32 {
 // ----- chat / rag ------------------------------------------------------------
 
 /// Score live RAG answers. Deterministic-first: `contains`/`clean`/`count_ok`/`routed`/`citations`/
-/// `attribution`/`errored` gate the verdict (they test facts + structure, robust to LLM wording);
-/// `similarity` gates only if the fixture set a floor; `judge` is ALWAYS Info-only. Metric keys are
-/// indexed by question position (`chat.q{i}.*`) so baselines line up — do NOT reorder a fixture's
-/// questions once a baseline exists. Async because similarity + judge call Ollama via `ctx`.
-pub async fn score_chat(gt: &ChatGt, answers: &[RagAnswer], ctx: &Ctx) -> Vec<Metric> {
+/// `attribution`/`conv_scoped`/`errored` gate the verdict (they test facts + structure, robust to
+/// LLM wording); `similarity` gates only if the fixture set a floor; `judge` is ALWAYS Info-only.
+/// Metric keys are indexed by question position (`chat.q{i}.*`) so baselines line up — do NOT
+/// reorder a fixture's questions once a baseline exists. Async because similarity + judge call
+/// Ollama via `ctx` (whose pool also backs the `conv_scoped` citation lookup). `conv_gt`/`obs`/
+/// `base_ns` feed `citation_conversation_label` (the GT-label -> dominant-id matching).
+pub async fn score_chat(
+    gt: &ChatGt,
+    answers: &[RagAnswer],
+    ctx: &Ctx,
+    conv_gt: Option<&ConversationsGt>,
+    obs: &Observed,
+    base_ns: i64,
+) -> Vec<Metric> {
     let mut m = Vec::new();
     let embed_model = std::env::var("EMBED_MODEL").unwrap_or_else(|_| "mxbai-embed-large".into());
     for (i, (q, a)) in gt.questions.iter().zip(answers.iter()).enumerate() {
@@ -470,12 +720,38 @@ pub async fn score_chat(gt: &ChatGt, answers: &[RagAnswer], ctx: &Ctx) -> Vec<Me
         if !q.must_contain.is_empty() {
             let hits = q.must_contain.iter().filter(|s| ans_norm.contains(&normalize(s))).count();
             let frac = hits as f64 / q.must_contain.len() as f64;
+            // On a miss, quote the answer head — "0/1 present" alone is undiagnosable
+            // (paraphrase drift vs decline vs empty stream all look identical).
+            let detail = if hits < q.must_contain.len() {
+                let head: String = a.answer.chars().take(160).collect();
+                format!(
+                    "{hits}/{} required phrases present; answer: {head:?}",
+                    q.must_contain.len()
+                )
+            } else {
+                format!("{hits}/{} required phrases present", q.must_contain.len())
+            };
+            m.push(Metric::new(p("contains"), frac, Direction::HigherBetter, frac >= 1.0, detail));
+        }
+        if !q.must_contain_any.is_empty() {
+            let hit = q.must_contain_any.iter().find(|s| ans_norm.contains(&normalize(s)));
+            let ok = hit.is_some();
+            let detail = match hit {
+                Some(h) => format!("matched {h:?} (1 of {} accepted variants)", q.must_contain_any.len()),
+                None => {
+                    let head: String = a.answer.chars().take(160).collect();
+                    format!(
+                        "none of {} accepted variants present; answer: {head:?}",
+                        q.must_contain_any.len()
+                    )
+                }
+            };
             m.push(Metric::new(
-                p("contains"),
-                frac,
-                Direction::HigherBetter,
-                frac >= 1.0,
-                format!("{hits}/{} required phrases present", q.must_contain.len()),
+                p("contains_any"),
+                if ok { 1.0 } else { 0.0 },
+                Direction::Boolean,
+                ok,
+                detail,
             ));
         }
         if !q.must_not_contain.is_empty() {
@@ -553,6 +829,9 @@ pub async fn score_chat(gt: &ChatGt, answers: &[RagAnswer], ctx: &Ctx) -> Vec<Me
                 format!("{hits}/{} expected names attributed in citations", q.citation_must_attribute.len()),
             ));
         }
+        if q.citations_single_conversation {
+            m.push(conv_scoped_metric(p("conv_scoped"), q, a, ctx, conv_gt, obs, base_ns).await);
+        }
         if let Some(reference) = &q.reference_answer {
             let sim = match (
                 embed(ctx, &embed_model, &a.answer).await,
@@ -583,6 +862,97 @@ pub async fn score_chat(gt: &ChatGt, answers: &[RagAnswer], ctx: &Ctx) -> Vec<Me
         }
     }
     m
+}
+
+/// `chat.q{i}.conv_scoped`: did the answer's citations stay inside ONE threaded conversation?
+/// Resolves each cited source's segment_id to its sentences' `conversation_id`s via the eval pool
+/// (`ctx.pool` — the same DB-direct access `observe` uses). Passes iff they collapse to exactly one
+/// non-NULL id (plus, when `citation_conversation_label` is set, that id must equal the GT label's
+/// dominant observed id). When EVERY cited sentence is unthreaded (NULL), degrades to an Info-style
+/// non-gating pass — the `routed` pattern: a threader that hasn't run is missing infrastructure,
+/// not a wrong answer. A failed lookup likewise degrades to Info (never a false regression).
+async fn conv_scoped_metric(
+    key: String,
+    q: &ChatQ,
+    a: &RagAnswer,
+    ctx: &Ctx,
+    conv_gt: Option<&ConversationsGt>,
+    obs: &Observed,
+    base_ns: i64,
+) -> Metric {
+    if a.sources.is_empty() {
+        return Metric::new(key, 0.0, Direction::Boolean, false, "no citations to scope");
+    }
+    let mut seg_ids: Vec<Uuid> =
+        a.sources.iter().filter_map(|s| Uuid::parse_str(&s.segment_id).ok()).collect();
+    seg_ids.sort();
+    seg_ids.dedup();
+    if seg_ids.is_empty() {
+        return Metric::new(
+            key,
+            0.0,
+            Direction::Boolean,
+            false,
+            format!("{} citations but no parseable segment ids", a.sources.len()),
+        );
+    }
+    let rows: Vec<(Option<Uuid>,)> = match sqlx::query_as(
+        "SELECT DISTINCT conversation_id FROM transcript_sentences WHERE segment_id = ANY($1)",
+    )
+    .bind(&seg_ids)
+    .fetch_all(&ctx.pool)
+    .await
+    {
+        Ok(r) => r,
+        Err(e) => return Metric::info(key, 0.0, format!("conversation lookup failed: {e}")),
+    };
+    if rows.is_empty() {
+        return Metric::new(
+            key,
+            0.0,
+            Direction::Boolean,
+            false,
+            format!("no transcript sentences found for {} cited segment(s)", seg_ids.len()),
+        );
+    }
+    let has_null = rows.iter().any(|(c,)| c.is_none());
+    let mut ids: Vec<Uuid> = rows.into_iter().filter_map(|(c,)| c).collect();
+    ids.sort();
+    ids.dedup();
+    if ids.is_empty() {
+        // Every cited sentence unthreaded: the threader hasn't assigned here — degrade, don't fail.
+        return Metric::info(
+            key,
+            1.0,
+            "all cited segments unthreaded (conversation_id NULL); non-gating pass until the threader runs",
+        );
+    }
+
+    let mut ok = ids.len() == 1 && !has_null;
+    let mut detail = format!(
+        "{} distinct conversation id(s) across {} cited segment(s){}",
+        ids.len(),
+        seg_ids.len(),
+        if has_null { " (+ unthreaded sentences)" } else { "" },
+    );
+    if let Some(label) = &q.citation_conversation_label {
+        let want = conv_gt.and_then(|g| {
+            let matches = match_conv_utterances(&g.utterances, &obs.sentences, base_ns);
+            label_dominant(&matches, label)
+        });
+        match (want, ok) {
+            (Some(w), true) => {
+                ok = ids[0] == w;
+                detail = format!("{detail}; cited {} vs label '{label}' dominant {w}", ids[0]);
+            }
+            (Some(w), false) => detail = format!("{detail}; label '{label}' dominant {w} (unchecked: not a single id)"),
+            (None, _) => {
+                ok = false;
+                detail = format!("{detail}; label '{label}' has no dominant conversation id in ground truth");
+            }
+        }
+    }
+    Metric::new(key, if ok { 1.0 } else { 0.0 }, Direction::Boolean, ok, detail)
 }
 
 /// Embed `text` via the same Ollama the RAG/worker use (`/api/embeddings`, `EMBED_MODEL`). Local +
@@ -686,6 +1056,221 @@ fn number_word(n: i64) -> Option<String> {
     }
 }
 
+// ----- advisor ---------------------------------------------------------------
+
+/// Score a scripted advisor conversation (the `advisor` modality). Deterministic-first, like
+/// `score_chat`: every check tests STRUCTURE (did a follow-up round fire, did the turn end in an
+/// answer, what grounded it) or FACTS (substrings), never prose shape. Metric keys are indexed by
+/// turn position (`advisor.t{i}.*`) so baselines line up — do NOT reorder a fixture's turns once
+/// a baseline exists. Sync + pure (no service calls): the live querying already happened in
+/// `query_advisor`, and any transport failure went INCONCLUSIVE before reaching here.
+pub fn score_advisor(gt: &AdvisorGt, turns: &[crate::query_advisor::AdvisorTurnResult]) -> Vec<Metric> {
+    let mut m = Vec::new();
+    for (i, (t, r)) in gt.turns.iter().zip(turns.iter()).enumerate() {
+        let p = |k: &str| format!("advisor.t{i}.{k}");
+        let ans_norm = normalize(&r.answer);
+
+        // Guard: a swallowed `error` event must not silently pass the other checks.
+        m.push(Metric::new(
+            p("errored"),
+            if r.errored { 0.0 } else { 1.0 },
+            Direction::Boolean,
+            !r.errored,
+            if r.errored { "stream reported an error event" } else { "clean stream" },
+        ));
+
+        if let Some(want) = t.expect_questions {
+            let ok = r.saw_questions == want;
+            let detail = match (want, r.saw_questions) {
+                (true, true) => format!("follow-up round fired ({} questions)", r.questions.len()),
+                (true, false) => "expected a follow-up questions round; none fired".to_string(),
+                (false, false) => "no follow-up round (as expected)".to_string(),
+                (false, true) => format!("unexpected follow-up round: {:?}", r.questions),
+            };
+            m.push(Metric::new(p("questions"), if ok { 1.0 } else { 0.0 }, Direction::Boolean, ok, detail));
+        }
+        if let Some(want) = t.expect_final_answer {
+            // "Ended in a final answer" == token text streamed (a questions turn streams none).
+            let has_answer = !ans_norm.is_empty();
+            let ok = has_answer == want;
+            let detail = match (want, has_answer) {
+                (true, true) => format!("final answer streamed ({} chars)", r.answer.len()),
+                (true, false) if r.saw_questions => "turn ended in a questions round, not an answer".to_string(),
+                (true, false) => "no final answer text streamed".to_string(),
+                (false, false) => "no final answer (as expected)".to_string(),
+                (false, true) => {
+                    let head: String = r.answer.chars().take(160).collect();
+                    format!("unexpected final answer: {head:?}")
+                }
+            };
+            m.push(Metric::new(p("final_answer"), if ok { 1.0 } else { 0.0 }, Direction::Boolean, ok, detail));
+        }
+        if !t.expect_chapters_any.is_empty() {
+            let ok = t.expect_chapters_any.iter().any(|c| r.chapters.contains(c));
+            m.push(Metric::new(
+                p("chapters_any"),
+                if ok { 1.0 } else { 0.0 },
+                Direction::Boolean,
+                ok,
+                format!("final grounding {:?} vs any-of {:?}", r.chapters, t.expect_chapters_any),
+            ));
+        }
+        if !t.expect_chapters_all.is_empty() {
+            let hits = t.expect_chapters_all.iter().filter(|c| r.chapters.contains(c)).count();
+            let frac = hits as f64 / t.expect_chapters_all.len() as f64;
+            m.push(Metric::new(
+                p("chapters_all"),
+                frac,
+                Direction::HigherBetter,
+                frac >= 1.0,
+                format!("{hits}/{} required chapters in final grounding {:?}", t.expect_chapters_all.len(), r.chapters),
+            ));
+        }
+        if !t.expect_substrings.is_empty() {
+            let hits = t.expect_substrings.iter().filter(|s| ans_norm.contains(&normalize(s))).count();
+            let frac = hits as f64 / t.expect_substrings.len() as f64;
+            // On a miss, quote the answer head (the `score_chat` pattern) — a bare count is
+            // undiagnosable (paraphrase drift vs questions-round vs empty stream look identical).
+            let detail = if hits < t.expect_substrings.len() {
+                let head: String = r.answer.chars().take(160).collect();
+                format!("{hits}/{} required substrings present; answer: {head:?}", t.expect_substrings.len())
+            } else {
+                format!("{hits}/{} required substrings present", t.expect_substrings.len())
+            };
+            m.push(Metric::new(p("contains"), frac, Direction::HigherBetter, frac >= 1.0, detail));
+        }
+    }
+    m
+}
+
+#[cfg(test)]
+mod advisor_tests {
+    use super::*;
+    use crate::query_advisor::AdvisorTurnResult;
+
+    fn turn(msg: &str) -> AdvisorTurn {
+        AdvisorTurn {
+            message: msg.into(),
+            expect_questions: None,
+            expect_final_answer: None,
+            expect_chapters_any: vec![],
+            expect_chapters_all: vec![],
+            expect_substrings: vec![],
+        }
+    }
+
+    fn questions_turn() -> AdvisorTurnResult {
+        AdvisorTurnResult {
+            message: "m".into(),
+            session_id: "s".into(),
+            saw_questions: true,
+            questions: vec!["What happened?".into()],
+            ..Default::default()
+        }
+    }
+
+    fn answer_turn(answer: &str, chapters: &[i64]) -> AdvisorTurnResult {
+        AdvisorTurnResult {
+            message: "m".into(),
+            session_id: "s".into(),
+            answer: answer.into(),
+            chapters: chapters.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn find<'a>(ms: &'a [Metric], key: &str) -> &'a Metric {
+        ms.iter().find(|m| m.key == key).unwrap_or_else(|| panic!("metric {key} missing"))
+    }
+
+    #[test]
+    fn questions_assertion_both_polarities() {
+        let mut t0 = turn("bare");
+        t0.expect_questions = Some(true);
+        let mut t1 = turn("full");
+        t1.expect_questions = Some(false);
+        let gt = AdvisorGt { turns: vec![t0, t1] };
+
+        // t0 asked (as expected), t1 answered (as expected) -> both pass.
+        let ms = score_advisor(&gt, &[questions_turn(), answer_turn("do this", &[])]);
+        assert!(find(&ms, "advisor.t0.questions").floor_ok);
+        assert!(find(&ms, "advisor.t1.questions").floor_ok);
+
+        // Flipped observations -> both fail.
+        let ms = score_advisor(&gt, &[answer_turn("do this", &[]), questions_turn()]);
+        assert!(!find(&ms, "advisor.t0.questions").floor_ok);
+        assert!(!find(&ms, "advisor.t1.questions").floor_ok);
+    }
+
+    #[test]
+    fn final_answer_requires_token_text() {
+        let mut t = turn("full context");
+        t.expect_final_answer = Some(true);
+        let gt = AdvisorGt { turns: vec![t] };
+
+        assert!(find(&score_advisor(&gt, &[answer_turn("here is a plan", &[])]), "advisor.t0.final_answer").floor_ok);
+        // A questions round streams no tokens -> the final-answer assertion fails, diagnosably.
+        let m = &score_advisor(&gt, &[questions_turn()]);
+        let fa = find(m, "advisor.t0.final_answer");
+        assert!(!fa.floor_ok);
+        assert!(fa.detail.contains("questions round"));
+
+        // Negative polarity: a questions turn must NOT have streamed an answer.
+        let mut t = turn("bare");
+        t.expect_final_answer = Some(false);
+        let gt = AdvisorGt { turns: vec![t] };
+        assert!(find(&score_advisor(&gt, &[questions_turn()]), "advisor.t0.final_answer").floor_ok);
+        assert!(!find(&score_advisor(&gt, &[answer_turn("surprise", &[])]), "advisor.t0.final_answer").floor_ok);
+    }
+
+    #[test]
+    fn chapters_any_and_all_check_final_grounding() {
+        let mut t = turn("q");
+        t.expect_chapters_any = vec![3, 7];
+        t.expect_chapters_all = vec![3, 9];
+        let gt = AdvisorGt { turns: vec![t] };
+
+        let ms = score_advisor(&gt, &[answer_turn("a", &[3, 9, 12])]);
+        assert!(find(&ms, "advisor.t0.chapters_any").floor_ok); // 3 present
+        let all = find(&ms, "advisor.t0.chapters_all");
+        assert_eq!(all.value, 1.0); // 3 and 9 both present
+        assert!(all.floor_ok);
+
+        let ms = score_advisor(&gt, &[answer_turn("a", &[9])]);
+        assert!(!find(&ms, "advisor.t0.chapters_any").floor_ok); // neither 3 nor 7
+        let all = find(&ms, "advisor.t0.chapters_all");
+        assert_eq!(all.value, 0.5); // 9 of {3,9}
+        assert!(!all.floor_ok);
+    }
+
+    #[test]
+    fn substrings_are_case_insensitive_and_normalized() {
+        let mut t = turn("q");
+        t.expect_substrings = vec!["Win-Win".into(), "reciprocity".into()];
+        let gt = AdvisorGt { turns: vec![t] };
+        // Case + punctuation differences must not matter (both sides go through `normalize`).
+        let ms = score_advisor(&gt, &[answer_turn("Aim for a win win outcome; use RECIPROCITY.", &[])]);
+        let c = find(&ms, "advisor.t0.contains");
+        assert_eq!(c.value, 1.0);
+        assert!(c.floor_ok);
+
+        let ms = score_advisor(&gt, &[answer_turn("Aim for a win win outcome.", &[])]);
+        let c = find(&ms, "advisor.t0.contains");
+        assert_eq!(c.value, 0.5);
+        assert!(!c.floor_ok);
+        assert!(c.detail.contains("answer:")); // miss quotes the answer head
+    }
+
+    #[test]
+    fn errored_stream_gates_even_without_assertions() {
+        let gt = AdvisorGt { turns: vec![turn("q")] };
+        let mut r = answer_turn("partial", &[]);
+        r.errored = true;
+        assert!(!find(&score_advisor(&gt, &[r]), "advisor.t0.errored").floor_ok);
+        assert!(find(&score_advisor(&gt, &[answer_turn("ok", &[])]), "advisor.t0.errored").floor_ok);
+    }
+}
+
 #[cfg(test)]
 mod chat_tests {
     use super::*;
@@ -704,5 +1289,235 @@ mod chat_tests {
     fn cosine_of_identical_is_one() {
         let v = vec![0.1f32, 0.2, 0.3];
         assert!((cosine(&v, &v) - 1.0).abs() < 1e-9);
+    }
+}
+
+#[cfg(test)]
+mod conversation_tests {
+    use super::*;
+
+    fn u(n: u128) -> Uuid {
+        Uuid::from_u128(n)
+    }
+
+    fn sent(text: &str, start: i64, end: i64, conv: Option<Uuid>) -> Sentence {
+        Sentence {
+            text: text.into(),
+            start_ns: start,
+            end_ns: end,
+            sentiment: None,
+            speaker_id: None,
+            conversation_id: conv,
+        }
+    }
+
+    fn utt(label: &str, contains: &str, a: i64, b: i64) -> ConvUttGt {
+        ConvUttGt { label: label.into(), text_contains: contains.into(), window_ns: [a, b] }
+    }
+
+    fn find<'a>(ms: &'a [Metric], key: &str) -> &'a Metric {
+        ms.iter().find(|m| m.key == key).unwrap_or_else(|| panic!("metric {key} missing"))
+    }
+
+    #[test]
+    fn pairwise_f1_perfect_clustering() {
+        let utts = vec![
+            ("A".to_string(), Some(u(1))),
+            ("A".to_string(), Some(u(1))),
+            ("B".to_string(), Some(u(2))),
+        ];
+        let (p, r, f1) = conv_pairwise_f1(&utts);
+        assert_eq!((p, r, f1), (1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn pairwise_f1_everything_merged() {
+        // 3 utterances all on one observed id: same_obs=3 pairs, same_gt=1 (A-A), both=1
+        // -> P 1/3, R 1, F1 0.5.
+        let utts = vec![
+            ("A".to_string(), Some(u(1))),
+            ("A".to_string(), Some(u(1))),
+            ("B".to_string(), Some(u(1))),
+        ];
+        let (p, r, f1) = conv_pairwise_f1(&utts);
+        assert!((p - 1.0 / 3.0).abs() < 1e-9);
+        assert!((r - 1.0).abs() < 1e-9);
+        assert!((f1 - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn canon_conv_labels_joins_must_merge_components() {
+        // T1+T2 are one GT conversation (declared via must_merge); T3 stands alone. Canonical
+        // key = smallest label of the component, so T1/T2 pairs stop counting as "should split".
+        let gt = ConversationsGt {
+            distinct_count: 2,
+            count_tolerance: 0,
+            min_pairwise_f1: 0.9,
+            min_coverage: 0.9,
+            must_not_merge: vec![],
+            must_merge: vec![["T1".into(), "T2".into()]],
+            utterances: vec![
+                ConvUttGt { label: "T1".into(), text_contains: "a".into(), window_ns: [0, 1] },
+                ConvUttGt { label: "T2".into(), text_contains: "b".into(), window_ns: [0, 1] },
+                ConvUttGt { label: "T3".into(), text_contains: "c".into(), window_ns: [0, 1] },
+            ],
+        };
+        let canon = canon_conv_labels(&gt);
+        assert_eq!(canon["T1"], "T1");
+        assert_eq!(canon["T2"], "T1");
+        assert_eq!(canon["T3"], "T3");
+        // With canonical labels, one observed id over T1+T2 is a PERFECT clustering.
+        let utts = vec![
+            (canon["T1"].clone(), Some(u(1))),
+            (canon["T2"].clone(), Some(u(1))),
+        ];
+        let (p, r, f1) = conv_pairwise_f1(&utts);
+        assert_eq!((p, r, f1), (1.0, 1.0, 1.0));
+    }
+
+    #[test]
+    fn pairwise_f1_null_dominant_is_a_singleton() {
+        // Same GT label but one side unthreaded: no same-observed pair -> recall 0 -> F1 0.
+        let utts = vec![("A".to_string(), Some(u(1))), ("A".to_string(), None)];
+        let (p, r, f1) = conv_pairwise_f1(&utts);
+        assert_eq!(p, 1.0); // no predicted pairs -> no false positives
+        assert_eq!(r, 0.0);
+        assert_eq!(f1, 0.0);
+    }
+
+    #[test]
+    fn pairwise_f1_vacuous_is_perfect() {
+        // No same-GT-label pairs and no same-observed pairs => 1.0 by definition.
+        let utts = vec![("A".to_string(), Some(u(1))), ("B".to_string(), Some(u(2)))];
+        assert_eq!(conv_pairwise_f1(&utts).2, 1.0);
+        // Two distinct labels, both unthreaded: also vacuous.
+        let utts = vec![("A".to_string(), None), ("B".to_string(), None)];
+        assert_eq!(conv_pairwise_f1(&utts).2, 1.0);
+    }
+
+    #[test]
+    fn dominant_ties_break_to_smaller_uuid() {
+        let mut c: HashMap<Uuid, usize> = HashMap::new();
+        assert_eq!(dominant_conv_id(&c), None);
+        c.insert(u(7), 2);
+        c.insert(u(3), 2);
+        assert_eq!(dominant_conv_id(&c), Some(u(3))); // tie -> lexicographically smaller
+        c.insert(u(9), 5);
+        assert_eq!(dominant_conv_id(&c), Some(u(9))); // count wins over uuid order
+    }
+
+    #[test]
+    fn dominant_is_most_sentences_via_matching() {
+        // One GT utterance whose window covers 3 sentences: 2x conv 5, 1x conv 4 -> dominant 5.
+        let sentences = vec![
+            sent("alpha one", 0, 10, Some(u(5))),
+            sent("alpha two", 10, 20, Some(u(5))),
+            sent("alpha three", 20, 30, Some(u(4))),
+        ];
+        let matches = match_conv_utterances(&[utt("A", "alpha", 0, 30)], &sentences, 0);
+        assert_eq!(matches[0].dominant, Some(u(5)));
+        // text_contains filters: only "alpha two" matches -> dominant follows the filter.
+        let matches = match_conv_utterances(&[utt("A", "alpha two", 0, 30)], &sentences, 0);
+        assert_eq!(matches[0].dominant, Some(u(5)));
+        // Window filters: only the last sentence overlaps [25,30).
+        let matches = match_conv_utterances(&[utt("A", "alpha", 25, 30)], &sentences, 0);
+        assert_eq!(matches[0].dominant, Some(u(4)));
+    }
+
+    #[test]
+    fn must_not_merge_nulls_never_match() {
+        // Both labels entirely unthreaded (NULL): they must NOT count as sharing an id, so
+        // must_not_merge passes — while coverage correctly fails (nothing threaded).
+        let gt = ConversationsGt {
+            distinct_count: 2,
+            count_tolerance: 0,
+            utterances: vec![utt("A", "hello", 0, 10), utt("B", "world", 10, 20)],
+            min_pairwise_f1: 0.90,
+            min_coverage: 0.90,
+            must_not_merge: vec![["A".into(), "B".into()]],
+            must_merge: vec![],
+        };
+        let obs = Observed {
+            sentences: vec![sent("hello there", 1, 5, None), sent("world peace", 11, 15, None)],
+            ..Default::default()
+        };
+        let ms = score_conversations(&gt, &obs, 0);
+        assert!(find(&ms, "conversations.must_not_merge.A-B").floor_ok);
+        assert!(!find(&ms, "conversations.coverage").floor_ok);
+        // 0 observed ids vs expected 2 -> count_error 2 breaches tolerance 0.
+        let ce = find(&ms, "conversations.count_error");
+        assert_eq!(ce.value, 2.0);
+        assert!(!ce.floor_ok);
+    }
+
+    #[test]
+    fn must_not_merge_fails_on_shared_id_and_must_merge_passes_on_equal_dominants() {
+        let gt = ConversationsGt {
+            distinct_count: 1,
+            count_tolerance: 0,
+            utterances: vec![utt("A", "hello", 0, 10), utt("B", "world", 10, 20)],
+            min_pairwise_f1: 0.90,
+            min_coverage: 0.90,
+            must_not_merge: vec![["A".into(), "B".into()]],
+            must_merge: vec![["A".into(), "B".into()]],
+        };
+        let obs = Observed {
+            sentences: vec![sent("hello there", 1, 5, Some(u(1))), sent("world peace", 11, 15, Some(u(1)))],
+            ..Default::default()
+        };
+        let ms = score_conversations(&gt, &obs, 0);
+        assert!(!find(&ms, "conversations.must_not_merge.A-B").floor_ok);
+        assert!(find(&ms, "conversations.must_merge.A-B").floor_ok);
+        assert!(find(&ms, "conversations.coverage").floor_ok);
+        assert!(find(&ms, "conversations.count_error").floor_ok);
+        // fragmentation Info: 1 observed / 1 expected.
+        assert_eq!(find(&ms, "conversations.fragmentation").value, 1.0);
+    }
+
+    #[test]
+    fn must_merge_requires_non_null_dominants() {
+        let gt = ConversationsGt {
+            distinct_count: 1,
+            count_tolerance: 1,
+            utterances: vec![utt("A", "hello", 0, 10), utt("B", "world", 10, 20)],
+            min_pairwise_f1: 0.90,
+            min_coverage: 0.90,
+            must_not_merge: vec![],
+            must_merge: vec![["A".into(), "B".into()]],
+        };
+        // B unthreaded -> its dominant is None -> must_merge fails even though A has an id.
+        let obs = Observed {
+            sentences: vec![sent("hello there", 1, 5, Some(u(1))), sent("world peace", 11, 15, None)],
+            ..Default::default()
+        };
+        let ms = score_conversations(&gt, &obs, 0);
+        assert!(!find(&ms, "conversations.must_merge.A-B").floor_ok);
+    }
+
+    #[test]
+    fn count_error_scopes_to_union_of_gt_windows() {
+        // A sentence OUTSIDE every GT window carries a third id — it must not inflate the count.
+        let gt = ConversationsGt {
+            distinct_count: 2,
+            count_tolerance: 0,
+            utterances: vec![utt("A", "", 0, 10), utt("B", "", 10, 20)],
+            min_pairwise_f1: 0.90,
+            min_coverage: 0.90,
+            must_not_merge: vec![],
+            must_merge: vec![],
+        };
+        let obs = Observed {
+            sentences: vec![
+                sent("in a", 1, 5, Some(u(1))),
+                sent("in b", 11, 15, Some(u(2))),
+                sent("way outside", 1_000, 1_010, Some(u(3))),
+            ],
+            ..Default::default()
+        };
+        let ms = score_conversations(&gt, &obs, 0);
+        let ce = find(&ms, "conversations.count_error");
+        assert_eq!(ce.value, 0.0);
+        assert!(ce.floor_ok);
+        assert!(find(&ms, "conversations.pairwise_f1").floor_ok);
     }
 }

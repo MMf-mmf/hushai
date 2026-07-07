@@ -1,0 +1,19 @@
+{
+  "conversations": {
+    "distinct_count": 1,
+    "count_tolerance": 1,
+    "min_pairwise_f1": 0.0,
+    "min_coverage": 0.0
+  },
+  "chat": {
+    "questions": [
+      {
+        "ask": "Did anyone talk about buying a boat?",
+        "agent_id": "auto",
+        "must_not_contain": [
+          "yes, they discussed the boat"
+        ]
+      }
+    ]
+  }
+}

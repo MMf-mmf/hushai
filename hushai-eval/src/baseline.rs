@@ -87,5 +87,9 @@ fn unchanged_band(key: &str, dir: Direction) -> f64 {
     if key.starts_with("sentiment.") {
         return 0.20;
     }
+    // Threading: F1/coverage move in small deterministic steps on tiny utterance sets.
+    if key == "conversations.pairwise_f1" || key == "conversations.coverage" {
+        return 0.05;
+    }
     0.10
 }

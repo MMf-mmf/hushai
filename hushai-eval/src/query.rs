@@ -13,6 +13,9 @@ pub struct Sentence {
     pub end_ns: i64,
     pub sentiment: Option<String>,
     pub speaker_id: Option<Uuid>,
+    /// Threaded conversation (migration 0025). NULL = unthreaded (pre-feature history / the
+    /// threader's lagging tail) — the scorer must treat NULL as "no evidence", never an error.
+    pub conversation_id: Option<Uuid>,
 }
 
 #[derive(Debug, Clone)]
@@ -66,11 +69,12 @@ pub async fn observe(
     let has = |m: &str| modalities.iter().any(|x| x == m);
     let mut o = Observed { window: (lo, hi), ..Default::default() };
 
-    if has("transcript") || has("speakers") || has("sentiment") {
+    if has("transcript") || has("speakers") || has("sentiment") || has("conversations") {
         // NB: transcript_sentences.speaker_id is TEXT (a stringified UUID), not a uuid column —
         // read it as String and parse to Uuid to match the speakers catalog (which IS uuid).
-        let rows: Vec<(String, i64, i64, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT text, start_unix_nanos, end_unix_nanos, sentiment, speaker_id
+        // conversation_id (0025) IS a real uuid column, so it decodes as Option<Uuid> directly.
+        let rows: Vec<(String, i64, i64, Option<String>, Option<String>, Option<Uuid>)> = sqlx::query_as(
+            "SELECT text, start_unix_nanos, end_unix_nanos, sentiment, speaker_id, conversation_id
              FROM transcript_sentences
              WHERE device_id = ANY($1) AND start_unix_nanos >= $2 AND start_unix_nanos < $3
              ORDER BY start_unix_nanos",
@@ -82,12 +86,13 @@ pub async fn observe(
         .await?;
         o.sentences = rows
             .into_iter()
-            .map(|(text, start_ns, end_ns, sentiment, spk)| Sentence {
+            .map(|(text, start_ns, end_ns, sentiment, spk, conversation_id)| Sentence {
                 text,
                 start_ns,
                 end_ns,
                 sentiment,
                 speaker_id: spk.and_then(|s| Uuid::parse_str(&s).ok()),
+                conversation_id,
             })
             .collect();
 

@@ -39,6 +39,11 @@ pub struct Source {
     /// `serde(default)` keeps citations persisted before this field (chat_messages.sources) readable.
     #[serde(default)]
     pub visual_context: Option<String>,
+    /// Persisted conversation assignment (migration 0025). `None` = unthreaded (pre-feature
+    /// history or the threader's lag tail) — consumers fall back to the gap heuristic.
+    /// `serde(default)` keeps citations persisted before this field readable.
+    #[serde(default)]
+    pub conversation_id: Option<Uuid>,
 }
 
 impl Default for Source {
@@ -53,6 +58,7 @@ impl Default for Source {
             speaker_name: None,
             time_label: String::new(),
             visual_context: None,
+            conversation_id: None,
         }
     }
 }
@@ -137,7 +143,7 @@ pub async fn nearest(
 
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "SELECT ts.segment_id, ts.device_id, ts.text, ts.start_unix_nanos, ts.speaker_id, \
-         (ts.embedding <=> ",
+         ts.conversation_id, (ts.embedding <=> ",
     );
     qb.push_bind(qvec.clone());
     qb.push(
@@ -185,6 +191,7 @@ pub async fn nearest(
             speaker_name: None,
             time_label: String::new(),
             visual_context: None,
+            conversation_id: row.try_get::<Option<Uuid>, _>("conversation_id")?,
         });
     }
     Ok(sources)
@@ -241,7 +248,8 @@ pub async fn list_by_speaker(
     limit: i64,
 ) -> anyhow::Result<Vec<Source>> {
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-        "SELECT ts.segment_id, ts.device_id, ts.text, ts.start_unix_nanos, ts.speaker_id \
+        "SELECT ts.segment_id, ts.device_id, ts.text, ts.start_unix_nanos, ts.speaker_id, \
+         ts.conversation_id \
          FROM transcript_sentences ts \
          WHERE ts.speaker_id = ANY(",
     );
@@ -275,6 +283,7 @@ pub async fn list_by_speaker(
             speaker_name: None,
             time_label: String::new(),
             visual_context: None,
+            conversation_id: row.try_get::<Option<Uuid>, _>("conversation_id")?,
         });
     }
     Ok(sources)
@@ -296,7 +305,8 @@ pub async fn list_speakers_in_window(
 ) -> anyhow::Result<Vec<Source>> {
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
         "SELECT DISTINCT ON (ts.speaker_id) \
-             ts.segment_id, ts.device_id, ts.text, ts.start_unix_nanos, ts.speaker_id \
+             ts.segment_id, ts.device_id, ts.text, ts.start_unix_nanos, ts.speaker_id, \
+             ts.conversation_id \
          FROM transcript_sentences ts \
          WHERE ts.text IS NOT NULL AND ts.start_unix_nanos >= ",
     );
@@ -325,6 +335,7 @@ pub async fn list_speakers_in_window(
             speaker_name: None,
             time_label: String::new(),
             visual_context: None,
+            conversation_id: row.try_get::<Option<Uuid>, _>("conversation_id")?,
         });
     }
     sources.sort_by_key(|s| s.start_unix_nanos);
@@ -364,6 +375,25 @@ pub struct ConvoSentence {
     pub start_unix_nanos: i64,
     pub end_unix_nanos: i64,
     pub speaker_id: Option<String>,
+    /// Persisted threading assignment (0025). `None` = unthreaded → gap-heuristic fallback.
+    pub conversation_id: Option<Uuid>,
+}
+
+impl ConvoSentence {
+    fn to_source(&self) -> Source {
+        Source {
+            segment_id: self.segment_id,
+            device_id: self.device_id.clone(),
+            text: self.text.clone(),
+            start_unix_nanos: self.start_unix_nanos,
+            distance: 0.0,
+            speaker_id: self.speaker_id.clone(),
+            speaker_name: None,
+            time_label: String::new(),
+            visual_context: None,
+            conversation_id: self.conversation_id,
+        }
+    }
 }
 
 /// The most recent recorded CONVERSATION, chronologically — the "what did we last discuss" path.
@@ -415,7 +445,8 @@ pub async fn latest_conversation(
     // 2. Backscan that device's timeline at/before the anchor (respect an explicit `after` floor),
     //    newest first, capped at scan_limit rows.
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-        "SELECT segment_id, device_id, text, start_unix_nanos, end_unix_nanos, speaker_id \
+        "SELECT segment_id, device_id, text, start_unix_nanos, end_unix_nanos, speaker_id, \
+         conversation_id \
          FROM transcript_sentences \
          WHERE text IS NOT NULL AND device_id = ",
     );
@@ -442,6 +473,7 @@ pub async fn latest_conversation(
                     .try_get::<Option<i64>, _>("end_unix_nanos")?
                     .unwrap_or_else(|| row.try_get("start_unix_nanos").unwrap_or(0)),
                 speaker_id: row.try_get::<Option<String>, _>("speaker_id")?,
+                conversation_id: row.try_get::<Option<Uuid>, _>("conversation_id")?,
             })
         })
         .collect::<Result<_, _>>()?;
@@ -453,6 +485,12 @@ pub async fn latest_conversation(
 /// contiguous conversation (walking back until a silence gap > `gap_nanos`), bounded by
 /// `max_sentences` and cumulative `max_chars`, then return them chronologically as `Source`s.
 /// Split out so the gap/cap logic is unit-testable without a database.
+///
+/// THREADED-FIRST (0025): the backscan also stops when the persisted `conversation_id`
+/// CHANGES from the first non-NULL id seen — two back-to-back different conversations
+/// closer than the gap no longer glue together (the pre-threading contamination hole).
+/// NULL rows (the threader's lag tail / pre-feature history) splice into the adjacent
+/// threaded conversation exactly as before, on the gap rule alone.
 pub fn take_latest_conversation(
     desc: &[ConvoSentence],
     gap_nanos: i64,
@@ -462,12 +500,20 @@ pub fn take_latest_conversation(
     let mut kept: Vec<&ConvoSentence> = Vec::new();
     let mut chars = 0usize;
     let mut prev_start: Option<i64> = None; // the newer (already-kept) sentence's start
+    let mut thread_id: Option<Uuid> = None; // first persisted conversation_id on the walk
     for s in desc {
         if let Some(newer_start) = prev_start {
             // Silence between this (older) sentence's end and the newer sentence's start.
             let gap = newer_start - s.end_unix_nanos;
             if gap > gap_nanos {
                 break; // conversation boundary — everything older belongs to a prior convo
+            }
+        }
+        if let Some(cid) = s.conversation_id {
+            match thread_id {
+                Some(t) if t != cid => break, // a DIFFERENT threaded conversation — stop
+                Some(_) => {}
+                None => thread_id = Some(cid), // the NULL tail spliced onto this conversation
             }
         }
         if kept.len() >= max_sentences {
@@ -484,19 +530,7 @@ pub fn take_latest_conversation(
     }
     // Kept is newest→oldest; emit chronological.
     kept.reverse();
-    kept.into_iter()
-        .map(|s| Source {
-            segment_id: s.segment_id,
-            device_id: s.device_id.clone(),
-            text: s.text.clone(),
-            start_unix_nanos: s.start_unix_nanos,
-            distance: 0.0,
-            speaker_id: s.speaker_id.clone(),
-            speaker_name: None,
-            time_label: String::new(),
-            visual_context: None,
-        })
-        .collect()
+    kept.into_iter().map(ConvoSentence::to_source).collect()
 }
 
 /// ALL conversations in a window ("what have we spoken about today"), grouped per device by the
@@ -517,7 +551,8 @@ pub async fn conversations_in_window(
     max_total_chars: usize,
 ) -> anyhow::Result<Vec<Vec<Source>>> {
     let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
-        "SELECT segment_id, device_id, text, start_unix_nanos, end_unix_nanos, speaker_id \
+        "SELECT segment_id, device_id, text, start_unix_nanos, end_unix_nanos, speaker_id, \
+         conversation_id \
          FROM transcript_sentences \
          WHERE text IS NOT NULL",
     );
@@ -547,6 +582,7 @@ pub async fn conversations_in_window(
                     .try_get::<Option<i64>, _>("end_unix_nanos")?
                     .unwrap_or_else(|| row.try_get("start_unix_nanos").unwrap_or(0)),
                 speaker_id: row.try_get::<Option<String>, _>("speaker_id")?,
+                conversation_id: row.try_get::<Option<Uuid>, _>("conversation_id")?,
             })
         })
         .collect::<Result<_, _>>()?;
@@ -555,9 +591,15 @@ pub async fn conversations_in_window(
 
 /// Pure core of [`conversations_in_window`]: split DESC-ordered sentences into conversations —
 /// per DEVICE (a conversation lives on one camera's timeline; interleaved devices must not
-/// fragment each other), split on silence gaps > `gap_nanos` (the [`take_latest_conversation`]
-/// rule) — then keep the `max_convos` most RECENT conversations across all devices under a
-/// global char budget, and emit them oldest-first with chronological sentences.
+/// fragment each other) — then keep the `max_convos` most RECENT conversations across all
+/// devices under a global char budget, and emit them oldest-first with chronological sentences.
+///
+/// THREADED-FIRST (0025): rows carrying a persisted `conversation_id` group EXACTLY by that
+/// id (this is what separates two concurrent group conversations interleaved on ONE mic —
+/// the gap rule alone cannot). Only the NULL remainder (threader lag tail / pre-feature
+/// history) falls back to the silence-gap split; a NULL run then splices into the threaded
+/// conversation it is time-adjacent to (within `gap_nanos`) on the same device, so an open
+/// conversation and its unthreaded tail read as one.
 pub fn group_conversations(
     desc: &[ConvoSentence],
     gap_nanos: i64,
@@ -571,23 +613,71 @@ pub fn group_conversations(
     for s in desc {
         per_device.entry(s.device_id.as_str()).or_default().push(s);
     }
-    // Gap-split each device timeline into conversations (each newest→oldest internally).
     let mut convos: Vec<Vec<&ConvoSentence>> = Vec::new();
     for sentences in per_device.into_values() {
-        let mut current: Vec<&ConvoSentence> = Vec::new();
+        // 1. Threaded rows bucket by id (DESC order preserved; first-seen = newest first).
+        let mut threaded: Vec<(Uuid, Vec<&ConvoSentence>)> = Vec::new();
+        let mut nulls: Vec<&ConvoSentence> = Vec::new();
         for s in sentences {
+            match s.conversation_id {
+                Some(cid) => match threaded.iter_mut().find(|(id, _)| *id == cid) {
+                    Some((_, group)) => group.push(s),
+                    None => threaded.push((cid, vec![s])),
+                },
+                None => nulls.push(s),
+            }
+        }
+        // 2. Gap-split the NULL remainder (adjacent gaps within the NULL subsequence).
+        let mut null_runs: Vec<Vec<&ConvoSentence>> = Vec::new();
+        let mut current: Vec<&ConvoSentence> = Vec::new();
+        for s in nulls {
             if let Some(prev) = current.last() {
                 // `prev` is the NEWER sentence (DESC walk); silence between them:
                 let gap = prev.start_unix_nanos - s.end_unix_nanos;
                 if gap > gap_nanos {
-                    convos.push(std::mem::take(&mut current));
+                    null_runs.push(std::mem::take(&mut current));
                 }
             }
             current.push(s);
         }
         if !current.is_empty() {
-            convos.push(current);
+            null_runs.push(current);
         }
+        // 3. Splice each NULL run into the time-nearest threaded group within the gap
+        //    (deterministic: minimal distance, then smaller conversation_id). Runs with no
+        //    adjacent threaded group stand alone (pre-feature history keeps working).
+        for run in null_runs {
+            let run_newest = run.first().map(|s| s.start_unix_nanos).unwrap_or(0);
+            let run_oldest_end = run.last().map(|s| s.end_unix_nanos).unwrap_or(0);
+            let mut best: Option<(i64, Uuid)> = None;
+            for (cid, group) in &threaded {
+                let g_newest = group.first().map(|s| s.start_unix_nanos).unwrap_or(0);
+                let g_oldest_end = group.last().map(|s| s.end_unix_nanos).unwrap_or(0);
+                // Distance between the run's span and the group's span (0 if overlapping).
+                let dist = if run_oldest_end > g_newest {
+                    run_oldest_end - g_newest
+                } else if g_oldest_end > run_newest {
+                    g_oldest_end - run_newest
+                } else {
+                    0
+                };
+                if dist <= gap_nanos
+                    && best.is_none_or(|(bd, bid)| dist < bd || (dist == bd && *cid < bid))
+                {
+                    best = Some((dist, *cid));
+                }
+            }
+            match best {
+                Some((_, cid)) => {
+                    let (_, group) = threaded.iter_mut().find(|(id, _)| *id == cid).unwrap();
+                    group.extend(run);
+                    // Restore DESC order after the splice.
+                    group.sort_by_key(|s| std::cmp::Reverse((s.start_unix_nanos, s.segment_id)));
+                }
+                None => convos.push(run),
+            }
+        }
+        convos.extend(threaded.into_iter().map(|(_, g)| g));
     }
     // Most recent conversations first (by their newest sentence), keep max_convos.
     convos.sort_by_key(|c| std::cmp::Reverse(c.first().map(|s| s.start_unix_nanos).unwrap_or(0)));
@@ -611,24 +701,237 @@ pub fn group_conversations(
             break; // out of budget — older conversations are dropped entirely
         }
         kept.reverse(); // newest→oldest becomes chronological
-        out.push(
-            kept.into_iter()
-                .map(|s| Source {
-                    segment_id: s.segment_id,
-                    device_id: s.device_id.clone(),
-                    text: s.text.clone(),
-                    start_unix_nanos: s.start_unix_nanos,
-                    distance: 0.0,
-                    speaker_id: s.speaker_id.clone(),
-                    speaker_name: None,
-                    time_label: String::new(),
-                    visual_context: None,
-                })
-                .collect(),
-        );
+        out.push(kept.into_iter().map(ConvoSentence::to_source).collect());
     }
     out.reverse(); // recent-first selection becomes oldest-first narration order
     out
+}
+
+/// Relative-margin prune on semantic hits: keep only hits with `distance <= best + margin`.
+/// Complements the absolute `distance_threshold` — an unrelated conversation's hit can sit
+/// just under the absolute cutoff, and one such hit is enough for `expand_to_conversations`
+/// to drag that whole conversation into the grounded prompt. Runs BEFORE expansion.
+/// Deterministic rows carry `distance 0.0`, so `best` is 0.0 there and they all survive.
+/// A `margin <= 0` disables the prune. Pure and order-preserving.
+pub fn prune_rel_margin(sources: &mut Vec<Source>, margin: f64) {
+    if margin <= 0.0 || sources.is_empty() {
+        return;
+    }
+    let best = sources.iter().map(|s| s.distance).fold(f64::INFINITY, f64::min);
+    let cutoff = best + margin;
+    sources.retain(|s| s.distance <= cutoff);
+}
+
+/// Expand pruned semantic hits into CONVERSATION-scoped groups (0025). Hits sharing a
+/// persisted `conversation_id` become one group, widened with that conversation's own
+/// sentences within ±`window_nanos` of the hits (one indexed fetch per conversation on
+/// `transcript_sentences_conversation_time_idx` — never a blind device time-window, so a
+/// concurrent conversation can never bleed in). Unthreaded (NULL) hits stay single-sentence
+/// groups — today's exact behavior. Groups come back most-relevant-first (best hit
+/// distance); neighbors carry `distance 0.0` (the deterministic-path convention) and are
+/// deduped against the hits. `max_total_chars` bounds the whole expansion.
+pub async fn expand_to_conversations(
+    pool: &PgPool,
+    hits: &[Source],
+    window_nanos: i64,
+    max_sentences_per: usize,
+    max_total_chars: usize,
+) -> anyhow::Result<Vec<Vec<Source>>> {
+    // Distinct conversation ids in best-distance-first order; NULL hits pass through.
+    let mut order: Vec<Option<Uuid>> = Vec::new();
+    for h in hits {
+        if !order.contains(&h.conversation_id) {
+            order.push(h.conversation_id);
+        }
+    }
+    let mut budget = max_total_chars;
+    let mut groups: Vec<Vec<Source>> = Vec::new();
+    for cid in order {
+        let members: Vec<&Source> = hits
+            .iter()
+            .filter(|h| h.conversation_id == cid)
+            .collect();
+        let Some(cid) = cid else {
+            // Unthreaded hits: one single-sentence group each (fallback path).
+            for h in members {
+                budget = budget.saturating_sub(h.text.trim().chars().count());
+                groups.push(vec![h.clone()]);
+            }
+            continue;
+        };
+        let lo = members.iter().map(|h| h.start_unix_nanos).min().unwrap_or(0) - window_nanos;
+        let hi = members.iter().map(|h| h.start_unix_nanos).max().unwrap_or(0) + window_nanos;
+        let rows = sqlx::query(
+            "SELECT segment_id, device_id, text, start_unix_nanos, speaker_id, conversation_id \
+             FROM transcript_sentences \
+             WHERE conversation_id = $1 AND start_unix_nanos >= $2 AND start_unix_nanos <= $3 \
+               AND text IS NOT NULL \
+             ORDER BY start_unix_nanos, segment_id LIMIT $4",
+        )
+        .bind(cid)
+        .bind(lo)
+        .bind(hi)
+        .bind(max_sentences_per.max(1) as i64)
+        .fetch_all(pool)
+        .await?;
+        let mut group: Vec<Source> = Vec::new();
+        for row in rows {
+            let seg: Uuid = row.try_get("segment_id")?;
+            let start: i64 = row.try_get("start_unix_nanos")?;
+            // The hit row (with its real distance) wins over its neighbor duplicate.
+            if let Some(hit) = members
+                .iter()
+                .find(|h| h.segment_id == seg && h.start_unix_nanos == start)
+            {
+                group.push((*hit).clone());
+                continue;
+            }
+            let text: String = row.try_get::<Option<String>, _>("text")?.unwrap_or_default();
+            let add = text.trim().chars().count();
+            if add > budget && !group.is_empty() {
+                continue; // budget spent — keep the hits, skip further neighbors
+            }
+            budget = budget.saturating_sub(add);
+            group.push(Source {
+                segment_id: seg,
+                device_id: row
+                    .try_get::<Option<String>, _>("device_id")?
+                    .unwrap_or_default(),
+                text,
+                start_unix_nanos: start,
+                distance: 0.0,
+                speaker_id: row.try_get::<Option<String>, _>("speaker_id")?,
+                speaker_name: None,
+                time_label: String::new(),
+                visual_context: None,
+                conversation_id: Some(cid),
+            });
+        }
+        // Any hit the window fetch missed (e.g. LIMIT) still must appear.
+        for h in members {
+            if !group
+                .iter()
+                .any(|s| s.segment_id == h.segment_id && s.start_unix_nanos == h.start_unix_nanos)
+            {
+                group.push(h.clone());
+            }
+        }
+        group.sort_by_key(|s| (s.start_unix_nanos, s.segment_id));
+        groups.push(group);
+    }
+    Ok(groups)
+}
+
+/// Rebuild conversation groups from a flattened source list + per-group lengths (the
+/// flatten order is the render order, so citations line up). Used by the chat path, which
+/// must enrich the FLAT list (global unnamed-speaker ordinals) before re-grouping.
+pub fn regroup_sources(flat: &[Source], lens: &[usize]) -> Vec<Vec<Source>> {
+    let mut out = Vec::with_capacity(lens.len());
+    let mut i = 0usize;
+    for &n in lens {
+        let end = (i + n).min(flat.len());
+        out.push(flat[i..end].to_vec());
+        i = end;
+    }
+    out
+}
+
+/// Conversation catalog row for the list endpoint / participants queries.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ConversationMeta {
+    pub conversation_id: Uuid,
+    pub device_id: Option<String>,
+    pub started_at_unix_nanos: i64,
+    pub ended_at_unix_nanos: i64,
+    pub status: String,
+    /// Speaker uuids as text (display names resolve at the caller via `speakers::name_map`).
+    pub speaker_ids: Vec<String>,
+    pub sentence_count: i32,
+}
+
+/// List conversations newest-first, optionally filtered by device / window / a participant
+/// set (every id in `speaker_ids` must have spoken: `speaker_ids @> $n`, GIN-backed).
+pub async fn list_conversations(
+    pool: &PgPool,
+    device_id: Option<&str>,
+    after: Option<i64>,
+    before: Option<i64>,
+    speaker_ids: Option<&[Uuid]>,
+    limit: i64,
+) -> anyhow::Result<Vec<ConversationMeta>> {
+    let mut qb: QueryBuilder<Postgres> = QueryBuilder::new(
+        "SELECT conversation_id, primary_device_id, started_at_unix_nanos, ended_at_unix_nanos, \
+         status, speaker_ids, sentence_count FROM conversations WHERE TRUE",
+    );
+    if let Some(d) = device_id {
+        qb.push(" AND primary_device_id = ").push_bind(d.to_string());
+    }
+    if let Some(a) = after {
+        qb.push(" AND ended_at_unix_nanos >= ").push_bind(a);
+    }
+    if let Some(b) = before {
+        qb.push(" AND started_at_unix_nanos < ").push_bind(b);
+    }
+    if let Some(ids) = speaker_ids {
+        qb.push(" AND speaker_ids @> ").push_bind(ids.to_vec());
+    }
+    qb.push(" ORDER BY started_at_unix_nanos DESC LIMIT ")
+        .push_bind(limit.clamp(1, 500));
+    let rows = qb.build().fetch_all(pool).await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(ConversationMeta {
+                conversation_id: row.try_get("conversation_id")?,
+                device_id: row.try_get::<Option<String>, _>("primary_device_id")?,
+                started_at_unix_nanos: row.try_get("started_at_unix_nanos")?,
+                ended_at_unix_nanos: row.try_get("ended_at_unix_nanos")?,
+                status: row.try_get("status")?,
+                speaker_ids: row
+                    .try_get::<Vec<Uuid>, _>("speaker_ids")?
+                    .into_iter()
+                    .map(|u| u.to_string())
+                    .collect(),
+                sentence_count: row.try_get("sentence_count")?,
+            })
+        })
+        .collect()
+}
+
+/// The full ordered transcript of ONE conversation, as `Source`s (distance 0.0), ready for
+/// `enrich_for_display`. Bounded by `max_sentences`.
+pub async fn conversation_transcript(
+    pool: &PgPool,
+    conversation_id: Uuid,
+    max_sentences: usize,
+) -> anyhow::Result<Vec<Source>> {
+    let rows = sqlx::query(
+        "SELECT segment_id, device_id, text, start_unix_nanos, speaker_id, conversation_id \
+         FROM transcript_sentences \
+         WHERE conversation_id = $1 AND text IS NOT NULL \
+         ORDER BY start_unix_nanos, segment_id LIMIT $2",
+    )
+    .bind(conversation_id)
+    .bind(max_sentences.max(1) as i64)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            Ok(Source {
+                segment_id: row.try_get("segment_id")?,
+                device_id: row
+                    .try_get::<Option<String>, _>("device_id")?
+                    .unwrap_or_default(),
+                text: row.try_get::<Option<String>, _>("text")?.unwrap_or_default(),
+                start_unix_nanos: row.try_get("start_unix_nanos")?,
+                distance: 0.0,
+                speaker_id: row.try_get::<Option<String>, _>("speaker_id")?,
+                speaker_name: None,
+                time_label: String::new(),
+                visual_context: None,
+                conversation_id: row.try_get::<Option<Uuid>, _>("conversation_id")?,
+            })
+        })
+        .collect()
 }
 
 /// Open-vocabulary OBJECT retrieval (Phase B query side): the `top_k` nearest `scene_objects` rows
@@ -716,6 +1019,7 @@ pub async fn nearest_objects(
             speaker_name: None,
             time_label: String::new(),
             visual_context: None,
+            conversation_id: None,
         });
         if sources.len() as i64 >= top_k {
             break;
@@ -773,6 +1077,7 @@ pub async fn list_by_object_class(
             speaker_name: None,
             time_label: String::new(),
             visual_context: None,
+            conversation_id: None,
         });
     }
     sources.sort_by_key(|s| s.start_unix_nanos);
@@ -876,6 +1181,7 @@ pub async fn list_by_plate(
             speaker_name: None,
             time_label: String::new(),
             visual_context: None,
+            conversation_id: None,
         });
     }
     sources.sort_by_key(|s| s.start_unix_nanos);
@@ -950,6 +1256,7 @@ pub async fn list_co_occurring_persons(
             speaker_name: None,
             time_label: String::new(),
             visual_context: None,
+            conversation_id: None,
         });
     }
     Ok(sources)
@@ -1002,6 +1309,7 @@ pub async fn list_recent_persons(
             speaker_name: None,
             time_label: String::new(),
             visual_context: None,
+            conversation_id: None,
         });
     }
     Ok(sources)
@@ -1116,6 +1424,7 @@ pub async fn list_events(
             speaker_name: None,
             time_label: String::new(),
             visual_context: None,
+            conversation_id: None,
         });
     }
     Ok(sources)
@@ -1139,6 +1448,7 @@ fn person_rows_to_sources(rows: Vec<sqlx::postgres::PgRow>) -> anyhow::Result<Ve
             speaker_name: None,
             time_label: String::new(),
             visual_context: None,
+            conversation_id: None,
         });
     }
     Ok(sources)
@@ -1157,10 +1467,50 @@ mod tests {
             start_unix_nanos: start_secs * 1_000_000_000,
             end_unix_nanos: (start_secs + dur_secs) * 1_000_000_000,
             speaker_id: None,
+            conversation_id: None,
+        }
+    }
+
+    /// Same as [`sent`] but carrying a persisted conversation id (threaded row).
+    fn tsent(start_secs: i64, dur_secs: i64, text: &str, convo: u128) -> ConvoSentence {
+        ConvoSentence {
+            conversation_id: Some(Uuid::from_u128(convo)),
+            ..sent(start_secs, dur_secs, text)
         }
     }
 
     const GAP: i64 = 300 * 1_000_000_000; // 5 min, the default conversation gap
+
+    /// A semantic hit at the given cosine distance (only `distance` matters to the prune).
+    fn hit(distance: f64) -> Source {
+        Source { distance, ..sent(0, 2, "hit").to_source() }
+    }
+
+    #[test]
+    fn prune_rel_margin_drops_hits_far_from_best() {
+        // best 0.286 + margin 0.25 = 0.536: the 0.597 cross-conversation straggler dies,
+        // on-topic spread survives.
+        let mut s: Vec<Source> = [0.286, 0.302, 0.41, 0.521, 0.597].map(hit).into();
+        prune_rel_margin(&mut s, 0.25);
+        let kept: Vec<f64> = s.iter().map(|x| x.distance).collect();
+        assert_eq!(kept, vec![0.286, 0.302, 0.41, 0.521]);
+    }
+
+    #[test]
+    fn prune_rel_margin_keeps_deterministic_rows_and_respects_disable() {
+        // Exhaustive/deterministic rows all carry 0.0 — nothing is dropped.
+        let mut det: Vec<Source> = [0.0, 0.0, 0.0].map(hit).into();
+        prune_rel_margin(&mut det, 0.25);
+        assert_eq!(det.len(), 3);
+        // margin <= 0 disables entirely.
+        let mut off: Vec<Source> = [0.1, 0.9].map(hit).into();
+        prune_rel_margin(&mut off, 0.0);
+        assert_eq!(off.len(), 2);
+        // Empty input is a no-op, not a panic.
+        let mut empty: Vec<Source> = vec![];
+        prune_rel_margin(&mut empty, 0.25);
+        assert!(empty.is_empty());
+    }
 
     #[test]
     fn keeps_single_contiguous_conversation_in_chronological_order() {
@@ -1215,6 +1565,83 @@ mod tests {
     #[test]
     fn empty_input_yields_empty() {
         assert!(take_latest_conversation(&[], GAP, 40, 4000).is_empty());
+    }
+
+    #[test]
+    fn backscan_stops_when_threaded_conversation_changes() {
+        // Two back-to-back threaded conversations only 10s apart (< GAP): the pre-0025
+        // gap rule glued them; the id change must now stop the walk.
+        let desc = vec![
+            tsent(200, 2, "convo-b two", 0xB),
+            tsent(196, 2, "convo-b one", 0xB),
+            tsent(186, 2, "convo-a tail", 0xA), // 8s gap — inside GAP, different convo
+        ];
+        let out = take_latest_conversation(&desc, GAP, 40, 4000);
+        let texts: Vec<&str> = out.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["convo-b one", "convo-b two"], "id change is a hard stop");
+    }
+
+    #[test]
+    fn null_lag_tail_splices_onto_the_open_conversation() {
+        // The newest rows are unthreaded (threader lag); they splice onto the threaded
+        // conversation they're gap-contiguous with, and the walk still stops at the
+        // OLDER different conversation.
+        let desc = vec![
+            sent(300, 2, "lag two"),
+            sent(296, 2, "lag one"),
+            tsent(290, 2, "open convo", 0xB),
+            tsent(280, 2, "previous convo", 0xA),
+        ];
+        let out = take_latest_conversation(&desc, GAP, 40, 4000);
+        let texts: Vec<&str> = out.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["open convo", "lag one", "lag two"]);
+    }
+
+    #[test]
+    fn interleaved_threaded_conversations_group_by_id_not_gap() {
+        // Two concurrent group conversations interleaved on ONE device — the 0025 case
+        // the gap rule cannot separate. Rows carry their persisted ids.
+        let desc = vec![
+            tsent(118, 2, "b three", 0xB),
+            tsent(112, 2, "a three", 0xA),
+            tsent(106, 2, "b two", 0xB),
+            tsent(100, 2, "a two", 0xA),
+            tsent(94, 2, "b one", 0xB),
+            tsent(88, 2, "a one", 0xA),
+        ];
+        let convos = group_conversations(&desc, GAP, 8, 40, 4000);
+        assert_eq!(convos.len(), 2, "one group per conversation_id");
+        for c in &convos {
+            let cid = c[0].conversation_id;
+            assert!(c.iter().all(|s| s.conversation_id == cid), "no cross-id mixing");
+            assert_eq!(c.len(), 3);
+        }
+    }
+
+    #[test]
+    fn null_run_splices_into_adjacent_threaded_group() {
+        // A threaded conversation with an unthreaded lag tail 4s after it: one group.
+        // A far-away NULL run (an hour earlier) stands alone.
+        let desc = vec![
+            sent(204, 2, "tail two"),
+            sent(200, 2, "tail one"),
+            tsent(194, 2, "threaded two", 0xC),
+            tsent(190, 2, "threaded one", 0xC),
+            sent(-3600, 2, "ancient history"),
+        ];
+        let convos = group_conversations(&desc, GAP, 8, 40, 4000);
+        assert_eq!(convos.len(), 2);
+        let spliced = convos
+            .iter()
+            .find(|c| c.iter().any(|s| s.text == "threaded one"))
+            .unwrap();
+        let texts: Vec<&str> = spliced.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(texts, vec!["threaded one", "threaded two", "tail one", "tail two"]);
+        let standalone = convos
+            .iter()
+            .find(|c| c.iter().any(|s| s.text == "ancient history"))
+            .unwrap();
+        assert_eq!(standalone.len(), 1);
     }
 
     /// Same as [`sent`] but on a chosen device (group_conversations partitions per device).

@@ -1,0 +1,24 @@
+{
+  "case_id": "money_talk",
+  "config_hash": "9101d523bb6b975c",
+  "git_sha": "37a8372",
+  "metrics": {
+    "chat.q0.citations": 6.0,
+    "chat.q0.contains": 1.0,
+    "chat.q0.errored": 1.0,
+    "chat.q0.routed": 1.0,
+    "chat.q0.similarity": 0.9216268424698195,
+    "chat.q1.clean": 1.0,
+    "chat.q1.contains": 1.0,
+    "chat.q1.errored": 1.0,
+    "chat.q2.clean": 1.0,
+    "chat.q2.contains": 1.0,
+    "chat.q2.errored": 1.0,
+    "chat.q2.similarity": 0.85867012812306,
+    "conversations.count_error": 0.0,
+    "conversations.fragmentation": 1.0,
+    "sentiment.accuracy": 1.0,
+    "transcript.similarity": 0.958139534883721,
+    "transcript.wer": 0.07142857142857142
+  }
+}

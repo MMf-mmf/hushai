@@ -9,6 +9,7 @@
 pub mod audit;
 pub mod auth;
 pub mod config;
+pub mod conversations;
 pub mod db;
 pub mod devices;
 pub mod error;
@@ -25,6 +26,7 @@ pub mod routes;
 pub mod speakers;
 pub mod state;
 pub mod storage;
+pub mod threading;
 pub mod tls;
 pub mod watchlist;
 

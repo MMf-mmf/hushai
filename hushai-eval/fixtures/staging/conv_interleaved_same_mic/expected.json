@@ -1,0 +1,105 @@
+{
+  "transcript": {
+    "full_text": "the kitchen renovation starts next week. the contractor wants to install the cabinets first. did you watch the football match last night? the referee gave two penalties in the second half. good. the countertop and the new sink arrive on thursday so the cabinets must be done by then. yes. the goalkeeper saved the first penalty but the striker scored the winning goal at the end. i will confirm the cabinet delivery and make sure the plumber comes for the sink. our team climbs to second place in the league table with that goal.",
+    "max_wer": 0.4,
+    "min_similarity": 0.55
+  },
+  "conversations": {
+    "distinct_count": 2,
+    "count_tolerance": 0,
+    "min_pairwise_f1": 0.7,
+    "min_coverage": 0.9,
+    "must_not_merge": [
+      [
+        "RENO",
+        "BALL"
+      ]
+    ],
+    "utterances": [
+      {
+        "label": "RENO",
+        "text_contains": "renovation",
+        "window_ns": [
+          0,
+          12000000000
+        ]
+      },
+      {
+        "label": "BALL",
+        "text_contains": "penalties",
+        "window_ns": [
+          12000000000,
+          24000000000
+        ]
+      },
+      {
+        "label": "RENO",
+        "text_contains": "countertop",
+        "window_ns": [
+          24000000000,
+          36000000000
+        ]
+      },
+      {
+        "label": "BALL",
+        "text_contains": "goalkeeper",
+        "window_ns": [
+          36000000000,
+          48000000000
+        ]
+      },
+      {
+        "label": "RENO",
+        "text_contains": "cabinet delivery",
+        "window_ns": [
+          48000000000,
+          60000000000
+        ]
+      },
+      {
+        "label": "BALL",
+        "text_contains": "league table",
+        "window_ns": [
+          60000000000,
+          72000000000
+        ]
+      }
+    ]
+  },
+  "chat": {
+    "questions": [
+      {
+        "ask": "What did they say about the kitchen renovation?",
+        "agent_id": "auto",
+        "must_contain": [
+          "cabinet"
+        ],
+        "must_not_contain": [
+          "football",
+          "goal",
+          "referee",
+          "penalty"
+        ],
+        "min_citations": 1,
+        "citations_single_conversation": true,
+        "citation_conversation_label": "RENO"
+      },
+      {
+        "ask": "What was said about the football match?",
+        "agent_id": "auto",
+        "must_contain": [
+          "goal"
+        ],
+        "must_not_contain": [
+          "renovation",
+          "cabinet",
+          "plumber",
+          "sink"
+        ],
+        "min_citations": 1,
+        "citations_single_conversation": true,
+        "citation_conversation_label": "BALL"
+      }
+    ]
+  }
+}

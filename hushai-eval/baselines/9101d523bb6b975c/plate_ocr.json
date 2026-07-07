@@ -1,0 +1,8 @@
+{
+  "case_id": "plate_ocr",
+  "config_hash": "9101d523bb6b975c",
+  "git_sha": "37a8372",
+  "metrics": {
+    "plates.recall": 1.0
+  }
+}

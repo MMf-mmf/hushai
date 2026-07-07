@@ -1,0 +1,18 @@
+{
+  "case_id": "conv_topic_shift",
+  "description": "Hard topic pivot (holiday\u2192insurance), same two voices, NO gap, NO temporal interleave. Frozen semantics: sequential topic drift is ONE conversation (THREADER_TOPIC_ONLY_SPLIT=false). Characterization probe; count gates on 1.",
+  "device_id": "eval-conv-shift",
+  "media_file": "media.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "transcript",
+    "conversations"
+  ],
+  "tier": "full",
+  "poll": {
+    "timeout_secs": 240,
+    "interval_secs": 2
+  }
+}

@@ -31,6 +31,9 @@ forward-only — add a new numbered file, never edit a shipped one. See the head
 | 0022 | `skipped_status_and_hints` | `skipped` becomes a first-class TERMINAL status (+ `skip_reason`) on both AI work queues (backs the ingest hint gate + content gates). |
 | 0023 | `owner_identity` | `is_owner` on `speakers`/`persons` + a partial-unique single-owner index — the "This is me" tap. |
 | 0024 | `entity_profiles` | Running-memory profiles per person/speaker: append-only observation log folded incrementally from `events` (worker drain pass + RAG chat-time freshen); merge hooks fold duplicates. DERIVED/rebuildable. |
+| 0025 | `conversations` | Persisted conversation threading: `conversations` catalog + `conversation_id`/`turn_index` on `transcript_sentences` + `threader_state` watermark. Assigned by the worker-0 batch threader (gap blocks + same-mic disentanglement); open=provisional / closed=frozen / NULL=gap-heuristic fallback. |
+| 0026 | `advisor_books` | Ahithophel advisor corpus: `books` + `book_chapters` (raw AND clean text + routing synopsis) + `book_chunks` (`vector(1024)` + HNSW). Populated by `hushai-advisor`'s idempotent `ingest-book` binary; PLAIN tables (curated content, never retention-dropped). |
+| 0027 | `advisor_sessions` | Ahithophel advisor consultations: `advisor_sessions` (phase machine gathering/answering/done + followup_rounds + refined_question), gap-free-seq `advisor_messages` (`kind` = message/followup_questions/final_answer, `chapters` jsonb citations), and `advisor_memories` (embedded Q&A summaries, `vector(1024)` + HNSW). |
 
 **Adding one:** create `NNNN_short_name.sql` with a header comment; if it changes a backend `db.rs`
 `query!` macro, re-run `cd hushai-backend && DATABASE_URL=… cargo sqlx prepare -- --lib` and commit

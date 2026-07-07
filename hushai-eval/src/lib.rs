@@ -4,6 +4,8 @@
 //! fixture media deterministically → wait for both lanes + event quiescence → query results →
 //! score vs ground truth → classify vs the config-hash baseline. The suite verdict + exit code is
 //! what an agent loop consumes (0 pass/improved, 1 regression/floor-breach, 2 inconclusive/infra).
+//! (`advisor` cases skip the media pipeline entirely — they script a live-service conversation
+//! instead; see `run_advisor_case`.)
 
 pub mod baseline;
 pub mod ctx;
@@ -14,6 +16,7 @@ pub mod manifest;
 pub mod poll;
 pub mod probe;
 pub mod query;
+pub mod query_advisor;
 pub mod query_rag;
 pub mod report;
 pub mod reset;
@@ -79,6 +82,15 @@ async fn run_case(
 ) -> Result<CaseResult> {
     let base_ns = fx.meta.base_capture_unix_nanos;
     let (cid, split, tier) = (fx.meta.case_id.as_str(), fx.split.as_str(), fx.meta.tier.as_str());
+
+    // Advisor cases are SERVICE-level (the `advisor` modality): a scripted conversation against
+    // the live hushai-advisor, grounded in the pre-ingested book corpus — no media, no lanes, so
+    // the whole enroll/inject/poll/observe pipeline is skipped. Branch before the media reset;
+    // everything infra-shaped (service down, empty corpus, transport error) goes INCONCLUSIVE
+    // inside, so advisor fixtures can never turn a suite red when the optional service is absent.
+    if fx.meta.needs_advisor() {
+        return run_advisor_case(ctx, fx, manifest, update_baseline, force).await;
+    }
 
     reset::reset_db(ctx).await.context("reset db")?;
 
@@ -169,6 +181,29 @@ async fn run_case(
     let _ = &all_ids; // ids are per-injection polled above; kept for potential future cross-checks.
 
     let devices_vec: Vec<String> = devices.into_iter().collect();
+
+    // Threading quiescence (0025): the conversation threader runs on its own interval
+    // AFTER the transcript lanes finish; observing before it has assigned every sentence
+    // would score phantom NULLs. Timeout = infrastructure (inconclusive), never a FAIL.
+    if fx.meta.modality("conversations") {
+        let threaded = poll::wait_threaded(
+            ctx,
+            &devices_vec,
+            fx.meta.poll.timeout_secs.min(300),
+            fx.meta.poll.interval_secs.max(1),
+        )
+        .await
+        .context("waiting for conversation threading")?;
+        if !threaded {
+            return Ok(CaseResult::inconclusive(
+                cid,
+                split,
+                tier,
+                "conversation threader did not assign all sentences in time (is THREADER_ENABLED on and the worker running?)".to_string(),
+            ));
+        }
+    }
+
     let obs = query::observe(ctx, &devices_vec, win_lo, win_hi, &fx.meta.modalities)
         .await
         .context("querying observed results")?;
@@ -206,14 +241,43 @@ async fn run_case(
                     Err(e) => return Ok(CaseResult::inconclusive(cid, split, tier, format!("rag chat q{qi} transport error: {e:#}"))),
                 }
             }
-            metrics.extend(score::score_chat(chat_gt, &answers, ctx).await);
+            metrics.extend(
+                score::score_chat(
+                    chat_gt,
+                    &answers,
+                    ctx,
+                    fx.expected.conversations.as_ref(),
+                    &obs,
+                    base_ns,
+                )
+                .await,
+            );
         }
     }
 
+    let processed = audio_done_total.max(vision_done_total);
+    finalize_case(ctx, manifest, cid, split, tier, injected_total, processed, metrics, update_baseline, force)
+}
+
+/// Shared scoring tail: classify the metric vector against the config-hash baseline, assemble the
+/// `CaseResult`, and (on request) persist a new baseline. Used by the media pipeline AND the
+/// service-level advisor path so verdict/baseline semantics can't drift between them.
+#[allow(clippy::too_many_arguments)]
+fn finalize_case(
+    ctx: &Ctx,
+    manifest: &EnvManifest,
+    cid: &str,
+    split: &str,
+    tier: &str,
+    injected: usize,
+    processed: i64,
+    metrics: Vec<score::Metric>,
+    update_baseline: bool,
+    force: bool,
+) -> Result<CaseResult> {
     let baseline = baseline::load(ctx, &manifest.config_hash, cid);
     let bmap = baseline.as_ref().map(|b| b.metrics.clone());
-    let processed = audio_done_total.max(vision_done_total);
-    let case = CaseResult::from_metrics(cid, split, tier, injected_total, processed, metrics.clone(), |m| {
+    let case = CaseResult::from_metrics(cid, split, tier, injected, processed, metrics.clone(), |m| {
         let bv = bmap.as_ref().and_then(|mm| mm.get(&m.key).copied());
         let (cls, delta) = baseline::classify(m, bv);
         (cls, bv, delta)
@@ -227,4 +291,89 @@ async fn run_case(
     }
 
     Ok(case)
+}
+
+/// The `advisor` modality: reset the advisor's per-run state, run the fixture's scripted
+/// conversation against the live service (threading ONE session across turns), and score the
+/// captured turn shapes. Preconditions fail CLOSED to INCONCLUSIVE — a missing service, an
+/// un-ingested corpus, or a mid-conversation transport error is infrastructure (exit 2), never a
+/// false regression; only assertion failures on successful turns produce a FAIL.
+async fn run_advisor_case(
+    ctx: &Ctx,
+    fx: &Fixture,
+    manifest: &EnvManifest,
+    update_baseline: bool,
+    force: bool,
+) -> Result<CaseResult> {
+    let (cid, split, tier) = (fx.meta.case_id.as_str(), fx.split.as_str(), fx.meta.tier.as_str());
+    let Some(gt) = &fx.expected.advisor else {
+        return Ok(CaseResult::inconclusive(
+            cid,
+            split,
+            tier,
+            "advisor modality listed but expected.json has no `advisor` block".to_string(),
+        ));
+    };
+
+    // Precondition 1: the ingested book corpus. Every advisor answer is grounded in `book_chunks`;
+    // an empty corpus can only produce garbage, and a failed probe means the advisor migrations
+    // aren't applied. Both are infrastructure.
+    match query_advisor::book_chunk_count(ctx).await {
+        Ok(0) => {
+            return Ok(CaseResult::inconclusive(
+                cid,
+                split,
+                tier,
+                "book corpus empty (book_chunks=0) — run ingest-book".to_string(),
+            ));
+        }
+        Ok(_) => {}
+        Err(e) => {
+            return Ok(CaseResult::inconclusive(
+                cid,
+                split,
+                tier,
+                format!("book corpus probe failed (advisor migrations applied?): {e:#} — run ingest-book"),
+            ));
+        }
+    }
+
+    // Precondition 2: the advisor service is OPTIONAL — absence must never redden the suite.
+    if !query_advisor::advisor_up(ctx).await {
+        return Ok(CaseResult::inconclusive(
+            cid,
+            split,
+            tier,
+            "advisor service unreachable (the advisor modality needs the live :8095 service)".to_string(),
+        ));
+    }
+
+    // Invariant 1 for the advisor surface: pinned starting state. Sessions/messages/memories are
+    // per-run artifacts (a prior run's MEMORIZED facts would bleed into this run's answers); the
+    // corpus is reference data and survives (see reset::reset_advisor).
+    if let Err(e) = reset::reset_advisor(ctx).await {
+        return Ok(CaseResult::inconclusive(cid, split, tier, format!("advisor state reset failed: {e:#}")));
+    }
+
+    // The scripted conversation: turn 1's `session` event mints the session; every later turn
+    // continues it, so follow-up rounds and memory are exercised for real.
+    let mut turns = Vec::with_capacity(gt.turns.len());
+    let mut session_id: Option<String> = None;
+    for (ti, t) in gt.turns.iter().enumerate() {
+        match query_advisor::ask(ctx, &t.message, session_id.as_deref()).await {
+            Ok(r) => {
+                if session_id.is_none() && !r.session_id.is_empty() {
+                    session_id = Some(r.session_id.clone());
+                }
+                turns.push(r);
+            }
+            Err(e) => {
+                return Ok(CaseResult::inconclusive(cid, split, tier, format!("advisor turn t{ti} transport error: {e:#}")));
+            }
+        }
+    }
+
+    let metrics = score::score_advisor(gt, &turns);
+    // injected/processed = scripted/completed turns (the advisor analog of segment counts).
+    finalize_case(ctx, manifest, cid, split, tier, gt.turns.len(), turns.len() as i64, metrics, update_baseline, force)
 }

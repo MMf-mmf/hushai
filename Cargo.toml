@@ -20,6 +20,12 @@
 #   (identity-only, byte-identical fan-out), ramps 1..N cumulatively, samples the worker/backend
 #   Prometheus metrics + macOS system load each step, and reports the per-camera cost + the
 #   saturation point. Reuses hushai-backend's proto (path dep); drives everything else over HTTP.
+#
+# - hushai-advisor: the Ahithophel advisor service (:8095). Multi-agent advice pipeline
+#   (sufficiency gate → chapter routing → draft/critique/refine loop → memory) grounded in a
+#   book corpus ingested by its `ingest-book` binary (migrations 0026/0027). Reuses
+#   hushai-backend as a library (Config + pool + logging/TLS/metrics); LLM + embeddings via
+#   local Ollama through Rig, same 1024-dim embedding space as the rest of the system.
 [workspace]
 resolver = "2"
-members = ["hushai-backend", "hushai-worker", "hushai-rag", "hushai-viewer", "hushai-eval", "hushai-loadtest"]
+members = ["hushai-backend", "hushai-worker", "hushai-rag", "hushai-viewer", "hushai-eval", "hushai-loadtest", "hushai-advisor"]

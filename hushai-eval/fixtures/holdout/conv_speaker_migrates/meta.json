@@ -1,0 +1,34 @@
+{
+  "case_id": "conv_speaker_migrates",
+  "description": "SEALED HOLDOUT. Daniel speaks in cam1's dinner conversation, then joins cam2's report conversation mid-run: the shared speaker must not glue the two conversations across devices; his late utterances belong to the cam2 conversation.",
+  "device_id": "eval-conv-mig1",
+  "media_file": "clips/cam1_dinner.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "conversations"
+  ],
+  "tier": "full",
+  "injections": [
+    {
+      "media_file": "clips/cam1_dinner.mp4",
+      "device_id": "eval-conv-mig1",
+      "capture_start_offset_ns": 0
+    },
+    {
+      "media_file": "clips/cam2_report.mp4",
+      "device_id": "eval-conv-mig2",
+      "capture_start_offset_ns": 0
+    },
+    {
+      "media_file": "clips/cam2_daniel_joins.mp4",
+      "device_id": "eval-conv-mig2",
+      "capture_start_offset_ns": 16743628000
+    }
+  ],
+  "poll": {
+    "timeout_secs": 300,
+    "interval_secs": 2
+  }
+}

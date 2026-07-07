@@ -195,7 +195,10 @@ pub async fn rag_chat(
         || crate::routes::is_recency_query(&message)
         || crate::routes::is_speaker_roster_query(&message)
         || crate::routes::is_footage_stats_query(&message)
-        || crate::routes::is_window_summary_query(&message);
+        || crate::routes::is_window_summary_query(&message)
+        // Participants questions carry the names the detector needs verbatim; the
+        // condenser would rewrite them and defeat the resolver.
+        || crate::routes::is_participants_conversation_query(&message);
     let (message, router_context) = if st.cfg.query_condense
         && !history.is_empty()
         && !deterministic_intent
@@ -249,6 +252,15 @@ pub async fn rag_chat(
         {
             // "Tell me about <named voice>" → the Grounded arm surfaces the voice profile.
             crate::agents::DEFAULT_AGENT_ID
+        } else if crate::routes::is_participants_conversation_query(&message)
+            && !crate::speakers::resolve_names_in_text(&st.pool, &message)
+                .await
+                .map_err(internal)?
+                .is_empty()
+        {
+            // "What did X and Y talk about" → the Grounded arm's conversation-catalog
+            // branch (0025); keeps `expect_routed_agent` stable.
+            crate::agents::DEFAULT_AGENT_ID
         } else {
             st.llm
                 .classify_agent(&message, &router_context)
@@ -296,6 +308,10 @@ pub async fn rag_chat(
     // For reflection-with-no-target we skip the LLM entirely and stream a setup hint.
     let mut precomputed_answer: Option<String> = None;
     let mut reflection_digest: Option<String> = None;
+    // Conversation-group lengths from the 0025 expansion (Grounded semantic path only):
+    // `sources` is the FLATTENED render order; the stream site re-groups by these lengths
+    // AFTER enrichment so global unnamed-speaker ordinals stay collision-free.
+    let mut convo_group_lens: Option<Vec<usize>> = None;
     let mut sources: Vec<Source>;
     let names;
 
@@ -375,6 +391,21 @@ pub async fn rag_chat(
             let device_id = qf.device_id.or_else(|| df.device_id.clone());
             let after = qf.after_unix_nanos.or(df.after_unix_nanos);
             let before = qf.before_unix_nanos.or(df.before_unix_nanos);
+            // Voice deictic anchor (0025): "what were we just talking about", asked BY VOICE
+            // with no explicit device filter, means the conversation happening AT THAT
+            // PHONE — not whichever camera recorded most recently. Applied only to the
+            // deterministic conversation branches below (recency / window summary /
+            // participants); the semantic path stays unfiltered so topical questions still
+            // search every camera. This is the group-A-not-group-B guarantee for voice.
+            let convo_device_id = device_id.clone().or_else(|| {
+                if is_voice {
+                    req.caller.as_ref().and_then(|c| c.device_id.clone())
+                } else {
+                    None
+                }
+            });
+            #[allow(unused_assignments)]
+            let mut participants_ids: Vec<Uuid> = Vec::new();
             // Recency ("what did we last discuss"): summarize the most recent gap-grouped
             // conversation instead of semantic top-k (which returns a lone keyword-similar 2s
             // snippet — the exact "cites one tiny segment" failure). Window: explicit filters win,
@@ -417,7 +448,7 @@ pub async fn rag_chat(
                 let gap_nanos = st.cfg.conversation_gap_secs.max(1) * 1_000_000_000;
                 let mut convos = retrieve::conversations_in_window(
                     &st.pool,
-                    device_id.as_deref(),
+                    convo_device_id.as_deref(),
                     w_after,
                     w_before,
                     gap_nanos,
@@ -455,7 +486,7 @@ pub async fn rag_chat(
                 let gap_nanos = st.cfg.conversation_gap_secs.max(1) * 1_000_000_000;
                 let mut s = retrieve::latest_conversation(
                     &st.pool,
-                    device_id.as_deref(),
+                    convo_device_id.as_deref(),
                     r_after,
                     r_before,
                     gap_nanos,
@@ -477,6 +508,48 @@ pub async fn rag_chat(
                         .map_err(internal)?,
                 );
                 sources = s;
+            } else
+            // "What did X and Y talk about" → the persisted conversation catalog (0025):
+            // conversations whose participant set contains every resolved name, each
+            // rendered as its own section (never mixed). Falls through when no catalog
+            // name resolves (the phrase alone must not hijack "what did they talk about").
+            if crate::routes::is_participants_conversation_query(&message)
+                && !{
+                    let pids = crate::speakers::resolve_names_in_text(&st.pool, &message)
+                        .await
+                        .map_err(internal)?;
+                    participants_ids = pids.clone();
+                    pids.is_empty()
+                }
+            {
+                let now = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+                let parsed = crate::timeparse::window_in_query(&message, now, tz);
+                let p_after = after.or(parsed.map(|(a, _)| a));
+                let p_before = before.or(parsed.map(|(_, b)| b));
+                let mut groups = crate::routes::participants_conversation_groups(
+                    &st,
+                    &participants_ids,
+                    convo_device_id.as_deref(),
+                    p_after,
+                    p_before,
+                )
+                .await
+                .map_err(internal)?;
+                let lens: Vec<usize> = groups.iter().map(|g| g.len()).collect();
+                let mut flat: Vec<Source> = groups.drain(..).flatten().collect();
+                let ids: Vec<String> = flat.iter().filter_map(|x| x.speaker_id.clone()).collect();
+                names = crate::speakers::name_map(&st.pool, &ids)
+                    .await
+                    .map_err(internal)?;
+                retrieve::enrich_for_display(&mut flat, &names, now, tz);
+                let groups = retrieve::regroup_sources(&flat, &lens);
+                precomputed_answer = Some(
+                    st.llm
+                        .answer_grouped(&message, &groups, &names)
+                        .await
+                        .map_err(internal)?,
+                );
+                sources = flat;
             } else
             // Clip-scoped "who was speaking": a roster question over a bounded window is a SET
             // question — answer it deterministically (distinct speakers heard in the window),
@@ -648,6 +721,30 @@ pub async fn rag_chat(
             };
             // Exhaustive rows carry distance 0.0, so they survive this unchanged.
             s.retain(|x| x.distance <= st.cfg.distance_threshold);
+            // Relative-margin prune (see routes.rs): one marginal cross-conversation hit
+            // must not drag a whole unrelated conversation into the grounded prompt.
+            retrieve::prune_rel_margin(&mut s, st.cfg.prune_rel_margin);
+            // Conversation-neighborhood expansion (0025): pruned hits widen into their
+            // persisted conversation's surrounding sentences; the stream prompt then
+            // renders per-conversation sections so two concurrent conversations can never
+            // blend into one answer. Group lengths ride to the stream site — enrichment
+            // happens on the FLAT list below, then the groups are rebuilt by length.
+            if st.cfg.expand_enabled
+                && !want_exhaustive
+                && s.iter().any(|x| x.conversation_id.is_some())
+            {
+                let groups = retrieve::expand_to_conversations(
+                    &st.pool,
+                    &s,
+                    st.cfg.expand_window_secs.saturating_mul(1_000_000_000),
+                    st.cfg.expand_max_sentences_per_convo,
+                    st.cfg.expand_max_total_chars,
+                )
+                .await
+                .map_err(internal)?;
+                convo_group_lens = Some(groups.iter().map(|g| g.len()).collect());
+                s = groups.into_iter().flatten().collect();
+            }
             let ids: Vec<String> = s.iter().filter_map(|x| x.speaker_id.clone()).collect();
             names = crate::speakers::name_map(&st.pool, &ids)
                 .await
@@ -1185,6 +1282,12 @@ pub async fn rag_chat(
                 }
             }
         } else {
+            // Rebuild the 0025 conversation groups from the ENRICHED flat sources (hoisted:
+            // chat_stream's opaque return type captures its argument lifetimes).
+            let convo_groups: Option<Vec<Vec<Source>>> = convo_group_lens
+                .as_ref()
+                .filter(|lens| lens.len() > 1)
+                .map(|lens| crate::retrieve::regroup_sources(&sources, lens));
             // Both branches return different concrete stream types; box to one type.
             let stream_res = if is_reflection {
                 llm.reflect_stream(
@@ -1199,7 +1302,7 @@ pub async fn rag_chat(
                 .await
                 .map(StreamExt::boxed)
             } else {
-                llm.chat_stream(&message, &sources, &names, &system_prompt, history)
+                llm.chat_stream(&message, &sources, &names, &system_prompt, history, convo_groups.as_deref())
                     .await
                     .map(StreamExt::boxed)
             };
@@ -1565,6 +1668,7 @@ mod tests {
             speaker_name: None,
             time_label: String::new(),
             visual_context: None,
+            conversation_id: None,
         }
     }
 

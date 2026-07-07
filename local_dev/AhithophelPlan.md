@@ -280,4 +280,14 @@ and here is the results:
 - another issue I've seen is that the voice identification, for the voice assistant clearly does not recognize my previous voices. I have in the past enrolled my voice it identifies it sometimes it works sometimes it doesn't but definitely in another session. It then does not remember my voice, we should create a more thorough on boarding voice on boarding session to identify a users voice before we say yes we know this voice is set for the voice assistant to make sure that it works in all scenarios under different background, noises in different environments, etc..
 
 
-- Based on what we did now we need to add conversa
+- Based on what we did now we need to add conversa so that can differentiate between one speaker and another and are actually able to follow a conversation between two people or multiple people this is an advanced feature, however it's crucial to actually make sense out of the massive amount of incoming data. It's also important to be able to differentiate between two groups of people that might be having two different conversations so that one conversation does not get confused with another conversation and that if one group asks someone in their group of question, the AI should not get confused and think that they're asking people in a different group of question. Use the industry standard mechanisms for accomplish accomplishing this with 100% accuracy.
+Test and to end using our integrated rig with many different scenarios to make sure it works correctly, Play any amount of conversations from this computer for the camera to pick up etc. use your imagination. Spear no cost this is crucial that everything works exactly as expected
+
+
+
+# Development lifecycle
+- Plan with Fable and create a full spec document
+ that includes the full spec and the full testing lifecycle
+- then pass that spec to a more affordable model to code up the spec and open the pr
+- use Fable to code review the PR and suggest changes and improvements if necessary
+- then pass that Feedback back to the more affordable model to make the changes/improvements and merge the PR

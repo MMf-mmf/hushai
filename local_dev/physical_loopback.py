@@ -36,10 +36,10 @@ REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 ADB = os.path.expanduser(os.environ.get("ADB", "~/Library/Android/sdk/platform-tools/adb"))
 PKG = "com.hushai.android"
 ACTIVITY = f"{PKG}/.MainActivity"
-# Host-side ports the phys stack listens on (local_dev/phys.env: 8081/8091 so it can coexist
+# Host-side ports the phys stack listens on (local_dev/phys.env: 8082/8092 so it can coexist
 # with the Tier-1 stack). The PHONE keeps localhost:8080/8090 — `adb reverse` maps them here.
-PHYS_BACKEND_PORT = os.environ.get("PHYS_BACKEND_PORT", "8081")
-PHYS_RAG_PORT = os.environ.get("PHYS_RAG_PORT", "8091")
+PHYS_BACKEND_PORT = os.environ.get("PHYS_BACKEND_PORT", "8082")
+PHYS_RAG_PORT = os.environ.get("PHYS_RAG_PORT", "8092")
 BACKEND = os.environ.get("HUSHAI_BACKEND_URL", f"http://localhost:{PHYS_BACKEND_PORT}")
 RAG = os.environ.get("HUSHAI_RAG_URL", f"http://localhost:{PHYS_RAG_PORT}")
 # What the PHONE dials: its OWN localhost, which `adb reverse` tunnels to the host ports above.
@@ -54,6 +54,9 @@ RAG_TOKEN = os.environ.get("RAG_TOKEN", "dev-rag-token")
 RESET_TABLES = ("transcript_sentences, speaker_segments, person_segments, scene_objects, "
                 "plate_detections, speakers, persons, events, video_events, entity_profiles, "
                 "chat_sessions, chat_messages, "
+                # 0025: stale conversations/watermark poison later runs (closed spans partition
+                # the timeline finer every run; the eval harness hit exactly this bug).
+                "conversations, threader_state, "
                 "segment_transcription_status, segment_vision_status, segments, streams, sessions")
 
 
@@ -75,7 +78,7 @@ def norm(s: str) -> str:
 def load_scenario_chat(case: str):
     """Return the fixture's chat ground-truth (list of question dicts), or None. Searches
     train/ then holdout/. Shares the SAME expected.json the deterministic eval uses."""
-    for split in ("train", "holdout"):
+    for split in ("train", "holdout", "staging"):
         p = os.path.join(REPO, "hushai-eval", "fixtures", split, case, "expected.json")
         if os.path.isfile(p):
             with open(p) as f:
@@ -156,9 +159,62 @@ def score_scenario_chat(questions) -> list:
     return checks
 
 
+def load_timeline(case: str):
+    """Return [(abs_path, offset_ns, duration_ns)] from the fixture's meta.json injections[]
+    (train/holdout/staging), offsets ascending. Single-clip fixtures yield one entry."""
+    for split in ("train", "holdout", "staging"):
+        p = os.path.join(REPO, "hushai-eval", "fixtures", split, case, "meta.json")
+        if not os.path.isfile(p):
+            continue
+        with open(p) as f:
+            meta = json.load(f)
+        base_dir = os.path.dirname(p)
+        inj = meta.get("injections") or [{
+            "media_file": meta["media_file"], "device_id": meta.get("device_id"),
+            "capture_start_offset_ns": 0}]
+        out = []
+        for e in sorted(inj, key=lambda x: x.get("capture_start_offset_ns", 0)):
+            path = os.path.join(base_dir, e["media_file"])
+            dur = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
+                                  "-of", "csv=p=0", path], capture_output=True, text=True)
+            dur_ns = int(float(dur.stdout.strip()) * 1e9)
+            out.append((path, int(e.get("capture_start_offset_ns", 0)), dur_ns))
+        return out
+    return None
+
+
+def play_timeline(timeline, gap_scale: float):
+    """Replay the fixture acoustically: afplay each clip in offset order, sleeping the
+    (scaled) injection gap between clips. Wall-clock stands in for capture time — the phone
+    hears the same silence structure the deterministic injection encodes."""
+    cursor_ns = 0
+    for path, offset_ns, dur_ns in timeline:
+        gap_s = max(0.0, (offset_ns - cursor_ns) / 1e9) * gap_scale
+        if gap_s > 0:
+            print(f"[phys]   … {gap_s:.0f}s of silence (scaled gap)")
+            time.sleep(gap_s)
+        print(f"[phys]   ♪ {os.path.basename(path)} ({dur_ns/1e9:.0f}s)")
+        subprocess.run(["afplay", path], check=False)
+        cursor_ns = offset_ns + dur_ns
+
+
+def wait_threaded_phys(dev: str, timeout_s: int = 180) -> bool:
+    """Wait until every text sentence for the phone's device carries a conversation_id
+    (the threader runs on its own interval after the transcript lane finishes)."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        n = psql(f"SELECT count(*) FROM transcript_sentences WHERE device_id='{dev}' "
+                 f"AND text IS NOT NULL AND conversation_id IS NULL;")
+        if n == "0":
+            return True
+        time.sleep(5)
+    return False
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--media", required=True, help="video/image/audio file to display fullscreen")
+    ap.add_argument("--media", default="", help="video/image/audio file to display fullscreen "
+                    "(omit when using --timeline)")
     ap.add_argument("--case", required=True)
     ap.add_argument("--duration", type=int, default=25)
     ap.add_argument("--audio-only", action="store_true", help="capture mic only (no camera)")
@@ -169,6 +225,17 @@ def main() -> int:
                     "questions tolerantly against the live capture (routing + presence + no-hallucination)")
     ap.add_argument("--no-reset", action="store_true",
                     help="skip the TRUNCATE (accumulate-style sessions on the phys DB)")
+    ap.add_argument("--timeline", default="", help="fixture case name: replay its meta.json "
+                    "injections[] ACOUSTICALLY in offset order (afplay per clip + scaled sleeps) "
+                    "instead of --media. The conversation-threading Tier-2 mode.")
+    ap.add_argument("--gap-scale", type=float, default=1.0,
+                    help="scale factor for timeline injection gaps (0.2 turns a 600s gap into "
+                    "120s of wall time; start the phys stack with CONVERSATION_GAP_SECS scaled "
+                    "by the same factor)")
+    ap.add_argument("--expect-conversations", type=int, default=None,
+                    help="after processing, the distinct threaded conversation count for the "
+                    "phone's device must equal this (± --conv-tolerance)")
+    ap.add_argument("--conv-tolerance", type=int, default=0)
     args = ap.parse_args()
 
     scenario_qs = None
@@ -177,7 +244,12 @@ def main() -> int:
         if scenario_qs is None:
             raise SystemExit(f"--scenario '{args.scenario}': no fixtures/*/{args.scenario}/expected.json with a chat block")
 
-    if not os.path.isfile(args.media):
+    timeline = None
+    if args.timeline:
+        timeline = load_timeline(args.timeline)
+        if not timeline:
+            raise SystemExit(f"--timeline '{args.timeline}': no fixtures/*/{args.timeline}/meta.json with injections")
+    elif not os.path.isfile(args.media):
         raise SystemExit(f"media not found: {args.media}")
     if adb("devices").stdout.count("\tdevice") < 1:
         raise SystemExit("no adb device — is the phone plugged in + authorized?")
@@ -193,19 +265,34 @@ def main() -> int:
     adb("shell", "am", "force-stop", PKG)
     adb("logcat", "-c")
 
-    # Fullscreen playback (ffplay shows images too; -loop 0 holds/loops for the whole window).
-    play = subprocess.Popen(["ffplay", "-loglevel", "quiet", "-fs", "-loop", "0", args.media],
-                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    try:
-        time.sleep(1.0)
+    if timeline:
+        # Acoustic timeline replay: start capture, afplay the clips with scaled gaps, stop.
+        total_s = sum(d for _, _, d in timeline) / 1e9
+        gaps_s = sum(max(0, timeline[i][1] - (timeline[i-1][1] + timeline[i-1][2]))
+                     for i in range(1, len(timeline))) / 1e9 * args.gap_scale
+        est = int(total_s + gaps_s) + 10
         adb("shell", "am", "start", "-n", ACTIVITY, "--es", "url", PHONE_BACKEND, "--es", "rag_url", PHONE_RAG,
             "--es", "token", TOKEN, "--ez", "audio_only", "true" if args.audio_only else "false",
             "--ez", "autostart", "true")
-        print(f"[phys] capturing {args.duration}s …")
-        time.sleep(args.duration)
+        print(f"[phys] timeline capture ≈{est}s (speech {total_s:.0f}s + scaled gaps {gaps_s:.0f}s) …")
+        time.sleep(2.0)
+        play_timeline(timeline, args.gap_scale)
+        time.sleep(4.0)
         adb("shell", "am", "start", "-n", ACTIVITY, "--ez", "stop", "true")
-    finally:
-        play.terminate()
+    else:
+        # Fullscreen playback (ffplay shows images too; -loop 0 holds/loops for the whole window).
+        play = subprocess.Popen(["ffplay", "-loglevel", "quiet", "-fs", "-loop", "0", args.media],
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try:
+            time.sleep(1.0)
+            adb("shell", "am", "start", "-n", ACTIVITY, "--es", "url", PHONE_BACKEND, "--es", "rag_url", PHONE_RAG,
+                "--es", "token", TOKEN, "--ez", "audio_only", "true" if args.audio_only else "false",
+                "--ez", "autostart", "true")
+            print(f"[phys] capturing {args.duration}s …")
+            time.sleep(args.duration)
+            adb("shell", "am", "start", "-n", ACTIVITY, "--ez", "stop", "true")
+        finally:
+            play.terminate()
 
     mode = adb("logcat", "-d", "-s", "HUSHAI_TX:I").stdout
     m = re.search(r"capture started .* (audioOnly=\S+.*)", mode)
@@ -252,6 +339,15 @@ def main() -> int:
             checks.append((f"object '{lab}'", norm(lab) in no))
     if args.expect_face:
         checks.append(("face detected", int(nfaces) > 0))
+    if args.expect_conversations is not None:
+        # The threader lags the transcript lane; wait for it before counting.
+        if not wait_threaded_phys(dev):
+            print("[phys]   threading did not settle (is THREADER_ENABLED on for the phys worker?)")
+        got = int(psql(f"SELECT count(DISTINCT conversation_id) FROM transcript_sentences "
+                       f"WHERE device_id='{dev}' AND conversation_id IS NOT NULL;") or "0")
+        want, tol = args.expect_conversations, args.conv_tolerance
+        print(f"[phys]   conversations: observed {got}, expected {want} ±{tol}")
+        checks.append((f"conversations == {want}±{tol}", abs(got - want) <= tol))
 
     # RAG-chat realism gate (every iteration, per the plan): ask the scenario's questions against the
     # LIVE capture and check routing + presence + no-hallucination TOLERANTLY.

@@ -51,12 +51,22 @@
       },
       {
         "ask": "What do the recordings say about football scores?",
-        "must_contain": [
-          "don't have"
-        ],
         "must_not_contain": [
           "goal",
           "touchdown"
+        ],
+        "must_contain_any": [
+          "don't have",
+          "do not have",
+          "no information",
+          "not mention",
+          "no mention",
+          "nothing about",
+          "not contain",
+          "doesn't contain",
+          "doesn't mention",
+          "no recordings about",
+          "no recording about"
         ]
       },
       {

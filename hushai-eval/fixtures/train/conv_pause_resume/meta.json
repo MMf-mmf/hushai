@@ -1,0 +1,31 @@
+{
+  "case_id": "conv_pause_resume",
+  "description": "Same dialogue pauses 60s (inside the 300s gap) then resumes: must stay ONE conversation (T counter-fixture; diarization-independent).",
+  "device_id": "eval-conv-pause",
+  "media_file": "clips/part1.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "transcript",
+    "conversations",
+    "chat"
+  ],
+  "tier": "full",
+  "injections": [
+    {
+      "media_file": "clips/part1.mp4",
+      "device_id": "eval-conv-pause",
+      "capture_start_offset_ns": 0
+    },
+    {
+      "media_file": "clips/part2.mp4",
+      "device_id": "eval-conv-pause",
+      "capture_start_offset_ns": 69940952000
+    }
+  ],
+  "poll": {
+    "timeout_secs": 240,
+    "interval_secs": 2
+  }
+}

@@ -8,7 +8,8 @@
   "limit": 130,
   "base_capture_unix_nanos": 1781784000000000000,
   "modalities": [
-    "chat"
+    "chat",
+    "conversations"
   ],
   "tier": "full",
   "enroll": [

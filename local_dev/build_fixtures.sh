@@ -77,10 +77,11 @@ d,base,a,b,asplit,tot=sys.argv[1],int(sys.argv[2]),sys.argv[3],sys.argv[4],int(s
 # modalities once that lane is investigated/fixed (do NOT loosen mint gates just to pass this).
 json.dump({"case_id":"two_speakers","description":"two distinct TTS voices, known turns (ASR+events; diarization staged)",
  "device_id":"eval-two-speakers","media_file":"media.mp4","media_kind":"muxed","seg_seconds":2,
- "base_capture_unix_nanos":base,"modalities":["transcript","events"],"tier":"full",
+ "base_capture_unix_nanos":base,"modalities":["transcript","events","conversations"],"tier":"full",
  "poll":{"timeout_secs":180,"interval_secs":2}}, open(d+"/meta.json","w"), indent=2)
 json.dump({
  "transcript":{"full_text":a+" "+b,"max_wer":0.30,"min_similarity":0.70},
+ "conversations":{"distinct_count":1,"count_tolerance":0},
  "speakers":{"distinct_count":2,"count_tolerance":0,"min_purity":0.75,"utterances":[
    {"label":"A","text_contains":"how are you","window_ns":[0,asplit]},
    {"label":"B","text_contains":"not doing well","window_ns":[asplit,tot]}]},
@@ -112,7 +113,7 @@ json.dump({
  "case_id":"repeat_visitor",
  "description":"Same voice on two cameras a day apart (multi-injection). Scores transcript + live RAG chat: semantic recall + routing + no-hallucination decline (robust), plus a counting PROBE for the missing aggregation.",
  "device_id":"eval-repeat-front","media_file":"clips/day1_front.mp4","media_kind":"muxed","seg_seconds":2,
- "base_capture_unix_nanos":base,"modalities":["transcript","chat"],"tier":"full",
+ "base_capture_unix_nanos":base,"modalities":["transcript","chat","conversations"],"tier":"full",
  "injections":[
    {"media_file":"clips/day1_front.mp4","device_id":"eval-repeat-front","capture_start_offset_ns":0},
    {"media_file":"clips/day2_garage.mp4","device_id":"eval-repeat-garage","capture_start_offset_ns":DAY_NS}],
@@ -120,6 +121,7 @@ json.dump({
 }, open(d+"/meta.json","w"), indent=2)
 json.dump({
  "transcript":{"full_text":day1+" "+day2,"max_wer":0.35,"min_similarity":0.65},
+ "conversations":{"distinct_count":2,"count_tolerance":0},
  "chat":{
    "similarity_floor":None,
    "judge_enabled":False,
@@ -130,7 +132,7 @@ json.dump({
       "min_citations":1,
       "reference_answer":"The recordings mention a package delivery: one arrived Monday morning and was left by the gate, and a delivery truck returned Tuesday afternoon with a second parcel."},
      {"ask":"What do the recordings say about the stock market?",
-      "must_contain":["don't have"],
+      "must_contain_any":["don't have", "do not have", "no information", "not mention", "no mention", "nothing about", "not contain", "doesn't contain", "doesn't mention", "no recordings about", "no recording about"],
       "must_not_contain":["rose","fell","nasdaq","dow jones"],
       "reference_answer":"I don't have information about the stock market in the recordings."},
      {"ask":"On how many separate days did a delivery happen, according to the recordings?",
@@ -165,11 +167,12 @@ json.dump({
  "case_id":"money_talk",
  "description":"Worried money dialogue + calm reassurance (two voices). Scores transcript + sentiment + RAG chat: money recall, worried-tone recall, no-hallucination decline. Attribution not scored (diarization merges TTS voices at L2).",
  "device_id":"eval-money-talk","media_file":"media.mp4","media_kind":"muxed","seg_seconds":2,
- "base_capture_unix_nanos":base,"modalities":["transcript","sentiment","chat"],"tier":"full",
+ "base_capture_unix_nanos":base,"modalities":["transcript","sentiment","chat","conversations"],"tier":"full",
  "poll":{"timeout_secs":180,"interval_secs":2}
 }, open(d+"/meta.json","w"), indent=2)
 json.dump({
  "transcript":{"full_text":a1+" "+b1+" "+a2,"max_wer":0.35,"min_similarity":0.6},
+ "conversations":{"distinct_count":1,"count_tolerance":0},
  "sentiment":{"min_accuracy":0.4,"allow_null":True,"windows":[
    {"start_ns":0,"end_ns":6000000000,"label":"negative","allow":["negative","neutral"]}]},
  "chat":{
@@ -212,16 +215,17 @@ json.dump({
  "case_id":"chat_sessions",
  "description":"Session-correctness probe: q1 same-session coreference (the positive control), q2/q3 fresh-session bare follow-ups that must NOT inherit session-a context (the history-bleed pins; a leak would condense them into money questions). Meta-questions (what did I just ask) are deliberately NOT used: the persona declines them and retrieval echoes corpus terms.",
  "device_id":"eval-chat-sessions","media_file":"media.mp4","media_kind":"muxed","seg_seconds":2,
- "base_capture_unix_nanos":base,"modalities":["transcript","chat"],"tier":"fast",
+ "base_capture_unix_nanos":base,"modalities":["transcript","chat","conversations"],"tier":"fast",
  "poll":{"timeout_secs":120,"interval_secs":2}
 }, open(d+"/meta.json","w"), indent=2)
 json.dump({
  "transcript":{"full_text":a1+" "+b1,"max_wer":0.35,"min_similarity":0.6},
+ "conversations":{"distinct_count":1,"count_tolerance":0},
  "chat":{
    "similarity_floor":None,"judge_enabled":False,
    "questions":[
      {"ask":"What do the recordings say about money?","session":"a",
-      "expect_routed_agent":"recordings","must_contain":["money"],"min_citations":1,
+      "expect_routed_agent":"recordings","must_contain":["renovation","budget"],"min_citations":1,
       "reference_answer":"The recordings mention money for the kitchen renovation, with a budget of three thousand dollars."},
      {"ask":"When was that said?","session":"a",
       "must_not_contain":["don't have","which video"],"min_citations":1},
@@ -292,7 +296,7 @@ json.dump({
       "filters":{"device_id":"eval-script-long","after_offset_ns":120000000000,"before_offset_ns":180000000000},
       "must_contain":["dishwasher"],"must_not_contain":["birthday","packages"]},
      {"ask":"What do the recordings say about football scores?",
-      "must_contain":["don't have"],"must_not_contain":["goal","touchdown"]},
+      "must_contain_any":["don't have", "do not have", "no information", "not mention", "no mention", "nothing about", "not contain", "doesn't contain", "doesn't mention", "no recordings about", "no recording about"],"must_not_contain":["goal","touchdown"]},
      {"ask":"How many minutes of video do we have from this camera?",
       "filters":{"device_id":"eval-script-long"},
       "expect_number":4,"must_not_contain":["don't have","no footage"]},
@@ -315,7 +319,7 @@ import json,sys
 d,base=sys.argv[1],int(sys.argv[2])
 json.dump({"case_id":"silence_no_speech","description":"6s silence — must produce no speech/speakers",
  "device_id":"eval-silence","media_file":"media.mp4","media_kind":"muxed","seg_seconds":2,
- "base_capture_unix_nanos":base,"modalities":["transcript","speakers"],"tier":"full",
+ "base_capture_unix_nanos":base,"modalities":["transcript","speakers","conversations"],"tier":"full",
  "poll":{"timeout_secs":120,"interval_secs":2}}, open(d+"/meta.json","w"), indent=2)
 # Empty reference: a clean pipeline emits ~0 words. max_wer here = max spurious words tolerated
 # (WER over an empty ref is hyp_word_count, since ref length floors to 1). Whisper is known to
@@ -323,6 +327,7 @@ json.dump({"case_id":"silence_no_speech","description":"6s silence — must prod
 # delta catches any INCREASE. The hard counter-fixture gate is speakers.distinct_count == 0 (no
 # phantom speaker minted from noise).
 json.dump({"transcript":{"full_text":"","max_wer":6.0,"min_similarity":0.0},
+ "conversations":{"distinct_count":0,"count_tolerance":0},
  "speakers":{"distinct_count":0,"count_tolerance":0}}, open(d+"/expected.json","w"), indent=2)
 PY
 

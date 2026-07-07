@@ -1,0 +1,30 @@
+{
+  "case_id": "conv_two_devices_parallel",
+  "description": "Two simultaneous conversations on two cameras (fully overlapping wall-clock): device separation is absolute \u2014 2 conversations, never merged; chat answers must stay conversation-scoped (the cross-contamination gate).",
+  "device_id": "eval-conv-den",
+  "media_file": "clips/den_vet.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "conversations",
+    "chat"
+  ],
+  "tier": "full",
+  "injections": [
+    {
+      "media_file": "clips/den_vet.mp4",
+      "device_id": "eval-conv-den",
+      "capture_start_offset_ns": 0
+    },
+    {
+      "media_file": "clips/office_report.mp4",
+      "device_id": "eval-conv-office",
+      "capture_start_offset_ns": 0
+    }
+  ],
+  "poll": {
+    "timeout_secs": 300,
+    "interval_secs": 2
+  }
+}

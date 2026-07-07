@@ -1,0 +1,11 @@
+{
+  "advisor": {
+    "turns": [
+      {
+        "message": "A longtime client keeps delaying signing our renewal contract. I want to persuade him to commit this week without damaging the relationship. He responds well to social cues and hates feeling pressured. What should I do?",
+        "expect_questions": false,
+        "expect_final_answer": true
+      }
+    ]
+  }
+}

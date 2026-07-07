@@ -92,13 +92,22 @@ impl Meta {
         ["persons", "faces", "objects", "plates"].iter().any(|m| self.modality(m)) || self.needs_rag()
     }
     /// True if any scored modality requires the audio lane (see `needs_vision` on `chat`).
+    /// `conversations` rides on transcript_sentences, so it waits on the audio lane too.
     pub fn needs_audio(&self) -> bool {
-        ["transcript", "speakers", "sentiment"].iter().any(|m| self.modality(m)) || self.needs_rag()
+        ["transcript", "speakers", "sentiment", "conversations"].iter().any(|m| self.modality(m)) || self.needs_rag()
     }
 
     /// True if this case scores live RAG answers (the `chat` / `rag` modality).
     pub fn needs_rag(&self) -> bool {
         self.modality("chat") || self.modality("rag")
+    }
+
+    /// True if this case scores the live advisor service (the `advisor` modality). Advisor cases
+    /// are SERVICE-level scripted conversations grounded in the pre-ingested book corpus — no
+    /// media injection, no lane polling (lib.rs branches before the media pipeline). Standalone:
+    /// don't mix `advisor` with media modalities in one fixture.
+    pub fn needs_advisor(&self) -> bool {
+        self.modality("advisor")
     }
 
     /// The concrete list of clips to inject, in order. A single, fully-resolved plan whether the
@@ -209,6 +218,7 @@ impl Default for PollSpec {
 pub struct Expected {
     pub transcript: Option<TranscriptGt>,
     pub speakers: Option<SpeakersGt>,
+    pub conversations: Option<ConversationsGt>,
     pub sentiment: Option<SentimentGt>,
     pub persons: Option<PersonsGt>,
     pub objects: Option<ObjectsGt>,
@@ -218,6 +228,8 @@ pub struct Expected {
     /// either `"chat"` or `"rag"` as the JSON key.
     #[serde(default, alias = "rag")]
     pub chat: Option<ChatGt>,
+    /// Live advisor ground truth (scored only when the `advisor` modality is listed).
+    pub advisor: Option<AdvisorGt>,
 }
 
 // ----- chat / rag ground truth -----------------------------------------------
@@ -271,6 +283,11 @@ pub struct ChatQ {
     /// Every listed string must appear (normalized substring) in the answer.
     #[serde(default)]
     pub must_contain: Vec<String>,
+    /// AT LEAST ONE of these must appear — for assertions whose correct surface form varies
+    /// (e.g. a decline phrased "don't have" / "do not have" / "no information"). Use
+    /// `must_contain` for content words; this for phrasing-class checks.
+    #[serde(default)]
+    pub must_contain_any: Vec<String>,
     /// None of these may appear (hallucination / decline markers).
     #[serde(default)]
     pub must_not_contain: Vec<String>,
@@ -287,6 +304,15 @@ pub struct ChatQ {
     /// Each listed name must appear across the returned sources' `speaker_name` (normalized).
     #[serde(default)]
     pub citation_must_attribute: Vec<String>,
+    /// All cited segments' `conversation_id`s must collapse to exactly ONE non-NULL id (the
+    /// answer stayed inside a single threaded conversation). Degrades to Info when EVERY cited
+    /// segment is unthreaded (NULL) — the `routed` pattern for a threader that hasn't run.
+    #[serde(default)]
+    pub citations_single_conversation: bool,
+    /// Additionally: that single id must equal the dominant observed id of this GT conversation
+    /// label (needs `expected.conversations.utterances` for the label matching).
+    #[serde(default)]
+    pub citation_conversation_label: Option<String>,
 
     // ---- soft signals ----
     #[serde(default)]
@@ -334,6 +360,47 @@ pub struct ChatCaller {
     pub owner_verified: bool,
 }
 
+// ----- advisor ground truth ----------------------------------------------------
+
+/// Scripted advisor conversation (the `advisor` modality): each turn fires one message at the
+/// live hushai-advisor's `POST /v1/advisor/chat`; ALL turns thread ONE session (the first turn's
+/// `session` SSE event mints it, the harness threads the id into every later turn — the gate's
+/// follow-up rounds and the memory layer are exercised for real). Advisor fixtures are service-
+/// level: no media is injected, and the corpus (`book_chunks`) is probed before querying so an
+/// empty/unmigrated corpus is INCONCLUSIVE ("run ingest-book"), never a false FAIL.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdvisorGt {
+    pub turns: Vec<AdvisorTurn>,
+}
+
+/// One scripted turn + its assertions. Every assertion is optional (a turn may exist purely to
+/// feed the gate more context). Deterministic-first, like `ChatQ`: the checks test STRUCTURE
+/// (did a follow-up round fire, what grounded the answer) and FACTS (substrings), never prose
+/// shape. Metric keys are position-indexed (`advisor.t{i}.*`) so baselines line up — never
+/// reorder a fixture's turns once a baseline exists, only append.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AdvisorTurn {
+    pub message: String,
+    /// A `questions` follow-up round must (true) / must not (false) fire this turn.
+    #[serde(default)]
+    pub expect_questions: Option<bool>,
+    /// This turn must (true) / must not (false) end in a streamed final answer (token text).
+    /// Stronger than "answer non-empty is nice": true asserts the gate stopped asking and
+    /// actually answered; false asserts a questions turn streamed NO answer text.
+    #[serde(default)]
+    pub expect_final_answer: Option<bool>,
+    /// The FINAL grounding (LAST `chapters` event — refine iterations may emit several) must
+    /// contain AT LEAST ONE of these chapter numbers.
+    #[serde(default)]
+    pub expect_chapters_any: Vec<i64>,
+    /// The final grounding must contain ALL of these chapter numbers.
+    #[serde(default)]
+    pub expect_chapters_all: Vec<i64>,
+    /// Case-insensitive (normalized) substrings that must each appear in the final answer text.
+    #[serde(default)]
+    pub expect_substrings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct TranscriptGt {
     pub full_text: String,
@@ -377,6 +444,35 @@ pub struct UttGt {
 pub struct NamedGt {
     pub label: String,
     pub expect_display_name: String,
+}
+
+/// Conversation-threading ground truth (migration 0025: `transcript_sentences.conversation_id`,
+/// assigned by the worker's batch threader). Assignment-invariant like `SpeakersGt`: metrics never
+/// key on minted conversation UUIDs — labels map to observed ids via dominant-id/optimal-assignment.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConversationsGt {
+    pub distinct_count: i64,
+    #[serde(default)]
+    pub count_tolerance: i64,
+    #[serde(default)]
+    pub utterances: Vec<ConvUttGt>,
+    #[serde(default = "d_min_conv")]
+    pub min_pairwise_f1: f64,
+    #[serde(default = "d_min_conv")]
+    pub min_coverage: f64,
+    /// Label pairs that must NEVER share an observed conversation id (disentanglement negatives).
+    #[serde(default)]
+    pub must_not_merge: Vec<[String; 2]>,
+    /// Label pairs whose dominant observed ids must be equal and non-NULL (threading positives).
+    #[serde(default)]
+    pub must_merge: Vec<[String; 2]>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ConvUttGt {
+    pub label: String,
+    pub text_contains: String,
+    pub window_ns: [i64; 2],
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -474,7 +570,7 @@ pub struct EventGt {
 #[derive(Debug, Clone)]
 pub struct Fixture {
     pub dir: PathBuf,
-    pub split: String, // "train" | "holdout"
+    pub split: String, // "train" | "holdout" | "staging" (opt-in, never gates)
     pub meta: Meta,
     pub expected: Expected,
 }
@@ -526,6 +622,24 @@ fn read_json<T: serde::de::DeserializeOwned>(p: &Path) -> Result<T> {
     Ok(serde_json::from_str(&s).with_context(|| format!("parsing {}", p.display()))?)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The advisor staging fixtures are media-less, so nothing else exercises their JSON until a
+    /// live `--fixtures staging` run — parse them here so a schema/typo drift fails fast.
+    #[test]
+    fn advisor_staging_fixtures_parse() {
+        let root = crate::ctx::repo_root().join("hushai-eval/fixtures/staging");
+        for case in ["advisor_followup", "advisor_direct"] {
+            let fx = load(&root.join(case), "staging").expect(case);
+            assert!(fx.meta.needs_advisor(), "{case} must list the advisor modality");
+            let gt = fx.expected.advisor.as_ref().expect("advisor GT block");
+            assert!(!gt.turns.is_empty(), "{case} must script at least one turn");
+        }
+    }
+}
+
 // ----- serde defaults --------------------------------------------------------
 
 fn d_muxed() -> String { "muxed".into() }
@@ -541,5 +655,6 @@ fn d_one() -> i64 { 1 }
 fn d_max_wer() -> f64 { 0.15 }
 fn d_min_sim() -> f64 { 0.85 }
 fn d_min_purity() -> f64 { 0.80 }
+fn d_min_conv() -> f64 { 0.90 }
 fn d_min_acc() -> f64 { 0.5 }
 fn d_min_f1() -> f64 { 0.5 }

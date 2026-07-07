@@ -1,7 +1,7 @@
 //! HTTP surface: `POST /v1/rag/query` (embed -> retrieve -> ground -> answer).
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Path, Query, State};
 use axum::http::header::AUTHORIZATION;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 use subtle::ConstantTimeEq;
 
 use sqlx::PgPool;
+use uuid::Uuid;
 
 use crate::retrieve::{self, Filters, Source, Tuning};
 use crate::state::AppState;
@@ -143,6 +144,20 @@ pub async fn rag_query(
         return recency_query(&st, &req).await;
     }
 
+    // "What did X and Y talk about" → the persisted conversation catalog (0025). Fires only
+    // when ≥1 catalog voice name resolves (the phrase alone must not hijack "what did they
+    // talk about"); no resolved names falls through to the normal paths.
+    if agent.kind == crate::agents::AgentKind::Grounded
+        && is_participants_conversation_query(&req.query)
+    {
+        let pids = crate::speakers::resolve_names_in_text(&st.pool, &req.query)
+            .await
+            .map_err(internal)?;
+        if !pids.is_empty() {
+            return participants_query(&st, &req, &pids).await;
+        }
+    }
+
     if agent.kind == crate::agents::AgentKind::Reflection {
         return reflection_query(&st, &req.query, req.filters.unwrap_or_default(), agent).await;
     }
@@ -203,6 +218,32 @@ pub async fn rag_query(
     // Drop weak matches so we neither ground on nor cite irrelevant passages. (Exhaustive
     // rows have distance 0.0, so they survive this unchanged.)
     sources.retain(|s| s.distance <= st.cfg.distance_threshold);
+    // Then drop hits much weaker than the best one — the absolute cutoff alone lets an
+    // unrelated conversation's marginal hit through, and expansion below would amplify it
+    // into that entire conversation.
+    retrieve::prune_rel_margin(&mut sources, st.cfg.prune_rel_margin);
+
+    // Conversation-neighborhood expansion (0025): pruned hits widen into their persisted
+    // conversation's surrounding sentences and the answer prompt renders per-conversation
+    // sections, so two concurrent conversations can never blend into one answer. Kill
+    // switch + budgets in config; unthreaded hits keep the flat single-sentence behaviour.
+    let mut convo_group_lens: Option<Vec<usize>> = None;
+    if st.cfg.expand_enabled
+        && !want_exhaustive
+        && sources.iter().any(|s| s.conversation_id.is_some())
+    {
+        let groups = retrieve::expand_to_conversations(
+            &st.pool,
+            &sources,
+            st.cfg.expand_window_secs.saturating_mul(1_000_000_000),
+            st.cfg.expand_max_sentences_per_convo,
+            st.cfg.expand_max_total_chars,
+        )
+        .await
+        .map_err(internal)?;
+        convo_group_lens = Some(groups.iter().map(|g| g.len()).collect());
+        sources = groups.into_iter().flatten().collect();
+    }
 
     // Resolve speaker names once for attribution, then ask the LLM for a grounded answer
     // (it declines when sources is empty).
@@ -228,11 +269,22 @@ pub async fn rag_query(
             tracing::warn!(error = format!("{e:#}"), "vision enrichment skipped");
         }
     }
-    let answer = st
-        .llm
-        .answer(&req.query, &sources, &names)
-        .await
-        .map_err(internal)?;
+    // Grouped rendering only when the expansion actually found >1 conversation; a single
+    // group (or no threading) keeps the flat prompt byte-identical.
+    let answer = match &convo_group_lens {
+        Some(lens) if lens.len() > 1 => {
+            let groups = retrieve::regroup_sources(&sources, lens);
+            st.llm
+                .answer_grouped(&req.query, &groups, &names)
+                .await
+                .map_err(internal)?
+        }
+        _ => st
+            .llm
+            .answer(&req.query, &sources, &names)
+            .await
+            .map_err(internal)?,
+    };
 
     Ok(Json(QueryResponse { answer, sources }))
 }
@@ -592,6 +644,185 @@ pub(crate) async fn recency_query(
     Ok(Json(QueryResponse { answer, sources }))
 }
 
+/// Conversation-grouped sources for a PARTICIPANTS question ("what did X and Y talk
+/// about"): newest conversations from the 0025 catalog whose `speaker_ids` contain every
+/// resolved participant, each expanded to its ordered transcript. Oldest-first for
+/// narration. Empty when nothing threaded matches (the grouped prompt then declines —
+/// unthreaded history is reachable via the speaker filter / exhaustive paths instead).
+pub(crate) async fn participants_conversation_groups(
+    st: &AppState,
+    participant_ids: &[Uuid],
+    device_id: Option<&str>,
+    after: Option<i64>,
+    before: Option<i64>,
+) -> anyhow::Result<Vec<Vec<Source>>> {
+    let metas = retrieve::list_conversations(
+        &st.pool,
+        device_id,
+        after,
+        before,
+        Some(participant_ids),
+        st.cfg.summary_max_convos.max(1) as i64,
+    )
+    .await?;
+    let mut groups = Vec::new();
+    for m in &metas {
+        let t = retrieve::conversation_transcript(
+            &st.pool,
+            m.conversation_id,
+            st.cfg.recency_max_sentences,
+        )
+        .await?;
+        if !t.is_empty() {
+            groups.push(t);
+        }
+    }
+    groups.reverse(); // newest-first catalog order → oldest-first narration
+    Ok(groups)
+}
+
+/// Single-shot participants answer (the `/v1/rag/query` mirror of the chat branch).
+pub(crate) async fn participants_query(
+    st: &AppState,
+    req: &QueryRequest,
+    participant_ids: &[Uuid],
+) -> Result<Json<QueryResponse>, (StatusCode, String)> {
+    let tz = req.tz_offset(&st);
+    let now = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+    let qf = req.filters.as_ref();
+    let parsed = crate::timeparse::window_in_query(&req.query, now, tz);
+    let after = qf.and_then(|f| f.after_unix_nanos).or(parsed.map(|(a, _)| a));
+    let before = qf.and_then(|f| f.before_unix_nanos).or(parsed.map(|(_, b)| b));
+    let device_id = qf.and_then(|f| f.device_id.clone());
+
+    let mut groups =
+        participants_conversation_groups(st, participant_ids, device_id.as_deref(), after, before)
+            .await
+            .map_err(internal)?;
+
+    // Enrich FLAT (global unnamed ordinals), then re-group by the recorded lengths.
+    let lens: Vec<usize> = groups.iter().map(|g| g.len()).collect();
+    let mut flat: Vec<Source> = groups.drain(..).flatten().collect();
+    let ids: Vec<String> = flat.iter().filter_map(|s| s.speaker_id.clone()).collect();
+    let names = crate::speakers::name_map(&st.pool, &ids)
+        .await
+        .map_err(internal)?;
+    retrieve::enrich_for_display(&mut flat, &names, now, tz);
+    let groups = retrieve::regroup_sources(&flat, &lens);
+
+    let answer = st
+        .llm
+        .answer_grouped(&req.query, &groups, &names)
+        .await
+        .map_err(internal)?;
+    Ok(Json(QueryResponse {
+        answer,
+        sources: flat,
+    }))
+}
+
+/// Query params for `GET /v1/rag/conversations`.
+#[derive(Debug, Default, Deserialize)]
+pub struct ConversationsListParams {
+    #[serde(default)]
+    pub device_id: Option<String>,
+    #[serde(default)]
+    pub after_unix_nanos: Option<i64>,
+    #[serde(default)]
+    pub before_unix_nanos: Option<i64>,
+    /// Restrict to conversations where this named voice spoke.
+    #[serde(default)]
+    pub speaker_name: Option<String>,
+    #[serde(default)]
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConversationSummary {
+    pub conversation_id: String,
+    pub device_id: Option<String>,
+    pub started_at_unix_nanos: i64,
+    pub ended_at_unix_nanos: i64,
+    pub status: String,
+    /// Resolved display labels ("Alice", "unidentified speaker"...), stable order.
+    pub participants: Vec<String>,
+    pub sentence_count: i32,
+}
+
+/// `GET /v1/rag/conversations` — list threaded conversations (0025), newest first.
+pub async fn list_conversations_route(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Query(params): Query<ConversationsListParams>,
+) -> Result<Json<Vec<ConversationSummary>>, (StatusCode, String)> {
+    check_auth(&headers, &st)?;
+    let speaker_ids: Option<Vec<Uuid>> = match &params.speaker_name {
+        Some(name) => {
+            let ids = crate::speakers::resolve_name(&st.pool, name)
+                .await
+                .map_err(internal)?;
+            if ids.is_empty() {
+                return Ok(Json(vec![])); // unknown name matches nothing, never unfiltered
+            }
+            Some(ids)
+        }
+        None => None,
+    };
+    let metas = retrieve::list_conversations(
+        &st.pool,
+        params.device_id.as_deref(),
+        params.after_unix_nanos,
+        params.before_unix_nanos,
+        speaker_ids.as_deref(),
+        params.limit.unwrap_or(50),
+    )
+    .await
+    .map_err(internal)?;
+    let all_ids: Vec<String> = metas.iter().flat_map(|m| m.speaker_ids.clone()).collect();
+    let names = crate::speakers::name_map(&st.pool, &all_ids)
+        .await
+        .map_err(internal)?;
+    let out = metas
+        .into_iter()
+        .map(|m| {
+            let participants = m
+                .speaker_ids
+                .iter()
+                .map(|id| crate::speakers::display_label(Some(id), &names, None))
+                .collect();
+            ConversationSummary {
+                conversation_id: m.conversation_id.to_string(),
+                device_id: m.device_id,
+                started_at_unix_nanos: m.started_at_unix_nanos,
+                ended_at_unix_nanos: m.ended_at_unix_nanos,
+                status: m.status,
+                participants,
+                sentence_count: m.sentence_count,
+            }
+        })
+        .collect();
+    Ok(Json(out))
+}
+
+/// `GET /v1/rag/conversations/{id}` — one conversation's ordered, enriched transcript.
+pub async fn get_conversation_route(
+    State(st): State<AppState>,
+    headers: HeaderMap,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Vec<Source>>, (StatusCode, String)> {
+    check_auth(&headers, &st)?;
+    let mut sources = retrieve::conversation_transcript(&st.pool, id, 500)
+        .await
+        .map_err(internal)?;
+    let ids: Vec<String> = sources.iter().filter_map(|s| s.speaker_id.clone()).collect();
+    let names = crate::speakers::name_map(&st.pool, &ids)
+        .await
+        .map_err(internal)?;
+    let now = Utc::now().timestamp_nanos_opt().unwrap_or(i64::MAX);
+    retrieve::enrich_for_display(&mut sources, &names, now, st.cfg.analysis_tz_offset_secs);
+    Ok(Json(sources))
+}
+
 /// Person analogue of `retrieve::enrich_for_display`: set `speaker_name` via the PERSON label rules
 /// (`persons::display_label` — "unidentified person N" / "an unrecognized face") and the humanized
 /// `time_label`. (A face row carries `person_id::text` in `speaker_id`.)
@@ -783,6 +1014,30 @@ pub(crate) fn is_recency_query(query: &str) -> bool {
     ]
     .iter()
     .any(|p| q.contains(p))
+}
+
+/// Is the question about a CONVERSATION BETWEEN named participants ("what did X and Y talk
+/// about", "the conversation between X and Y")? Same narrow-phrase idiom as
+/// [`is_recency_query`]. Only meaningful when ≥1 catalog voice name resolves in the text
+/// (the caller checks `speakers::resolve_names_in_text` — the `is_profile_query` guard
+/// pattern); the phrase alone must not hijack "what did they talk about" from the
+/// recency/window paths. Answered from the persisted conversation catalog (0025):
+/// conversations whose `speaker_ids` contain every resolved participant.
+pub(crate) fn is_participants_conversation_query(query: &str) -> bool {
+    let q = query.to_lowercase();
+    [
+        "conversation between",
+        "conversations between",
+        "conversation with",
+        "talk about with",
+        "talked about with",
+        " and ", // "what did X and Y talk about / discuss" — requires the name check
+    ]
+    .iter()
+    .any(|p| q.contains(p))
+        && ["talk", "talked", "talking", "discuss", "discussed", "discussing", "conversation", "say", "said"]
+            .iter()
+            .any(|p| q.contains(p))
 }
 
 /// Is the question "how many PEOPLE (distinct humans) were seen" — a distinct-person count over

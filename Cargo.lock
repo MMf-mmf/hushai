@@ -3539,6 +3539,29 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "135b12329e5e3ce057a9f972339ea52bc954fe1e9358ef27f95e89716fbc5424"
 
 [[package]]
+name = "hushai-advisor"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-stream",
+ "axum",
+ "chrono",
+ "dotenvy",
+ "futures-util",
+ "hushai-backend",
+ "pgvector",
+ "rig",
+ "serde",
+ "serde_json",
+ "sqlx",
+ "subtle",
+ "tokio",
+ "tower-http",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "hushai-backend"
 version = "0.1.0"
 dependencies = [

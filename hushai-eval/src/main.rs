@@ -23,7 +23,8 @@ enum Cmd {
         /// Score only this case_id.
         #[arg(long)]
         case: Option<String>,
-        /// Which split(s) to run: "train", "holdout", or "all".
+        /// Which split(s) to run: "train", "holdout", "all" (train+holdout), or "staging"
+        /// (opt-in pre-promotion cases, e.g. the advisor suite; never part of "all").
         #[arg(long, default_value = "train")]
         fixtures: String,
         /// Write the current metric vector as the new baseline (only on a passing case unless --force).
@@ -67,6 +68,9 @@ async fn main() {
             let splits = match fixtures.as_str() {
                 "all" => vec!["train".to_string(), "holdout".to_string()],
                 "holdout" => vec!["holdout".to_string()],
+                // Opt-in ONLY: staging (probe drafts + pre-promotion cases like the advisor
+                // fixtures) is deliberately excluded from "all" so it can't gate baselines.
+                "staging" => vec!["staging".to_string()],
                 _ => vec!["train".to_string()],
             };
             let opts = RunOpts { tier, case, splits, update_baseline, force, json };

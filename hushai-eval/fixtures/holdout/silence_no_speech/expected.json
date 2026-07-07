@@ -7,5 +7,9 @@
   "speakers": {
     "distinct_count": 0,
     "count_tolerance": 0
+  },
+  "conversations": {
+    "distinct_count": 0,
+    "count_tolerance": 0
   }
 }

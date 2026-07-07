@@ -31,6 +31,7 @@ Kotlin (Square Wire).
 | `hushai-android/` | Native Kotlin capture client: Camera2 + dual MediaCodec → ~2s segments; live preview, battery-saver, **audio-only mode**, on-device **voice assistant** (RAG chat + TTS), and Voices/People/Plates/Events screens. First real client. | [`hushai-android/README.md`](hushai-android/README.md) |
 | `hushai-eval/` | End-to-end regression harness: inject **known** clips into the live pipeline → wait for completion → score vs ground truth → improvement/regression verdict + exit code. | [`hushai-eval/RECURSIVE_TESTING.md`](hushai-eval/RECURSIVE_TESTING.md), [`hushai-eval/README.md`](hushai-eval/README.md) |
 | `hushai-loadtest/` | Capacity harness: replay ONE clip as N **synthetic cameras**, ramp 1→N, sample worker/host load, report the **saturation point** + bottleneck stage. | [`hushai-loadtest/README.md`](hushai-loadtest/README.md), [`docs/hardware-sizing-30-cameras.md`](docs/hardware-sizing-30-cameras.md) |
+| `hushai-advisor/` | The **Ahithophel advisor** (`:8095`): multi-agent advice pipeline grounded in an ingested book — sufficiency gate (asks follow-up questions) → chapter routing → draft/critique/refine loop → streamed answer → Q&A memory (migrations 0026/0027). Corpus is populated by its `ingest-book` binary from `Agent Ahithophel/books/chapters_text/`. SSE protocol extends the rag chat one with `phase`/`questions`/`chapters` events. Sets `num_ctx` explicitly (`ADVISOR_NUM_CTX`, default 16384) — the only service that does; multi-chapter prompts silently truncate at Ollama's 4096 default otherwise. | [`hushai-advisor/`](hushai-advisor/), [`local_dev/AhithophelPlan.md`](local_dev/AhithophelPlan.md) |
 | `contracts/` | The camera→backend contract — the authoritative boundary. | [`contracts/cameraToBackendContract.md`](contracts/cameraToBackendContract.md) |
 | `docs/` | Human-facing runbooks + design references (onboarding, device/footage mgmt, vision/ALPR, scaling, perception hardening, LAN URL, feature parity). | [`docs/`](docs/) |
 | `local_dev/` | Scripts to run + provision the stack — see "Running the stack" below. | this file |
@@ -107,6 +108,7 @@ cd hushai-backend && SQLX_OFFLINE=true cargo run                       # backend
 cd <root> && SQLX_OFFLINE=true cargo run -p hushai-worker              # worker   -> drains, then polls
 cd <root> && SQLX_OFFLINE=true cargo run -p hushai-rag                 # rag      -> :8090
 cd <root> && SQLX_OFFLINE=true cargo run -p hushai-viewer              # viewer   -> 127.0.0.1:8070
+cd <root> && SQLX_OFFLINE=true cargo run -p hushai-advisor             # advisor  -> :8095
 ./local_dev/run_hushai_app.sh --duration 120                          # Android over USB (adb reverse)
 
 curl -s localhost:8090/v1/rag/query -H 'content-type: application/json' \
@@ -276,6 +278,55 @@ dropped — **media is ALWAYS stored regardless of gating.**
 - Known gap (documented): merges don't repoint `events.subject_id`, so loser events not yet
   consumed at merge time never fold in (bounded to the grace window).
 
+### Conversation threading (migration 0025)
+
+- **What it is:** persisted conversations — `conversations` catalog + denormalized
+  `transcript_sentences.conversation_id`/`turn_index` — assigned by a batch threader
+  (`hushai-backend/src/threading.rs` pure core + `conversations.rs` orchestration, driven by
+  worker 0 every `THREADER_INTERVAL_SECS`, checked BEFORE claiming so load can't starve it).
+  Industry-standard conversation disentanglement: silence-gap blocks (`CONVERSATION_GAP_SECS`,
+  the shared truth with rag/profiles), then within-block speaker-pair graphs (reply-shaped
+  adjacency + topic affinity over the 1024-d sentence embeddings) separate two concurrent
+  group conversations on ONE mic. Split gate is conservative: size floor, temporal interleave
+  required (`THREADER_TOPIC_ONLY_SPLIT=false` — sequential topic drift never splits), low
+  cross-group similarity.
+- **Determinism contract:** the pure core has total tie-breaks and injected id-minting; same
+  input + same `config_hash(ThreaderCfg)` ⇒ byte-identical output (the eval lineage gate).
+  All `THREADER_*`/`CONVO_*` knobs are in the eval manifest KNOB_PREFIXES.
+- **Mutability contract (0025 header is normative):** `open` conversations are provisional
+  (revisable while in the batch window); `closed` are frozen except append-only late-attach of
+  reprocessed rows inside their span; `conversation_id NULL` = unthreaded → every consumer
+  falls back to the query-time gap heuristic (dual-path, no backfill required). Threading
+  windows derive from the BATCH'S CAPTURE TIMES, never the wall clock — backlog uploads (an
+  offline phone's store-and-forward day, eval fixtures pinned in the past) thread in their own
+  capture-time context. Pre-feature history stays NULL until `thread_backfill`
+  (`THREADER_BACKFILL_ON_START` one-shot).
+- **Cross-device = LINK, never merge** (`link_group_id`): overlapping wall-clock + shared
+  speaker ⇒ same link group; merging would interleave duplicate ASR text of the same audio.
+- **Lifecycle events:** close (gap + `CONVO_CLOSE_GRACE_SECS`) emits ONE `conversation` event
+  (`dedup_key='convo:<id>'`) with participants metadata — feeds alerts/feed/profiles later.
+- **RAG consumption:** grounded hits expand to conversation neighborhoods
+  (`retrieve::expand_to_conversations`, `RAG_EXPAND_*` knobs + kill switch), but only after
+  the relative-margin prune (`retrieve::prune_rel_margin`, `RAG_PRUNE_REL_MARGIN`, default
+  0.25): hits with `distance > best + margin` are dropped so one marginal hit from an
+  unrelated conversation — it can sit just under the absolute `RAG_DISTANCE_THRESHOLD` —
+  never drags that whole conversation into the prompt. The prompt then
+  renders per-conversation sections with a never-combine instruction
+  (`llm::build_grouped_prompt` — enrich the FLAT list first, then regroup, or unnamed-speaker
+  ordinals collide across groups). `take_latest_conversation` stops the backscan when the
+  persisted conversation id CHANGES (two back-to-back conversations < gap apart no longer
+  glue); `group_conversations` buckets threaded rows by id and gap-splits only the NULL
+  remainder. New intent `is_participants_conversation_query` ("what did X and Y talk about")
+  → `conversations WHERE speaker_ids @> …`. Voice recency questions anchor to the asking
+  phone's device (`caller.device_id`) when no explicit filter — the group-A-not-group-B
+  guarantee for voice. Endpoints: `GET /v1/rag/conversations[/{id}]`.
+- **Honest limits (do not promise 100%):** same-topic interleaved groups on one mono mic are
+  information-theoretically inseparable (no spatial audio); acoustically overlapped 2s
+  segments arrive with `speaker_id NULL` (the multi-speaker refusal) and topic-attach as
+  orphans — safe degradation, never a speaker misattribution. Device separation and ≥gap
+  separation are absolute; disjoint-speaker-set separation needs the speaker lane to actually
+  separate the voices.
+
 ### Chat correctness (2026-07 overhaul — the "executive chat" fixes)
 
 - **Visit coalescing:** `presence.rs` counts VISITS (gap-coalesced continuous appearances,
@@ -429,7 +480,11 @@ constant-time (`subtle`). Set `RAG_TOKEN` (it WARNs if unset). Onboard a camera:
 `hushai-eval` injects **known** clips into the **live** pipeline, waits for completion, scores vs
 ground truth, and emits a verdict + exit code (0 pass · 1 regression · 2 inconclusive). It scores
 both perception AND the RAG chat ANSWER (the `chat`/`rag` modality: `must_contain`/`expect_number`/
-`expect_routed_agent`/`min_citations`/…). It REFUSES to run against a non-`*_test` DB (it TRUNCATEs
+`expect_routed_agent`/`min_citations`/…). An `advisor` modality (staging split only:
+`--fixtures staging`) scripts multi-turn consultations against hushai-advisor
+(`expect_questions`/`expect_final_answer`/`expect_chapters_any|all`/`expect_substrings`;
+`HUSHAI_ADVISOR_URL`/`ADVISOR_TOKEN`) — absent service or un-ingested corpus yields
+INCONCLUSIVE, never FAIL. It REFUSES to run against a non-`*_test` DB (it TRUNCATEs
 result tables) — bring it up with `./local_dev/run_stack.sh --test-db` (determinism profile
 `local_dev/eval.env`), then `cargo run -p hushai-eval -- run --tier {fast|full}`. A physical
 camera-at-screen tier is `local_dev/physical_loopback.py`. Read the playbook before using the loop.

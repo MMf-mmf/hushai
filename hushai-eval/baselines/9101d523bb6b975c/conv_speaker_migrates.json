@@ -1,0 +1,14 @@
+{
+  "case_id": "conv_speaker_migrates",
+  "config_hash": "9101d523bb6b975c",
+  "git_sha": "37a8372",
+  "metrics": {
+    "conversations.count_error": 0.0,
+    "conversations.coverage": 1.0,
+    "conversations.fragmentation": 1.0,
+    "conversations.must_merge.REPORT-JOIN": 1.0,
+    "conversations.must_not_merge.DINNER-REPORT": 1.0,
+    "conversations.pairwise_f1": 1.0,
+    "conversations.purity": 1.0
+  }
+}

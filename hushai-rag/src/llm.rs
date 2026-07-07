@@ -151,6 +151,26 @@ impl Llm {
             .map_err(|e| anyhow!("LLM prompt failed: {e}"))
     }
 
+    /// [`Llm::answer`] over CONVERSATION-scoped groups (0025): renders per-conversation
+    /// sections via [`build_grouped_prompt`] so the model never merges statements across
+    /// concurrent conversations. Groups must already be enriched (flat) by the caller.
+    pub async fn answer_grouped(
+        &self,
+        question: &str,
+        groups: &[Vec<Source>],
+        names: &HashMap<String, String>,
+    ) -> anyhow::Result<String> {
+        let agent = self
+            .tune(self.client.agent(&self.model))
+            .preamble(crate::agents::default_preamble())
+            .build();
+        let prompt = build_grouped_prompt(question, groups, names);
+        agent
+            .prompt(prompt)
+            .await
+            .map_err(|e| anyhow!("LLM prompt failed: {e}"))
+    }
+
     /// Multi-turn, token-streaming grounded answer. `system_prompt` is the selected
     /// agent's persona; `history` is the prior conversation (oldest→newest) for
     /// coreference. Returns a stream of answer-text deltas (tool-call / reasoning items
@@ -163,12 +183,21 @@ impl Llm {
         names: &HashMap<String, String>,
         system_prompt: &str,
         history: Vec<Message>,
+        groups: Option<&[Vec<Source>]>,
     ) -> anyhow::Result<impl Stream<Item = anyhow::Result<String>> + Send> {
         let agent = self
             .tune(self.client.agent(&self.model))
             .preamble(system_prompt)
             .build();
-        let prompt = build_prompt(question, sources, names);
+        // Conversation-scoped grouping (0025): when the retrieval expanded into more than
+        // one conversation, render per-conversation sections (never mixing groups);
+        // otherwise byte-identical to the flat prompt.
+        let prompt = match groups {
+            Some(g) if g.iter().filter(|x| !x.is_empty()).count() > 1 => {
+                build_grouped_prompt(question, g, names)
+            }
+            _ => build_prompt(question, sources, names),
+        };
         let stream = agent.stream_prompt(prompt).with_history(history).await;
         Ok(stream.filter_map(|item| async move {
             match item {
@@ -578,6 +607,90 @@ pub fn build_window_summary_prompt(
     )
 }
 
+/// Assemble the grounded prompt over CONVERSATION-scoped groups (0025): each group renders
+/// as its own section with a participants header, GLOBAL `[i]` numbering continues across
+/// sections (the flattened groups are exactly the `sources` array the SSE carries, so
+/// citation indices line up — the window-summary contract), and a trailing instruction
+/// forbids combining statements across conversations. A single group degenerates to the
+/// flat `build_prompt` layout plus the participants line.
+///
+/// CALLER CONTRACT: run `enrich_for_display` over the FLAT source list BEFORE grouping —
+/// unnamed-speaker ordinals are assigned globally, so "unidentified speaker 1" in two
+/// different sections is guaranteed to be the same voice (and two different voices never
+/// share a label).
+pub fn build_grouped_prompt(
+    question: &str,
+    groups: &[Vec<Source>],
+    names: &HashMap<String, String>,
+) -> String {
+    let nonempty = groups.iter().filter(|g| !g.is_empty()).count();
+    if nonempty == 0 {
+        return build_prompt(question, &[], names);
+    }
+    if nonempty == 1 {
+        let flat: Vec<Source> = groups.iter().flatten().cloned().collect();
+        return build_prompt(question, &flat, names);
+    }
+    let mut ctx = String::new();
+    let mut i = 0usize;
+    let mut section = 0usize;
+    for group in groups.iter().filter(|g| !g.is_empty()) {
+        // Participants in first-utterance order, deduped on the enriched label.
+        let mut participants: Vec<String> = Vec::new();
+        for s in group {
+            let who = s.speaker_name.clone().unwrap_or_else(|| {
+                crate::speakers::display_label(s.speaker_id.as_deref(), names, None)
+            });
+            if !participants.contains(&who) {
+                participants.push(who);
+            }
+        }
+        let when = group
+            .first()
+            .map(|s| s.time_label.clone())
+            .filter(|t| !t.is_empty())
+            .map(|t| format!("{t} — "))
+            .unwrap_or_default();
+        section += 1;
+        ctx.push_str(&format!(
+            "Conversation {section} ({}{}):\n",
+            when,
+            participants.join(", ")
+        ));
+        for s in group {
+            i += 1;
+            let who = s.speaker_name.clone().unwrap_or_else(|| {
+                crate::speakers::display_label(s.speaker_id.as_deref(), names, None)
+            });
+            let vis = match &s.visual_context {
+                Some(v) if !v.trim().is_empty() => format!(" — {}", v.trim()),
+                _ => String::new(),
+            };
+            if s.time_label.is_empty() {
+                ctx.push_str(&format!("[{}] ({}) {}{}\n", i, who, s.text.trim(), vis));
+            } else {
+                ctx.push_str(&format!(
+                    "[{}] ({}, {}) {}{}\n",
+                    i,
+                    who,
+                    s.time_label,
+                    s.text.trim(),
+                    vis
+                ));
+            }
+        }
+        ctx.push('\n');
+    }
+    format!(
+        "Context passages, grouped by conversation:\n{ctx}\
+         Question: {question}\n\n\
+         Each conversation above is a SEPARATE discussion between only the people listed \
+         for it. Never combine statements from different conversations into one answer. If \
+         the question is about one conversation, ignore the others and say which \
+         conversation you are describing."
+    )
+}
+
 /// Assemble the numbered OBJECT-sightings block + question. Each line is the seen object (the
 /// whole-frame `__frame__` rows render as "something in view") and its plain-language time. No
 /// speaker attribution; identity/timestamps are pre-humanized so the model never sees raw values.
@@ -670,6 +783,7 @@ mod tests {
             speaker_name: None,
             time_label: "yesterday at 5:14 PM".into(),
             visual_context: None,
+            conversation_id: None,
         }
     }
 

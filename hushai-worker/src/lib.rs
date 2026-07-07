@@ -196,6 +196,22 @@ pub async fn run() -> anyhow::Result<()> {
         );
     }
 
+    // One-shot: thread ALL historical NULL-conversation transcript rows (pre-0025
+    // history) through the conversation threader. Off by default; turn on for one run.
+    if cfg.threader_backfill_on_start {
+        let opts = cfg.threader_opts();
+        match hushai_backend::conversations::thread_backfill(&pool, &opts, 0, i64::MAX, false)
+            .await
+        {
+            Ok(stats) => tracing::info!(
+                rows_assigned = stats.rows_assigned,
+                convos_minted = stats.convos_minted,
+                "conversation backfill complete"
+            ),
+            Err(e) => tracing::warn!(error = format!("{e:#}"), "conversation backfill failed"),
+        }
+    }
+
     let shutdown = Arc::new(AtomicBool::new(false));
     spawn_shutdown_watcher(shutdown.clone());
 
@@ -767,7 +783,40 @@ async fn worker_loop(
     // needs no shared state. Initialized to now() so the first pass waits one interval.
     let mut last_autoheal = std::time::Instant::now();
     let mut last_profiles = std::time::Instant::now();
+    let mut last_threader = std::time::Instant::now();
     while !shutdown.load(Ordering::SeqCst) {
+        // Conversation threading (worker 0, interval-gated). Checked BEFORE claiming —
+        // unlike the drain-time autoheal/profile passes — so a sustained ingest backlog
+        // can never starve threading. The pass is bounded (THREADER_MAX_ROWS_PER_PASS)
+        // and cheap when idle (one indexed watermark scan finding nothing).
+        if worker_id == 0
+            && cfg.threader_enabled
+            && last_threader.elapsed().as_secs() >= cfg.threader_interval_secs
+        {
+            last_threader = std::time::Instant::now();
+            let opts = cfg.threader_opts();
+            match hushai_backend::conversations::thread_pass(&pool, &opts).await {
+                Ok(stats) if stats.rows_scanned > 0 || stats.convos_closed > 0 => {
+                    hushai_backend::observe::counter_by(
+                        "hushai_threader_rows_assigned_total",
+                        &[],
+                        stats.rows_assigned,
+                    );
+                    tracing::info!(
+                        scanned = stats.rows_scanned,
+                        assigned = stats.rows_assigned,
+                        late_attached = stats.late_attached,
+                        minted = stats.convos_minted,
+                        closed = stats.convos_closed,
+                        deleted = stats.convos_deleted,
+                        linked = stats.links_created,
+                        "conversation threading pass"
+                    );
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!(error = format!("{e:#}"), "threading pass failed"),
+            }
+        }
         // Load governor: by default audio is the lane we keep running (vision pauses first), so this
         // only fires when the operator inverted the priority (LOAD_PAUSE_VISION_FIRST=false).
         if governor.audio_should_pause() {

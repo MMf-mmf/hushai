@@ -1,0 +1,54 @@
+{
+  "conversations": {
+    "distinct_count": 2,
+    "count_tolerance": 0,
+    "min_pairwise_f1": 0.85,
+    "min_coverage": 0.9,
+    "must_not_merge": [
+      [
+        "DINNER",
+        "REPORT"
+      ]
+    ],
+    "must_merge": [
+      [
+        "REPORT",
+        "JOIN"
+      ]
+    ],
+    "utterances": [
+      {
+        "label": "DINNER",
+        "text_contains": "salmon",
+        "window_ns": [
+          0,
+          9108934000
+        ]
+      },
+      {
+        "label": "REPORT",
+        "text_contains": "quarterly report",
+        "window_ns": [
+          0,
+          8743628000
+        ]
+      },
+      {
+        "label": "JOIN",
+        "text_contains": "hiring budget",
+        "window_ns": [
+          16743628000,
+          23900726000
+        ]
+      },
+      {
+        "label": "JOIN",
+        "text_contains": "we will raise",
+        "window_ns": [
+          16743628000,
+          23900726000
+        ]
+      }
+    ]
+  }
+}

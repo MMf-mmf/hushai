@@ -1,0 +1,11 @@
+{
+  "case_id": "advisor_direct",
+  "description": "Sufficient-context single turn: a fully-specified persuasion situation (who, goal, deadline, constraints) must SKIP the follow-up gate and stream a final answer. No chapter assertions — routing content depends on the live corpus synopses. Service-level advisor case: no media is injected (media fields below are unused placeholders).",
+  "device_id": "eval-advisor",
+  "media_file": "",
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "advisor"
+  ],
+  "tier": "full"
+}

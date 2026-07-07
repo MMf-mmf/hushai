@@ -14,6 +14,7 @@ TRUNCATE
   events, video_events, alert_rules, alert_deliveries, watchlist,
   rolling_summaries, entity_profiles, chat_sessions, chat_messages,
   segment_transcription_status, segment_vision_status,
+  conversations, threader_state,
   segments, streams, sessions
 RESTART IDENTITY CASCADE";
 
@@ -37,6 +38,18 @@ pub async fn reset_db(ctx: &Ctx) -> Result<()> {
             .await
             .with_context(|| format!("calling {f}(1)"))?;
     }
+    Ok(())
+}
+
+/// Advisor-surface reset (the `advisor` modality): sessions/messages/memories are per-run state —
+/// a prior run's memorized facts would bleed into later answers — while `books`/`book_chapters`/
+/// `book_chunks` are the ingested reference corpus and MUST survive (the analog of `devices`
+/// above). Kept OUT of `TRUNCATE_SQL` so media fixtures never require the advisor migrations.
+pub async fn reset_advisor(ctx: &Ctx) -> Result<()> {
+    sqlx::query("TRUNCATE advisor_sessions, advisor_messages, advisor_memories RESTART IDENTITY CASCADE")
+        .execute(&ctx.pool)
+        .await
+        .context("TRUNCATE advisor session/message/memory tables")?;
     Ok(())
 }
 

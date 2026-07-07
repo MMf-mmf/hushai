@@ -9,7 +9,8 @@
   "modalities": [
     "transcript",
     "sentiment",
-    "chat"
+    "chat",
+    "conversations"
   ],
   "tier": "full",
   "poll": {

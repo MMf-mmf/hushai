@@ -1,0 +1,18 @@
+{
+  "case_id": "conv_overlap_degrade",
+  "description": "True acoustic double-talk (two dialogues amixed). Graceful-degradation probe: the pipeline must complete (multi-speaker refusal \u2192 NULL speakers is the SAFE path), count \u2264 2, and chat must not fabricate specifics. Never a quality gate.",
+  "device_id": "eval-conv-overlap",
+  "media_file": "media.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "conversations",
+    "chat"
+  ],
+  "tier": "full",
+  "poll": {
+    "timeout_secs": 240,
+    "interval_secs": 2
+  }
+}

@@ -1,0 +1,51 @@
+[package]
+name = "hushai-advisor"
+version = "0.1.0"
+edition = "2024"
+description = "Ahithophel advisor service: multi-agent advice pipeline (sufficiency gate → chapter routing → draft/critique/refine loop → memory) grounded in an ingested book corpus (Rust + Rig + Ollama)."
+
+[dependencies]
+# Reuse the ingest backend's Config + DB pool + logging/TLS/metrics (path dep).
+hushai-backend = { path = "../hushai-backend" }
+
+# Constant-time bearer-token comparison (matches the backend's auth hardening).
+subtle = "2"
+
+# Rig: local embeddings + completion via the Ollama provider.
+rig = "0.37"
+
+# HTTP server.
+axum = { version = "0.8", features = ["macros"] }
+tower-http = { version = "0.6", features = ["trace"] }
+
+# Database. Runtime (unchecked) queries; `json` for chapters/memories jsonb columns.
+sqlx = { version = "0.9", features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "uuid",
+    "chrono",
+    "json",
+] }
+
+# Native binary vector encoding for book_chunks / advisor_memories embeddings
+# (same pgvector binary-protocol binding as hushai-rag/src/retrieve.rs).
+pgvector = { version = "0.4.2", features = ["sqlx"] }
+
+tokio = { version = "1", features = ["full"] }
+# SSE chat: build the event stream and consume Rig's token stream.
+async-stream = "0.3"
+futures-util = "0.3"
+tracing = "0.1"
+# Logging is initialised centrally by `hushai_backend::logging`; this crate only
+# emits via `tracing` macros, so it needs no direct `tracing-subscriber` dep.
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+dotenvy = "0.15"
+uuid = { version = "1", features = ["v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[[bin]]
+name = "ingest-book"
+path = "src/bin/ingest_book.rs"

@@ -1,0 +1,23 @@
+{
+  "case_id": "repeat_visitor",
+  "config_hash": "9101d523bb6b975c",
+  "git_sha": "37a8372",
+  "metrics": {
+    "chat.q0.citations": 6.0,
+    "chat.q0.contains": 1.0,
+    "chat.q0.errored": 1.0,
+    "chat.q0.routed": 1.0,
+    "chat.q0.similarity": 0.9422950530160984,
+    "chat.q1.clean": 1.0,
+    "chat.q1.contains_any": 1.0,
+    "chat.q1.errored": 1.0,
+    "chat.q1.similarity": 0.8812219003228188,
+    "chat.q2.clean": 1.0,
+    "chat.q2.count_ok": 1.0,
+    "chat.q2.errored": 1.0,
+    "conversations.count_error": 0.0,
+    "conversations.fragmentation": 1.0,
+    "transcript.similarity": 0.9009009009009009,
+    "transcript.wer": 0.075
+  }
+}

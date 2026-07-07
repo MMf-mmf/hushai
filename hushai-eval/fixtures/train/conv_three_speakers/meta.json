@@ -1,0 +1,19 @@
+{
+  "case_id": "conv_three_speakers",
+  "description": "Three voices round-robin on one topic (trip planning): a multi-speaker conversation must stay ONE conversation \u2014 the anti-fragmentation gate (diarization-independent: works whether the lane mints 0, 1, or 3 voices).",
+  "device_id": "eval-conv-trio",
+  "media_file": "media.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "transcript",
+    "conversations",
+    "chat"
+  ],
+  "tier": "full",
+  "poll": {
+    "timeout_secs": 240,
+    "interval_secs": 2
+  }
+}

@@ -1,0 +1,37 @@
+{
+  "transcript": {
+    "full_text": "for the holidays i want to visit the mountains and rent a small cabin near the ski slopes. a cabin sounds lovely. we can ski in the morning and rest by the fireplace at night. completely different thing. the insurance company finally called back about the roof claim. what did the insurance adjuster say about the hail damage estimate?",
+    "max_wer": 0.35,
+    "min_similarity": 0.6
+  },
+  "conversations": {
+    "distinct_count": 1,
+    "count_tolerance": 0,
+    "min_pairwise_f1": 0.9,
+    "min_coverage": 0.9,
+    "must_merge": [
+      [
+        "HOLIDAY",
+        "CLAIM"
+      ]
+    ],
+    "utterances": [
+      {
+        "label": "HOLIDAY",
+        "text_contains": "ski",
+        "window_ns": [
+          0,
+          8739818500
+        ]
+      },
+      {
+        "label": "CLAIM",
+        "text_contains": "insurance",
+        "window_ns": [
+          5826545666,
+          17479637000
+        ]
+      }
+    ]
+  }
+}

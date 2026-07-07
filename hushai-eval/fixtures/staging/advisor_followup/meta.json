@@ -1,0 +1,11 @@
+{
+  "case_id": "advisor_followup",
+  "description": "Insufficient-context gate probe: turn 1 is a bare situation and MUST trigger a follow-up questions round; turns 2-3 supply the real situation + specifics. Only turn 1 (questions) and the FINAL turn (a streamed answer) are asserted — the gate may legitimately ask once more on turn 2. Service-level advisor case: no media is injected (media fields below are unused placeholders).",
+  "device_id": "eval-advisor",
+  "media_file": "",
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "advisor"
+  ],
+  "tier": "full"
+}

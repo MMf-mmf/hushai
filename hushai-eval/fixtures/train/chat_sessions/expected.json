@@ -13,7 +13,8 @@
         "session": "a",
         "expect_routed_agent": "recordings",
         "must_contain": [
-          "money"
+          "renovation",
+          "budget"
         ],
         "min_citations": 1,
         "reference_answer": "The recordings mention money for the kitchen renovation, with a budget of three thousand dollars."
@@ -46,5 +47,9 @@
         ]
       }
     ]
+  },
+  "conversations": {
+    "distinct_count": 1,
+    "count_tolerance": 0
   }
 }

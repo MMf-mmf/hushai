@@ -19,16 +19,26 @@
       },
       {
         "ask": "What do the recordings say about the stock market?",
-        "must_contain": [
-          "don't have"
-        ],
         "must_not_contain": [
           "rose",
           "fell",
           "nasdaq",
           "dow jones"
         ],
-        "reference_answer": "I don't have information about the stock market in the recordings."
+        "reference_answer": "I don't have information about the stock market in the recordings.",
+        "must_contain_any": [
+          "don't have",
+          "do not have",
+          "no information",
+          "not mention",
+          "no mention",
+          "nothing about",
+          "not contain",
+          "doesn't contain",
+          "doesn't mention",
+          "no recordings about",
+          "no recording about"
+        ]
       },
       {
         "ask": "On how many separate days did a delivery happen, according to the recordings?",
@@ -39,5 +49,9 @@
         ]
       }
     ]
+  },
+  "conversations": {
+    "distinct_count": 2,
+    "count_tolerance": 0
   }
 }

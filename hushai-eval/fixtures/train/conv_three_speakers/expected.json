@@ -1,0 +1,62 @@
+{
+  "transcript": {
+    "full_text": "for the summer trip i suggest we drive up the coast and camp near the lighthouse. camping sounds great. i will bring the big tent and the portable stove. i can plan the hiking routes and book the campsite for the first weekend of august. then it is settled. coast drive, lighthouse camp, and the august hiking routes. i will also pack the fishing rods in case the campsite is near the water. and i will print the trail maps so we are not relying on phone signal.",
+    "max_wer": 0.35,
+    "min_similarity": 0.6
+  },
+  "conversations": {
+    "distinct_count": 1,
+    "count_tolerance": 0,
+    "min_pairwise_f1": 0.9,
+    "min_coverage": 0.9,
+    "must_merge": [
+      [
+        "T1",
+        "T2"
+      ]
+    ],
+    "utterances": [
+      {
+        "label": "T1",
+        "text_contains": "up the coast",
+        "window_ns": [
+          0,
+          12370839000
+        ]
+      },
+      {
+        "label": "T1",
+        "text_contains": "tent",
+        "window_ns": [
+          0,
+          12370839000
+        ]
+      },
+      {
+        "label": "T2",
+        "text_contains": "fishing rods",
+        "window_ns": [
+          8247226000,
+          24741678000
+        ]
+      },
+      {
+        "label": "T2",
+        "text_contains": "trail maps",
+        "window_ns": [
+          8247226000,
+          24741678000
+        ]
+      }
+    ]
+  },
+  "chat": {
+    "questions": [
+      {
+        "ask": "How many separate conversations happened in the recordings?",
+        "agent_id": "auto",
+        "expect_number": 1
+      }
+    ]
+  }
+}

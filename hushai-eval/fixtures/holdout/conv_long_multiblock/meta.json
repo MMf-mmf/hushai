@@ -1,0 +1,36 @@
+{
+  "case_id": "conv_long_multiblock",
+  "description": "SEALED HOLDOUT. Three conversations (budget/deliveries/birthday) separated by 450s injection gaps on one camera: T at scale \u2014 exactly 3 conversations; a window-scoped chat question must answer from the middle conversation only.",
+  "device_id": "eval-conv-blocks",
+  "media_file": "clips/budget.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "transcript",
+    "conversations",
+    "chat"
+  ],
+  "tier": "full",
+  "injections": [
+    {
+      "media_file": "clips/budget.mp4",
+      "device_id": "eval-conv-blocks",
+      "capture_start_offset_ns": 0
+    },
+    {
+      "media_file": "clips/deliveries.mp4",
+      "device_id": "eval-conv-blocks",
+      "capture_start_offset_ns": 458303855000
+    },
+    {
+      "media_file": "clips/birthday.mp4",
+      "device_id": "eval-conv-blocks",
+      "capture_start_offset_ns": 915341860000
+    }
+  ],
+  "poll": {
+    "timeout_secs": 420,
+    "interval_secs": 2
+  }
+}

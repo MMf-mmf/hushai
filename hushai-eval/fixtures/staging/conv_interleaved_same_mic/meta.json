@@ -1,0 +1,19 @@
+{
+  "case_id": "conv_interleaved_same_mic",
+  "description": "Two groups (reno: Samantha+Daniel / football: Karen+Rishi) interleaved on ONE mic in 12s slots. The disentanglement case: requires the speaker lane to separate the cast; pairwise_f1 floor starts SOFT (0.70) \u2014 measure, then freeze upward. STAGING until the voice-separability pre-check passes for this cast.",
+  "device_id": "eval-conv-mixmic",
+  "media_file": "media.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "transcript",
+    "conversations",
+    "chat"
+  ],
+  "tier": "full",
+  "poll": {
+    "timeout_secs": 300,
+    "interval_secs": 2
+  }
+}

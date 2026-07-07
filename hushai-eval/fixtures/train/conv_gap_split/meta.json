@@ -1,0 +1,30 @@
+{
+  "case_id": "conv_gap_split",
+  "description": "Two dialogues, same voices, +600s injection gap on one camera: the hard temporal boundary must yield exactly 2 conversations (pure T signal; diarization-independent).",
+  "device_id": "eval-conv-gap",
+  "media_file": "clips/dinner.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "transcript",
+    "conversations"
+  ],
+  "tier": "fast",
+  "injections": [
+    {
+      "media_file": "clips/dinner.mp4",
+      "device_id": "eval-conv-gap",
+      "capture_start_offset_ns": 0
+    },
+    {
+      "media_file": "clips/car.mp4",
+      "device_id": "eval-conv-gap",
+      "capture_start_offset_ns": 613274966000
+    }
+  ],
+  "poll": {
+    "timeout_secs": 240,
+    "interval_secs": 2
+  }
+}

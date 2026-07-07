@@ -7,6 +7,54 @@ Newest first. Dates are when the work landed on the current development branch
 
 ## Unreleased (in-flight)
 
+- **Ahithophel advisor v1 (2026-07-06, migrations 0026/0027, new crate `hushai-advisor`)** —
+  the first Ahithophel-framework agent (AhithophelPlan "Agent Architecture and Roles"): an
+  Axum service (`:8095`) running a bounded multi-agent consultation pipeline over an ingested
+  book. Min-Info + Yenta collapse into ONE sufficiency-gate call (numbered follow-up
+  questions, `ADVISOR_MAX_FOLLOWUP_ROUNDS` cap, unparseable verdict = proceed — a flaky 7B
+  can never wedge a session); Message Refiner folds the gathered Q&A into a standalone
+  problem statement; Traffic Controller routes over 50 chapter synopses widened by pgvector
+  chunk candidates (anti-tunnel-vision); Answer→Controller→Refiner iterate at most
+  `ADVISOR_MAX_REFINE_ITERS`, converging when routing proposes no new chapters; the polished
+  answer streams over SSE (`session`/`phase`/`questions`/`chapters`/`token`/`done`, extending
+  the rag chat protocol); a Q&A summary embeds into `advisor_memories` for retrieval into
+  later consultations. Corpus: `books`/`book_chapters`/`book_chunks` (0026) populated by the
+  idempotent `ingest-book` binary from `Agent Ahithophel/books/chapters_text/` — deterministic
+  OCR heuristics (de-hyphenation, page-number strip, drop-cap rejoin, mid-sentence paragraph
+  merge) + a length-ratio-guarded LLM copy-edit pass, paragraph-packed ~1500-char chunks in
+  the shared mxbai 1024-d space. Sessions: `advisor_sessions` phase machine
+  (gathering/answering/done) + gap-free-seq `advisor_messages` with a `kind` discriminator
+  (0027). First service to set `num_ctx` explicitly (`ADVISOR_NUM_CTX=16384`) — multi-chapter
+  prompts silently truncate at Ollama's 4096 default. Temperament and Research agents
+  deliberately deferred (temperament hook parameter exists; web research conflicts with the
+  local-only privacy stance). run_stack.sh launches it as service #5 and mints
+  `ADVISOR_TOKEN`.
+
+- **Conversation threading (2026-07-06, migration 0025)** — persisted conversations with
+  concurrent-group separation (the AhithophelPlan "conversa" ask). `conversations` catalog +
+  `conversation_id`/`turn_index` on `transcript_sentences`, assigned by a deterministic batch
+  threader on worker 0 (silence-gap blocks → speaker-turn/topic disentanglement of interleaved
+  same-mic group conversations; Elsner–Charniak-style pairwise evidence + graph partition).
+  Closed conversations freeze + emit one `conversation` event; cross-device overlap LINKS
+  (`link_group_id`), never merges. RAG became conversation-scoped: neighborhood expansion +
+  per-conversation prompt sections with a never-combine instruction, id-change stop in the
+  recency backscan (fixes back-to-back conversations gluing under the gap), threaded-first
+  window grouping, a participants intent ("what did X and Y talk about"), voice recency
+  anchored to the asking phone, and `GET /v1/rag/conversations[/{id}]`. Analytics groups by
+  `COALESCE(conversation_id, device:gap_seq)`. Eval grew a `conversations` modality
+  (pairwise-F1 / coverage / count / must-not-merge gates + conversation-scoped citation
+  checks), a threading quiesce wait, THREADER_/CONVO_/RAG_EXPAND_ knob lineage, and 9 conv_*
+  fixtures (5 train/holdout diarization-independent, 2 sealed holdout, 2 staging probes incl.
+  the same-mic interleave that hard-depends on TTS voice separability). NOTE: sequential topic
+  drift without temporal interleave deliberately stays ONE conversation
+  (`THREADER_TOPIC_ONLY_SPLIT=false`); same-topic interleaved groups on one mono mic are
+  documented as information-theoretically inseparable — no 100% claim. Retrieval gained a
+  relative-margin prune (`RAG_PRUNE_REL_MARGIN`, default 0.25): semantic hits with
+  `distance > best + margin` are dropped BEFORE neighborhood expansion, so one marginal hit
+  from an unrelated conversation (just under the absolute `RAG_DISTANCE_THRESHOLD`) can no
+  longer pull that entire conversation into the grounded prompt — this is what makes
+  answer citations collapse to a single conversation on single-topic questions.
+
 - **Executive-chat overhaul (2026-07-05)** — fixes for the owner's live-testing bug batch:
   visit coalescing (`presence.rs` counts continuous VISITS, never per-2s-segment sightings —
   the "seen 62 times" bug), a deterministic distinct-people count, a footage-stats capability

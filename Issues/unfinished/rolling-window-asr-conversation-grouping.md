@@ -1,5 +1,16 @@
 **Title:** `[hushai-worker + hushai-backend + hushai-rag] - Rolling-window ASR analysis stage (decouple analysis from the 2s transport segment) + conversation grouping with multi-device fusion, surfaced in RAG`
 
+> **STATUS UPDATE (2026-07-06):** the CONVERSATION half of this ticket (Part B — persisted
+> `conversations`, `conversation_id` on `transcript_sentences`, gap grouping, RAG
+> conversation-neighborhood expansion) shipped as **migration 0025** — decoupled from
+> windowing, extended with same-mic concurrent-group disentanglement and a cross-device
+> LINK (never merge) instead of Part B's fusion-merge. See AGENTS.md "Conversation
+> threading (migration 0025)" + CHANGELOG. The ROLLING-WINDOW ASR half (Part A —
+> `transcription_windows`, window-keyed writes, DTW word timestamps) remains OPEN and is
+> still the biggest transcript-quality lever; if built, thread the resulting sentences
+> through the existing threader unchanged (it operates on `transcript_sentences` rows
+> regardless of producer). Migration numbers in this ticket are stale (0004/0005 era).
+
 - **Description**:
 
   Fix the root cause of "the transcript is chopped up too much" and give the stack a

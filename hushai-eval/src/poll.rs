@@ -186,3 +186,35 @@ async fn event_count(ctx: &Ctx, device_id: &str, base_ns: i64) -> Result<i64> {
     .await?;
     Ok(n)
 }
+
+/// Threading quiescence (0025): wait until every TEXT sentence on the case's devices has a
+/// `conversation_id`. The threader runs on its own interval AFTER the transcript lanes
+/// finish, so a fixture scoring the `conversations` modality must not observe early. All
+/// text-bearing rows in the batch window get assigned (orphans included); a timeout is
+/// INFRASTRUCTURE (inconclusive, exit 2), never a scored failure.
+pub async fn wait_threaded(
+    ctx: &Ctx,
+    devices: &[String],
+    timeout_secs: u64,
+    interval_secs: u64,
+) -> Result<bool> {
+    let timeout = Duration::from_secs(timeout_secs);
+    let interval = Duration::from_secs(interval_secs.max(1));
+    let started = Instant::now();
+    loop {
+        let (unthreaded,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM transcript_sentences \
+             WHERE device_id = ANY($1) AND text IS NOT NULL AND conversation_id IS NULL",
+        )
+        .bind(devices)
+        .fetch_one(&ctx.pool)
+        .await?;
+        if unthreaded == 0 {
+            return Ok(true);
+        }
+        if started.elapsed() > timeout {
+            return Ok(false);
+        }
+        tokio::time::sleep(interval).await;
+    }
+}

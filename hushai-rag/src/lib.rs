@@ -59,6 +59,11 @@ pub fn router(state: AppState) -> Router {
             get(chat::list_messages),
         )
         .route("/v1/rag/agents", get(chat::list_agents))
+        .route("/v1/rag/conversations", get(routes::list_conversations_route))
+        .route(
+            "/v1/rag/conversations/{id}",
+            get(routes::get_conversation_route),
+        )
         .route("/v1/tts", post(routes::tts_synthesize))
         // Structured per-request access log with a correlatable `request_id` (see crate::logging).
         .layer(

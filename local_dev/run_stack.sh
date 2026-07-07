@@ -34,6 +34,8 @@
 #   worker   (no port)  CWD=repo root     (loads root .env; models/* + blobs are relative)
 #   rag      :8090   CWD=repo root        (loads root .env)
 #   viewer   :8070   CWD=repo root        (loads root .env)
+#   advisor  :8095   CWD=repo root        (loads root .env; Ahithophel advisor — needs an
+#                                          ingested book: cargo run -p hushai-advisor --bin ingest-book)
 # All are launched with SQLX_OFFLINE=true and DYLD_FALLBACK_LIBRARY_PATH pointing at
 # the build dir so sherpa-rs's bundled libonnxruntime.1.17.1.dylib resolves for a
 # directly-launched binary (AGENTS.md "vision ONNX runtime" / worker plist).
@@ -236,7 +238,7 @@ done
 is_ours() {  # does this command line belong to a Hushai stack binary we launched?
   case "$1" in
     *"$PROFILE_DIR/"*|*"$REPO_ROOT/target/"*|\
-    *hushai-backend*|*hushai-worker*|*hushai-rag*|*hushai-viewer*) return 0 ;;
+    *hushai-backend*|*hushai-worker*|*hushai-rag*|*hushai-viewer*|*hushai-advisor*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -245,7 +247,7 @@ reclaim_ports() {
   # 1. TERM everything tracked from the last run (pid files under logs/).
   stop_from_pidfiles
   # 2. TERM any still-listening process on our ports that is one of OUR binaries.
-  for p in 8080 8090 8070; do
+  for p in 8080 8090 8070 8095; do
     for pid in $(hushai_pids_on_port "$p"); do
       cmd="$(hushai_pid_command "$pid")"
       if is_ours "$cmd"; then
@@ -256,14 +258,14 @@ reclaim_ports() {
   done
   if [[ "$killed" -eq 1 ]]; then sleep 1; fi
   # 3. Hard-kill any of ours that ignored TERM.
-  for p in 8080 8090 8070; do
+  for p in 8080 8090 8070 8095; do
     for pid in $(hushai_pids_on_port "$p"); do
       cmd="$(hushai_pid_command "$pid")"
       if is_ours "$cmd"; then kill -KILL "$pid" 2>/dev/null || true; fi
     done
   done
   # 4. Anything still listening is NOT ours → refuse, naming the offender.
-  for p in 8080 8090 8070; do
+  for p in 8080 8090 8070 8095; do
     for pid in $(hushai_pids_on_port "$p"); do
       foreign="$foreign  :$p pid $pid ($(hushai_pid_command "$pid" | awk '{print $1}'))"
     done
@@ -322,6 +324,12 @@ if [[ -z "${RAG_TOKEN:-}" ]]; then
   if command -v openssl >/dev/null 2>&1; then RAG_TOKEN="$(openssl rand -hex 32)"; else RAG_TOKEN="dev-rag-token"; fi
 fi
 export RAG_TOKEN
+# advisor bearer — same posture: the advisor archive (personal consultations) must not
+# be world-open on 0.0.0.0:8095.
+if [[ -z "${ADVISOR_TOKEN:-}" ]]; then
+  if command -v openssl >/dev/null 2>&1; then ADVISOR_TOKEN="$(openssl rand -hex 32)"; else ADVISOR_TOKEN="dev-advisor-token"; fi
+fi
+export ADVISOR_TOKEN
 # viewer admin password (the viewer IS the admin panel; loopback is always allowed).
 : "${VIEWER_ADMIN_PASSWORD:=hushai-dev}"
 export VIEWER_ADMIN_PASSWORD
@@ -409,13 +417,13 @@ done
 # Build once (so the four launches are instant and don't race the compiler)
 # ---------------------------------------------------------------------------
 if [[ "$DO_BUILD" -eq 1 ]]; then
-  log build "cargo build ($PROFILE) -p backend,worker,rag,viewer…"
+  log build "cargo build ($PROFILE) -p backend,worker,rag,viewer,advisor…"
   ( cd "$REPO_ROOT" && SQLX_OFFLINE=true cargo build ${PROFILE_FLAG[@]+"${PROFILE_FLAG[@]}"} \
-      -p hushai-backend -p hushai-worker -p hushai-rag -p hushai-viewer ) \
+      -p hushai-backend -p hushai-worker -p hushai-rag -p hushai-viewer -p hushai-advisor ) \
     || die "build failed."
   log build "ok"
 fi
-for b in hushai-backend hushai-worker hushai-rag hushai-viewer; do
+for b in hushai-backend hushai-worker hushai-rag hushai-viewer hushai-advisor; do
   [[ -x "$PROFILE_DIR/$b" ]] || die "missing binary $PROFILE_DIR/$b (build first, or drop --no-build)."
 done
 
@@ -488,6 +496,13 @@ launch viewer "$REPO_ROOT" hushai-viewer
 wait_http "$SCHEME://127.0.0.1:8070/healthz" viewer 30 \
   || { log warn "viewer never answered :8070 — see $LOG_DIR/viewer.log"; }
 
+# 5. advisor (:8095) — the Ahithophel advisor; warn (not fatal) if unhealthy. Answers
+#    need an ingested book (cargo run -p hushai-advisor --bin ingest-book) — without one
+#    the service is up but consultations return a "run ingest-book" error.
+launch advisor "$REPO_ROOT" hushai-advisor
+wait_http "$SCHEME://localhost:8095/healthz" advisor 40 \
+  || { log warn "advisor never answered :8095/healthz — see $LOG_DIR/advisor.log"; }
+
 # ---------------------------------------------------------------------------
 # Optional: best-effort Android capture client (needs a USB phone)
 # ---------------------------------------------------------------------------
@@ -514,10 +529,12 @@ cat <<EOF
   ┌─ Hushai stack is up ($PROFILE${TLS:+, TLS}${LAN:+, LAN}) ──────────────────────────
   │  webapp (NVR + chat)   →  $WEBAPP_URL   (admin: IP-allowlist + password)
   │  rag api               →  $SCHEME://localhost:8090   (/v1/rag/query, /v1/rag/chat, /v1/tts — RAG_TOKEN required)
+  │  advisor api           →  $SCHEME://localhost:8095   (/v1/advisor/chat SSE — ADVISOR_TOKEN required)
   │  backend ingest        →  $SCHEME://localhost:8080   (/v1/segments, /v1/speakers, /v1/persons)
   │  worker                →  draining segments (transcribe + embed + speaker + vision)
   │  admin login           →  password "$VIEWER_ADMIN_PASSWORD"  (set VIEWER_ADMIN_PASSWORD to change)
   │  rag token             →  $RAG_TOKEN
+  │  advisor token         →  $ADVISOR_TOKEN
   │  logs                  →  local_dev/logs/<service>.log
   │  Ctrl-C                →  stop everything cleanly
   └───────────────────────────────────────────────────────────────

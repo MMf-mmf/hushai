@@ -385,6 +385,9 @@ fn decline_digest(target_label: String, window: (i64, i64), coverage: Coverage) 
 /// The gap-grouping query: collapse to segment grain, flag conversation boundaries and
 /// speaker-change (monologue) runs per device timeline, then roll up per conversation that
 /// the target participates in. Returns one `ConvoRow` per such conversation.
+// Grouping key (0025): rows carrying a persisted conversation_id group EXACTLY by it
+// (concurrent same-device conversations stay separate); NULL rows keep the legacy
+// per-device gap sequence. COALESCE(conversation_id, device:gap_seq) — the dual-path rule.
 async fn fetch_convos(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     target: &[String],
@@ -402,6 +405,7 @@ async fn fetch_convos(
              SELECT ts.device_id, ts.segment_id, ts.speaker_id, \
                     (ts.speaker_id = ANY($1::text[])) AS is_target, \
                     MIN(ts.sentiment) AS sentiment, \
+                    MIN(ts.conversation_id::text) AS conversation_id, \
                     MIN(ts.start_unix_nanos) AS seg_start, \
                     MAX(ts.end_unix_nanos) AS seg_end, \
                     COALESCE(SUM(GREATEST(ts.end_unix_nanos - ts.start_unix_nanos, 0)), 0)::bigint AS spoken_nanos \
@@ -421,23 +425,25 @@ async fn fetch_convos(
          ), \
          numbered AS ( \
              SELECT f.*, \
-                 SUM(is_new) OVER (PARTITION BY device_id ORDER BY seg_start, segment_id) AS convo_seq, \
+                 COALESCE(f.conversation_id, \
+                          f.device_id || ':' || (SUM(is_new) OVER (PARTITION BY device_id ORDER BY seg_start, segment_id))::text \
+                 ) AS convo_key, \
                  SUM(CASE WHEN is_new = 1 OR spk_change = 1 THEN 1 ELSE 0 END) \
                      OVER (PARTITION BY device_id ORDER BY seg_start, segment_id) AS run_seq \
              FROM flagged f \
          ), \
          run_rollup AS ( \
-             SELECT device_id, convo_seq, run_seq, bool_and(is_target) AS run_is_target, \
+             SELECT convo_key, run_seq, bool_and(is_target) AS run_is_target, \
                     SUM(spoken_nanos)::bigint AS run_nanos \
-             FROM numbered GROUP BY device_id, convo_seq, run_seq \
+             FROM numbered GROUP BY convo_key, run_seq \
          ), \
          convo_monologue AS ( \
-             SELECT device_id, convo_seq, \
+             SELECT convo_key, \
                     COALESCE(MAX(run_nanos) FILTER (WHERE run_is_target), 0)::bigint AS max_target_run \
-             FROM run_rollup GROUP BY device_id, convo_seq \
+             FROM run_rollup GROUP BY convo_key \
          ), \
          convos AS ( \
-             SELECT device_id, convo_seq, \
+             SELECT convo_key, \
                     MIN(seg_start) AS convo_start, \
                     (MAX(seg_end) - MIN(seg_start))::bigint AS total_nanos, \
                     COALESCE(SUM(spoken_nanos) FILTER (WHERE is_target), 0)::bigint AS target_spoken_nanos, \
@@ -448,12 +454,12 @@ async fn fetch_convos(
                     COUNT(*) FILTER (WHERE NOT is_target AND sentiment = 'positive')::bigint AS other_pos, \
                     COUNT(*) FILTER (WHERE NOT is_target AND sentiment = 'neutral')::bigint AS other_neu, \
                     COUNT(*) FILTER (WHERE NOT is_target AND sentiment = 'negative')::bigint AS other_neg \
-             FROM numbered GROUP BY device_id, convo_seq \
+             FROM numbered GROUP BY convo_key \
          ) \
          SELECT c.convo_start, c.total_nanos, c.target_spoken_nanos, c.all_spoken_nanos, \
                 c.unattributed_nanos, c.other_ids, c.other_pos, c.other_neu, c.other_neg, \
                 m.max_target_run \
-         FROM convos c JOIN convo_monologue m USING (device_id, convo_seq) \
+         FROM convos c JOIN convo_monologue m USING (convo_key) \
          WHERE c.has_target",
     )
     .bind(target.to_vec())
@@ -681,6 +687,7 @@ async fn fetch_excerpts(
             speaker_name: None,
             time_label: String::new(),
             visual_context: None,
+            conversation_id: None,
         });
     }
     Ok(out)
@@ -1160,6 +1167,7 @@ mod tests {
                 speaker_name: None,
                 time_label: String::new(),
                 visual_context: None,
+                conversation_id: None,
             }],
             limits: LIMITS,
         };

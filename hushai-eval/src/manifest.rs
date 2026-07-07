@@ -82,6 +82,11 @@ const KNOB_PREFIXES: &[&str] = &[
     "LOAD_GOVERNOR_",
     "LOAD_PAUSE_",
     "FRAMES_PER_SEGMENT",
+    // Conversation threading (0025): every threader knob changes conversation_id output.
+    "THREADER_",
+    "CONVO_",
+    "RAG_EXPAND_",
+    "RAG_PRUNE_",
 ];
 
 #[derive(Debug, Clone, Serialize)]

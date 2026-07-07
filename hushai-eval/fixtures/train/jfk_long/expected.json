@@ -77,5 +77,9 @@
         ]
       }
     ]
+  },
+  "conversations": {
+    "distinct_count": 1,
+    "count_tolerance": 0
   }
 }
