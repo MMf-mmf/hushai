@@ -7,6 +7,28 @@ Newest first. Dates are when the work landed on the current development branch
 
 ## Unreleased (in-flight)
 
+- **Gotham Wave 2 / Pillar G2 — baselines + pattern anomalies (2026-07-08, spec `Gotham.md`
+  §1.6, uses migration 0029)** — new `hushai-backend::patterns` producer: per-touched-subject
+  `entity_baselines` recompute (168 hour-of-week histogram, dwell p50/p90, device/companion
+  top-K — pure math in `graph.rs`, deterministic) + `off_schedule_presence` anomaly emission,
+  wired into the `graph_pass` transaction. Anomalies are ordinary `events` rows
+  (`event_type='pattern_anomaly'`, `severity='warning'`, `metadata.kind`, idempotent
+  `dedup_key='anom:<kind>:<subject>:<civil-day>'`, `ON CONFLICT DO NOTHING`), so they ride the
+  shipped A-pillar (rules/cooldown/feed/webhook/push) with zero new alert plumbing; the worker-0
+  driver alert-evaluates the freshly-emitted anomaly ids post-commit (the evaluator is
+  worker-crate). **off_schedule is judged AS-OF** — each visit against the histogram of the
+  subject's STRICTLY-EARLIER visits (the spec's incremental "new visit vs prior baseline" model),
+  so a subject's first appearances (incl. the enrollment clip an hour before a case) never fire;
+  only a later violation of an established rhythm does. The drain queries exclude
+  `pattern_anomaly`/`gotham_briefing` so the graph never folds its OWN output (a feedback loop the
+  `graph_db` guard caught). Eval `graph` modality gains `expect_anomaly`/`expect_no_anomaly`/
+  `expect_baseline` (assignment-invariant: subject by enrolled name→id, `metadata.kind`,
+  peak-hour-of-day); F4 `graph_baseline_rhythm` + F5 `anomaly_novel_time` (train) + F6
+  `anomaly_negatives` (sealed holdout) **calibrated live on the rig, gate ×2, frozen under
+  config_hash `d4acc862`**. `graph_db` integration guard extended (baseline row + off_schedule
+  anomaly + immature-subject negative). Digest render + endpoints + F7 + the other three anomaly
+  predicates are PR5/follow-ups; alert-DELIVERY E2E (Phase D feed/webhook) rides the shipped
+  A-pillar and is the tracked remaining Phase-D item.
 - **Gotham intelligence layer — Wave 1 / Pillar G1 data layer (2026-07-08, migrations
   0028–0030, spec `Gotham.md`)** — the entity/link graph: `entity_edges` (co_present /
   conversed_with / arrived_with_vehicle / visits_place / the review-queued voice↔face

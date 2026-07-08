@@ -21,6 +21,7 @@ pub mod hints;
 pub mod ingest;
 pub mod logging;
 pub mod observe;
+pub mod patterns;
 pub mod persons;
 pub mod plates;
 pub mod profiles;

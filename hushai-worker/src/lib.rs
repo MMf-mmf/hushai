@@ -982,21 +982,48 @@ async fn worker_loop(
                 {
                     last_graph = std::time::Instant::now();
                     match hushai_backend::graph_pass::graph_pass(&pool, &cfg.graph_opts()).await {
-                        Ok(stats) if stats.edges_upserted > 0 => {
-                            hushai_backend::observe::counter_by(
-                                "hushai_graph_edges_upserted_total",
-                                &[],
-                                stats.edges_upserted,
-                            );
-                            tracing::info!(
-                                events = stats.events_consumed,
-                                conversations = stats.conversations_consumed,
-                                edges = stats.edges_upserted,
-                                bindings = stats.bindings_surfaced,
-                                "entity graph folded"
-                            );
+                        Ok(stats) => {
+                            if stats.edges_upserted > 0 {
+                                hushai_backend::observe::counter_by(
+                                    "hushai_graph_edges_upserted_total",
+                                    &[],
+                                    stats.edges_upserted,
+                                );
+                            }
+                            if stats.anomalies_emitted > 0 {
+                                hushai_backend::observe::counter_by(
+                                    "hushai_graph_anomalies_total",
+                                    &[],
+                                    stats.anomalies_emitted,
+                                );
+                            }
+                            if stats.edges_upserted > 0
+                                || stats.baselines_recomputed > 0
+                                || stats.anomalies_emitted > 0
+                            {
+                                tracing::info!(
+                                    events = stats.events_consumed,
+                                    conversations = stats.conversations_consumed,
+                                    edges = stats.edges_upserted,
+                                    bindings = stats.bindings_surfaced,
+                                    baselines = stats.baselines_recomputed,
+                                    anomalies = stats.anomalies_emitted,
+                                    "entity graph folded"
+                                );
+                            }
+                            // Anomalies are ordinary `events` rows, but the alert evaluator lives in
+                            // THIS (worker) crate — the backend pass can only emit them. Fire each
+                            // emitted anomaly into the A-pillar (feed/webhook/push) here (Gotham.md
+                            // §1.6 / Phase D). NOT gated on edges_upserted: a pass can emit an
+                            // anomaly with zero new edges.
+                            if cfg.events.alerts_enabled {
+                                for id in &stats.anomaly_event_ids {
+                                    if let Err(e) = crate::alerts::evaluate(&pool, *id).await {
+                                        tracing::warn!(error = %e, event_id = %id, "anomaly alert-eval failed");
+                                    }
+                                }
+                            }
                         }
-                        Ok(_) => {}
                         Err(e) => tracing::warn!(error = %e, "graph pass failed"),
                     }
                 }

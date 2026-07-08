@@ -594,6 +594,38 @@ pub struct GraphGt {
     /// `expect_no_edge`: counter-assertions — below-threshold pairs must NOT have bound.
     #[serde(default)]
     pub no_edges: Vec<EdgeExpect>,
+    /// `expect_anomaly` (Gotham G2): a `pattern_anomaly` event of this kind for this subject present.
+    #[serde(default)]
+    pub anomalies: Vec<AnomalyExpect>,
+    /// `expect_no_anomaly` (G2): the subject must have NO `pattern_anomaly` of this kind (the
+    /// non-over-firing counter-assertion — F6 sealed holdout).
+    #[serde(default)]
+    pub no_anomalies: Vec<AnomalyExpect>,
+    /// `expect_baseline` (G2): assert the subject's recomputed `entity_baselines` row.
+    #[serde(default)]
+    pub baselines: Vec<BaselineExpect>,
+}
+
+/// A `pattern_anomaly` assertion (G2). `subject` names the entity by enrolled `display_name`
+/// (resolved to a catalog id, assignment-invariant); `kind` is the `metadata.kind`
+/// (`off_schedule_presence` / `first_time_pairing` / `unknown_person_cluster` / `new_vehicle_for_person`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct AnomalyExpect {
+    pub subject: EntityRef,
+    pub kind: String,
+}
+
+/// A baseline assertion (G2) against the subject's recomputed `entity_baselines` row.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BaselineExpect {
+    pub subject: EntityRef,
+    /// `visits_in_window >=` this.
+    #[serde(default)]
+    pub min_visits: Option<i64>,
+    /// The modal (peak) hour-of-week bucket's HOUR-OF-DAY (`peak_bucket % 24`) must equal this —
+    /// weekday-agnostic so a weekly-cadence fixture asserts "arrives ~09:00" without pinning the day.
+    #[serde(default)]
+    pub peak_hour_of_day: Option<i64>,
 }
 
 /// One graph node reference. For `person`/`speaker`/`plate` the `name` is the enrolled `display_name`
@@ -701,18 +733,34 @@ mod tests {
     /// fast. Also asserts the every-edge invariant: a known set of edge kinds + resolvable endpoint
     /// kinds, so a typo in a fixture (`vist_place`, `pesron`) is caught at unit time, not on the rig.
     #[test]
-    fn graph_staging_fixtures_parse() {
+    fn graph_fixtures_parse() {
         const EDGE_KINDS: &[&str] =
             &["co_present", "conversed_with", "arrived_with_vehicle", "same_identity_candidate", "visits_place"];
         const NODE_KINDS: &[&str] = &["person", "speaker", "plate", "device"];
-        let root = crate::ctx::repo_root().join("hushai-eval/fixtures/staging");
-        for case in ["graph_face_voice_bind", "graph_cross_camera_fusion", "graph_person_vehicle"] {
-            let fx = load(&root.join(case), "staging").expect(case);
+        const ANOMALY_KINDS: &[&str] =
+            &["off_schedule_presence", "first_time_pairing", "unknown_person_cluster", "new_vehicle_for_person"];
+        // G1 (F1-F3) + G2 (F4/F5 train, F6 holdout). Loads meta+expected only (no media needed).
+        let cases: &[(&str, &str)] = &[
+            ("train", "graph_face_voice_bind"),
+            ("train", "graph_cross_camera_fusion"),
+            ("train", "graph_person_vehicle"),
+            ("train", "graph_baseline_rhythm"),
+            ("train", "anomaly_novel_time"),
+            ("holdout", "anomaly_negatives"),
+        ];
+        for (split, case) in cases {
+            let root = crate::ctx::repo_root().join(format!("hushai-eval/fixtures/{split}"));
+            let fx = load(&root.join(case), split).expect(case);
             assert!(fx.meta.needs_graph(), "{case} must list the graph modality");
             let gt = fx.expected.graph.as_ref().unwrap_or_else(|| panic!("{case}: graph GT block"));
             assert!(
-                !gt.entities.is_empty() || !gt.edges.is_empty() || !gt.no_edges.is_empty(),
-                "{case} must assert at least one entity/edge"
+                !gt.entities.is_empty()
+                    || !gt.edges.is_empty()
+                    || !gt.no_edges.is_empty()
+                    || !gt.anomalies.is_empty()
+                    || !gt.no_anomalies.is_empty()
+                    || !gt.baselines.is_empty(),
+                "{case} must assert at least one entity/edge/anomaly/baseline"
             );
             for e in gt.edges.iter().chain(gt.no_edges.iter()) {
                 assert!(EDGE_KINDS.contains(&e.kind.as_str()), "{case}: bad edge kind {}", e.kind);
@@ -722,6 +770,13 @@ mod tests {
             }
             for ent in &gt.entities {
                 assert!(NODE_KINDS.contains(&ent.kind.as_str()), "{case}: bad entity kind {}", ent.kind);
+            }
+            for a in gt.anomalies.iter().chain(gt.no_anomalies.iter()) {
+                assert!(ANOMALY_KINDS.contains(&a.kind.as_str()), "{case}: bad anomaly kind {}", a.kind);
+                assert!(NODE_KINDS.contains(&a.subject.kind.as_str()), "{case}: bad anomaly subject kind {}", a.subject.kind);
+            }
+            for b in &gt.baselines {
+                assert!(NODE_KINDS.contains(&b.subject.kind.as_str()), "{case}: bad baseline subject kind {}", b.subject.kind);
             }
         }
     }

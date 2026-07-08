@@ -1,0 +1,29 @@
+{
+  "case_id": "anomaly_novel_time",
+  "description": "Gotham G2 fixture F5 (off_schedule_presence). Alice's F4 rhythm (5 weekly Thursday 09:00 visits) PLUS one novel LATER appearance on a Friday 09:00 (base+29d, after the rhythm is established). off_schedule is judged AS-OF (each visit vs the subject's strictly-earlier visits, the incremental model): by the Friday visit Alice has 5+ mature Thursday-09:00 visits, and the Friday-09:00 bucket holds 0 of that prior mass (< GRAPH_ANOMALY_HOUR_MIN_FRAC) → exactly ONE off_schedule_presence anomaly fires. The Thursday regulars do NOT (each sees its own bucket dominate the prior), and neither does the enrollment clip an hour before the case (immature prior). The anomaly rides the ordinary events stack (Phase D). base_capture Thursday 09:00 UTC; tz 0. TRAIN.",
+  "device_id": "eval-anomaly-time",
+  "media_file": "clips/alice_face.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781773200000000000,
+  "modalities": [
+    "graph"
+  ],
+  "tier": "full",
+  "enroll": [
+    { "modality": "person", "name": "Alice", "ref": "clips/alice_face.mp4" }
+  ],
+  "injections": [
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-anomaly-time", "capture_start_offset_ns": 0, "seed": "w0" },
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-anomaly-time", "capture_start_offset_ns": 604800000000000, "seed": "w1" },
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-anomaly-time", "capture_start_offset_ns": 1209600000000000, "seed": "w2" },
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-anomaly-time", "capture_start_offset_ns": 1814400000000000, "seed": "w3" },
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-anomaly-time", "capture_start_offset_ns": 2419200000000000, "seed": "w4" },
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-anomaly-time", "capture_start_offset_ns": 2505600000000000, "seed": "novel" }
+  ],
+  "poll": {
+    "timeout_secs": 300,
+    "interval_secs": 3,
+    "quiesce_polls": 2
+  }
+}

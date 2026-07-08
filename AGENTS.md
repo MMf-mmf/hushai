@@ -363,8 +363,23 @@ dropped — **media is ALWAYS stored regardless of gating.**
   0030/Wave 4) are later waves.
 - **Wave-1 scope note:** co-presence is batch-local (the `profiles::co_present` precedent — a rare
   batch split costs one observation, converges as events drain); binding accumulates
-  `together`+`speaker_only` (person_only is a documented follow-up). Baselines/anomalies/journeys
-  tables exist (0029/0030) but are NOT populated yet.
+  `together`+`speaker_only` (person_only is a documented follow-up). Journeys (0030) NOT populated
+  yet (Wave 4).
+- **Wave-2 / G2 (baselines + anomalies):** `hushai-backend/src/patterns.rs` is the "patterns"
+  producer, called inside the `graph_pass` transaction for every subject touched this pass:
+  recompute the `entity_baselines` row (168 hour-of-week histogram, dwell p50/p90, device/companion
+  top-K — deterministic pure math in `graph.rs`) and emit `off_schedule_presence` anomalies.
+  Anomalies are ordinary `events` rows (`event_type='pattern_anomaly'`, dedup by
+  `anom:<kind>:<subject>:<civil-day>`, `ON CONFLICT DO NOTHING`) → ride the shipped A-pillar; the
+  worker-0 driver alert-evaluates the fresh anomaly ids AFTER the pass commits (the evaluator lives
+  in the worker crate, so the backend pass only emits + reports ids in `GraphStats.anomaly_event_ids`).
+  **off_schedule is AS-OF**: each visit judged against the subject's STRICTLY-EARLIER visits (a
+  running prior histogram), so first appearances (incl. the enrollment clip an hour before a case)
+  never fire — only a later rhythm violation does. The drain queries EXCLUDE
+  `pattern_anomaly`/`gotham_briefing` so the graph never folds its own output. Eval: `expect_anomaly`
+  /`expect_no_anomaly`/`expect_baseline` on the graph modality; F4/F5/F6 gate under `d4acc862`. Only
+  `off_schedule_presence` is wired (the Phase-D exemplar); the other three predicates + the daily
+  digest (0029 `daily_digests`) are PR5/follow-ups.
 
 ### Chat correctness (2026-07 overhaul — the "executive chat" fixes)
 

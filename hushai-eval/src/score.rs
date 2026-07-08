@@ -643,7 +643,8 @@ fn score_events(gt: &EventsGt, obs: &Observed) -> Vec<Metric> {
 fn score_graph(gt: &GraphGt, obs: &Observed) -> Vec<Metric> {
     let mut out = Vec::new();
     let mut satisfied = 0usize;
-    let total = gt.entities.len() + gt.edges.len() + gt.no_edges.len();
+    let total = gt.entities.len() + gt.edges.len() + gt.no_edges.len()
+        + gt.anomalies.len() + gt.no_anomalies.len() + gt.baselines.len();
 
     for e in &gt.entities {
         let ok = resolve_entity(e, &obs.entity_ids).is_some();
@@ -697,10 +698,89 @@ fn score_graph(gt: &GraphGt, obs: &Observed) -> Vec<Metric> {
         ));
     }
 
+    // Anomalies (G2): resolve the subject by enrolled name; a pattern_anomaly of `kind` must exist.
+    for a in &gt.anomalies {
+        let sid = resolve_entity(&a.subject, &obs.entity_ids);
+        let ok = sid.as_ref().is_some_and(|id| anomaly_present(obs, &a.subject.kind, id, &a.kind));
+        if ok {
+            satisfied += 1;
+        }
+        out.push(Metric::new(
+            format!("graph.anomaly.{}.{}", a.kind, key_name(&a.subject.name)),
+            b2f(ok), Direction::Boolean, ok,
+            format!("anomaly {} for {}:{} present={ok}", a.kind, a.subject.kind, a.subject.name),
+        ));
+    }
+
+    // Counter-assertion (G2): the subject must have NO anomaly of `kind` (non-over-firing).
+    for a in &gt.no_anomalies {
+        let sid = resolve_entity(&a.subject, &obs.entity_ids);
+        let present = sid.as_ref().is_some_and(|id| anomaly_present(obs, &a.subject.kind, id, &a.kind));
+        let ok = !present;
+        if ok {
+            satisfied += 1;
+        }
+        out.push(Metric::new(
+            format!("graph.no_anomaly.{}.{}", a.kind, key_name(&a.subject.name)),
+            b2f(ok), Direction::Boolean, ok,
+            format!("no anomaly {} for {}:{} must hold: present={present}", a.kind, a.subject.kind, a.subject.name),
+        ));
+    }
+
+    // Baselines (G2): the subject's recomputed row meets the visit floor + peak hour-of-day.
+    for b in &gt.baselines {
+        let sid = resolve_entity(&b.subject, &obs.entity_ids);
+        let row = sid.as_ref().and_then(|id| {
+            obs.baselines.iter().find(|r| r.subject_type == b.subject.kind && &r.subject_id == id)
+        });
+        let ok = row.is_some_and(|r| {
+            b.min_visits.is_none_or(|m| r.visits_in_window >= m)
+                && b.peak_hour_of_day.is_none_or(|h| peak_hour_of_day(&r.hour_histogram) == Some(h))
+        });
+        if ok {
+            satisfied += 1;
+        }
+        let (v, pk) =
+            row.map(|r| (r.visits_in_window, peak_hour_of_day(&r.hour_histogram))).unwrap_or((0, None));
+        out.push(Metric::new(
+            format!("graph.baseline.{}.{}", b.subject.kind, key_name(&b.subject.name)),
+            b2f(ok), Direction::Boolean, ok,
+            format!(
+                "baseline {}:{} visits={v} peak_hod={pk:?} (want visits>={:?} hod={:?})",
+                b.subject.kind, b.subject.name, b.min_visits, b.peak_hour_of_day
+            ),
+        ));
+    }
+
     let frac = if total == 0 { 1.0 } else { satisfied as f64 / total as f64 };
     out.insert(0, Metric::new("graph.match", frac, Direction::HigherBetter, frac >= 1.0,
         format!("{satisfied}/{total} graph assertions satisfied")));
     out
+}
+
+/// True when a `pattern_anomaly` of `kind` exists for `(subject_kind, subject_id)`.
+fn anomaly_present(obs: &Observed, subject_kind: &str, subject_id: &str, kind: &str) -> bool {
+    obs.anomalies.iter().any(|a| {
+        a.subject_type.as_deref() == Some(subject_kind)
+            && a.subject_id.as_deref() == Some(subject_id)
+            && a.kind.as_deref() == Some(kind)
+    })
+}
+
+/// Hour-of-day (0..24) of the modal hour-of-week bucket (first max by bucket index; None if empty).
+fn peak_hour_of_day(hist: &[i32]) -> Option<i64> {
+    let mut best_i = usize::MAX;
+    let mut best_v = i32::MIN;
+    for (i, &v) in hist.iter().enumerate() {
+        if v > best_v {
+            best_v = v;
+            best_i = i;
+        }
+    }
+    if best_v <= 0 {
+        return None;
+    }
+    Some((best_i % 24) as i64)
 }
 
 /// Resolve an [`EntityRef`] to its catalog id string. `device` ids are literal; the others map an
@@ -1738,5 +1818,78 @@ mod graph_tests {
         let agg = find(&ms, "graph.match");
         assert!((agg.value - 2.0 / 3.0).abs() < 1e-9);
         assert!(!agg.floor_ok);
+    }
+
+    fn anom(kind: &str) -> crate::query::AnomalyObs {
+        crate::query::AnomalyObs {
+            subject_type: Some("person".into()),
+            subject_id: Some("A".into()), // Alice (person) resolves to "A" in obs_with
+            kind: Some(kind.into()),
+        }
+    }
+
+    #[test]
+    fn anomaly_present_and_no_anomaly_counter() {
+        let mut o = obs_with(vec![]);
+        o.anomalies = vec![anom("off_schedule_presence")];
+        // expect_anomaly for the present kind PASSES; a different kind FAILS.
+        let gt = GraphGt {
+            anomalies: vec![
+                AnomalyExpect { subject: eref("person", "Alice"), kind: "off_schedule_presence".into() },
+                AnomalyExpect { subject: eref("person", "Alice"), kind: "unknown_person_cluster".into() },
+            ],
+            ..Default::default()
+        };
+        let ms = score_graph(&gt, &o);
+        assert!(find(&ms, "graph.anomaly.off_schedule_presence.alice").floor_ok);
+        assert!(!find(&ms, "graph.anomaly.unknown_person_cluster.alice").floor_ok);
+
+        // expect_no_anomaly: FAILS for the present kind, PASSES for an absent kind.
+        let gt = GraphGt {
+            no_anomalies: vec![
+                AnomalyExpect { subject: eref("person", "Alice"), kind: "off_schedule_presence".into() },
+                AnomalyExpect { subject: eref("person", "Alice"), kind: "first_time_pairing".into() },
+            ],
+            ..Default::default()
+        };
+        let ms = score_graph(&gt, &o);
+        assert!(!find(&ms, "graph.no_anomaly.off_schedule_presence.alice").floor_ok);
+        assert!(find(&ms, "graph.no_anomaly.first_time_pairing.alice").floor_ok);
+    }
+
+    #[test]
+    fn baseline_visits_floor_and_peak_hour() {
+        let mut o = obs_with(vec![]);
+        let mut hist = vec![0i32; 168];
+        hist[105] = 5; // Thursday 09:00 (weekday 4 * 24 + 9)
+        hist[3] = 1; // a lone off-hours visit
+        o.baselines = vec![crate::query::BaselineObs {
+            subject_type: "person".into(),
+            subject_id: "A".into(),
+            visits_in_window: 6,
+            hour_histogram: hist,
+        }];
+        // visits>=5 AND peak hour-of-day 9 -> pass.
+        let gt = GraphGt {
+            baselines: vec![BaselineExpect {
+                subject: eref("person", "Alice"),
+                min_visits: Some(5),
+                peak_hour_of_day: Some(9),
+            }],
+            ..Default::default()
+        };
+        assert!(find(&score_graph(&gt, &o), "graph.baseline.person.alice").floor_ok);
+        // Too-high visit floor -> fail.
+        let gt = GraphGt {
+            baselines: vec![BaselineExpect { subject: eref("person", "Alice"), min_visits: Some(7), peak_hour_of_day: None }],
+            ..Default::default()
+        };
+        assert!(!find(&score_graph(&gt, &o), "graph.baseline.person.alice").floor_ok);
+        // Wrong peak hour -> fail.
+        let gt = GraphGt {
+            baselines: vec![BaselineExpect { subject: eref("person", "Alice"), min_visits: None, peak_hour_of_day: Some(3) }],
+            ..Default::default()
+        };
+        assert!(!find(&score_graph(&gt, &o), "graph.baseline.person.alice").floor_ok);
     }
 }

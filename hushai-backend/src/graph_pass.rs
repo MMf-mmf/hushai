@@ -15,7 +15,7 @@
 //! fixtures still settle), evidence deduped by event_id, confidences rounded to 4 decimals in the
 //! pure core. Same-config re-folds are stable.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::{Value, json};
 use sqlx::{PgPool, Postgres, Row, Transaction};
@@ -80,12 +80,19 @@ impl GraphOpts {
     }
 }
 
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Default, Clone)]
 pub struct GraphStats {
     pub events_consumed: u64,
     pub conversations_consumed: u64,
     pub edges_upserted: u64,
     pub bindings_surfaced: u64,
+    /// Subjects whose `entity_baselines` row was recomputed this pass (Wave 2).
+    pub baselines_recomputed: u64,
+    /// `pattern_anomaly` events emitted this pass (Wave 2).
+    pub anomalies_emitted: u64,
+    /// The emitted anomaly event_ids — the worker driver alert-evaluates these post-commit (the
+    /// backend can't reach the worker's `alerts::evaluate`). Empty for a no-anomaly pass.
+    pub anomaly_event_ids: Vec<Uuid>,
 }
 
 /// One identity-carrying event, minimal fields for folding.
@@ -126,8 +133,31 @@ pub async fn graph_pass(pool: &PgPool, opts: &GraphOpts) -> anyhow::Result<Graph
     }
 
     let mut stats = GraphStats::default();
-    let ev_wm = drain_events(&mut tx, opts, state.events_watermark_micros, &cfg_hash, &mut stats).await?;
-    let cv_wm = drain_conversations(&mut tx, opts, state.conversations_watermark_micros, &cfg_hash, &mut stats).await?;
+    let (ev_wm, touched_ev) =
+        drain_events(&mut tx, opts, state.events_watermark_micros, &cfg_hash, &mut stats).await?;
+    let (cv_wm, touched_cv) =
+        drain_conversations(&mut tx, opts, state.conversations_watermark_micros, &cfg_hash, &mut stats)
+            .await?;
+
+    // Step 4 (§1.5 / §1.6): recompute baselines for the subjects touched this pass and emit
+    // off-schedule anomalies. off_schedule is judged AS-OF (each visit vs the subject's
+    // strictly-earlier visits), independent of the baseline row written here (see
+    // patterns::recompute_and_flag).
+    let mut touched = touched_ev;
+    touched.extend(touched_cv);
+    if !touched.is_empty() {
+        let ids = crate::patterns::recompute_and_flag(
+            &mut tx,
+            &opts.cfg,
+            opts.tz_offset_secs,
+            &cfg_hash,
+            &touched,
+        )
+        .await?;
+        stats.baselines_recomputed = touched.len() as u64;
+        stats.anomalies_emitted = ids.len() as u64;
+        stats.anomaly_event_ids = ids;
+    }
 
     // Advance watermarks (max seen this pass; unchanged when nothing drained) + stamp config_hash.
     sqlx::query(
@@ -178,7 +208,7 @@ async fn drain_events(
     prior_wm_micros: i64,
     cfg_hash: &str,
     stats: &mut GraphStats,
-) -> anyhow::Result<i64> {
+) -> anyhow::Result<(i64, BTreeSet<(String, Uuid)>)> {
     let slack_nanos = opts.cfg.copresence_slack_secs.max(1) * NANOS_PER_SEC;
     // DB-clock "now" for the in-progress guard (fixtures with pinned capture still settle).
     let now_ns: i64 = sqlx::query_scalar("SELECT (extract(epoch from now()) * 1e9)::bigint")
@@ -193,6 +223,7 @@ async fn drain_events(
          WHERE e.subject_id IS NOT NULL \
            AND e.subject_type = ANY(ARRAY['person','speaker','plate']) \
            AND e.device_id IS NOT NULL \
+           AND e.event_type NOT IN ('pattern_anomaly', 'gotham_briefing') \
            AND e.updated_at > to_timestamp($1::double precision / 1e6) \
            AND e.updated_at < now() - make_interval(secs => $2) \
            AND e.end_unix_nanos <= $3 \
@@ -206,7 +237,7 @@ async fn drain_events(
     .await?;
 
     if rows.is_empty() {
-        return Ok(prior_wm_micros);
+        return Ok((prior_wm_micros, BTreeSet::new()));
     }
     let events: Vec<EvRow> = rows
         .into_iter()
@@ -353,7 +384,9 @@ async fn drain_events(
         }
     }
 
-    Ok(new_wm)
+    // Subjects touched this pass (drives the Wave-2 baseline recompute + anomaly judging).
+    let touched: BTreeSet<(String, Uuid)> = by_subject.keys().cloned().collect();
+    Ok((new_wm, touched))
 }
 
 /// Coalesce one subject's events into visits (interval-aware, same rule as
@@ -401,7 +434,7 @@ async fn drain_conversations(
     prior_wm_micros: i64,
     cfg_hash: &str,
     stats: &mut GraphStats,
-) -> anyhow::Result<i64> {
+) -> anyhow::Result<(i64, BTreeSet<(String, Uuid)>)> {
     let slack_nanos = opts.cfg.copresence_slack_secs.max(1) * NANOS_PER_SEC;
     let rows = sqlx::query(
         "SELECT conversation_id, primary_device_id, started_at_unix_nanos, ended_at_unix_nanos, \
@@ -418,11 +451,12 @@ async fn drain_conversations(
     .fetch_all(&mut **tx)
     .await?;
     if rows.is_empty() {
-        return Ok(prior_wm_micros);
+        return Ok((prior_wm_micros, BTreeSet::new()));
     }
 
     let mut new_wm = prior_wm_micros;
     let mut consumed = 0u64;
+    let mut touched: BTreeSet<(String, Uuid)> = BTreeSet::new();
     for r in &rows {
         consumed += 1;
         new_wm = new_wm.max(r.get::<i64, _>("updated_micros"));
@@ -432,6 +466,9 @@ async fn drain_conversations(
         let mut speakers: Vec<Uuid> = r.try_get("speaker_ids")?;
         speakers.sort();
         speakers.dedup();
+        for sp in &speakers {
+            touched.insert(("speaker".to_string(), *sp));
+        }
 
         // conversed_with: every distinct speaker pair in the conversation.
         for i in 0..speakers.len() {
@@ -464,6 +501,7 @@ async fn drain_conversations(
         let persons_present: Vec<Uuid> = sqlx::query_scalar(
             "SELECT DISTINCT subject_id FROM events \
              WHERE subject_type = 'person' AND subject_id IS NOT NULL AND device_id = $1 \
+               AND event_type NOT IN ('pattern_anomaly', 'gotham_briefing') \
                AND start_unix_nanos < $2 AND end_unix_nanos > $3",
         )
         .bind(&dev)
@@ -489,7 +527,7 @@ async fn drain_conversations(
         }
     }
     stats.conversations_consumed = consumed;
-    Ok(new_wm)
+    Ok((new_wm, touched))
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1007,7 +1045,11 @@ pub async fn rebuild(pool: &PgPool, opts: &GraphOpts) -> anyhow::Result<GraphSta
         total.conversations_consumed += s.conversations_consumed;
         total.edges_upserted += s.edges_upserted;
         total.bindings_surfaced += s.bindings_surfaced;
-        if s.events_consumed == 0 && s.conversations_consumed == 0 {
+        total.baselines_recomputed += s.baselines_recomputed;
+        total.anomalies_emitted += s.anomalies_emitted;
+        let stop = s.events_consumed == 0 && s.conversations_consumed == 0;
+        total.anomaly_event_ids.extend(s.anomaly_event_ids);
+        if stop {
             break;
         }
     }

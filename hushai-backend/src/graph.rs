@@ -10,7 +10,7 @@
 //! Determinism rules (the `profiles.rs` idioms): integer/ratio math only, confidences rounded to
 //! 4 decimals before storage, total tie-breaks on every sort, `BTreeMap`/`BTreeSet` iteration.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use sha2::{Digest, Sha256};
 
@@ -481,6 +481,167 @@ pub fn round4(x: f32) -> f32 {
     (x * 10_000.0).round() / 10_000.0
 }
 
+// ---------------------------------------------------------------------------------------------
+// Baselines (§1.6 / migration 0029) — pure recompute over a subject's trailing-window visits
+// ---------------------------------------------------------------------------------------------
+
+/// Companion tally cap kept in `entity_baselines.companion_stats` (top-K, deterministic order).
+/// A code constant, NOT a ★ knob — it does not fold into [`config_hash`] (which tracks the GRAPH_*
+/// ENV knobs). NOTE: changing it silently alters stored `companion_stats` with no config-hash
+/// change; the eval only notices via a fixture that asserts companion_stats (none do today), so
+/// treat a change as baseline-affecting and re-freeze deliberately.
+pub const COMPANION_TOP_K: usize = 8;
+
+/// One subject visit fed to the baseline folder (device + interval; dwell = end − start).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaselineVisit {
+    pub device_id: String,
+    pub start_unix_nanos: i64,
+    pub end_unix_nanos: i64,
+}
+
+/// One companion tally (from the subject's `co_present` edges), fed to the baseline folder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompanionTally {
+    pub node_type: NodeType,
+    pub node_id: String,
+    pub observations: i64,
+}
+
+/// A subject's recomputed baseline (the computed columns of the 0029 `entity_baselines` row).
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct EntityBaseline {
+    /// 168 hour-of-week buckets (local civil time, fixed offset). `sum == visits_in_window`.
+    pub hour_histogram: Vec<i32>,
+    pub visits_in_window: i64,
+    pub dwell_p50_secs: Option<i32>,
+    pub dwell_p90_secs: Option<i32>,
+    /// `{"<device_id>":{"visits":N,"last_seen_ns":..}}`
+    pub device_stats: serde_json::Value,
+    /// `[{"node_type":..,"node_id":..,"observations":N}]`, top-K, deterministic order.
+    pub companion_stats: serde_json::Value,
+}
+
+/// Deterministic nearest-rank percentile (`q ∈ [0,1]`) over an unsorted slice; `None` if empty.
+pub fn percentile(values: &[i64], q: f64) -> Option<i64> {
+    if values.is_empty() {
+        return None;
+    }
+    let mut v = values.to_vec();
+    v.sort_unstable();
+    let q = q.clamp(0.0, 1.0);
+    let n = v.len();
+    // Nearest-rank: rank = ceil(q · n), 1-indexed, clamped into [1, n].
+    let rank = ((q * n as f64).ceil() as usize).clamp(1, n);
+    Some(v[rank - 1])
+}
+
+/// Fold a subject's trailing-window visits + companion tallies into an [`EntityBaseline`].
+/// Deterministic throughout: histogram by [`hour_of_week`], dwell percentiles nearest-rank,
+/// `device_stats` in `BTreeMap` (device_id) order, companions top-K sorted observations-desc then
+/// node type/id.
+pub fn build_baseline(
+    visits: &[BaselineVisit],
+    companions: &[CompanionTally],
+    tz_offset_secs: i64,
+) -> EntityBaseline {
+    let mut hist = vec![0i32; 168];
+    let mut dwells: Vec<i64> = Vec::with_capacity(visits.len());
+    // device_id → (visits, last_seen_ns)
+    let mut dev: BTreeMap<String, (i64, i64)> = BTreeMap::new();
+    for v in visits {
+        let b = hour_of_week(v.start_unix_nanos, tz_offset_secs);
+        if b < hist.len() {
+            hist[b] += 1;
+        }
+        dwells.push(((v.end_unix_nanos - v.start_unix_nanos).max(0)) / NANOS_PER_SEC);
+        let e = dev.entry(v.device_id.clone()).or_insert((0, i64::MIN));
+        e.0 += 1;
+        e.1 = e.1.max(v.end_unix_nanos);
+    }
+    let device_stats = serde_json::Value::Object(
+        dev.into_iter()
+            .map(|(k, (visits, last))| {
+                (k, serde_json::json!({ "visits": visits, "last_seen_ns": last }))
+            })
+            .collect(),
+    );
+
+    let mut comps = companions.to_vec();
+    comps.sort_by(|a, b| {
+        b.observations
+            .cmp(&a.observations)
+            .then_with(|| a.node_type.as_str().cmp(b.node_type.as_str()))
+            .then_with(|| a.node_id.cmp(&b.node_id))
+    });
+    comps.truncate(COMPANION_TOP_K);
+    let companion_stats = serde_json::Value::Array(
+        comps
+            .iter()
+            .map(|c| {
+                serde_json::json!({
+                    "node_type": c.node_type.as_str(),
+                    "node_id": c.node_id,
+                    "observations": c.observations,
+                })
+            })
+            .collect(),
+    );
+
+    EntityBaseline {
+        visits_in_window: visits.len() as i64,
+        dwell_p50_secs: percentile(&dwells, 0.5).map(|x| x as i32),
+        dwell_p90_secs: percentile(&dwells, 0.9).map(|x| x as i32),
+        hour_histogram: hist,
+        device_stats,
+        companion_stats,
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Anomaly kinds + emission helpers (§1.6)
+// ---------------------------------------------------------------------------------------------
+
+/// The `events.event_type` all pattern anomalies carry (0014 free-text vocabulary, no migration).
+pub const EVENT_TYPE_PATTERN_ANOMALY: &str = "pattern_anomaly";
+
+/// The four §1.6 anomaly kinds (stored in `events.metadata.kind`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnomalyKind {
+    OffSchedulePresence,
+    FirstTimePairing,
+    UnknownPersonCluster,
+    NewVehicleForPerson,
+}
+
+impl AnomalyKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            AnomalyKind::OffSchedulePresence => "off_schedule_presence",
+            AnomalyKind::FirstTimePairing => "first_time_pairing",
+            AnomalyKind::UnknownPersonCluster => "unknown_person_cluster",
+            AnomalyKind::NewVehicleForPerson => "new_vehicle_for_person",
+        }
+    }
+}
+
+/// Local civil day index (days since epoch under the fixed offset) — the anomaly dedup bucket, so
+/// an anomaly fires at most once per subject per day no matter how many passes re-drain it.
+pub fn civil_day(unix_nanos: i64, tz_offset_secs: i64) -> i64 {
+    (unix_nanos.div_euclid(NANOS_PER_SEC) + tz_offset_secs).div_euclid(86_400)
+}
+
+/// Idempotent anomaly `dedup_key = "anom:<kind>:<subject>:<bucket>"` (§1.6). `subject` is a stable
+/// key ("person:<uuid>" / "device:<id>"); `bucket` is typically [`civil_day`] as a string.
+///
+/// off_schedule detection itself reuses [`is_off_schedule`]: `patterns::recompute_and_flag` judges
+/// each visit (in capture order) against the histogram of the subject's STRICTLY-EARLIER visits —
+/// the spec's incremental "new visit vs prior baseline" model — so a subject's first appearances
+/// (incl. the enrollment clip) never fire, only a later violation of an established rhythm.
+pub fn anom_dedup_key(kind: AnomalyKind, subject: &str, bucket: &str) -> String {
+    format!("anom:{}:{}:{}", kind.as_str(), subject, bucket)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,5 +816,83 @@ mod tests {
         assert_eq!(a, config_hash(&GraphCfg::default())); // stable
         let b = config_hash(&GraphCfg { bind_margin: 0.25, ..GraphCfg::default() });
         assert_ne!(a, b); // any ★ knob shifts the lineage
+    }
+
+    fn bvis(dev: &str, start: i64, dwell_secs: i64) -> BaselineVisit {
+        BaselineVisit { device_id: dev.into(), start_unix_nanos: start, end_unix_nanos: start + dwell_secs * SEC }
+    }
+
+    #[test]
+    fn percentile_is_nearest_rank() {
+        assert_eq!(percentile(&[], 0.5), None);
+        let v = [10, 20, 30, 40, 50];
+        assert_eq!(percentile(&v, 0.5), Some(30)); // ceil(0.5*5)=3 → v[2]
+        assert_eq!(percentile(&v, 0.9), Some(50)); // ceil(0.9*5)=5 → v[4]
+        assert_eq!(percentile(&v, 0.0), Some(10)); // clamped to rank 1
+        assert_eq!(percentile(&[7], 0.9), Some(7));
+        // Unsorted input sorts internally.
+        assert_eq!(percentile(&[50, 10, 30], 0.5), Some(30));
+    }
+
+    #[test]
+    fn build_baseline_folds_histogram_dwell_devices_companions() {
+        // 5 visits at Friday 08:xx (bucket 128), 1 at a different bucket, across two devices.
+        let visits = vec![
+            bvis("front", T0, 60),
+            bvis("front", T0 + 86_400 * SEC * 7, 120), // +1 week → same bucket 128
+            bvis("front", T0 + 86_400 * SEC * 14, 30),
+            bvis("garage", T0, 90),
+            bvis("garage", T0 + 3600 * SEC, 90), // +1h → bucket 129
+        ];
+        let comps = vec![
+            CompanionTally { node_type: NodeType::Speaker, node_id: "s1".into(), observations: 2 },
+            CompanionTally { node_type: NodeType::Person, node_id: "p9".into(), observations: 9 },
+        ];
+        let b = build_baseline(&visits, &comps, 0);
+        assert_eq!(b.visits_in_window, 5);
+        assert_eq!(b.hour_histogram.len(), 168);
+        assert_eq!(b.hour_histogram.iter().map(|&h| h as i64).sum::<i64>(), 5);
+        assert_eq!(b.hour_histogram[128], 4);
+        assert_eq!(b.hour_histogram[129], 1);
+        // dwell secs sorted: [30,60,90,90,120]; p50 nearest-rank rank3 → 90, p90 rank5 → 120.
+        assert_eq!(b.dwell_p50_secs, Some(90));
+        assert_eq!(b.dwell_p90_secs, Some(120));
+        // device_stats keyed + counted.
+        assert_eq!(b.device_stats["front"]["visits"], serde_json::json!(3));
+        assert_eq!(b.device_stats["garage"]["visits"], serde_json::json!(2));
+        // companions sorted observations-desc → p9(9) before s1(2).
+        assert_eq!(b.companion_stats[0]["node_id"], serde_json::json!("p9"));
+        assert_eq!(b.companion_stats[1]["node_id"], serde_json::json!("s1"));
+    }
+
+    #[test]
+    fn off_schedule_as_of_prior_histogram() {
+        // As-of model (patterns.rs): judge a visit against the histogram of STRICTLY-EARLIER visits.
+        let cfg = GraphCfg::default(); // min_visits 5, hour_min_frac 0.05
+        // Prior = 5 visits all at bucket 128 (a mature, concentrated rhythm).
+        let mut prior = vec![0i32; 168];
+        prior[128] = 5;
+        // A later visit at a novel bucket 30: 0/5 of prior mass < 0.05 → off-schedule.
+        assert!(is_off_schedule(&prior, 30, &cfg));
+        // A later visit back at bucket 128: 5/5 = 1.0 → NOT off-schedule.
+        assert!(!is_off_schedule(&prior, 128, &cfg));
+        // Immature prior (4 visits) → nothing fires yet (a subject's early visits, incl. enroll).
+        let mut immature = vec![0i32; 168];
+        immature[128] = 4;
+        assert!(!is_off_schedule(&immature, 30, &cfg));
+        // Empty prior (the very first appearance) → never fires.
+        assert!(!is_off_schedule(&vec![0i32; 168], 30, &cfg));
+    }
+
+    #[test]
+    fn anomaly_dedup_key_and_civil_day() {
+        assert_eq!(civil_day(0, 0), 0);
+        assert_eq!(civil_day(86_400 * SEC + 5 * SEC, 0), 1);
+        // −9h offset pushes an early-morning ns back to the previous civil day.
+        assert_eq!(civil_day(3600 * SEC, -9 * 3600), -1);
+        assert_eq!(
+            anom_dedup_key(AnomalyKind::OffSchedulePresence, "person:abc", "20123"),
+            "anom:off_schedule_presence:person:abc:20123"
+        );
     }
 }

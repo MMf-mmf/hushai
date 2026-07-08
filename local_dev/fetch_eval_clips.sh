@@ -189,5 +189,34 @@ if [[ -d "$STG/graph_cross_camera_fusion" ]]; then
   kenburns_face "$bsrc" "$STG/graph_face_voice_bind/clips/mallory_silent.mp4"
   echo "[done] regenerated Gotham graph fixture media under $STG"
 else
-  echo "[skip] graph_* — no staging fixture dirs"
+  echo "[skip] graph_* — no train fixture dirs"
+fi
+
+# --- Gotham G2 baseline/anomaly fixtures (F4-F6, `graph` modality) --------------------------------
+# Reuse the same face substrates: Judith (→ Alice, the enrolled weekly regular) + Sally (→ the F6
+# stranger, a DISTINCT face). Weekly-cadence multi-injection stages the rhythm; the silent-face
+# ffmpeg recipe matches G1 so the pipeline output — and thus the frozen baselines — reproduce.
+G2_TRAIN="$ROOT/hushai-eval/fixtures/train"
+G2_HOLD="$ROOT/hushai-eval/fixtures/holdout"
+if [[ -d "$G2_TRAIN/graph_baseline_rhythm" ]]; then
+  jsrc="$CACHE/face_id.jpg"
+  bsrc="$CACHE/bob.jpg"
+  [[ -s "$jsrc" ]] || curl -fSL -m 180 -o "$jsrc" "https://commons.wikimedia.org/wiki/Special:FilePath/Judith%20A.%20Resnik,%20official%20portrait%20(cropped).jpg"
+  [[ -s "$bsrc" ]] || curl -fSL -m 180 -o "$bsrc" "https://commons.wikimedia.org/wiki/Special:FilePath/Sally_Ride_(1984).jpg"
+  kb_face() {
+    ffmpeg -y -loglevel error -loop 1 -i "$1" -f lavfi -i "anullsrc=r=16000:cl=mono" \
+      -vf "scale=2560:1440:force_original_aspect_ratio=increase,crop=2560:1440,zoompan=z='min(zoom+0.0008,1.3)':d=150:s=1280x720:fps=25,format=yuv420p" \
+      -t 6 -map 0:v -map 1:a -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -shortest "$2"
+  }
+  for d in "$G2_TRAIN/graph_baseline_rhythm" "$G2_TRAIN/anomaly_novel_time" "$G2_HOLD/anomaly_negatives"; do
+    mkdir -p "$d/clips"
+    echo "[graph] G2 alice_face.mp4 → ${d##*/}"
+    kb_face "$jsrc" "$d/clips/alice_face.mp4"
+  done
+  mkdir -p "$G2_HOLD/anomaly_negatives/clips"
+  echo "[graph] G2 stranger_face.mp4 (F6 unknown)"
+  kb_face "$bsrc" "$G2_HOLD/anomaly_negatives/clips/stranger_face.mp4"
+  echo "[done] regenerated Gotham G2 fixture media"
+else
+  echo "[skip] graph G2 — no fixture dirs"
 fi

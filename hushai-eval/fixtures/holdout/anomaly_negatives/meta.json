@@ -1,0 +1,29 @@
+{
+  "case_id": "anomaly_negatives",
+  "description": "Gotham G2 fixture F6 (sealed anomaly counter-fixture, HOLDOUT). The known enrolled subject Alice keeps her usual rhythm (5 weekly Thursday 09:00 visits) and a never-seen stranger face appears ONCE. Nothing must over-fire: Alice mints ZERO off_schedule anomalies (every visit is her usual bucket), and the lone stranger has an immature baseline (1 visit < GRAPH_ANOMALY_MIN_VISITS) so it can't be flagged either. A single unknown is also below the unknown_person_cluster gate. This is the 'a red is a finding, never a threshold edit' guard against anomaly fatigue. base_capture Thursday 09:00 UTC; tz 0. HOLDOUT (sealed).",
+  "device_id": "eval-anomaly-neg",
+  "media_file": "clips/alice_face.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781773200000000000,
+  "modalities": [
+    "graph"
+  ],
+  "tier": "full",
+  "enroll": [
+    { "modality": "person", "name": "Alice", "ref": "clips/alice_face.mp4" }
+  ],
+  "injections": [
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-anomaly-neg", "capture_start_offset_ns": 0, "seed": "w0" },
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-anomaly-neg", "capture_start_offset_ns": 604800000000000, "seed": "w1" },
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-anomaly-neg", "capture_start_offset_ns": 1209600000000000, "seed": "w2" },
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-anomaly-neg", "capture_start_offset_ns": 1814400000000000, "seed": "w3" },
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-anomaly-neg", "capture_start_offset_ns": 2419200000000000, "seed": "w4" },
+    { "media_file": "clips/stranger_face.mp4", "device_id": "eval-anomaly-neg", "capture_start_offset_ns": 756000000000000, "seed": "stranger" }
+  ],
+  "poll": {
+    "timeout_secs": 300,
+    "interval_secs": 3,
+    "quiesce_polls": 2
+  }
+}

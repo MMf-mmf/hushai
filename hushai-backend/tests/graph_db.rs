@@ -96,12 +96,44 @@ async fn binding_status(pool: &PgPool, a: &str, b: &str) -> Option<String> {
     row.and_then(|r| r.get::<Option<String>, _>("status"))
 }
 
+/// True when a `pattern_anomaly` event of `kind` exists for the subject (Gotham G2).
+async fn anomaly_present(pool: &PgPool, subject: Uuid, kind: &str) -> bool {
+    let row = sqlx::query(
+        "SELECT 1 AS ok FROM events \
+         WHERE event_type = 'pattern_anomaly' AND subject_id = $1 AND metadata->>'kind' = $2 LIMIT 1",
+    )
+    .bind(subject).bind(kind)
+    .fetch_optional(pool)
+    .await
+    .unwrap();
+    row.is_some()
+}
+
+/// A subject's recomputed `entity_baselines.visits_in_window` (Gotham G2), if the row exists.
+async fn baseline_visits(pool: &PgPool, subject: Uuid) -> Option<i64> {
+    let row = sqlx::query("SELECT visits_in_window FROM entity_baselines WHERE subject_id = $1")
+        .bind(subject)
+        .fetch_optional(pool)
+        .await
+        .unwrap();
+    row.map(|r| r.get::<i32, _>("visits_in_window") as i64)
+}
+
 #[tokio::test]
 async fn rebuild_correlates_cross_subject_edges_in_one_batch() {
     let Some(pool) = connect().await else {
         eprintln!("DATABASE_URL unset — skipping graph_db integration test");
         return;
     };
+
+    // Idempotent pre-clean: end-cleanup runs only on success, so a prior ABORTED run can leave the
+    // fixed-norm plate (unique `plate_text_norm='EMD774'`) or `graphtest-*` rows behind and collide.
+    // `entity_edges`/`entity_baselines`/`entity_journeys` are TRUNCATEd by `rebuild` below. Order
+    // respects the events→devices FK.
+    sqlx::query("DELETE FROM events WHERE device_id LIKE 'graphtest-%'").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM conversations WHERE primary_device_id LIKE 'graphtest-%'").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM license_plates WHERE plate_text_norm = 'EMD774'").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM devices WHERE device_id LIKE 'graphtest-%'").execute(&pool).await.unwrap();
 
     let device = format!("graphtest-{}", Uuid::now_v7());
     let alice = Uuid::now_v7();
@@ -110,12 +142,13 @@ async fn rebuild_correlates_cross_subject_edges_in_one_batch() {
     let plate = Uuid::now_v7();
     let dave = Uuid::now_v7(); // person for the voice↔face binding scenario
     let dave_spk = Uuid::now_v7(); // his speaker
+    let erin = Uuid::now_v7(); // person for the G2 baseline / off_schedule scenario
     let base = now_ns() - 10 * 86_400 * SEC; // ~10 days ago: safely past the drain's slack guard.
 
     sqlx::query("INSERT INTO devices (device_id, source_kind) VALUES ($1,'test') ON CONFLICT DO NOTHING")
         .bind(&device).execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO persons (person_id) VALUES ($1),($2),($3),($4)")
-        .bind(alice).bind(bob).bind(carol).bind(dave).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO persons (person_id) VALUES ($1),($2),($3),($4),($5)")
+        .bind(alice).bind(bob).bind(carol).bind(dave).bind(erin).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO speakers (speaker_id) VALUES ($1)").bind(dave_spk).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO license_plates (plate_id, plate_text, plate_text_norm) VALUES ($1,'EMD 774','EMD774')")
         .bind(plate).execute(&pool).await.unwrap();
@@ -139,6 +172,20 @@ async fn rebuild_correlates_cross_subject_edges_in_one_batch() {
         seed_event(&pool, &device, "person", dave, t, t + 12 * SEC).await; // Dave's face present
         seed_conversation(&pool, &device, dave_spk, t, t + 12 * SEC).await; // Dave's voice speaks
     }
+
+    // G2 baseline / off_schedule scenario (Erin), temporally isolated ~60 days back so it never
+    // co-occurs with the others. Five visits one week apart at the SAME time-of-day establish a
+    // mature rhythm in ONE hour-of-week bucket; a LATER sixth visit (+29 days → a different weekday
+    // bucket, after the rhythm is set) holds 0/5 of her prior mass → exactly one off_schedule
+    // anomaly under the AS-OF model. Alice, with only 2 visits, has an IMMATURE baseline → never
+    // flagged. The outlier must come AFTER the regulars (as-of judges vs strictly-earlier visits).
+    let base_e = now_ns() - 90 * 86_400 * SEC;
+    for k in 0..5i64 {
+        let t = base_e + k * 7 * 86_400 * SEC; // weekly → same hour-of-week bucket
+        seed_event(&pool, &device, "person", erin, t, t + 12 * SEC).await;
+    }
+    let outlier = base_e + 29 * 86_400 * SEC; // a later, different-weekday bucket (rhythm established)
+    seed_event(&pool, &device, "person", erin, outlier, outlier + 12 * SEC).await;
 
     // One authoritative fold of the WHOLE scenario: grace 0 (fresh events eligible) + a huge budget
     // so everything drains in ONE batch (so cross-subject visits co-occur — the fix under test).
@@ -187,13 +234,32 @@ async fn rebuild_correlates_cross_subject_edges_in_one_batch() {
         "binding must SURFACE to 'candidate' (guards the upsert_edge status-persist fix)"
     );
 
+    // G2: Erin's baseline recomputed (6 visits in the trailing window) and her lone off-hours visit
+    // flags exactly one off_schedule_presence anomaly.
+    assert!(
+        baseline_visits(&pool, erin).await.is_some_and(|v| v >= 5),
+        "Erin's entity_baselines row must be recomputed with >= 5 visits (got {:?})",
+        baseline_visits(&pool, erin).await
+    );
+    assert!(
+        anomaly_present(&pool, erin, "off_schedule_presence").await,
+        "Erin's +15h off-hours visit must fire an off_schedule_presence anomaly (leave-one-out vs 5 mature regulars)"
+    );
+    // Negative: Alice (2 visits, immature baseline) must NOT be flagged — the anomaly-storm guard.
+    assert!(
+        !anomaly_present(&pool, alice, "off_schedule_presence").await,
+        "Alice's immature 2-visit baseline must NOT fire off_schedule (visits < GRAPH_ANOMALY_MIN_VISITS)"
+    );
+
     // cleanup (device-namespaced + our catalog ids; entity_edges is derived/global — drop ours).
     sqlx::query("DELETE FROM entity_edges WHERE src_id = ANY($1) OR dst_id = ANY($1)")
         .bind(vec![a, b, c, p, d, ds, device.clone()]).execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM conversations WHERE primary_device_id = $1").bind(&device).execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM events WHERE device_id = $1").bind(&device).execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM entity_baselines WHERE subject_id = ANY($1)")
+        .bind(vec![alice, bob, carol, dave, erin]).execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM persons WHERE person_id = ANY($1)")
-        .bind(vec![alice, bob, carol, dave]).execute(&pool).await.unwrap();
+        .bind(vec![alice, bob, carol, dave, erin]).execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM speakers WHERE speaker_id = $1").bind(dave_spk).execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM license_plates WHERE plate_id = $1").bind(plate).execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM devices WHERE device_id = $1").bind(&device).execute(&pool).await.unwrap();

@@ -57,6 +57,25 @@ pub struct EdgeObs {
     pub status: Option<String>,
 }
 
+/// One `pattern_anomaly` event (Gotham G2), reduced to what an assertion needs: which subject and
+/// which anomaly kind (`metadata.kind`). `subject_id` is the stringified catalog UUID.
+#[derive(Debug, Clone)]
+pub struct AnomalyObs {
+    pub subject_type: Option<String>,
+    pub subject_id: Option<String>,
+    pub kind: Option<String>,
+}
+
+/// One recomputed `entity_baselines` row (Gotham G2). `hour_histogram` is the 168 hour-of-week
+/// buckets; `subject_id` is the stringified catalog UUID.
+#[derive(Debug, Clone)]
+pub struct BaselineObs {
+    pub subject_type: String,
+    pub subject_id: String,
+    pub visits_in_window: i64,
+    pub hour_histogram: Vec<i32>,
+}
+
 /// Name→id resolution for graph assertions (assignment-invariance): the enrolled `display_name` of a
 /// person/speaker/plate maps to its catalog id. Device endpoints resolve to their literal id, so they
 /// need no map. Empty when the `graph` modality isn't scored.
@@ -83,6 +102,10 @@ pub struct Observed {
     pub graph_edges: Vec<EdgeObs>,
     /// Enrolled-name → catalog-id resolution for graph assertions.
     pub entity_ids: EntityIds,
+    /// `pattern_anomaly` events (Gotham G2), read when the `graph` modality is scored.
+    pub anomalies: Vec<AnomalyObs>,
+    /// Recomputed `entity_baselines` rows (Gotham G2), read when the `graph` modality is scored.
+    pub baselines: Vec<BaselineObs>,
 }
 
 const SLACK_NS: i64 = 5_000_000_000;
@@ -290,6 +313,37 @@ pub async fn observe(
             // (guards a future multi-plate fixture where plate A's display_name equals plate B's norm).
             o.entity_ids.plate.entry(norm).or_insert_with(|| id.to_string());
         }
+
+        // Pattern anomalies (Gotham G2) — ordinary events rows, unwindowed (the fold is
+        // capture-anchored; assertions resolve the subject by enrolled name → id + metadata.kind).
+        o.anomalies = sqlx::query_as::<_, (Option<String>, Option<Uuid>, Option<String>)>(
+            "SELECT subject_type, subject_id, metadata->>'kind' AS kind \
+             FROM events WHERE event_type = 'pattern_anomaly'",
+        )
+        .fetch_all(&ctx.pool)
+        .await?
+        .into_iter()
+        .map(|(subject_type, subject_id, kind)| AnomalyObs {
+            subject_type,
+            subject_id: subject_id.map(|u| u.to_string()),
+            kind,
+        })
+        .collect();
+
+        // Recomputed baselines (Gotham G2).
+        o.baselines = sqlx::query_as::<_, (String, Uuid, i32, Vec<i32>)>(
+            "SELECT subject_type, subject_id, visits_in_window, hour_histogram FROM entity_baselines",
+        )
+        .fetch_all(&ctx.pool)
+        .await?
+        .into_iter()
+        .map(|(subject_type, subject_id, visits, hist)| BaselineObs {
+            subject_type,
+            subject_id: subject_id.to_string(),
+            visits_in_window: visits as i64,
+            hour_histogram: hist,
+        })
+        .collect();
     }
 
     Ok(o)

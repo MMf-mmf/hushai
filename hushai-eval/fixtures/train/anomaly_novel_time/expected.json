@@ -1,0 +1,13 @@
+{
+  "graph": {
+    "entities": [
+      { "kind": "person", "name": "Alice" }
+    ],
+    "baselines": [
+      { "subject": { "kind": "person", "name": "Alice" }, "min_visits": 5, "peak_hour_of_day": 9 }
+    ],
+    "anomalies": [
+      { "subject": { "kind": "person", "name": "Alice" }, "kind": "off_schedule_presence" }
+    ]
+  }
+}

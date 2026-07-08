@@ -1,0 +1,11 @@
+{
+  "case_id": "anomaly_negatives",
+  "config_hash": "d4acc862fd0ba577",
+  "git_sha": "463f5a4",
+  "metrics": {
+    "graph.baseline.person.alice": 1.0,
+    "graph.entity.person.alice": 1.0,
+    "graph.match": 1.0,
+    "graph.no_anomaly.off_schedule_presence.alice": 1.0
+  }
+}

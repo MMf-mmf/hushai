@@ -102,10 +102,10 @@ Dependency order: **G1 → {G2, G5}**; **G3** starts in parallel with G1 (existi
 **Shipped means**: relationship questions ("who hangs out with whom", "who frequents the front door", "whose voice is that face") answered from materialized, evidence-carrying edges via a bearer-authed API; merge/delete reconciliation proven; Tier-1 fixtures green twice back-to-back.
 
 ### G2 — Baselines, anomalies, daily briefing
-- [ ] Migration 0029 (`entity_baselines`, `daily_digests`)
-- [ ] `patterns.rs` — baseline recompute + anomaly predicates + digest render
-- [ ] Anomalies emitted as ordinary `events` rows (`event_type='pattern_anomaly'`) → the whole A1–A7 stack (rules, cooldown, feed, webhook, push) works with **zero new alert plumbing**
-- [ ] Digest endpoints + fixtures F4–F7
+- [x] Migration 0029 (`entity_baselines`, `daily_digests`) — shipped in Wave 1
+- [~] `patterns.rs` — baseline recompute + anomaly predicates ✅ (PR4); digest render → PR5
+- [x] Anomalies emitted as ordinary `events` rows (`event_type='pattern_anomaly'`) → ride the A1–A7 stack with zero new alert plumbing. **AS-OF `off_schedule_presence`** wired (each visit judged vs the subject's strictly-earlier visits — the incremental model); baselines recomputed per touched subject in the graph pass; the worker alert-evaluates fresh anomalies post-commit (the evaluator is worker-crate). The other three predicates have pure cores in `graph.rs`; wiring them is a follow-up.
+- [~] Digest endpoints + fixtures F4–F7 — **F4/F5/F6 CALIBRATED live (gate ×2, frozen `d4acc862`)** ← PR4: F4 `graph_baseline_rhythm` (baseline visits≥5 peak-hour 09, no anomaly), F5 `anomaly_novel_time` (off_schedule fires), F6 `anomaly_negatives` (sealed holdout, no over-fire). Digest + F7 → PR5.
 
 **Shipped means**: an off-schedule visit fires an alert rule end-to-end; the briefing endpoint returns byte-stable structured facts for a *pinned* date; sealed anomaly-negative fixture green.
 
@@ -769,8 +769,8 @@ Executed after each wave's implementation; fenced commands + bold PASS criteria 
 | 0 | Preconditions (migrations 0028–0030 @ head, ollama models, clean graph) | ✅ |
 | A | Build + clippy + unit totals (eval 30, graph 12, graph_db integration 1) | ✅ |
 | B | Graph API + auth (401) + rebuild determinism (identical edge set) | ✅ |
-| C | Graph fixtures F1–F3 ×2 (F4/F6 = Wave 2) | ✅ |
-| D | Anomaly → alert end-to-end + negative | ⬜ |
+| C | Graph fixtures F1–F3 ×2 (+ G2 F4/F5/F6 ×2, frozen `d4acc862`) | ✅ |
+| D | Anomaly detection + emission (F4/F5/F6 live ×2 + `graph_db` guard); alert-DELIVERY E2E (rule→feed/webhook) via the worker path | ◑ (detection ✅; delivery pending) |
 | E | Briefing byte-stable + F7 | ⬜ |
 | F | Agent staging F8–F11 ×2 + cap + kill-switch + fallback | ⬜ |
 | G | Viewer investigation UX + e2e | ⬜ |

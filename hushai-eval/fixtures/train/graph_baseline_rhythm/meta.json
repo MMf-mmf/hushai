@@ -1,0 +1,28 @@
+{
+  "case_id": "graph_baseline_rhythm",
+  "description": "Gotham G2 fixture F4 (baseline rhythm). The enrolled person Alice appears every week on the SAME weekday at ~09:00 across 5 weeks. Weekly cadence is deliberate: baselines are 168 hour-of-week buckets, so daily injections would scatter each visit into a distinct weekday bucket — weekly repetition concentrates them in ONE bucket, which is what a 'rhythm' means. The recomputed entity_baselines row must show visits_in_window >= 5 with the peak hour-of-week bucket at hour-of-day 09; and because every visit is the SAME bucket, NO off_schedule_presence anomaly fires (leave-one-out never makes a regular look rare). base_capture is a Thursday 09:00:00 UTC; tz offset is 0 (fixed convention). TRAIN.",
+  "device_id": "eval-baseline-rhythm",
+  "media_file": "clips/alice_face.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781773200000000000,
+  "modalities": [
+    "graph"
+  ],
+  "tier": "full",
+  "enroll": [
+    { "modality": "person", "name": "Alice", "ref": "clips/alice_face.mp4" }
+  ],
+  "injections": [
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-baseline-rhythm", "capture_start_offset_ns": 0, "seed": "w0" },
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-baseline-rhythm", "capture_start_offset_ns": 604800000000000, "seed": "w1" },
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-baseline-rhythm", "capture_start_offset_ns": 1209600000000000, "seed": "w2" },
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-baseline-rhythm", "capture_start_offset_ns": 1814400000000000, "seed": "w3" },
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-baseline-rhythm", "capture_start_offset_ns": 2419200000000000, "seed": "w4" }
+  ],
+  "poll": {
+    "timeout_secs": 300,
+    "interval_secs": 3,
+    "quiesce_polls": 2
+  }
+}
