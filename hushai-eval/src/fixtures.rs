@@ -604,6 +604,43 @@ pub struct GraphGt {
     /// `expect_baseline` (G2): assert the subject's recomputed `entity_baselines` row.
     #[serde(default)]
     pub baselines: Vec<BaselineExpect>,
+    /// `expect_briefing` (G2 / Phase E): assert the pinned-date daily digest's structured `sections`.
+    #[serde(default)]
+    pub briefing: Option<BriefingGt>,
+}
+
+/// A daily-digest assertion (G2 / Phase E) against `daily_digests.sections` for a PINNED civil date.
+/// The runner forces generation of `date`'s digest (a backend POST) after the authoritative rebuild,
+/// then the scorer checks structured counts + label mentions — NEVER the prose `rendered_text` (a
+/// narration surface). `date` is `YYYY-MM-DD` under the eval's fixed tz offset (0).
+#[derive(Debug, Clone, Deserialize)]
+pub struct BriefingGt {
+    pub date: String,
+    /// Exact-match assertions on `sections.counts.*` (each field independently optional).
+    #[serde(default)]
+    pub counts: BriefingCounts,
+    /// Labels (enrolled `display_name`s) that MUST appear somewhere in `sections` — assignment-
+    /// invariant, the way the graph modality names entities.
+    #[serde(default)]
+    pub mentions: Vec<String>,
+}
+
+/// Exact-count assertions against `daily_digests.sections.counts`. Every field is optional; the
+/// calibration protocol freezes the observed value (widen, never narrow) — RECURSIVE_TESTING §4.
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct BriefingCounts {
+    #[serde(default)]
+    pub new_entities: Option<i64>,
+    #[serde(default)]
+    pub anomalies: Option<i64>,
+    #[serde(default)]
+    pub top_visitors: Option<i64>,
+    #[serde(default)]
+    pub conversations: Option<i64>,
+    #[serde(default)]
+    pub first_time_pairings: Option<i64>,
+    #[serde(default)]
+    pub journeys: Option<i64>,
 }
 
 /// A `pattern_anomaly` assertion (G2). `subject` names the entity by enrolled `display_name`
@@ -739,13 +776,14 @@ mod tests {
         const NODE_KINDS: &[&str] = &["person", "speaker", "plate", "device"];
         const ANOMALY_KINDS: &[&str] =
             &["off_schedule_presence", "first_time_pairing", "unknown_person_cluster", "new_vehicle_for_person"];
-        // G1 (F1-F3) + G2 (F4/F5 train, F6 holdout). Loads meta+expected only (no media needed).
+        // G1 (F1-F3) + G2 (F4/F5/F7 train, F6 holdout). Loads meta+expected only (no media needed).
         let cases: &[(&str, &str)] = &[
             ("train", "graph_face_voice_bind"),
             ("train", "graph_cross_camera_fusion"),
             ("train", "graph_person_vehicle"),
             ("train", "graph_baseline_rhythm"),
             ("train", "anomaly_novel_time"),
+            ("train", "briefing_daily"),
             ("holdout", "anomaly_negatives"),
         ];
         for (split, case) in cases {
@@ -759,8 +797,9 @@ mod tests {
                     || !gt.no_edges.is_empty()
                     || !gt.anomalies.is_empty()
                     || !gt.no_anomalies.is_empty()
-                    || !gt.baselines.is_empty(),
-                "{case} must assert at least one entity/edge/anomaly/baseline"
+                    || !gt.baselines.is_empty()
+                    || gt.briefing.is_some(),
+                "{case} must assert at least one entity/edge/anomaly/baseline/briefing"
             );
             for e in gt.edges.iter().chain(gt.no_edges.iter()) {
                 assert!(EDGE_KINDS.contains(&e.kind.as_str()), "{case}: bad edge kind {}", e.kind);
@@ -777,6 +816,24 @@ mod tests {
             }
             for b in &gt.baselines {
                 assert!(NODE_KINDS.contains(&b.subject.kind.as_str()), "{case}: bad baseline subject kind {}", b.subject.kind);
+            }
+            if let Some(br) = &gt.briefing {
+                let d = br.date.as_bytes();
+                assert!(
+                    d.len() == 10 && d[4] == b'-' && d[7] == b'-',
+                    "{case}: briefing.date must be YYYY-MM-DD, got {}",
+                    br.date
+                );
+                assert!(
+                    !br.mentions.is_empty()
+                        || br.counts.new_entities.is_some()
+                        || br.counts.anomalies.is_some()
+                        || br.counts.top_visitors.is_some()
+                        || br.counts.conversations.is_some()
+                        || br.counts.first_time_pairings.is_some()
+                        || br.counts.journeys.is_some(),
+                    "{case}: briefing must assert at least one count or mention"
+                );
             }
         }
     }

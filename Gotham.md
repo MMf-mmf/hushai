@@ -103,9 +103,9 @@ Dependency order: **G1 → {G2, G5}**; **G3** starts in parallel with G1 (existi
 
 ### G2 — Baselines, anomalies, daily briefing
 - [x] Migration 0029 (`entity_baselines`, `daily_digests`) — shipped in Wave 1
-- [~] `patterns.rs` — baseline recompute + anomaly predicates ✅ (PR4); digest render → PR5
+- [x] `patterns.rs` — baseline recompute + anomaly predicates ✅ (PR4); **daily-digest producer ✅ (PR5)**
 - [x] Anomalies emitted as ordinary `events` rows (`event_type='pattern_anomaly'`) → ride the A1–A7 stack with zero new alert plumbing. **AS-OF `off_schedule_presence`** wired (each visit judged vs the subject's strictly-earlier visits — the incremental model); baselines recomputed per touched subject in the graph pass; the worker alert-evaluates fresh anomalies post-commit (the evaluator is worker-crate). The other three predicates have pure cores in `graph.rs`; wiring them is a follow-up.
-- [~] Digest endpoints + fixtures F4–F7 — **F4/F5/F6 CALIBRATED live (gate ×2, frozen `d4acc862`)** ← PR4: F4 `graph_baseline_rhythm` (baseline visits≥5 peak-hour 09, no anomaly), F5 `anomaly_novel_time` (off_schedule fires), F6 `anomaly_negatives` (sealed holdout, no over-fire). Digest + F7 → PR5.
+- [x] Digest producer + endpoints + fixtures F4–F7 — **ALL CALIBRATED live (gate ×2, frozen `d4acc862`)**. PR4: F4 `graph_baseline_rhythm` (baseline visits≥5 peak-hour 09, no anomaly), F5 `anomaly_novel_time` (off_schedule fires), F6 `anomaly_negatives` (sealed holdout, no over-fire). **PR5: `patterns::build_and_upsert_digest` (deterministic `sections` + template `rendered_text`, NO LLM), `POST /v1/graph/digests/{date}` force-generate + worker-0 wall-clock driver (`GRAPH_DIGEST_HOUR_LOCAL`, non-hashed), F7 `briefing_daily` (pinned-date structured `sections` — 8/8 assertions gate ×2).**
 
 **Shipped means**: an off-schedule visit fires an alert rule end-to-end; the briefing endpoint returns byte-stable structured facts for a *pinned* date; sealed anomaly-negative fixture green.
 
@@ -771,7 +771,7 @@ Executed after each wave's implementation; fenced commands + bold PASS criteria 
 | B | Graph API + auth (401) + rebuild determinism (identical edge set) | ✅ |
 | C | Graph fixtures F1–F3 ×2 (+ G2 F4/F5/F6 ×2, frozen `d4acc862`) | ✅ |
 | D | Anomaly detection + emission (F4/F5/F6 live ×2 + `graph_db` guard); alert-DELIVERY E2E (rule→feed/webhook) via the worker path | ◑ (detection ✅; delivery pending) |
-| E | Briefing byte-stable + F7 | ⬜ |
+| E | Briefing byte-stable + F7 (`briefing_daily` 8/8 gate ×2, `d4acc862`; `graph_db` outlier-day digest guard) | ✅ |
 | F | Agent staging F8–F11 ×2 + cap + kill-switch + fallback | ⬜ |
 | G | Viewer investigation UX + e2e | ⬜ |
 | H | Voice markers + phone rig | ⬜ |
@@ -795,7 +795,7 @@ Executed after each wave's implementation; fenced commands + bold PASS criteria 
 2. **`graph_pass.rs` + worker-0 driver + `/v1/graph/*` read API** — merge/delete hooks, metrics, proxy route, AGENTS.md component row + this spec cross-linked.
 3. **Eval `graph` modality + F1–F3 + baselines** — makes Phases B/C executable.
 4. **Baselines/anomalies → events integration + F4–F6** — Phase D.
-5. **Digest + endpoints + F7** — Phase E.
+5. **Digest + endpoints + F7** — Phase E. ✅ LANDED: `patterns::build_and_upsert_digest` (deterministic `sections`/`rendered_text`, no LLM), `POST /v1/graph/digests/{date}` force-generate + worker-0 wall-clock driver (`GRAPH_DIGEST_HOUR_LOCAL`), eval `expect_briefing` (`BriefingGt` counts + mentions), F7 `briefing_daily` gate ×2 under `d4acc862`.
 6. **`gotham/` module + rig runtime + probe + migration 0031 + slash row + AGENTS.md:386 correction + rig pin** — the G3 skeleton, read-only tools 1–14.
 7. **Eval `agent` modality + F8–F11** — Phase F.
 8. **Viewer investigation UI + binding queue + e2e** — Phase G (after advisor-v2 PR 2).

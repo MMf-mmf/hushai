@@ -13,7 +13,7 @@
 //! `entity_edges` globally (derived data), so this must be the only graph test in its binary.
 
 use hushai_backend::graph::GraphCfg;
-use hushai_backend::graph_pass::{rebuild, GraphOpts};
+use hushai_backend::graph_pass::{generate_digest_for_date, rebuild, GraphOpts};
 use sqlx::{PgPool, Row};
 use uuid::Uuid;
 
@@ -251,7 +251,34 @@ async fn rebuild_correlates_cross_subject_edges_in_one_batch() {
         "Alice's immature 2-visit baseline must NOT fire off_schedule (visits < GRAPH_ANOMALY_MIN_VISITS)"
     );
 
+    // G2 Phase E: the daily digest for Erin's OUTLIER civil day surfaces exactly that anomaly and
+    // nothing spurious. The outlier is temporally isolated (base_e + 29d = 1 day after her last
+    // regular, 61d back), so that day holds ONLY her lone off-hours visit: 1 anomaly, 0 new entities
+    // (Erin was first seen 29 days earlier), and the kind appears in the structured `sections`.
+    let outlier_day = outlier.div_euclid(SEC).div_euclid(86_400); // tz offset 0
+    let digest_date: String = sqlx::query_scalar("SELECT (DATE '1970-01-01' + ($1::int))::text")
+        .bind(outlier_day as i32)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let sections = generate_digest_for_date(&pool, &opts, &digest_date).await.expect("generate digest");
+    assert_eq!(
+        sections["counts"]["anomalies"].as_i64(),
+        Some(1),
+        "outlier-day digest must carry Erin's single off_schedule anomaly (sections={sections})"
+    );
+    assert_eq!(
+        sections["counts"]["new_entities"].as_i64(),
+        Some(0),
+        "Erin is not a NEW entity on the outlier day (first seen 29 days earlier)"
+    );
+    assert!(
+        serde_json::to_string(&sections).unwrap().contains("off_schedule_presence"),
+        "the digest's anomalies section must name the anomaly kind"
+    );
+
     // cleanup (device-namespaced + our catalog ids; entity_edges is derived/global — drop ours).
+    sqlx::query("DELETE FROM daily_digests WHERE digest_date = $1::date").bind(&digest_date).execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM entity_edges WHERE src_id = ANY($1) OR dst_id = ANY($1)")
         .bind(vec![a, b, c, p, d, ds, device.clone()]).execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM conversations WHERE primary_device_id = $1").bind(&device).execute(&pool).await.unwrap();

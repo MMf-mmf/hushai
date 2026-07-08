@@ -1,0 +1,16 @@
+{
+  "case_id": "briefing_daily",
+  "config_hash": "d4acc862fd0ba577",
+  "git_sha": "baa0818",
+  "metrics": {
+    "graph.briefing.count.anomalies": 1.0,
+    "graph.briefing.count.conversations": 1.0,
+    "graph.briefing.count.first_time_pairings": 1.0,
+    "graph.briefing.count.journeys": 1.0,
+    "graph.briefing.count.new_entities": 1.0,
+    "graph.briefing.count.top_visitors": 1.0,
+    "graph.briefing.mention.alice": 1.0,
+    "graph.entity.person.alice": 1.0,
+    "graph.match": 1.0
+  }
+}

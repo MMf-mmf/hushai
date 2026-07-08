@@ -208,7 +208,10 @@ if [[ -d "$G2_TRAIN/graph_baseline_rhythm" ]]; then
       -vf "scale=2560:1440:force_original_aspect_ratio=increase,crop=2560:1440,zoompan=z='min(zoom+0.0008,1.3)':d=150:s=1280x720:fps=25,format=yuv420p" \
       -t 6 -map 0:v -map 1:a -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -shortest "$2"
   }
-  for d in "$G2_TRAIN/graph_baseline_rhythm" "$G2_TRAIN/anomaly_novel_time" "$G2_HOLD/anomaly_negatives"; do
+  # F7 briefing_daily shares the same Judith→Alice substrate (multi-week rhythm; the digest for a
+  # pinned date summarizes it). Regenerate its clip alongside F4/F5/F6.
+  for d in "$G2_TRAIN/graph_baseline_rhythm" "$G2_TRAIN/anomaly_novel_time" "$G2_TRAIN/briefing_daily" "$G2_HOLD/anomaly_negatives"; do
+    [[ -d "$d" ]] || continue
     mkdir -p "$d/clips"
     echo "[graph] G2 alice_face.mp4 → ${d##*/}"
     kb_face "$jsrc" "$d/clips/alice_face.mp4"

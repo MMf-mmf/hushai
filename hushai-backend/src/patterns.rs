@@ -19,10 +19,17 @@
 //! exemplar ("an off-schedule visit fires an alert rule end-to-end"). The other three predicates
 //! (`first_time_pairing`, `unknown_person_cluster`, `new_vehicle_for_person`) have pure cores in
 //! [`crate::graph`] already; wiring them is a documented follow-up.
+//!
+//! This file ALSO owns the G2 **daily digest** producer ([`build_and_upsert_digest`], Phase E): a
+//! deterministic structured summary of one civil day's activity (new entities, top visitors,
+//! anomalies, conversations, first-time pairings, journeys) rendered by a template — NO LLM at write
+//! time (the `hushai-rag::analytics::render_digest` discipline; the RAG/G3 layer narrates at READ
+//! time). Materialized on demand for a pinned date (`graph_pass::generate_digest`, the eval + admin
+//! path) or by the worker-0 wall-clock driver (`graph_pass::maybe_generate_daily_digest`).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
-use serde_json::json;
+use serde_json::{json, Value};
 use sqlx::{Postgres, Row, Transaction};
 use uuid::Uuid;
 
@@ -287,4 +294,399 @@ async fn emit_anomaly(
     .fetch_optional(&mut **tx)
     .await?;
     Ok(id)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Daily digest (§1.6 / migration 0029) — deterministic structured facts + template render, no LLM
+// ---------------------------------------------------------------------------------------------
+
+/// One subject reference in a digest section (resolved label is best-effort).
+struct SubjectRow {
+    subject_type: String,
+    subject_id: Uuid,
+    label: Option<String>,
+}
+/// One top-visitor tally.
+struct Visitor {
+    subject_type: String,
+    subject_id: Uuid,
+    label: Option<String>,
+    visits: i64,
+}
+/// One anomaly line (from the pinned day's `pattern_anomaly` events).
+struct AnomRow {
+    kind: Option<String>,
+    subject_type: Option<String>,
+    subject_id: Option<String>,
+    label: Option<String>,
+    hour_bucket: Option<i64>,
+}
+/// One first-time co-presence pairing (a `co_present` edge first observed on the day).
+struct PairRow {
+    a_type: String,
+    a_id: String,
+    a_label: Option<String>,
+    b_type: String,
+    b_id: String,
+    b_label: Option<String>,
+}
+/// One journey row (Wave 4 — the query is forward-compatible; empty until the stitcher ships).
+struct JourneyRow {
+    subject_type: String,
+    subject_id: String,
+    label: Option<String>,
+    hop_count: i64,
+}
+
+/// Per-subject `(device, start, end)` event tuples for one civil day (digest visit-coalescing input).
+type DayVisits = BTreeMap<(String, Uuid), Vec<(String, i64, i64)>>;
+
+/// Build + upsert the deterministic daily digest for `civil_day` (§1.6 / migration 0029). NO LLM:
+/// `sections` is structured integer/label facts and `rendered_text` is a template render (the
+/// `hushai-rag::analytics::render_digest` discipline). Idempotent by the `digest_date` PK. Returns
+/// the `sections` jsonb for the caller (the admin endpoint / eval / tests).
+///
+/// The digest for civil day D covers activity whose START falls in D's local-civil window
+/// `[D*86400 - tz, (D+1)*86400 - tz)` seconds — capture-anchored, never wall clock — reading the
+/// same sessionized sources as the graph: `events` (EXCLUDING the graph's own `pattern_anomaly`/
+/// `gotham_briefing` output — the no-self-fold rule), closed `conversations`, materialized
+/// `co_present` edges, and `entity_journeys`. Deterministic throughout: `BTreeMap` subject order,
+/// total tie-breaks on every sort.
+pub async fn build_and_upsert_digest(
+    tx: &mut Transaction<'_, Postgres>,
+    cfg: &GraphCfg,
+    tz_offset_secs: i64,
+    cfg_hash: &str,
+    civil_day: i64,
+) -> anyhow::Result<Value> {
+    let day_lo = (civil_day * 86_400 - tz_offset_secs) * NANOS_PER_SEC;
+    let day_hi = ((civil_day + 1) * 86_400 - tz_offset_secs) * NANOS_PER_SEC;
+    let gap_nanos = cfg.copresence_slack_secs.max(1) * NANOS_PER_SEC;
+
+    // The civil date as an ISO string — Postgres does the day-count → date conversion (robust vs
+    // hand-rolled calendar math). It is the `digest_date` PK and is echoed in `sections.date`.
+    let date_iso: String = sqlx::query_scalar("SELECT (DATE '1970-01-01' + ($1::int))::text")
+        .bind(civil_day as i32)
+        .fetch_one(&mut **tx)
+        .await?;
+
+    // 1. Perception events on the day → per-subject coalesced visits (top_visitors).
+    let ev_rows = sqlx::query(
+        "SELECT subject_type, subject_id, device_id, start_unix_nanos, end_unix_nanos \
+         FROM events \
+         WHERE subject_id IS NOT NULL AND device_id IS NOT NULL \
+           AND subject_type = ANY(ARRAY['person','speaker','plate']) \
+           AND event_type NOT IN ('pattern_anomaly', 'gotham_briefing') \
+           AND start_unix_nanos >= $1 AND start_unix_nanos < $2 \
+         ORDER BY subject_type, subject_id, device_id, start_unix_nanos",
+    )
+    .bind(day_lo)
+    .bind(day_hi)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut per_subject: DayVisits = DayVisits::new();
+    for r in &ev_rows {
+        per_subject
+            .entry((r.get::<String, _>("subject_type"), r.get::<Uuid, _>("subject_id")))
+            .or_default()
+            .push((
+                r.get::<String, _>("device_id"),
+                r.get::<i64, _>("start_unix_nanos"),
+                r.get::<i64, _>("end_unix_nanos"),
+            ));
+    }
+    let mut visitors: Vec<Visitor> = Vec::new();
+    for ((stype, sid), raw) in &per_subject {
+        let Some(nt) = NodeType::parse(stype) else { continue };
+        let visits = coalesce_visits(raw, gap_nanos).len() as i64;
+        let label = resolve_label(tx, nt, *sid).await?;
+        visitors.push(Visitor { subject_type: stype.clone(), subject_id: *sid, label, visits });
+    }
+    // top_visitors: visits desc, then type, then id (total order).
+    visitors.sort_by(|a, b| {
+        b.visits
+            .cmp(&a.visits)
+            .then_with(|| a.subject_type.cmp(&b.subject_type))
+            .then_with(|| a.subject_id.cmp(&b.subject_id))
+    });
+    let total_visitors = visitors.len();
+    visitors.truncate(graph::DIGEST_TOP_VISITORS);
+
+    // 2. new_entities: subjects whose FIRST-EVER perception event (any device/day) lands on the day.
+    let new_rows = sqlx::query(
+        "SELECT subject_type, subject_id FROM ( \
+           SELECT subject_type, subject_id, MIN(start_unix_nanos) AS first_start \
+           FROM events \
+           WHERE subject_id IS NOT NULL \
+             AND subject_type = ANY(ARRAY['person','speaker','plate']) \
+             AND event_type NOT IN ('pattern_anomaly', 'gotham_briefing') \
+           GROUP BY subject_type, subject_id \
+         ) f \
+         WHERE f.first_start >= $1 AND f.first_start < $2 \
+         ORDER BY subject_type, subject_id",
+    )
+    .bind(day_lo)
+    .bind(day_hi)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut new_entities: Vec<SubjectRow> = Vec::new();
+    for r in &new_rows {
+        let stype: String = r.get("subject_type");
+        let sid: Uuid = r.get("subject_id");
+        let Some(nt) = NodeType::parse(&stype) else { continue };
+        let label = resolve_label(tx, nt, sid).await?;
+        new_entities.push(SubjectRow { subject_type: stype, subject_id: sid, label });
+    }
+
+    // 3. anomalies on the day (the graph's OWN output — labelled at emit time; read directly).
+    let anom_rows = sqlx::query(
+        "SELECT subject_type, subject_id, subject_label, metadata->>'kind' AS kind, \
+                metadata->>'hour_bucket' AS hour_bucket \
+         FROM events \
+         WHERE event_type = 'pattern_anomaly' \
+           AND start_unix_nanos >= $1 AND start_unix_nanos < $2 \
+         ORDER BY metadata->>'kind', subject_type, subject_id",
+    )
+    .bind(day_lo)
+    .bind(day_hi)
+    .fetch_all(&mut **tx)
+    .await?;
+    let anomalies: Vec<AnomRow> = anom_rows
+        .iter()
+        .map(|r| AnomRow {
+            kind: r.get::<Option<String>, _>("kind"),
+            subject_type: r.get::<Option<String>, _>("subject_type"),
+            subject_id: r.get::<Option<Uuid>, _>("subject_id").map(|u| u.to_string()),
+            label: r.get::<Option<String>, _>("subject_label"),
+            hour_bucket: r.get::<Option<String>, _>("hour_bucket").and_then(|s| s.parse().ok()),
+        })
+        .collect();
+
+    // 4. conversations closed on the day: count + distinct participants.
+    let conv_count: i64 = sqlx::query_scalar(
+        "SELECT count(*)::bigint FROM conversations \
+         WHERE status = 'closed' AND started_at_unix_nanos >= $1 AND started_at_unix_nanos < $2",
+    )
+    .bind(day_lo)
+    .bind(day_hi)
+    .fetch_one(&mut **tx)
+    .await?;
+    let conv_participants: i64 = sqlx::query_scalar(
+        "SELECT count(DISTINCT s)::bigint \
+         FROM conversations c, unnest(c.speaker_ids) AS s \
+         WHERE c.status = 'closed' AND c.started_at_unix_nanos >= $1 AND c.started_at_unix_nanos < $2",
+    )
+    .bind(day_lo)
+    .bind(day_hi)
+    .fetch_one(&mut **tx)
+    .await?;
+
+    // 5. first_time_pairings: `co_present` edges whose first_seen lands on the day (0→1 transition).
+    let pair_rows = sqlx::query(
+        "SELECT src_type, src_id, dst_type, dst_id FROM entity_edges \
+         WHERE edge_type = 'co_present' \
+           AND first_seen_unix_nanos >= $1 AND first_seen_unix_nanos < $2 \
+         ORDER BY src_type, src_id, dst_type, dst_id",
+    )
+    .bind(day_lo)
+    .bind(day_hi)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut pairings: Vec<PairRow> = Vec::new();
+    for r in &pair_rows {
+        let (a_type, a_id): (String, String) = (r.get("src_type"), r.get("src_id"));
+        let (b_type, b_id): (String, String) = (r.get("dst_type"), r.get("dst_id"));
+        let a_label = endpoint_label(tx, &a_type, &a_id).await?;
+        let b_label = endpoint_label(tx, &b_type, &b_id).await?;
+        pairings.push(PairRow { a_type, a_id, a_label, b_type, b_id, b_label });
+    }
+
+    // 6. journeys started on the day (Wave 4 — empty until the stitcher ships; query is ready).
+    let journey_rows = sqlx::query(
+        "SELECT subject_type, subject_id, hop_count FROM entity_journeys \
+         WHERE started_at_unix_nanos >= $1 AND started_at_unix_nanos < $2 \
+         ORDER BY subject_type, subject_id, started_at_unix_nanos",
+    )
+    .bind(day_lo)
+    .bind(day_hi)
+    .fetch_all(&mut **tx)
+    .await?;
+    let mut journeys: Vec<JourneyRow> = Vec::new();
+    for r in &journey_rows {
+        let stype: String = r.get("subject_type");
+        let sid: Uuid = r.get("subject_id");
+        let label = match NodeType::parse(&stype) {
+            Some(nt) => resolve_label(tx, nt, sid).await?,
+            None => None,
+        };
+        journeys.push(JourneyRow {
+            subject_type: stype,
+            subject_id: sid.to_string(),
+            label,
+            hop_count: r.get::<i32, _>("hop_count") as i64,
+        });
+    }
+
+    // Assemble deterministic `sections` jsonb + a template `rendered_text` (no LLM).
+    let sections = json!({
+        "date": date_iso,
+        "new_entities": new_entities.iter().map(subject_json).collect::<Vec<_>>(),
+        "anomalies": anomalies.iter().map(anom_json).collect::<Vec<_>>(),
+        "top_visitors": visitors.iter().map(visitor_json).collect::<Vec<_>>(),
+        "conversations": { "count": conv_count, "participants": conv_participants },
+        "first_time_pairings": pairings.iter().map(pair_json).collect::<Vec<_>>(),
+        "journeys": journeys.iter().map(journey_json).collect::<Vec<_>>(),
+        "counts": {
+            "new_entities": new_entities.len(),
+            "anomalies": anomalies.len(),
+            "top_visitors": total_visitors,       // distinct visitors (pre-truncation)
+            "conversations": conv_count,
+            "first_time_pairings": pairings.len(),
+            "journeys": journeys.len(),
+        },
+    });
+    let rendered_text = render_digest_text(
+        &date_iso,
+        &new_entities,
+        &visitors,
+        total_visitors,
+        &anomalies,
+        conv_count,
+        conv_participants,
+        &pairings,
+        &journeys,
+    );
+
+    sqlx::query(
+        "INSERT INTO daily_digests \
+           (digest_date, tz_offset_secs, sections, rendered_text, config_hash, created_at, updated_at) \
+         VALUES ($1::date, $2, $3, $4, $5, now(), now()) \
+         ON CONFLICT (digest_date) DO UPDATE SET \
+           tz_offset_secs = $2, sections = $3, rendered_text = $4, config_hash = $5, updated_at = now()",
+    )
+    .bind(&date_iso)
+    .bind(tz_offset_secs as i32)
+    .bind(&sections)
+    .bind(&rendered_text)
+    .bind(cfg_hash)
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(sections)
+}
+
+/// Best-effort display label for a graph edge endpoint `(type, id-string)`. Device endpoints ARE
+/// their id; person/speaker/plate resolve through the catalog (None when unnamed or the id is not a
+/// parseable uuid).
+async fn endpoint_label(
+    tx: &mut Transaction<'_, Postgres>,
+    node_type: &str,
+    node_id: &str,
+) -> anyhow::Result<Option<String>> {
+    match NodeType::parse(node_type) {
+        Some(NodeType::Device) | None => Ok(Some(node_id.to_string())),
+        Some(nt) => match Uuid::parse_str(node_id) {
+            Ok(id) => resolve_label(tx, nt, id).await,
+            Err(_) => Ok(None),
+        },
+    }
+}
+
+fn label_or(l: &Option<String>) -> &str {
+    l.as_deref().unwrap_or("unidentified")
+}
+
+fn subject_json(s: &SubjectRow) -> Value {
+    json!({ "type": s.subject_type, "id": s.subject_id.to_string(), "label": s.label })
+}
+fn visitor_json(v: &Visitor) -> Value {
+    json!({ "type": v.subject_type, "id": v.subject_id.to_string(), "label": v.label, "visits": v.visits })
+}
+fn anom_json(a: &AnomRow) -> Value {
+    json!({ "kind": a.kind, "subject_type": a.subject_type, "subject_id": a.subject_id, "label": a.label, "hour_bucket": a.hour_bucket })
+}
+fn pair_json(p: &PairRow) -> Value {
+    json!({
+        "a": { "type": p.a_type, "id": p.a_id, "label": p.a_label },
+        "b": { "type": p.b_type, "id": p.b_id, "label": p.b_label },
+    })
+}
+fn journey_json(j: &JourneyRow) -> Value {
+    json!({ "subject_type": j.subject_type, "subject_id": j.subject_id, "label": j.label, "hop_count": j.hop_count })
+}
+
+/// Deterministic template render of the digest — the read-time-narration boundary (§1.6): the RAG/G3
+/// layer turns this into prose; the store keeps only facts. One line per section; empty sections say
+/// so explicitly (never silently dropped — the `render_digest` discipline).
+#[allow(clippy::too_many_arguments)]
+fn render_digest_text(
+    date: &str,
+    new_entities: &[SubjectRow],
+    top_visitors: &[Visitor],
+    total_visitors: usize,
+    anomalies: &[AnomRow],
+    conv_count: i64,
+    conv_participants: i64,
+    pairings: &[PairRow],
+    journeys: &[JourneyRow],
+) -> String {
+    let plural = |n: i64| if n == 1 { "" } else { "s" };
+    let mut out = format!("DAILY BRIEFING for {date}\n");
+
+    if new_entities.is_empty() {
+        out.push_str("NEW ENTITIES: none.\n");
+    } else {
+        let names: Vec<&str> = new_entities.iter().map(|e| label_or(&e.label)).collect();
+        out.push_str(&format!("NEW ENTITIES: {} ({}).\n", new_entities.len(), names.join(", ")));
+    }
+
+    if total_visitors == 0 {
+        out.push_str("VISITORS: none seen.\n");
+    } else {
+        let parts: Vec<String> = top_visitors
+            .iter()
+            .map(|v| format!("{} ({} visit{})", label_or(&v.label), v.visits, plural(v.visits)))
+            .collect();
+        let more = total_visitors.saturating_sub(top_visitors.len());
+        let tail = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+        out.push_str(&format!(
+            "VISITORS: {} subject{} seen — {}{}.\n",
+            total_visitors,
+            if total_visitors == 1 { "" } else { "s" },
+            parts.join(", "),
+            tail
+        ));
+    }
+
+    out.push_str(&format!(
+        "CONVERSATIONS: {conv_count} across {conv_participants} participant{}.\n",
+        plural(conv_participants)
+    ));
+
+    if anomalies.is_empty() {
+        out.push_str("ANOMALIES: none.\n");
+    } else {
+        let parts: Vec<String> = anomalies
+            .iter()
+            .map(|a| format!("{} ({})", a.kind.as_deref().unwrap_or("anomaly"), label_or(&a.label)))
+            .collect();
+        out.push_str(&format!("ANOMALIES: {} — {}.\n", anomalies.len(), parts.join(", ")));
+    }
+
+    if pairings.is_empty() {
+        out.push_str("FIRST-TIME PAIRINGS: none.\n");
+    } else {
+        let parts: Vec<String> = pairings
+            .iter()
+            .map(|p| format!("{} & {}", label_or(&p.a_label), label_or(&p.b_label)))
+            .collect();
+        out.push_str(&format!("FIRST-TIME PAIRINGS: {} — {}.\n", pairings.len(), parts.join(", ")));
+    }
+
+    if journeys.is_empty() {
+        out.push_str("JOURNEYS: none.\n");
+    } else {
+        out.push_str(&format!("JOURNEYS: {}.\n", journeys.len()));
+    }
+    out
 }

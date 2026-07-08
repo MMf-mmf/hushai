@@ -1018,6 +1018,85 @@ pub async fn bound_person_for_speaker(pool: &PgPool, speaker: Uuid) -> anyhow::R
     Ok(pid.and_then(|s| Uuid::parse_str(&s).ok()))
 }
 
+// ---------------------------------------------------------------------------------------------
+// Daily digest (§1.6 / Phase E) — the patterns producer wrapped in the pass's advisory lock
+// ---------------------------------------------------------------------------------------------
+
+/// Materialize + return the daily-digest `sections` for a pinned ISO civil date (`YYYY-MM-DD`). The
+/// admin `POST /v1/graph/digests/{date}` + the eval force a pinned date HERE (the wall-clock driver
+/// can't be used deterministically). Advisory-locked on `GRAPH_LOCK_KEY` so it never reads edges
+/// mid-fold and serializes with a concurrent pass. Determinism = the underlying capture-anchored data.
+pub async fn generate_digest_for_date(
+    pool: &PgPool,
+    opts: &GraphOpts,
+    date_iso: &str,
+) -> anyhow::Result<Value> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(GRAPH_LOCK_KEY).execute(&mut *tx).await?;
+    let civil_day: i32 = sqlx::query_scalar("SELECT ($1::date - DATE '1970-01-01')::int")
+        .bind(date_iso)
+        .fetch_one(&mut *tx)
+        .await?;
+    let cfg_hash = graph::config_hash(&opts.cfg);
+    let sections = crate::patterns::build_and_upsert_digest(
+        &mut tx,
+        &opts.cfg,
+        opts.tz_offset_secs,
+        &cfg_hash,
+        civil_day as i64,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(sections)
+}
+
+/// Worker-0 wall-clock driver (§1.6): once local wall-clock passes `digest_hour_local` AND no row
+/// exists for YESTERDAY's local civil date, materialize it (idempotent by PK). Returns the civil-day
+/// index generated, or `None` when it's too early today / already done. `GRAPH_DIGEST_HOUR_LOCAL` is
+/// a NON-hashed knob (not in `GraphCfg`/`config_hash`) — this path is never eval-exercised (the eval
+/// forces a pinned date), so it needs no byte-determinism guarantee, only idempotency.
+pub async fn maybe_generate_daily_digest(
+    pool: &PgPool,
+    opts: &GraphOpts,
+    digest_hour_local: i64,
+) -> anyhow::Result<Option<i64>> {
+    let now_secs: i64 =
+        sqlx::query_scalar("SELECT (extract(epoch from now()))::bigint").fetch_one(pool).await?;
+    let local_secs = now_secs + opts.tz_offset_secs;
+    let local_hour = local_secs.rem_euclid(86_400) / 3_600;
+    if local_hour < digest_hour_local {
+        return Ok(None); // too early in the local day — yesterday's digest waits for the hour gate
+    }
+    let yesterday = local_secs.div_euclid(86_400) - 1;
+    const EXISTS_SQL: &str =
+        "SELECT 1 FROM daily_digests WHERE digest_date = (DATE '1970-01-01' + ($1::int))";
+    let exists: Option<i32> =
+        sqlx::query_scalar(EXISTS_SQL).bind(yesterday as i32).fetch_optional(pool).await?;
+    if exists.is_some() {
+        return Ok(None);
+    }
+    let mut tx = pool.begin().await?;
+    sqlx::query("SELECT pg_advisory_xact_lock($1)").bind(GRAPH_LOCK_KEY).execute(&mut *tx).await?;
+    // Re-check under the lock — a concurrent worker/pass may have just generated it.
+    let exists2: Option<i32> =
+        sqlx::query_scalar(EXISTS_SQL).bind(yesterday as i32).fetch_optional(&mut *tx).await?;
+    if exists2.is_some() {
+        tx.commit().await?;
+        return Ok(None);
+    }
+    let cfg_hash = graph::config_hash(&opts.cfg);
+    crate::patterns::build_and_upsert_digest(
+        &mut tx,
+        &opts.cfg,
+        opts.tz_offset_secs,
+        &cfg_hash,
+        yesterday,
+    )
+    .await?;
+    tx.commit().await?;
+    Ok(Some(yesterday))
+}
+
 /// Explicit rebuild (admin / GRAPH_REBUILD_ON_START): truncate derived rows, reset watermarks,
 /// then refold from scratch. Confirmed/rejected binding decisions are DERIVED too — a rebuild
 /// re-runs trials but preserves nothing by design; the owner seed re-creates the owner edge.

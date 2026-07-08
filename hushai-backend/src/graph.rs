@@ -492,6 +492,12 @@ pub fn round4(x: f32) -> f32 {
 /// treat a change as baseline-affecting and re-freeze deliberately.
 pub const COMPANION_TOP_K: usize = 8;
 
+/// Cap on the daily digest's `top_visitors` list (§1.6 / migration 0029). Like [`COMPANION_TOP_K`]
+/// a code constant, NOT a ★ knob — it does not fold into [`config_hash`]. It bounds a *rendered
+/// report* rather than a stored derivation, so a change re-orders a digest's tail but never a graph
+/// baseline; no fixture asserts a full top-K list, so re-freeze deliberately if you change it.
+pub const DIGEST_TOP_VISITORS: usize = 10;
+
 /// One subject visit fed to the baseline folder (device + interval; dwell = end − start).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BaselineVisit {

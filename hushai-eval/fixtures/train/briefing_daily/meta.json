@@ -1,0 +1,25 @@
+{
+  "case_id": "briefing_daily",
+  "description": "Gotham G2 fixture F7 (daily briefing / Phase E). Shares the F4/F5 Judith→Alice face substrate: the enrolled person Alice appears on two successive weeks (Thursday 09:00 UTC, base + 7d) — a multi-day scenario. The daily digest is force-materialized for the PINNED week-0 civil date 2026-06-18 (the enroll clip an hour earlier + the week-0 case injection both land on it) via POST /v1/graph/digests/{date}; assertions hit the structured `sections`, never the prose `rendered_text`. Structurally deterministic regardless of exact detection counts: first_time_pairings=0 (Alice is the only subject on this device → no co-presence) and journeys=0 (no stitcher until Wave 4); Alice is mentioned (she is the day's new entity + top visitor). Other counts (new_entities/anomalies/conversations) are frozen live per the calibration protocol. base_capture Thursday 09:00 UTC; tz 0. TRAIN.",
+  "device_id": "eval-briefing-daily",
+  "media_file": "clips/alice_face.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781773200000000000,
+  "modalities": [
+    "graph"
+  ],
+  "tier": "full",
+  "enroll": [
+    { "modality": "person", "name": "Alice", "ref": "clips/alice_face.mp4" }
+  ],
+  "injections": [
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-briefing-daily", "capture_start_offset_ns": 0, "seed": "w0" },
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-briefing-daily", "capture_start_offset_ns": 604800000000000, "seed": "w1" }
+  ],
+  "poll": {
+    "timeout_secs": 300,
+    "interval_secs": 3,
+    "quiesce_polls": 2
+  }
+}

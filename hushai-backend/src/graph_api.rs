@@ -479,6 +479,55 @@ pub async fn digest_by_date(
     })))
 }
 
+/// POST /v1/graph/digests/{date} — admin (Gotham.md §1.6 / Phase E): force-materialize the digest
+/// for a pinned ISO civil date (`YYYY-MM-DD`) and return it. The GET on this path reads; this WRITE
+/// path is what the eval + operator use to generate a digest OFF the worker's wall-clock schedule
+/// (the wall-clock trigger can't be used deterministically — eval invariant 3). Audit-logged.
+pub async fn generate_digest(
+    State(st): State<AppState>,
+    Path(date): Path<String>,
+) -> Result<Json<Value>, IngestError> {
+    // Cheap format guard so a malformed date is a clean 400, not a SQL cast 500.
+    if !is_iso_date(&date) {
+        return Err(IngestError::BadRequest("date must be YYYY-MM-DD".into()));
+    }
+    let opts = graph_pass::GraphOpts::from_env();
+    let sections = graph_pass::generate_digest_for_date(&st.pool, &opts, &date)
+        .await
+        .map_err(IngestError::Internal)?;
+    crate::audit::record(
+        &st.pool,
+        crate::audit::AuditEntry::event("operator", None, "graph.digest.generate")
+            .with_detail(json!({ "date": date })),
+    )
+    .await;
+    Ok(Json(json!({ "date": date, "sections": sections })))
+}
+
+/// Strict `YYYY-MM-DD` validation: shape (digits + hyphens at 4/7) AND a real calendar date
+/// (month 1–12, day 1–days-in-month, leap-year-aware). A shape-valid but out-of-range date like
+/// `2026-13-45` is client error → a clean 400 here, rather than a Postgres `$1::date` cast error
+/// surfacing as a 500 downstream.
+fn is_iso_date(s: &str) -> bool {
+    let b = s.as_bytes();
+    if b.len() != 10 || b[4] != b'-' || b[7] != b'-' {
+        return false;
+    }
+    if !b.iter().enumerate().all(|(i, c)| i == 4 || i == 7 || c.is_ascii_digit()) {
+        return false;
+    }
+    // Safe: the positions are verified all-ASCII-digit above.
+    let num = |lo: usize, hi: usize| s[lo..hi].parse::<u32>().unwrap_or(0);
+    let (y, m, d) = (num(0, 4), num(5, 7), num(8, 10));
+    if !(1..=12).contains(&m) || d < 1 {
+        return false;
+    }
+    let leap = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+    let days_in_month =
+        [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31][(m - 1) as usize];
+    d <= days_in_month
+}
+
 // ---------------------------------------------------------------------------------------------
 // POST /v1/graph/rebuild — admin, audit-logged (§1.7)
 // ---------------------------------------------------------------------------------------------

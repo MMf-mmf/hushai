@@ -211,6 +211,7 @@ async fn run_case(
     // then (2) trigger ONE authoritative rebuild that folds the whole scenario in a single batch —
     // deterministic and correct for every edge type (see `poll::wait_graph_inputs_settled`). Both
     // steps fail CLOSED to inconclusive, never a scored FAIL.
+    let mut digest_sections: Option<serde_json::Value> = None;
     if fx.meta.needs_graph() {
         let settled = poll::wait_graph_inputs_settled(
             ctx,
@@ -236,11 +237,27 @@ async fn run_case(
                 "graph rebuild endpoint unreachable/unauthorized (the graph modality needs the live backend graph API up)".to_string(),
             ));
         }
+        // Briefing (Gotham G2 / Phase E): force-materialize the pinned-date digest AFTER the
+        // authoritative rebuild folded the whole scenario, then score its structured `sections`.
+        if let Some(b) = fx.expected.graph.as_ref().and_then(|g| g.briefing.as_ref()) {
+            match query::generate_digest(ctx, &b.date).await.context("generating daily digest")? {
+                Some(sections) => digest_sections = Some(sections),
+                None => {
+                    return Ok(CaseResult::inconclusive(
+                        cid,
+                        split,
+                        tier,
+                        "digest generate endpoint unreachable/unauthorized (the briefing assertion needs the live backend digest producer)".to_string(),
+                    ));
+                }
+            }
+        }
     }
 
-    let obs = query::observe(ctx, &devices_vec, win_lo, win_hi, &fx.meta.modalities)
+    let mut obs = query::observe(ctx, &devices_vec, win_lo, win_hi, &fx.meta.modalities)
         .await
         .context("querying observed results")?;
+    obs.digest_sections = digest_sections;
     let mut metrics = score::score_all(&fx.expected, &obs, base_ns, &fx.meta.modalities);
 
     // RAG step: score LIVE chat answers. Unlike `observe` (DB-direct), this needs the running RAG

@@ -643,7 +643,7 @@ fn score_events(gt: &EventsGt, obs: &Observed) -> Vec<Metric> {
 fn score_graph(gt: &GraphGt, obs: &Observed) -> Vec<Metric> {
     let mut out = Vec::new();
     let mut satisfied = 0usize;
-    let total = gt.entities.len() + gt.edges.len() + gt.no_edges.len()
+    let mut total = gt.entities.len() + gt.edges.len() + gt.no_edges.len()
         + gt.anomalies.len() + gt.no_anomalies.len() + gt.baselines.len();
 
     for e in &gt.entities {
@@ -750,6 +750,50 @@ fn score_graph(gt: &GraphGt, obs: &Observed) -> Vec<Metric> {
                 b.subject.kind, b.subject.name, b.min_visits, b.peak_hour_of_day
             ),
         ));
+    }
+
+    // Briefing (G2 / Phase E): assert the pinned-date digest's structured `sections` — exact counts
+    // + label mentions. NEVER the prose `rendered_text` (a narration surface). `digest_sections` is
+    // Some here (the runner returns INCONCLUSIVE before scoring when the digest can't be produced).
+    if let Some(br) = &gt.briefing {
+        let sections = obs.digest_sections.clone().unwrap_or_else(|| serde_json::json!({}));
+        let counts = sections.get("counts").cloned().unwrap_or_else(|| serde_json::json!({}));
+        let count_asserts: [(&str, Option<i64>); 6] = [
+            ("new_entities", br.counts.new_entities),
+            ("anomalies", br.counts.anomalies),
+            ("top_visitors", br.counts.top_visitors),
+            ("conversations", br.counts.conversations),
+            ("first_time_pairings", br.counts.first_time_pairings),
+            ("journeys", br.counts.journeys),
+        ];
+        for (field, want) in count_asserts {
+            let Some(w) = want else { continue };
+            total += 1;
+            let got = counts.get(field).and_then(|v| v.as_i64());
+            let ok = got == Some(w);
+            if ok {
+                satisfied += 1;
+            }
+            out.push(Metric::new(
+                format!("graph.briefing.count.{field}"),
+                b2f(ok), Direction::Boolean, ok,
+                format!("briefing {field}={got:?} (want {w})"),
+            ));
+        }
+        // mentions: each label must appear somewhere in the serialized sections (labels live there).
+        let hay = serde_json::to_string(&sections).unwrap_or_default();
+        for mention in &br.mentions {
+            total += 1;
+            let ok = hay.contains(mention.as_str());
+            if ok {
+                satisfied += 1;
+            }
+            out.push(Metric::new(
+                format!("graph.briefing.mention.{}", key_name(mention)),
+                b2f(ok), Direction::Boolean, ok,
+                format!("briefing mentions {mention:?}: present={ok}"),
+            ));
+        }
     }
 
     let frac = if total == 0 { 1.0 } else { satisfied as f64 / total as f64 };
@@ -1891,5 +1935,48 @@ mod graph_tests {
             ..Default::default()
         };
         assert!(!find(&score_graph(&gt, &o), "graph.baseline.person.alice").floor_ok);
+    }
+
+    #[test]
+    fn briefing_counts_and_mentions() {
+        let mut o = obs_with(vec![]);
+        // A digest whose structured `sections` names Alice as the day's new entity + top visitor.
+        o.digest_sections = Some(serde_json::json!({
+            "date": "2026-06-18",
+            "new_entities": [{ "type": "person", "id": "A", "label": "Alice" }],
+            "top_visitors": [{ "type": "person", "id": "A", "label": "Alice", "visits": 1 }],
+            "counts": {
+                "new_entities": 1, "anomalies": 0, "top_visitors": 1,
+                "conversations": 0, "first_time_pairings": 0, "journeys": 0,
+            },
+        }));
+        // Exact counts + a present mention all pass.
+        let gt = GraphGt {
+            briefing: Some(BriefingGt {
+                date: "2026-06-18".into(),
+                counts: BriefingCounts { new_entities: Some(1), first_time_pairings: Some(0), ..Default::default() },
+                mentions: vec!["Alice".into()],
+            }),
+            ..Default::default()
+        };
+        let ms = score_graph(&gt, &o);
+        assert!(find(&ms, "graph.briefing.count.new_entities").floor_ok);
+        assert!(find(&ms, "graph.briefing.count.first_time_pairings").floor_ok);
+        assert!(find(&ms, "graph.briefing.mention.alice").floor_ok);
+        assert!(find(&ms, "graph.match").floor_ok);
+
+        // A wrong count and an absent mention both fail (and drag the aggregate below 1.0).
+        let gt = GraphGt {
+            briefing: Some(BriefingGt {
+                date: "2026-06-18".into(),
+                counts: BriefingCounts { new_entities: Some(2), ..Default::default() },
+                mentions: vec!["Mallory".into()],
+            }),
+            ..Default::default()
+        };
+        let ms = score_graph(&gt, &o);
+        assert!(!find(&ms, "graph.briefing.count.new_entities").floor_ok);
+        assert!(!find(&ms, "graph.briefing.mention.mallory").floor_ok);
+        assert!(!find(&ms, "graph.match").floor_ok);
     }
 }

@@ -1026,6 +1026,23 @@ async fn worker_loop(
                         }
                         Err(e) => tracing::warn!(error = %e, "graph pass failed"),
                     }
+                    // Daily digest (§1.6 / Phase E): once local wall-clock passes
+                    // GRAPH_DIGEST_HOUR_LOCAL and yesterday's digest is missing, materialize it
+                    // (idempotent by PK; cheap guard query otherwise). NON-hashed schedule knob;
+                    // deterministic content is proven via the eval's forced-date path, not here.
+                    match hushai_backend::graph_pass::maybe_generate_daily_digest(
+                        &pool,
+                        &cfg.graph_opts(),
+                        cfg.graph_digest_hour_local,
+                    )
+                    .await
+                    {
+                        Ok(Some(day)) => {
+                            tracing::info!(civil_day = day, "daily digest materialized")
+                        }
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!(error = %e, "daily digest generation failed"),
+                    }
                 }
                 // Wait for a new-segment NOTIFY or the poll backstop, whichever comes first.
                 tokio::select! {

@@ -106,6 +106,12 @@ pub struct Observed {
     pub anomalies: Vec<AnomalyObs>,
     /// Recomputed `entity_baselines` rows (Gotham G2), read when the `graph` modality is scored.
     pub baselines: Vec<BaselineObs>,
+    /// The pinned-date daily-digest `sections` jsonb (Gotham G2 / Phase E). Populated by
+    /// [`generate_digest`] (a backend `POST /v1/graph/digests/{date}`) ONLY when the fixture carries
+    /// an `expect_briefing` assertion; `None` otherwise. `None` at score time means the fixture
+    /// asserted a briefing but the backend couldn't produce one — the runner maps that to
+    /// INCONCLUSIVE before scoring, so the scorer never sees `Some`-vs-`None` as a false FAIL.
+    pub digest_sections: Option<serde_json::Value>,
 }
 
 const SLACK_NS: i64 = 5_000_000_000;
@@ -368,6 +374,30 @@ pub async fn trigger_graph_rebuild(ctx: &Ctx) -> Result<bool> {
         Err(e) => {
             eprintln!("[graph] rebuild request failed (backend unreachable?): {e}");
             Ok(false)
+        }
+    }
+}
+
+/// Force-materialize + fetch the daily digest for a pinned ISO date via the backend admin API
+/// (`POST /v1/graph/digests/{date}`). The wall-clock worker trigger can't be used deterministically
+/// (eval invariant 3), so the `briefing` modality drives generation explicitly here, after the
+/// authoritative rebuild has folded the whole scenario. Returns the `sections` jsonb on success, or
+/// `None` when the endpoint is unreachable / unauthorized / absent (an old backend) — the caller maps
+/// that to INCONCLUSIVE, never a scored failure (mirrors `trigger_graph_rebuild`).
+pub async fn generate_digest(ctx: &Ctx, date_iso: &str) -> Result<Option<serde_json::Value>> {
+    let url = format!("{}/v1/graph/digests/{date_iso}", ctx.backend_url.trim_end_matches('/'));
+    match ctx.http.post(&url).bearer_auth(&ctx.device_token).send().await {
+        Ok(r) if r.status().is_success() => {
+            let body: serde_json::Value = r.json().await?;
+            Ok(Some(body.get("sections").cloned().unwrap_or(serde_json::json!({}))))
+        }
+        Ok(r) => {
+            eprintln!("[graph] digest generate returned {} (backend without the digest producer?)", r.status());
+            Ok(None)
+        }
+        Err(e) => {
+            eprintln!("[graph] digest generate request failed (backend unreachable?): {e}");
+            Ok(None)
         }
     }
 }

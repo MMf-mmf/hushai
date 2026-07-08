@@ -210,7 +210,10 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/graph/journeys", get(graph_api::list_journeys))
         .route("/v1/graph/digests", get(graph_api::list_digests))
-        .route("/v1/graph/digests/{date}", get(graph_api::digest_by_date))
+        .route(
+            "/v1/graph/digests/{date}",
+            get(graph_api::digest_by_date).post(graph_api::generate_digest),
+        )
         .route("/v1/graph/rebuild", post(graph_api::rebuild))
         .route(
             "/v1/graph/neighbors/{type}/{id}",

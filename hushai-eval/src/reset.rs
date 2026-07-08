@@ -40,6 +40,7 @@ DO $$ BEGIN
   END IF;
   IF to_regclass('public.entity_baselines') IS NOT NULL THEN TRUNCATE entity_baselines; END IF;
   IF to_regclass('public.entity_journeys') IS NOT NULL THEN TRUNCATE entity_journeys; END IF;
+  IF to_regclass('public.daily_digests') IS NOT NULL THEN TRUNCATE daily_digests; END IF;
   IF to_regclass('public.graph_state') IS NOT NULL THEN
     UPDATE graph_state SET events_watermark = to_timestamp(0),
       conversations_watermark = to_timestamp(0), config_hash = NULL, updated_at = now() WHERE id = 1;

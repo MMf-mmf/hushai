@@ -195,6 +195,10 @@ pub struct WorkerConfig {
     pub graph_anomaly_hour_min_frac: f32,
     pub graph_anomaly_unknown_cluster_min: i64,
     pub graph_journey_gap_secs: i64,
+    /// Local wall-clock hour (0–23) at/after which worker 0 materializes YESTERDAY's daily digest
+    /// (§1.6 / Phase E). NON-hashed (NOT in `graph_opts()`/`config_hash`) — it schedules a report,
+    /// never changes a stored derivation; the eval forces a pinned date instead of this trigger.
+    pub graph_digest_hour_local: i64,
 
     // --- Conversation threading (migration 0025; worker 0 drives hushai_backend::conversations) ---
     /// Master switch for the interval-gated threading pass on worker 0. Unlike autoheal
@@ -695,6 +699,7 @@ impl WorkerConfig {
             graph_anomaly_hour_min_frac: parse("GRAPH_ANOMALY_HOUR_MIN_FRAC", "0.05")?,
             graph_anomaly_unknown_cluster_min: parse("GRAPH_ANOMALY_UNKNOWN_CLUSTER_MIN", "3")?,
             graph_journey_gap_secs: parse("GRAPH_JOURNEY_GAP_SECS", "600")?,
+            graph_digest_hour_local: parse("GRAPH_DIGEST_HOUR_LOCAL", "21")?,
             threader_enabled: parse("THREADER_ENABLED", "true")?,
             threader_interval_secs: parse("THREADER_INTERVAL_SECS", "30")?,
             threader_min_age_secs: parse("THREADER_MIN_AGE_SECS", "10")?,

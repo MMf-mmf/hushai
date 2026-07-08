@@ -378,8 +378,18 @@ dropped — **media is ALWAYS stored regardless of gating.**
   never fire — only a later rhythm violation does. The drain queries EXCLUDE
   `pattern_anomaly`/`gotham_briefing` so the graph never folds its own output. Eval: `expect_anomaly`
   /`expect_no_anomaly`/`expect_baseline` on the graph modality; F4/F5/F6 gate under `d4acc862`. Only
-  `off_schedule_presence` is wired (the Phase-D exemplar); the other three predicates + the daily
-  digest (0029 `daily_digests`) are PR5/follow-ups.
+  `off_schedule_presence` is wired (the Phase-D exemplar); the other three predicates are follow-ups.
+- **Wave-2 / G2 daily digest (PR5, Phase E):** `patterns::build_and_upsert_digest` materializes one
+  civil day's `daily_digests` row — deterministic `sections` jsonb (`new_entities`, `top_visitors`,
+  `anomalies`, `conversations`, `first_time_pairings`, `journeys` + a `counts` sub-object) and a
+  template `rendered_text`, **NO LLM at write time** (the `analytics::render_digest` discipline; the
+  RAG/G3 layer narrates at read time). Same no-self-fold exclusion + capture-anchored day window
+  `[D*86400-tz, (D+1)*86400-tz)`. Two triggers: `POST /v1/graph/digests/{date}` (force a pinned date;
+  the eval + operator path) and the worker-0 wall-clock driver (`GRAPH_DIGEST_HOUR_LOCAL` default 21,
+  **NON-hashed** — a report schedule, not a stored derivation, so NOT in `GraphCfg`/`config_hash` and
+  deliberately NOT in `eval.env`). Eval `expect_briefing` (`BriefingGt`: `counts` + `mentions` vs the
+  structured `sections`, never prose); F7 `briefing_daily` gates ×2 under `d4acc862`. `rebuild` does
+  NOT truncate `daily_digests` (date-partitioned reports, not fold state).
 
 ### Chat correctness (2026-07 overhaul — the "executive chat" fixes)
 

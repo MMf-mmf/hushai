@@ -7,6 +7,31 @@ Newest first. Dates are when the work landed on the current development branch
 
 ## Unreleased (in-flight)
 
+- **Gotham Wave 2 / Pillar G2 — daily briefing / digest (PR5, 2026-07-08, spec `Gotham.md` §1.6,
+  Phase E, uses migration 0029 `daily_digests`)** — new `patterns::build_and_upsert_digest`: for a
+  pinned civil day it materializes a deterministic `daily_digests` row — `sections` jsonb
+  (`new_entities`, `top_visitors`, `anomalies`, `conversations`, `first_time_pairings`, `journeys`,
+  plus a `counts` sub-object) and a template `rendered_text`, with **NO LLM at write time** (the
+  `hushai-rag::analytics::render_digest` discipline — the RAG/G3 layer narrates at read time). Reads
+  the same sessionized sources as the graph, with the same no-self-fold exclusion
+  (`event_type NOT IN ('pattern_anomaly','gotham_briefing')`) over a capture-anchored day window
+  `[D*86400-tz, (D+1)*86400-tz)`; deterministic throughout (BTreeMap order, total tie-breaks). Two
+  triggers: `POST /v1/graph/digests/{date}` (`graph_pass::generate_digest_for_date`, admin/eval
+  force-a-pinned-date, audit-logged, strict `YYYY-MM-DD` calendar validation → 400) and a worker-0
+  wall-clock driver (`graph_pass::maybe_generate_daily_digest`, once local time passes
+  `GRAPH_DIGEST_HOUR_LOCAL` default 21, idempotent by PK, re-checked under the graph advisory lock).
+  `GRAPH_DIGEST_HOUR_LOCAL` is **NON-hashed** (a report schedule, not a stored derivation → NOT in
+  `GraphCfg`/`config_hash`, and deliberately kept OUT of `eval.env` so the eval config-hash — which
+  prefix-folds `GRAPH_` — does not shift and re-baseline F1–F6). `rebuild` does NOT truncate
+  `daily_digests` (date-partitioned reports, not fold state); the eval `reset` does (derived data).
+  Eval `graph` modality gains `expect_briefing` (`BriefingGt`: exact `counts` + label `mentions`
+  against the structured `sections`, never the prose); the runner force-generates the pinned-date
+  digest after the authoritative rebuild and fails CLOSED to INCONCLUSIVE if the endpoint is absent.
+  **F7 `briefing_daily` (train) calibrated live on the rig — 8/8 assertions, gate ×2, frozen under
+  config_hash `d4acc862`** (config-hash unchanged, so F1–F6 stayed valid). `graph_db` integration
+  guard extended with an outlier-day digest assertion (the anomaly surfaces in `sections`; the
+  subject is not "new" that day). Adversarial multi-agent review: 1 confirmed finding (a
+  calendar-invalid but shape-valid date returned 500 not 400) fixed + verified live.
 - **Gotham Wave 2 / Pillar G2 — baselines + pattern anomalies (2026-07-08, spec `Gotham.md`
   §1.6, uses migration 0029)** — new `hushai-backend::patterns` producer: per-touched-subject
   `entity_baselines` recompute (168 hour-of-week histogram, dwell p50/p90, device/companion

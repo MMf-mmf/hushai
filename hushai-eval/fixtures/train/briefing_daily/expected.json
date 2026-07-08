@@ -1,0 +1,21 @@
+{
+  "graph": {
+    "entities": [
+      { "kind": "person", "name": "Alice" }
+    ],
+    "briefing": {
+      "date": "2026-06-18",
+      "counts": {
+        "new_entities": 1,
+        "anomalies": 0,
+        "top_visitors": 1,
+        "conversations": 0,
+        "first_time_pairings": 0,
+        "journeys": 0
+      },
+      "mentions": [
+        "Alice"
+      ]
+    }
+  }
+}
