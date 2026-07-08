@@ -62,7 +62,7 @@ Dependency order: **G1 → {G2, G5}**; **G3** starts in parallel with G1 (existi
 - [x] Worker-0 driver + `GRAPH_*` knobs
 - [x] `/v1/graph/*` read API (entity page, edges, neighbors, timeline, path, bindings, rebuild)
 - [x] Binding trials + review queue + confirm/reject + owner seed + `arrived_with_vehicle`
-- [x] Eval `graph` modality + fixtures F1–F3 + baselines  ← PR 3: harness + F1–F3 CALIBRATED on the rig (Phases 0/A/B/C all pass; each fixture green + gate ×2; media reproducible via `fetch_eval_clips.sh`). Live in `staging`, promotion-ready.
+- [x] Eval `graph` modality + fixtures F1–F3 + baselines  ← PR 3: harness + F1–F3 CALIBRATED on the rig (Phases 0/A/B/C all pass; each fixture green + gate ×2; media reproducible via `fetch_eval_clips.sh`). **Promoted `staging`→`train`; full-suite re-baselined under config_hash `d4acc862`** (graph metrics byte-deterministic). Two pre-existing LLM chat fixtures (`money_talk`/`repeat_visitor`) fail on brittle keyword assertions under 7B answer drift — unrelated to Wave 1, tracked separately.
 
 > **Status (2026-07-08):** G1 code landed and compiles workspace-wide (backend/worker/viewer);
 > `graph::` unit tests green (12/12). PR 3 (eval `graph` modality) built: `GraphGt` +

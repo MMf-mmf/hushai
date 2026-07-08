@@ -143,12 +143,12 @@ else
   echo "[skip] $PLATE_CASE — no fixture dir (ground truth not committed?)"
 fi
 
-# --- Gotham entity-graph fixtures (F1–F3, `graph` eval modality, split=staging) ------------------
+# --- Gotham entity-graph fixtures (F1–F3, `graph` eval modality, split=train) --------------------
 # Reuse the proven PD substrates: the Judith Resnik portrait (face_id → "Alice"), a Sally Ride
 # portrait (→ "Bob"/"Mallory" — a DISTINCT face so re-ID mints a second person), the Auckland plate
 # crop (→ EMD774, which the ALPR reads as "EM0774"), and the JFK Rice speech (→ Alice's voice). Same
 # ffmpeg recipes as above so the pipeline output — and thus the frozen graph baselines — reproduce.
-STG="$ROOT/hushai-eval/fixtures/staging"
+STG="$ROOT/hushai-eval/fixtures/train"
 BOB_URL="https://commons.wikimedia.org/wiki/Special:FilePath/Sally_Ride_(1984).jpg"
 if [[ -d "$STG/graph_cross_camera_fusion" ]]; then
   # sources (cache-shared with face_id / plate_ocr / jfk_moon above)

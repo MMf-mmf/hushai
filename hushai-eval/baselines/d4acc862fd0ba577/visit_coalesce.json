@@ -1,0 +1,20 @@
+{
+  "case_id": "visit_coalesce",
+  "config_hash": "d4acc862fd0ba577",
+  "git_sha": "9454e97",
+  "metrics": {
+    "chat.q0.clean": 1.0,
+    "chat.q0.count_ok": 1.0,
+    "chat.q0.errored": 1.0,
+    "chat.q0.routed": 1.0,
+    "chat.q1.clean": 1.0,
+    "chat.q1.count_ok": 1.0,
+    "chat.q1.errored": 1.0,
+    "chat.q2.clean": 1.0,
+    "chat.q2.contains": 1.0,
+    "chat.q2.errored": 1.0,
+    "chat.q2.routed": 1.0,
+    "persons.count_error": 0.0,
+    "persons.distinct_count": 1.0
+  }
+}

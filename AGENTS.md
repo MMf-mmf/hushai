@@ -529,7 +529,7 @@ assignment-invariant (assert by enrolled name/device_id, never a minted UUID). B
 correlates cross-subject edges BATCH-LOCALLY, the harness doesn't observe the worker's incremental
 fold — it waits for graph inputs to settle (`poll::wait_graph_inputs_settled`: conversations sealed
 + events committed) then triggers one authoritative `POST /v1/graph/rebuild` (whole-scenario single
-batch → deterministic). F1–F3 live in `staging` until rig calibration promotes them to `train`. It REFUSES to run against a non-`*_test` DB (it TRUNCATEs
+batch → deterministic). F1–F3 are in `train` (Phase-C calibrated on the rig, gate ×2, then promoted alongside the full-suite re-baseline the `GRAPH_` config-hash change forced — all baselines now under config_hash `d4acc862`). It REFUSES to run against a non-`*_test` DB (it TRUNCATEs
 result tables) — bring it up with `./local_dev/run_stack.sh --test-db` (determinism profile
 `local_dev/eval.env`), then `cargo run -p hushai-eval -- run --tier {fast|full}`. A physical
 camera-at-screen tier is `local_dev/physical_loopback.py`. Read the playbook before using the loop.

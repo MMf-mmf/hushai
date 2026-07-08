@@ -1,0 +1,26 @@
+{
+  "case_id": "clip_speaker_roster",
+  "config_hash": "d4acc862fd0ba577",
+  "git_sha": "9454e97",
+  "metrics": {
+    "chat.q0.attribution": 1.0,
+    "chat.q0.citations": 2.0,
+    "chat.q0.clean": 1.0,
+    "chat.q0.contains": 1.0,
+    "chat.q0.errored": 1.0,
+    "chat.q0.routed": 1.0,
+    "chat.q0.similarity": 0.9326788132450425,
+    "chat.q1.clean": 1.0,
+    "chat.q1.contains": 1.0,
+    "chat.q1.errored": 1.0,
+    "chat.q1.routed": 1.0,
+    "chat.q1.similarity": 0.9243792782126046,
+    "chat.q2.citations": 7.0,
+    "chat.q2.clean": 1.0,
+    "chat.q2.errored": 1.0,
+    "chat.q2.routed": 1.0,
+    "chat.q2.similarity": 0.6946222975189261,
+    "transcript.similarity": 0.8529411764705882,
+    "transcript.wer": 0.3181818181818182
+  }
+}

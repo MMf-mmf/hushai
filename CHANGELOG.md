@@ -34,8 +34,9 @@ Newest first. Dates are when the work landed on the current development branch
     before `observe`; `"GRAPH_"` folded into the eval config-hash (`manifest.rs`) so a knob change
     re-baselines; `eval.env` graph knobs (`GRAPH_ENABLED`, `GRAPH_INTERVAL_SECS=2`,
     `GRAPH_GRACE_SECS=0`). Fixtures F1–F3 (`graph_face_voice_bind`/`graph_cross_camera_fusion`/
-    `graph_person_vehicle`) authored in **staging** (a parse + edge/node-kind-invariant unit test
-    guards their JSON) pending live-rig calibration → promote to `train` (Gotham.md Phase C). +7
+    `graph_person_vehicle`) in **train** — authored in staging, Phase-C calibrated on the rig
+    (each green + gate ×2), then promoted (a parse + edge/node-kind-invariant unit test guards
+    their JSON). +7
     eval unit tests (6 scorer + 1 fixture parse). Every graph read query + the fold-quiescence gate
     LIVE-VALIDATED against the real 0028 schema (scratch schema, dropped).
   - **PR 3 verification pass — 3 fixes from an adversarial multi-agent review (2026-07-08).**
@@ -69,9 +70,12 @@ Newest first. Dates are when the work landed on the current development branch
     froze at the first trial's NULL and NEVER transitioned NULL→`candidate` through folding — the G1
     voice↔face review queue never auto-surfaced in shipped code (fix: `status = $13`; guarded by an
     extended `graph_db.rs` binding assertion). Also: the ALPR reads plate EMD774 as `EM0774` (D→0),
-    so F3 enrolls the OCR norm with display name 'EMD774'. F1–F3 remain in `staging` (calibrated,
-    gate ×2, reproducible) — promotion to `train` is ready, to be done alongside the full-suite
-    re-baseline that the `GRAPH_` config-hash change already requires.
+    so F3 enrolls the OCR norm with display name 'EMD774'. F1–F3 promoted `staging`→`train` and
+    the full-suite re-baseline the `GRAPH_` config-hash change forced was run — all fixtures now
+    baselined under config_hash `d4acc862` (graph metrics byte-deterministic). Two pre-existing
+    LLM-answer chat fixtures (`money_talk`, `repeat_visitor`) fail deterministically on brittle
+    keyword assertions under 7B answer drift — unrelated to Wave 1 (hushai-rag untouched, model
+    unchanged), tracked separately, NOT re-baselined.
 - **Ahithophel advisor v1 (2026-07-06, migrations 0026/0027, new crate `hushai-advisor`)** —
   the first Ahithophel-framework agent (AhithophelPlan "Agent Architecture and Roles"): an
   Axum service (`:8095`) running a bounded multi-agent consultation pipeline over an ingested

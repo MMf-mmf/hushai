@@ -1,7 +1,7 @@
 {
   "case_id": "graph_face_voice_bind",
   "config_hash": "d4acc862fd0ba577",
-  "git_sha": "4b8426a",
+  "git_sha": "9454e97",
   "metrics": {
     "graph.edge.same_identity_candidate.alice__alice": 1.0,
     "graph.entity.person.alice": 1.0,
