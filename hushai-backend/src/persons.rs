@@ -352,6 +352,8 @@ pub async fn merge_person(
     crate::watchlist::reconcile_merge(&mut tx, "person", loser, into).await?;
     // Fold the loser's accumulated running-memory profile into the survivor's.
     crate::profiles::merge_in_tx(&mut tx, "person", loser, into).await?;
+    // Repoint the loser's Gotham graph edges onto the survivor (fold duplicates, drop self-edges).
+    crate::graph_pass::merge_in_tx(&mut tx, "person", loser, into).await?;
 
     sqlx::query("DELETE FROM persons WHERE person_id = $1")
         .bind(loser)

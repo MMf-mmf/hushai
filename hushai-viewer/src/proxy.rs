@@ -155,6 +155,8 @@ fn is_backend_path(path: &str) -> bool {
         || path.starts_with("/v1/audit/")
         || path == "/v1/watchlist"
         || path.starts_with("/v1/watchlist/")
+        // Gotham entity-graph read/admin surface (Gotham.md §1.7) is backend-owned (schema owner).
+        || path.starts_with("/v1/graph/")
 }
 
 async fn forward_inner(state: ViewerState, req: Request) -> Result<Response, String> {

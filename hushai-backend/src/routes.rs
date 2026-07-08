@@ -18,6 +18,7 @@ use crate::auth;
 use crate::db;
 use crate::devices;
 use crate::events;
+use crate::graph_api;
 use crate::ingest;
 use crate::persons;
 use crate::plates;
@@ -192,6 +193,42 @@ pub fn router(state: AppState) -> Router {
             auth::require_bearer,
         ));
 
+    // Gotham entity-graph read/admin surface (Gotham.md §1.7) — bearer-authed, proxied via the
+    // viewer like the other `/v1/*` admin surfaces. Literal sub-paths precede bare `/{id}` so
+    // they aren't captured as ids. Every GET maps 1:1 to a Detective (G3) tool.
+    let graph = Router::new()
+        .route("/v1/graph/edges", get(graph_api::list_edges))
+        .route("/v1/graph/path", get(graph_api::shortest_path))
+        .route("/v1/graph/bindings", get(graph_api::list_bindings))
+        .route(
+            "/v1/graph/bindings/{edge_id}/confirm",
+            post(graph_api::confirm_binding),
+        )
+        .route(
+            "/v1/graph/bindings/{edge_id}/reject",
+            post(graph_api::reject_binding),
+        )
+        .route("/v1/graph/journeys", get(graph_api::list_journeys))
+        .route("/v1/graph/digests", get(graph_api::list_digests))
+        .route("/v1/graph/digests/{date}", get(graph_api::digest_by_date))
+        .route("/v1/graph/rebuild", post(graph_api::rebuild))
+        .route(
+            "/v1/graph/neighbors/{type}/{id}",
+            get(graph_api::neighbors),
+        )
+        .route(
+            "/v1/graph/entities/{type}/{id}/timeline",
+            get(graph_api::entity_timeline),
+        )
+        .route(
+            "/v1/graph/entities/{type}/{id}",
+            get(graph_api::entity_page),
+        )
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::require_bearer,
+        ));
+
     Router::new()
         .route("/healthz", get(healthz))
         .route("/readyz", get(readyz))
@@ -205,6 +242,7 @@ pub fn router(state: AppState) -> Router {
         .merge(events)
         .merge(audit)
         .merge(watchlist)
+        .merge(graph)
         // One structured access line per request, carrying a generated `request_id` that every
         // handler log inherits (see crate::logging) — so a request is traceable end-to-end.
         .layer(

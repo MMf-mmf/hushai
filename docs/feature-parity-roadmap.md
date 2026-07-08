@@ -99,6 +99,12 @@ Make the stack observable, packaged, and horizontally honest — the table stake
 - [ ] **C3. Multi-tenancy + RBAC + sites/orgs** — only if the product needs multi-org; heavy.
 - [ ] **C4. Floor-plan / camera map view.**
 - [ ] **C5. Time-limited share links** — share a clip without an account.
+- [~] **C6. Intelligence layer (entity graph · link analysis · anomaly baselines · agentic
+  "Detective") → [`Gotham.md`](../Gotham.md).** Wave 1 / Pillar G1 data layer landed
+  (migrations 0028–0030, `graph.rs`/`graph_pass.rs`/`graph_api.rs`) + its deterministic eval
+  `graph` modality (harness built + SQL-validated; F1–F3 in staging pending rig calibration →
+  train). Later waves add baselines/anomalies (G2), the tool-calling runtime (G3), UI + voice
+  (G4), journeys (G5).
 
 ---
 

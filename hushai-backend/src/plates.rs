@@ -380,6 +380,8 @@ pub async fn merge_plate(
 
     // Keep any "of interest" watch alive across the merge (repoint/drop) before the loser disappears.
     crate::watchlist::reconcile_merge(&mut tx, "plate", loser, into).await?;
+    // Repoint the loser's Gotham graph edges onto the survivor (fold duplicates, drop self-edges).
+    crate::graph_pass::merge_in_tx(&mut tx, "plate", loser, into).await?;
 
     sqlx::query("DELETE FROM license_plates WHERE plate_id = $1")
         .bind(loser)

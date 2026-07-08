@@ -172,6 +172,30 @@ pub struct WorkerConfig {
     /// Profile text cap (chars); oldest lines are deterministically compacted beyond it.
     pub profiles_max_chars: usize,
 
+    // --- Gotham entity graph (migrations 0028–0030; worker 0 drives hushai_backend::graph_pass) ---
+    /// Master switch for the interval-gated graph fold on worker 0 (Gotham.md §5).
+    pub graph_enabled: bool,
+    /// Minimum seconds between graph passes.
+    pub graph_interval_secs: u64,
+    /// Per-pass event/conversation budget (bounded backfill; converges over passes).
+    pub graph_max_events_per_pass: i64,
+    /// Truncate derived rows + reset watermarks once on start, then refold.
+    pub graph_rebuild_on_start: bool,
+    // ★ determinism-relevant (folded into graph::config_hash):
+    pub graph_grace_secs: i64,
+    pub graph_copresence_slack_secs: i64,
+    pub graph_copresence_max_subjects: usize,
+    pub graph_vehicle_corr_window_secs: i64,
+    pub graph_edge_sample_cap: usize,
+    pub graph_bind_min_sessions: i64,
+    pub graph_bind_min_confidence: f32,
+    pub graph_bind_margin: f32,
+    pub graph_baseline_window_days: i64,
+    pub graph_anomaly_min_visits: i64,
+    pub graph_anomaly_hour_min_frac: f32,
+    pub graph_anomaly_unknown_cluster_min: i64,
+    pub graph_journey_gap_secs: i64,
+
     // --- Conversation threading (migration 0025; worker 0 drives hushai_backend::conversations) ---
     /// Master switch for the interval-gated threading pass on worker 0. Unlike autoheal
     /// this runs even while the queue is busy (checked BEFORE claiming) so sustained
@@ -554,6 +578,29 @@ impl WorkerConfig {
             link_min_overlap_frac: self.threader_link_min_overlap_frac,
         }
     }
+
+    /// Build the Gotham graph-pass options from the GRAPH_* knobs (Gotham.md §5).
+    pub fn graph_opts(&self) -> hushai_backend::graph_pass::GraphOpts {
+        hushai_backend::graph_pass::GraphOpts {
+            cfg: hushai_backend::graph::GraphCfg {
+                grace_secs: self.graph_grace_secs,
+                copresence_slack_secs: self.graph_copresence_slack_secs,
+                copresence_max_subjects: self.graph_copresence_max_subjects,
+                vehicle_corr_window_secs: self.graph_vehicle_corr_window_secs,
+                edge_sample_cap: self.graph_edge_sample_cap,
+                bind_min_sessions: self.graph_bind_min_sessions,
+                bind_min_confidence: self.graph_bind_min_confidence,
+                bind_margin: self.graph_bind_margin,
+                baseline_window_days: self.graph_baseline_window_days,
+                anomaly_min_visits: self.graph_anomaly_min_visits,
+                anomaly_hour_min_frac: self.graph_anomaly_hour_min_frac,
+                anomaly_unknown_cluster_min: self.graph_anomaly_unknown_cluster_min,
+                journey_gap_secs: self.graph_journey_gap_secs,
+            },
+            max_events_per_pass: self.graph_max_events_per_pass,
+            tz_offset_secs: 0,
+        }
+    }
 }
 
 impl WorkerConfig {
@@ -631,6 +678,23 @@ impl WorkerConfig {
             profiles_grace_secs: parse("PROFILES_GRACE_SECS", "90")?,
             profiles_max_events_per_pass: parse("PROFILES_MAX_EVENTS_PER_PASS", "2000")?,
             profiles_max_chars: parse("PROFILES_MAX_CHARS", "8000")?,
+            graph_enabled: parse("GRAPH_ENABLED", "true")?,
+            graph_interval_secs: parse("GRAPH_INTERVAL_SECS", "300")?,
+            graph_max_events_per_pass: parse("GRAPH_MAX_EVENTS_PER_PASS", "2000")?,
+            graph_rebuild_on_start: parse("GRAPH_REBUILD_ON_START", "false")?,
+            graph_grace_secs: parse("GRAPH_GRACE_SECS", "90")?,
+            graph_copresence_slack_secs: parse("GRAPH_COPRESENCE_SLACK_SECS", "120")?,
+            graph_copresence_max_subjects: parse("GRAPH_COPRESENCE_MAX_SUBJECTS", "12")?,
+            graph_vehicle_corr_window_secs: parse("GRAPH_VEHICLE_CORR_WINDOW_SECS", "180")?,
+            graph_edge_sample_cap: parse("GRAPH_EDGE_SAMPLE_CAP", "16")?,
+            graph_bind_min_sessions: parse("GRAPH_BIND_MIN_SESSIONS", "3")?,
+            graph_bind_min_confidence: parse("GRAPH_BIND_MIN_CONFIDENCE", "0.6")?,
+            graph_bind_margin: parse("GRAPH_BIND_MARGIN", "0.2")?,
+            graph_baseline_window_days: parse("GRAPH_BASELINE_WINDOW_DAYS", "30")?,
+            graph_anomaly_min_visits: parse("GRAPH_ANOMALY_MIN_VISITS", "5")?,
+            graph_anomaly_hour_min_frac: parse("GRAPH_ANOMALY_HOUR_MIN_FRAC", "0.05")?,
+            graph_anomaly_unknown_cluster_min: parse("GRAPH_ANOMALY_UNKNOWN_CLUSTER_MIN", "3")?,
+            graph_journey_gap_secs: parse("GRAPH_JOURNEY_GAP_SECS", "600")?,
             threader_enabled: parse("THREADER_ENABLED", "true")?,
             threader_interval_secs: parse("THREADER_INTERVAL_SECS", "30")?,
             threader_min_age_secs: parse("THREADER_MIN_AGE_SECS", "10")?,

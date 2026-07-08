@@ -349,6 +349,8 @@ pub async fn merge_speaker(
 
     // Fold the loser's accumulated running-memory profile into the survivor's.
     crate::profiles::merge_in_tx(&mut tx, "speaker", loser, into).await?;
+    // Repoint the loser's Gotham graph edges onto the survivor (fold duplicates, drop self-edges).
+    crate::graph_pass::merge_in_tx(&mut tx, "speaker", loser, into).await?;
 
     sqlx::query("DELETE FROM speakers WHERE speaker_id = $1")
         .bind(loser)
@@ -868,6 +870,8 @@ async fn collapse_cluster(
             .await?;
         // Fold the loser's accumulated running-memory profile into the canonical identity.
         crate::profiles::merge_in_tx(tx, "speaker", loser, canon_id).await?;
+        // Repoint the loser's Gotham graph edges onto the canonical identity.
+        crate::graph_pass::merge_in_tx(tx, "speaker", loser, canon_id).await?;
         removed += 1;
     }
 

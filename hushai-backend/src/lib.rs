@@ -15,6 +15,8 @@ pub mod devices;
 pub mod error;
 pub mod events;
 pub mod graph;
+pub mod graph_api;
+pub mod graph_pass;
 pub mod hints;
 pub mod ingest;
 pub mod logging;

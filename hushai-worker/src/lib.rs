@@ -784,6 +784,25 @@ async fn worker_loop(
     let mut last_autoheal = std::time::Instant::now();
     let mut last_profiles = std::time::Instant::now();
     let mut last_threader = std::time::Instant::now();
+    let mut last_graph = std::time::Instant::now();
+
+    // Gotham graph: one-time rebuild-on-start (worker 0 only) — truncate derived rows, reset
+    // watermarks, refold from surviving sources (the THREADER_BACKFILL_ON_START idiom). Also
+    // (re)seed the owner voice↔face binding regardless, so it exists before the first pass.
+    if worker_id == 0 && cfg.graph_enabled {
+        if cfg.graph_rebuild_on_start {
+            match hushai_backend::graph_pass::rebuild(&pool, &cfg.graph_opts()).await {
+                Ok(stats) => tracing::info!(
+                    edges = stats.edges_upserted,
+                    "graph rebuilt on start (GRAPH_REBUILD_ON_START)"
+                ),
+                Err(e) => tracing::warn!(error = %e, "graph rebuild on start failed"),
+            }
+        }
+        if let Err(e) = hushai_backend::graph_pass::seed_owner_binding(&pool).await {
+            tracing::warn!(error = %e, "owner binding seed failed");
+        }
+    }
     while !shutdown.load(Ordering::SeqCst) {
         // Conversation threading (worker 0, interval-gated). Checked BEFORE claiming —
         // unlike the drain-time autoheal/profile passes — so a sustained ingest backlog
@@ -952,6 +971,33 @@ async fn worker_loop(
                         }
                         Ok(_) => {}
                         Err(e) => tracing::warn!(error = %e, "profiles pass failed"),
+                    }
+                }
+                // Fold settled events + closed conversations into the Gotham entity graph
+                // (worker-0-only, interval-gated, drain-time — the profiles idiom). The backend
+                // fn serializes on its own GRAPH_LOCK_KEY advisory lock.
+                if worker_id == 0
+                    && cfg.graph_enabled
+                    && last_graph.elapsed().as_secs() >= cfg.graph_interval_secs
+                {
+                    last_graph = std::time::Instant::now();
+                    match hushai_backend::graph_pass::graph_pass(&pool, &cfg.graph_opts()).await {
+                        Ok(stats) if stats.edges_upserted > 0 => {
+                            hushai_backend::observe::counter_by(
+                                "hushai_graph_edges_upserted_total",
+                                &[],
+                                stats.edges_upserted,
+                            );
+                            tracing::info!(
+                                events = stats.events_consumed,
+                                conversations = stats.conversations_consumed,
+                                edges = stats.edges_upserted,
+                                bindings = stats.bindings_surfaced,
+                                "entity graph folded"
+                            );
+                        }
+                        Ok(_) => {}
+                        Err(e) => tracing::warn!(error = %e, "graph pass failed"),
                     }
                 }
                 // Wait for a new-segment NOTIFY or the poll backstop, whichever comes first.
