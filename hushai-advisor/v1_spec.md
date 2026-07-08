@@ -135,9 +135,14 @@ synopsis, so this does not fail the spec.
 ## Phase C — Service launch (incl. the fail-closed negative test)
 
 **C1 — negative test first:** no token + non-loopback bind must REFUSE to start.
+`env -u` strips any `ADVISOR_TOKEN` / `ADVISOR_ALLOW_INSECURE` the shell inherited
+(e.g. from a sourced `eval.env` or a prior `run_stack.sh`) — otherwise the guard is
+satisfied, the service *starts* world-bound on `0.0.0.0:8095`, and this negative test
+would spuriously "fail" while leaving an unauthenticated advisor listening.
 
 ```bash
-SQLX_OFFLINE=true ADVISOR_BIND_ADDR=0.0.0.0:8095 ./target/debug/hushai-advisor; echo "exit=$?"
+env -u ADVISOR_TOKEN -u ADVISOR_ALLOW_INSECURE \
+  SQLX_OFFLINE=true ADVISOR_BIND_ADDR=0.0.0.0:8095 ./target/debug/hushai-advisor; echo "exit=$?"
 ```
 
 Expected: exits non-zero quickly; log contains
@@ -232,7 +237,20 @@ grep -c "^event: token" /tmp/turn_direct.sse       # expected: > 50
 ```
 
 **D4 — concurrent turn on a busy session → 409.**
-Start D3's request (or any long turn) in the background, then within ~8 s:
+Start a long turn in the background and capture its session id from the SSE `session`
+event (the id only exists in-stream — a sessionless request mints it server-side):
+
+```bash
+curl -sN --max-time 240 http://127.0.0.1:8095/v1/advisor/chat \
+  -H 'content-type: application/json' -H 'Authorization: Bearer dev-advisor-token' \
+  -d '{"message":"A longtime client keeps delaying signing our renewal contract. I want to persuade him to commit this week without damaging the relationship. He responds well to social cues and hates feeling pressured. What should I do?"}' \
+  > /tmp/turn_busy.sse &
+# wait for the session event, then extract the id:
+until grep -q '"session_id"' /tmp/turn_busy.sse 2>/dev/null; do sleep 0.3; done
+BUSY_SID=$(grep -m1 '"session_id"' /tmp/turn_busy.sse | sed 's/.*"session_id":"\([^"]*\)".*/\1/')
+```
+
+Then, while that turn is still streaming (within ~8 s), fire the concurrent request:
 
 ```bash
 curl -s -o /dev/null -w "%{http_code}\n" --max-time 10 http://127.0.0.1:8095/v1/advisor/chat \

@@ -307,7 +307,7 @@ as `New` against existing baselines — non-gating retrofit (`baseline.rs:56-58`
 **Service addition (small, coordinated):** after `retrieve_memories`
 (`hushai-advisor/src/pipeline.rs:158-167`) the advisor emits a new SSE event
 `memory {recalled: n, nearest_distance: d}`. The harness parses it in `handle_block`
-(`query_advisor.rs:139-180`) into `memories_recalled: Option<i64>`; `None` (old binary)
+(`query_advisor.rs:124-181`) into `memories_recalled: Option<i64>`; `None` (old binary)
 degrades the metric to Info — the `routed` degradation pattern (`score.rs:790-796`).
 `nearest_distance` is calibration telemetry against the 0.6 cutoff. Viewer/Android
 clients ignore unknown events by design — no client change.
