@@ -1,0 +1,31 @@
+{
+  "case_id": "graph_person_vehicle",
+  "description": "Gotham G1 fixture F3 (person<->vehicle). Alice and the plate are co-staged on the driveway camera TWICE (arrived_with_vehicle, obs 2). A different person (Bob) is co-sighted with the same plate ONCE (below the evidence bar) and must NOT bind — the counter-assertion against a single spurious co-sighting. CALIBRATED on the rig (Phase C): PASSES + gate x2. NB the ALPR reads the plate as 'EM0774' (D->0), so the enroll seeds plate_text='EM0774' (the OCR norm the detection matches) with display_name 'EMD774' — one catalog row, asserted by its true name. Media regenerable via local_dev/fetch_eval_clips.sh. Ready to promote staging->train (Gotham.md F3) alongside the GRAPH_-knob train re-baseline.",
+  "device_id": "eval-graph-drive",
+  "media_file": "clips/alice_face.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "graph"
+  ],
+  "tier": "full",
+  "enroll": [
+    { "modality": "person", "name": "Alice", "ref": "clips/alice_face.mp4" },
+    { "modality": "person", "name": "Bob", "ref": "clips/bob_face.mp4" },
+    { "modality": "plate", "name": "EMD774", "plate_text": "EM0774" }
+  ],
+  "injections": [
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-graph-drive", "capture_start_offset_ns": 0, "seed": "a1" },
+    { "media_file": "clips/plate.mp4", "device_id": "eval-graph-drive", "capture_start_offset_ns": 30000000000, "seed": "p1" },
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-graph-drive", "capture_start_offset_ns": 3600000000000, "seed": "a2" },
+    { "media_file": "clips/plate.mp4", "device_id": "eval-graph-drive", "capture_start_offset_ns": 3630000000000, "seed": "p2" },
+    { "media_file": "clips/bob_face.mp4", "device_id": "eval-graph-drive", "capture_start_offset_ns": 7200000000000, "seed": "b1" },
+    { "media_file": "clips/plate.mp4", "device_id": "eval-graph-drive", "capture_start_offset_ns": 7230000000000, "seed": "p3" }
+  ],
+  "poll": {
+    "timeout_secs": 300,
+    "interval_secs": 3,
+    "quiesce_polls": 2
+  }
+}

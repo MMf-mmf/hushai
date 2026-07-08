@@ -327,6 +327,45 @@ dropped — **media is ALWAYS stored regardless of gating.**
   separation are absolute; disjoint-speaker-set separation needs the speaker lane to actually
   separate the voices.
 
+### Gotham entity graph (migrations 0028–0030, Wave 1 / Pillar G1) — spec `Gotham.md`
+
+- **What it is:** the intelligence layer's materialized inter-entity relationships — the links
+  the perception pipeline perceives but never joins. `entity_edges` (0028) carries five edge
+  types: `co_present` (overlapping visits, same device), `conversed_with` (speaker pairs from
+  closed conversations), `arrived_with_vehicle` (person→plate temporal correlation),
+  `visits_place` (entity→device), and the review-queued voice↔face binding
+  `same_identity_candidate`. Nodes are the EXISTING catalogs (persons/speakers/plates/devices) —
+  no node table; endpoints are `(node_type text, node_id text)` with NO FK (the `events.subject_id`
+  contract). `graph_state` is the watermark singleton.
+- **Producer:** `hushai-backend/src/graph.rs` (pure deterministic cores — canonical undirected
+  ordering, co-presence pairing, binding Jaccard, evidence merge, journey stitch, anomaly
+  predicates, `GraphCfg`+`config_hash`, unit-tested) + `graph_pass.rs` (the `profiles.rs` sibling:
+  advisory-locked `GRAPH_LOCK_KEY`, watermark drain over settled `events` + closed
+  `conversations`, idempotent edge upserts). Driven by **worker 0** at drain time
+  (`GRAPH_*` knobs, `graph_interval_secs`), the exact profiles-driver idiom. Merge folds via
+  `graph_pass::merge_in_tx` beside the `profiles::merge_in_tx` hooks in
+  `persons`/`speakers`/`plates` merges; hard-delete cascades via `delete_entity_in_tx`.
+- **Voice↔face binding (§1.4):** deterministic trials over closed conversations; NEVER
+  auto-merges. An edge surfaces to the review queue (`status='candidate'`) only past all three
+  gates (min sessions, min Jaccard, margin over runner-up — defeats the always-together
+  confound); user confirm/reject via `/v1/graph/bindings/{id}/{confirm,reject}` (audit-logged,
+  rejection sticky). `confirmed` is the only state consumers may union history across
+  (`bound_person_for_speaker`). The owner seed idempotently confirms the `is_owner`↔`is_owner`
+  edge. **Catalogs never merge — 192-d and 512-d spaces don't mix; the edge IS the identity.**
+- **Determinism:** integer/ratio math, no LLM anywhere in materialization; watermarks are WALL
+  clock, "now" is the DB clock (pinned-capture fixtures still settle); confidences rounded to 4
+  decimals; `config_hash` (SHA-256 hex[..8] of the ★ knobs) stamps every row — a knob change is a
+  new eval lineage. DERIVED/rebuildable: `POST /v1/graph/rebuild` truncates + refolds byte-stable.
+- **API (`graph_api.rs`, `/v1/graph/*`, bearer-authed, proxied via viewer `is_backend_path`):**
+  entity page, timeline, edges, neighbors (bounded recursive CTE, hops ≤ 3), path (≤ 4), binding
+  queue + confirm/reject, rebuild. `journeys`/`digests` endpoints ship their table contract now;
+  their producers (`patterns.rs` baselines/anomalies/digests = 0029/Wave 2; journey stitcher =
+  0030/Wave 4) are later waves.
+- **Wave-1 scope note:** co-presence is batch-local (the `profiles::co_present` precedent — a rare
+  batch split costs one observation, converges as events drain); binding accumulates
+  `together`+`speaker_only` (person_only is a documented follow-up). Baselines/anomalies/journeys
+  tables exist (0029/0030) but are NOT populated yet.
+
 ### Chat correctness (2026-07 overhaul — the "executive chat" fixes)
 
 - **Visit coalescing:** `presence.rs` counts VISITS (gap-coalesced continuous appearances,
@@ -484,7 +523,13 @@ both perception AND the RAG chat ANSWER (the `chat`/`rag` modality: `must_contai
 `--fixtures staging`) scripts multi-turn consultations against hushai-advisor
 (`expect_questions`/`expect_final_answer`/`expect_chapters_any|all`/`expect_substrings`;
 `HUSHAI_ADVISOR_URL`/`ADVISOR_TOKEN`) — absent service or un-ingested corpus yields
-INCONCLUSIVE, never FAIL. It REFUSES to run against a non-`*_test` DB (it TRUNCATEs
+INCONCLUSIVE, never FAIL. A `graph` modality (Gotham G1, DB-direct + deterministic like
+perception) scores the materialized `entity_edges`: `expect_entity`/`expect_edge`/`expect_no_edge`,
+assignment-invariant (assert by enrolled name/device_id, never a minted UUID). Because `graph_pass`
+correlates cross-subject edges BATCH-LOCALLY, the harness doesn't observe the worker's incremental
+fold — it waits for graph inputs to settle (`poll::wait_graph_inputs_settled`: conversations sealed
++ events committed) then triggers one authoritative `POST /v1/graph/rebuild` (whole-scenario single
+batch → deterministic). F1–F3 live in `staging` until rig calibration promotes them to `train`. It REFUSES to run against a non-`*_test` DB (it TRUNCATEs
 result tables) — bring it up with `./local_dev/run_stack.sh --test-db` (determinism profile
 `local_dev/eval.env`), then `cargo run -p hushai-eval -- run --tier {fast|full}`. A physical
 camera-at-screen tier is `local_dev/physical_loopback.py`. Read the playbook before using the loop.

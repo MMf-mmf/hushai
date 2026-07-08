@@ -1,0 +1,25 @@
+{
+  "case_id": "graph_cross_camera_fusion",
+  "description": "Gotham G1 fixture F2 (cross-camera fusion). The same enrolled person (Alice) is seen on the FRONT camera on day 1 and the GARAGE camera on day 2 (multi-injection, +86400s). The graph must materialize a visits_place edge to BOTH devices from the one identity — the fusion the perception pipeline perceives but never joins. STAGING pending Phase-C live calibration; the Wave-4 expect_journey [front, garage] assertion is added when the journey stitcher + expect_journey field land (Gotham.md F2, split=train).",
+  "device_id": "eval-graph-front",
+  "media_file": "clips/alice_face.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "graph"
+  ],
+  "tier": "full",
+  "enroll": [
+    { "modality": "person", "name": "Alice", "ref": "clips/alice_face.mp4" }
+  ],
+  "injections": [
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-graph-front", "capture_start_offset_ns": 0 },
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-graph-garage", "capture_start_offset_ns": 86400000000000, "seed": "day2" }
+  ],
+  "poll": {
+    "timeout_secs": 300,
+    "interval_secs": 3,
+    "quiesce_polls": 2
+  }
+}

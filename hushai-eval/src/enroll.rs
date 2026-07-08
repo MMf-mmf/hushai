@@ -70,6 +70,10 @@ async fn enroll_plate(ctx: &Ctx, fx: &Fixture, spec: &EnrollSpec) -> Result<()> 
     let norm: String = text.chars().filter(|c| c.is_alphanumeric()).flat_map(|c| c.to_uppercase()).collect();
     let device = fx.meta.device_id.clone();
     let now_ns = fx.meta.base_capture_unix_nanos;
+    // The FK `license_plates.first_seen_device_id -> devices` must resolve; the case device isn't
+    // upserted until the inject loop (after enroll), so create it here (the person/speaker enroll
+    // path does the same for its `-ref` device).
+    reset::upsert_device(ctx, &device).await?;
     sqlx::query(
         "INSERT INTO license_plates
            (plate_id, plate_text, plate_text_norm, display_name,

@@ -42,6 +42,31 @@ pub struct EventObs {
     pub start_ns: i64,
 }
 
+/// One materialized `entity_edges` row (Gotham G1). Endpoints are `(type, id)` text pairs with no FK
+/// (the 0024/0028 contract). `id` is a stringified catalog UUID for person/speaker/plate, or the
+/// literal `device_id` for device endpoints.
+#[derive(Debug, Clone)]
+pub struct EdgeObs {
+    pub edge_type: String,
+    pub src_type: String,
+    pub src_id: String,
+    pub dst_type: String,
+    pub dst_id: String,
+    pub observation_count: i64,
+    pub confidence: Option<f32>,
+    pub status: Option<String>,
+}
+
+/// Name→id resolution for graph assertions (assignment-invariance): the enrolled `display_name` of a
+/// person/speaker/plate maps to its catalog id. Device endpoints resolve to their literal id, so they
+/// need no map. Empty when the `graph` modality isn't scored.
+#[derive(Debug, Clone, Default)]
+pub struct EntityIds {
+    pub person: HashMap<String, String>, // display_name -> person_id::text
+    pub speaker: HashMap<String, String>,
+    pub plate: HashMap<String, String>, // display_name OR plate_text_norm -> plate_id::text
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct Observed {
     pub window: (i64, i64),
@@ -53,6 +78,11 @@ pub struct Observed {
     pub plates: Vec<PlateCat>,
     pub plate_reads: HashMap<String, i64>, // plate_text_norm -> reads in window
     pub events: Vec<EventObs>,
+    /// All materialized graph edges (Gotham G1). Unwindowed: edges are already folded from the
+    /// window's events/conversations, and the whole point of the graph is cross-time relationships.
+    pub graph_edges: Vec<EdgeObs>,
+    /// Enrolled-name → catalog-id resolution for graph assertions.
+    pub entity_ids: EntityIds,
 }
 
 const SLACK_NS: i64 = 5_000_000_000;
@@ -206,5 +236,84 @@ pub async fn observe(
             .collect();
     }
 
+    if has("graph") {
+        // The materialized edges (Gotham G1). Unwindowed — the fold already applied the window's
+        // events/conversations, and relationships are inherently cross-time. `src_id`/`dst_id` are
+        // TEXT (stringified UUIDs, or a device_id literal), so read them as String.
+        o.graph_edges = sqlx::query_as(
+            "SELECT edge_type, src_type, src_id, dst_type, dst_id, observation_count, confidence, status
+             FROM entity_edges",
+        )
+        .fetch_all(&ctx.pool)
+        .await?
+        .into_iter()
+        .map(
+            |(edge_type, src_type, src_id, dst_type, dst_id, observation_count, confidence, status): (
+                String, String, String, String, String, i64, Option<f32>, Option<String>,
+            )| EdgeObs {
+                edge_type, src_type, src_id, dst_type, dst_id, observation_count, confidence, status
+            },
+        )
+        .collect();
+
+        // Name→id resolution (assignment-invariance): assertions name entities by enrolled
+        // display_name; the graph stores catalog ids. Only NAMED rows resolve — an unnamed cluster
+        // can't be asserted by name (and shouldn't be: it's the counter-assertion's job).
+        for (name, id) in sqlx::query_as::<_, (String, Uuid)>(
+            "SELECT display_name, person_id FROM persons WHERE display_name IS NOT NULL",
+        )
+        .fetch_all(&ctx.pool)
+        .await?
+        {
+            o.entity_ids.person.insert(name, id.to_string());
+        }
+        for (name, id) in sqlx::query_as::<_, (String, Uuid)>(
+            "SELECT display_name, speaker_id FROM speakers WHERE display_name IS NOT NULL",
+        )
+        .fetch_all(&ctx.pool)
+        .await?
+        {
+            o.entity_ids.speaker.insert(name, id.to_string());
+        }
+        // Plates resolve by display_name AND by normalized text (a fixture may name a plate by its
+        // string when no human label was assigned).
+        for (name, norm, id) in sqlx::query_as::<_, (Option<String>, String, Uuid)>(
+            "SELECT display_name, plate_text_norm, plate_id FROM license_plates",
+        )
+        .fetch_all(&ctx.pool)
+        .await?
+        {
+            if let Some(n) = name {
+                o.entity_ids.plate.insert(n, id.to_string());
+            }
+            // The normalized-text key is a FALLBACK: never clobber an explicit display_name binding
+            // (guards a future multi-plate fixture where plate A's display_name equals plate B's norm).
+            o.entity_ids.plate.entry(norm).or_insert_with(|| id.to_string());
+        }
+    }
+
     Ok(o)
+}
+
+/// Trigger a single authoritative graph rebuild via the backend admin API (`POST /v1/graph/rebuild`)
+/// — the one non-DB call in this module. Needed because `graph_pass` correlates cross-subject edges
+/// batch-locally; a whole-scenario rebuild folds every subject in ONE batch so the graph is
+/// deterministic (see `poll::wait_graph_inputs_settled`). The eval already authenticates to the
+/// backend with `device_token` on every injection (`inject.rs` POSTs `/v1/segments`), so the same
+/// bearer works here. Returns `Ok(false)` when the graph surface is unreachable / unauthorized /
+/// absent (an old backend without the endpoint) — the caller maps that to INCONCLUSIVE, never a scored
+/// failure. `Ok(true)` = rebuilt (the handler folds to convergence synchronously before responding).
+pub async fn trigger_graph_rebuild(ctx: &Ctx) -> Result<bool> {
+    let url = format!("{}/v1/graph/rebuild", ctx.backend_url.trim_end_matches('/'));
+    match ctx.http.post(&url).bearer_auth(&ctx.device_token).send().await {
+        Ok(r) if r.status().is_success() => Ok(true),
+        Ok(r) => {
+            eprintln!("[graph] rebuild endpoint returned {} (backend without the graph API?)", r.status());
+            Ok(false)
+        }
+        Err(e) => {
+            eprintln!("[graph] rebuild request failed (backend unreachable?): {e}");
+            Ok(false)
+        }
+    }
 }

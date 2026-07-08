@@ -89,12 +89,20 @@ impl Meta {
     /// lanes to drain (a chat-only fixture used to wait on NOTHING — the poller quiesced at 0
     /// processed and the case went inconclusive with `audio_done=0 injected=N`).
     pub fn needs_vision(&self) -> bool {
-        ["persons", "faces", "objects", "plates"].iter().any(|m| self.modality(m)) || self.needs_rag()
+        ["persons", "faces", "objects", "plates"].iter().any(|m| self.modality(m)) || self.needs_rag() || self.needs_graph()
     }
     /// True if any scored modality requires the audio lane (see `needs_vision` on `chat`).
     /// `conversations` rides on transcript_sentences, so it waits on the audio lane too.
     pub fn needs_audio(&self) -> bool {
-        ["transcript", "speakers", "sentiment", "conversations"].iter().any(|m| self.modality(m)) || self.needs_rag()
+        ["transcript", "speakers", "sentiment", "conversations"].iter().any(|m| self.modality(m)) || self.needs_rag() || self.needs_graph()
+    }
+
+    /// True if this case scores the Gotham entity graph (the `graph` modality). The graph is FOLDED
+    /// from the pipeline's `events` (0014) + CLOSED `conversations` (0025), so a graph fixture must
+    /// wait on BOTH producing lanes AND on the graph inputs settling before an authoritative rebuild
+    /// (see `poll::wait_graph_inputs_settled` + `query::trigger_graph_rebuild`).
+    pub fn needs_graph(&self) -> bool {
+        self.modality("graph")
     }
 
     /// True if this case scores live RAG answers (the `chat` / `rag` modality).
@@ -230,6 +238,8 @@ pub struct Expected {
     pub chat: Option<ChatGt>,
     /// Live advisor ground truth (scored only when the `advisor` modality is listed).
     pub advisor: Option<AdvisorGt>,
+    /// Entity-graph ground truth (scored only when the `graph` modality is listed; Gotham G1).
+    pub graph: Option<GraphGt>,
 }
 
 // ----- chat / rag ground truth -----------------------------------------------
@@ -565,6 +575,53 @@ pub struct EventGt {
     pub min_severity: String,
 }
 
+// ----- graph ground truth (Gotham G1) ----------------------------------------
+
+/// Entity-graph ground truth (scored only when the `graph` modality is listed). ASSIGNMENT-INVARIANT
+/// like every identity modality: edges are asserted by DENORMALIZED names (enrolled `display_name`s)
+/// / device_ids via [`EntityRef`], never by minted UUIDs — the scorer resolves the name to its
+/// catalog id at query time (the `clip_speaker_roster` `enroll:` precedent). Same clips + pinned
+/// timestamps + locked `GRAPH_*` knobs ⇒ byte-identical edges (Gotham.md §3.1).
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct GraphGt {
+    /// `expect_entity`: each must resolve to a live catalog id (enrollment + re-identification worked).
+    #[serde(default)]
+    pub entities: Vec<EntityRef>,
+    /// `expect_edge`: each must be present with `>= min_evidence` observations (and, for a binding,
+    /// the required `status` when set).
+    #[serde(default)]
+    pub edges: Vec<EdgeExpect>,
+    /// `expect_no_edge`: counter-assertions — below-threshold pairs must NOT have bound.
+    #[serde(default)]
+    pub no_edges: Vec<EdgeExpect>,
+}
+
+/// One graph node reference. For `person`/`speaker`/`plate` the `name` is the enrolled `display_name`
+/// (resolved to a catalog id by the scorer); for `device` the `name` IS the literal `device_id`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EntityRef {
+    /// "person" | "speaker" | "plate" | "device"
+    pub kind: String,
+    pub name: String,
+}
+
+/// An edge assertion. Endpoint order is not significant for the undirected edge types
+/// (`co_present`, `conversed_with`, `same_identity_candidate`) — the scorer matches either
+/// direction. `min_evidence` is the `observation_count` floor (default 1); `expect_no_edge`
+/// ignores it. `status` optionally pins a binding's review-queue state.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EdgeExpect {
+    pub from: EntityRef,
+    pub to: EntityRef,
+    /// "co_present" | "conversed_with" | "arrived_with_vehicle" | "same_identity_candidate" | "visits_place"
+    pub kind: String,
+    #[serde(default = "d_one")]
+    pub min_evidence: i64,
+    /// For `same_identity_candidate`: require the edge to carry this status ("candidate"/"confirmed"/"rejected").
+    #[serde(default)]
+    pub status: Option<String>,
+}
+
 // ----- loading + discovery ---------------------------------------------------
 
 #[derive(Debug, Clone)]
@@ -636,6 +693,36 @@ mod tests {
             assert!(fx.meta.needs_advisor(), "{case} must list the advisor modality");
             let gt = fx.expected.advisor.as_ref().expect("advisor GT block");
             assert!(!gt.turns.is_empty(), "{case} must script at least one turn");
+        }
+    }
+
+    /// The graph (Gotham G1) staging fixtures are media-less until a live rig calibration run, so
+    /// nothing else exercises their JSON — parse them here so a `GraphGt` schema/typo drift fails
+    /// fast. Also asserts the every-edge invariant: a known set of edge kinds + resolvable endpoint
+    /// kinds, so a typo in a fixture (`vist_place`, `pesron`) is caught at unit time, not on the rig.
+    #[test]
+    fn graph_staging_fixtures_parse() {
+        const EDGE_KINDS: &[&str] =
+            &["co_present", "conversed_with", "arrived_with_vehicle", "same_identity_candidate", "visits_place"];
+        const NODE_KINDS: &[&str] = &["person", "speaker", "plate", "device"];
+        let root = crate::ctx::repo_root().join("hushai-eval/fixtures/staging");
+        for case in ["graph_face_voice_bind", "graph_cross_camera_fusion", "graph_person_vehicle"] {
+            let fx = load(&root.join(case), "staging").expect(case);
+            assert!(fx.meta.needs_graph(), "{case} must list the graph modality");
+            let gt = fx.expected.graph.as_ref().unwrap_or_else(|| panic!("{case}: graph GT block"));
+            assert!(
+                !gt.entities.is_empty() || !gt.edges.is_empty() || !gt.no_edges.is_empty(),
+                "{case} must assert at least one entity/edge"
+            );
+            for e in gt.edges.iter().chain(gt.no_edges.iter()) {
+                assert!(EDGE_KINDS.contains(&e.kind.as_str()), "{case}: bad edge kind {}", e.kind);
+                for ep in [&e.from, &e.to] {
+                    assert!(NODE_KINDS.contains(&ep.kind.as_str()), "{case}: bad node kind {}", ep.kind);
+                }
+            }
+            for ent in &gt.entities {
+                assert!(NODE_KINDS.contains(&ent.kind.as_str()), "{case}: bad entity kind {}", ent.kind);
+            }
         }
     }
 }

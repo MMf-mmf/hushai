@@ -7,6 +7,71 @@ Newest first. Dates are when the work landed on the current development branch
 
 ## Unreleased (in-flight)
 
+- **Gotham intelligence layer — Wave 1 / Pillar G1 data layer (2026-07-08, migrations
+  0028–0030, spec `Gotham.md`)** — the entity/link graph: `entity_edges` (co_present /
+  conversed_with / arrived_with_vehicle / visits_place / the review-queued voice↔face
+  `same_identity_candidate` binding) + `graph_state` watermark (0028); `entity_baselines` /
+  `daily_digests` (0029) and `entity_journeys` + `camera_adjacency` view (0030) ship their
+  schema now, populated in later waves. New `hushai-backend::graph` (pure deterministic cores —
+  canonical undirected ordering, co-presence pairing, binding Jaccard, evidence merge, journey
+  stitch, anomaly predicates, `GraphCfg`/`config_hash`; 12 unit tests) + `graph_pass` (the
+  `profiles.rs` sibling: `GRAPH_LOCK_KEY` advisory-locked watermark drain over settled `events`
+  + closed `conversations`, idempotent edge upserts, `merge_in_tx`/`delete_entity_in_tx`
+  reconciliation, `seed_owner_binding`, `rebuild`) driven by worker 0 (`GRAPH_*` knobs). Read/
+  admin API `/v1/graph/*` (`graph_api`, bearer-authed, proxied via viewer `is_backend_path`):
+  entity page/timeline, edges, neighbors (recursive CTE ≤ 3 hops), path (≤ 4), binding queue +
+  confirm/reject (audit-logged, sticky reject), rebuild. Merge hooks land beside
+  `profiles::merge_in_tx` in persons/speakers/plates. Deterministic (no LLM in materialization),
+  DERIVED/rebuildable, never auto-merges identities.
+  - **PR 3 — eval `graph` modality (2026-07-08).** The deterministic Tier-1 harness for the
+    graph: `GraphGt` + `expect_entity`/`expect_edge`/`expect_no_edge` on `Expected`
+    (`fixtures.rs`); `score_graph` gated in `score_all` — assignment-invariant (edges asserted by
+    enrolled `display_name`/`device_id` → resolved to catalog ids, never minted UUIDs), undirected
+    kinds match either endpoint order, `expect_no_edge` is threshold-aware (a below-`min_evidence`
+    co-sighting counts as "did not bind"); an unwindowed `entity_edges` read + name→id resolution
+    (`query.rs`); `poll::wait_graph_folded` (no OPEN conversations + fold watermark caught up to
+    eligible events/closed-conversations, mirroring `graph_pass::drain_*`), wired into `run_case`
+    before `observe`; `"GRAPH_"` folded into the eval config-hash (`manifest.rs`) so a knob change
+    re-baselines; `eval.env` graph knobs (`GRAPH_ENABLED`, `GRAPH_INTERVAL_SECS=2`,
+    `GRAPH_GRACE_SECS=0`). Fixtures F1–F3 (`graph_face_voice_bind`/`graph_cross_camera_fusion`/
+    `graph_person_vehicle`) authored in **staging** (a parse + edge/node-kind-invariant unit test
+    guards their JSON) pending live-rig calibration → promote to `train` (Gotham.md Phase C). +7
+    eval unit tests (6 scorer + 1 fixture parse). Every graph read query + the fold-quiescence gate
+    LIVE-VALIDATED against the real 0028 schema (scratch schema, dropped).
+  - **PR 3 verification pass — 3 fixes from an adversarial multi-agent review (2026-07-08).**
+    (1) `reset::reset_db` never cleared the graph tables → a prior case's `entity_edges` bled into
+    the next (`score_graph` reads them unwindowed): added guarded `RESET_GRAPH_SQL` (TRUNCATE
+    `entity_edges`/`entity_baselines`/`entity_journeys`, UPDATE-reset the `graph_state` singleton;
+    `to_regclass`-guarded so non-graph DBs are unaffected). (2) `graph_pass` correlates cross-subject
+    edges (`arrived_with_vehicle`/`co_present`) BATCH-LOCALLY, so the eval's serial inject-and-quiesce
+    cadence drained a person and their vehicle in separate passes → the edge never formed. The graph
+    modality now waits for inputs to settle (`poll::wait_graph_inputs_settled`) then triggers one
+    authoritative `POST /v1/graph/rebuild` (`query::trigger_graph_rebuild`, reusing the injection
+    bearer) that folds the whole scenario in a single batch; `GRAPH_INTERVAL_SECS` pinned high so the
+    incremental pass doesn't race it. (3) the rebuild handler used `GraphOpts::default()` (grace 90) —
+    which would exclude freshly-injected events (`updated_at` younger than 90s) → empty rebuild; added
+    `GraphOpts::from_env()` (backend) so the endpoint honors configured knobs (`GRAPH_GRACE_SECS=0`
+    for the eval). New backend integration test `tests/graph_db.rs` seeds events + rebuilds + asserts
+    cross-subject edges (`arrived_with_vehicle` obs 2 vs below-bar 1, `co_present`, `visits_place`) —
+    the permanent regression guard, green on `hushai_test` (now migrated to head 0030).
+  - **PR 3 live E2E on the rig — Gotham Phases 0/A/B/C ALL PASS (2026-07-08).** F1
+    (`graph_face_voice_bind`, voice↔face binding → `candidate`), F2 (`graph_cross_camera_fusion`,
+    `visits_place` to two devices), F3 (`graph_person_vehicle`, `arrived_with_vehicle` obs 2 + a
+    below-bar Bob negative) each run end-to-end against the live stack (backend+worker+rag+ollama on
+    `hushai_test`), PASS, and gate ×2 with identical verdicts (baselines frozen under config_hash
+    `d4acc862`). Phase B: `/v1/graph/*` returns 401 without bearer, correct edges/entity/neighbors
+    shapes, and `rebuild` round-trips to a byte-identical edge set. Fixture media (Judith + Sally PD
+    portraits, the Auckland plate crop, JFK Rice speech) is reproducible via `fetch_eval_clips.sh`
+    (F2 reproduces its baseline from script-regenerated clips). **The live run caught + fixed 2 more
+    real bugs:** (a) `enroll_plate` never upserted the case device before the FK insert → plate
+    direct-seed failed (added the `upsert_device` the person/speaker path already does); (b)
+    `graph_pass::upsert_edge`'s `ON CONFLICT DO UPDATE` **omitted `status`**, so a binding's status
+    froze at the first trial's NULL and NEVER transitioned NULL→`candidate` through folding — the G1
+    voice↔face review queue never auto-surfaced in shipped code (fix: `status = $13`; guarded by an
+    extended `graph_db.rs` binding assertion). Also: the ALPR reads plate EMD774 as `EM0774` (D→0),
+    so F3 enrolls the OCR norm with display name 'EMD774'. F1–F3 remain in `staging` (calibrated,
+    gate ×2, reproducible) — promotion to `train` is ready, to be done alongside the full-suite
+    re-baseline that the `GRAPH_` config-hash change already requires.
 - **Ahithophel advisor v1 (2026-07-06, migrations 0026/0027, new crate `hushai-advisor`)** —
   the first Ahithophel-framework agent (AhithophelPlan "Agent Architecture and Roles"): an
   Axum service (`:8095`) running a bounded multi-agent consultation pipeline over an ingested

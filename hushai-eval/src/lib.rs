@@ -204,6 +204,40 @@ async fn run_case(
         }
     }
 
+    // Gotham G1 graph fold. `graph_pass` correlates cross-subject edges BATCH-LOCALLY, so the
+    // worker's incremental fold can't materialize a person↔plate / co-presence edge whose subjects
+    // were injected in separate (serially-polled) clips. So instead of observing the incremental
+    // fold: (1) wait for the graph's INPUTS to settle (conversations sealed + events committed),
+    // then (2) trigger ONE authoritative rebuild that folds the whole scenario in a single batch —
+    // deterministic and correct for every edge type (see `poll::wait_graph_inputs_settled`). Both
+    // steps fail CLOSED to inconclusive, never a scored FAIL.
+    if fx.meta.needs_graph() {
+        let settled = poll::wait_graph_inputs_settled(
+            ctx,
+            &devices_vec,
+            fx.meta.poll.timeout_secs.min(300),
+            fx.meta.poll.interval_secs.max(1),
+        )
+        .await
+        .context("waiting for graph inputs to settle")?;
+        if !settled {
+            return Ok(CaseResult::inconclusive(
+                cid,
+                split,
+                tier,
+                "graph inputs did not settle in time (are conversations closing? is the threader running?)".to_string(),
+            ));
+        }
+        if !query::trigger_graph_rebuild(ctx).await.context("triggering graph rebuild")? {
+            return Ok(CaseResult::inconclusive(
+                cid,
+                split,
+                tier,
+                "graph rebuild endpoint unreachable/unauthorized (the graph modality needs the live backend graph API up)".to_string(),
+            ));
+        }
+    }
+
     let obs = query::observe(ctx, &devices_vec, win_lo, win_hi, &fx.meta.modalities)
         .await
         .context("querying observed results")?;

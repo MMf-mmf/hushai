@@ -1,0 +1,29 @@
+{
+  "case_id": "graph_face_voice_bind",
+  "description": "Gotham G1 fixture F1 (voice<->face binding). Alice's face + voice appear together across 3 conversation sessions on one camera, so a same_identity_candidate binding surfaces into the review queue (>= GRAPH_BIND_MIN_SESSIONS=3, never auto-confirmed). A second face (Mallory) is enrolled but NEVER speaks, so it must never bind to Alice's voice. STAGING pending Phase-C live calibration: the media (a muxed face+voice clip for Alice, a silent-face clip for Mallory) is curated on the rig and the assertion values are frozen twice back-to-back before promotion to train (Gotham.md F1, split=train).",
+  "device_id": "eval-graph-bind",
+  "media_file": "clips/alice_talks.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "graph"
+  ],
+  "tier": "full",
+  "enroll": [
+    { "modality": "person", "name": "Alice", "ref": "clips/alice_talks.mp4" },
+    { "modality": "speaker", "name": "Alice", "ref": "clips/alice_talks.mp4" },
+    { "modality": "person", "name": "Mallory", "ref": "clips/mallory_silent.mp4" }
+  ],
+  "injections": [
+    { "media_file": "clips/alice_talks.mp4", "device_id": "eval-graph-bind", "capture_start_offset_ns": 0, "seed": "s1" },
+    { "media_file": "clips/alice_talks.mp4", "device_id": "eval-graph-bind", "capture_start_offset_ns": 3600000000000, "seed": "s2" },
+    { "media_file": "clips/alice_talks.mp4", "device_id": "eval-graph-bind", "capture_start_offset_ns": 7200000000000, "seed": "s3" },
+    { "media_file": "clips/mallory_silent.mp4", "device_id": "eval-graph-bind", "capture_start_offset_ns": 10800000000000, "seed": "silent" }
+  ],
+  "poll": {
+    "timeout_secs": 300,
+    "interval_secs": 3,
+    "quiesce_polls": 2
+  }
+}

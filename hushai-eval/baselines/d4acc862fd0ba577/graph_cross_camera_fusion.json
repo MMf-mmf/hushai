@@ -1,0 +1,11 @@
+{
+  "case_id": "graph_cross_camera_fusion",
+  "config_hash": "d4acc862fd0ba577",
+  "git_sha": "4b8426a",
+  "metrics": {
+    "graph.edge.visits_place.alice__eval_graph_front": 1.0,
+    "graph.edge.visits_place.alice__eval_graph_garage": 1.0,
+    "graph.entity.person.alice": 1.0,
+    "graph.match": 1.0
+  }
+}

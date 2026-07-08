@@ -1,0 +1,12 @@
+{
+  "case_id": "graph_person_vehicle",
+  "config_hash": "d4acc862fd0ba577",
+  "git_sha": "4b8426a",
+  "metrics": {
+    "graph.edge.arrived_with_vehicle.alice__emd774": 1.0,
+    "graph.entity.person.alice": 1.0,
+    "graph.entity.plate.emd774": 1.0,
+    "graph.match": 1.0,
+    "graph.no_edge.arrived_with_vehicle.bob__emd774": 1.0
+  }
+}

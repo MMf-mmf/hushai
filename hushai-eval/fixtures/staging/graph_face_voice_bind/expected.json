@@ -1,0 +1,26 @@
+{
+  "graph": {
+    "entities": [
+      { "kind": "person", "name": "Alice" },
+      { "kind": "speaker", "name": "Alice" },
+      { "kind": "person", "name": "Mallory" }
+    ],
+    "edges": [
+      {
+        "from": { "kind": "speaker", "name": "Alice" },
+        "to": { "kind": "person", "name": "Alice" },
+        "kind": "same_identity_candidate",
+        "min_evidence": 3,
+        "status": "candidate"
+      }
+    ],
+    "no_edges": [
+      {
+        "from": { "kind": "person", "name": "Mallory" },
+        "to": { "kind": "speaker", "name": "Alice" },
+        "kind": "same_identity_candidate",
+        "min_evidence": 1
+      }
+    ]
+  }
+}

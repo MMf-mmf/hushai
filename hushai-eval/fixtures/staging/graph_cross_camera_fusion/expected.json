@@ -1,0 +1,21 @@
+{
+  "graph": {
+    "entities": [
+      { "kind": "person", "name": "Alice" }
+    ],
+    "edges": [
+      {
+        "from": { "kind": "person", "name": "Alice" },
+        "to": { "kind": "device", "name": "eval-graph-front" },
+        "kind": "visits_place",
+        "min_evidence": 1
+      },
+      {
+        "from": { "kind": "person", "name": "Alice" },
+        "to": { "kind": "device", "name": "eval-graph-garage" },
+        "kind": "visits_place",
+        "min_evidence": 1
+      }
+    ]
+  }
+}

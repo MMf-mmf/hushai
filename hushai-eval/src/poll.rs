@@ -218,3 +218,69 @@ pub async fn wait_threaded(
         tokio::time::sleep(interval).await;
     }
 }
+
+/// Graph-fold INPUT quiescence (Gotham G1): wait until everything the graph folds FROM is final on
+/// the case's devices, so the single authoritative rebuild the harness then triggers
+/// (`query::trigger_graph_rebuild`) sees a complete, stable input. Two conditions:
+///   1. No OPEN conversations remain — `conversed_with` / the voice↔face binding fold ONLY from
+///      CLOSED conversations, so we wait for the threader to seal them (stronger than
+///      `wait_threaded`, which only waits for sentence assignment).
+///   2. The subject-bearing `events` count holds steady for two reads — the event producer commits
+///      AFTER a segment's lane status flips `done` (a separate tx), so a just-finished injection
+///      may still be growing the event set.
+///
+/// WHY a rebuild, not the worker's incremental fold: `graph_pass` correlates cross-subject edges
+/// (`arrived_with_vehicle`, `co_present`) BATCH-LOCALLY — only within one pass's freshly-drained
+/// `all_visits`, never re-querying persisted visits (unlike the binding path, which re-queries
+/// `events`). The eval injects clips serially and polls each to quiescence, so a person and the
+/// plate they arrived with drain in SEPARATE passes and never correlate → the edge never forms. A
+/// single `rebuild` drains the whole scenario in ONE batch (budget 2000 ≫ any fixture), so all
+/// subjects co-occur and the fold is deterministic. `GRAPH_INTERVAL_SECS` is pinned high in
+/// `eval.env` so the worker's incremental pass doesn't race the rebuild. A timeout is
+/// INFRASTRUCTURE (inconclusive, exit 2) — e.g. the threader isn't closing conversations — never a
+/// scored failure.
+pub async fn wait_graph_inputs_settled(
+    ctx: &Ctx,
+    devices: &[String],
+    timeout_secs: u64,
+    interval_secs: u64,
+) -> Result<bool> {
+    let timeout = Duration::from_secs(timeout_secs);
+    let interval = Duration::from_secs(interval_secs.max(1));
+    let started = Instant::now();
+    let mut last = -1i64;
+    let mut stable = 0u32;
+    loop {
+        let (open_convs,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM conversations WHERE status = 'open' AND primary_device_id = ANY($1)",
+        )
+        .bind(devices)
+        .fetch_one(&ctx.pool)
+        .await?;
+
+        // The graph's event inputs (what drain_events reads): subject-bearing events on the devices.
+        let (ev_count,): (i64,) = sqlx::query_as(
+            "SELECT count(*) FROM events \
+             WHERE subject_id IS NOT NULL \
+               AND subject_type = ANY(ARRAY['person','speaker','plate']) \
+               AND device_id = ANY($1)",
+        )
+        .bind(devices)
+        .fetch_one(&ctx.pool)
+        .await?;
+
+        if ev_count == last {
+            stable += 1;
+        } else {
+            stable = 0;
+            last = ev_count;
+        }
+        if open_convs == 0 && stable >= 2 {
+            return Ok(true);
+        }
+        if started.elapsed() > timeout {
+            return Ok(false);
+        }
+        tokio::time::sleep(interval).await;
+    }
+}

@@ -87,6 +87,10 @@ const KNOB_PREFIXES: &[&str] = &[
     "CONVO_",
     "RAG_EXPAND_",
     "RAG_PRUNE_",
+    // Gotham entity graph (0028): every GRAPH_ knob changes the folded entity_edges (co-presence
+    // slack, vehicle-correlation window, binding thresholds, sample cap, grace) — determinism-
+    // relevant. Safe to prefix-fold: the family carries no secrets/URLs/bind-addrs.
+    "GRAPH_",
 ];
 
 #[derive(Debug, Clone, Serialize)]

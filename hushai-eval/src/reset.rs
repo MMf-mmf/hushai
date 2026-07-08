@@ -26,11 +26,36 @@ const ENSURE_PARTITIONS: &[&str] = &[
     "ensure_plate_detection_partitions",
 ];
 
+/// Gotham graph tables (migrations 0028–0030) are DERIVED — they must start empty each case, or a
+/// PRIOR case's materialized `entity_edges` bleeds into `score_graph` (which reads them UNWINDOWED)
+/// as false-positive edges / false-fail `expect_no_edge`s, and a stale `graph_state` watermark
+/// misreports fold quiescence. Kept OUT of `TRUNCATE_SQL` and guarded by `to_regclass` so media /
+/// advisor fixtures on a DB WITHOUT the graph migrations are unaffected (the `reset_advisor`
+/// precedent: never force a migration a fixture doesn't need). `graph_state` is RESET, not truncated
+/// — TRUNCATE would drop the `id = 1` singleton that `graph_pass::load_state` does `fetch_one` on.
+const RESET_GRAPH_SQL: &str = "
+DO $$ BEGIN
+  IF to_regclass('public.entity_edges') IS NOT NULL THEN
+    TRUNCATE entity_edges RESTART IDENTITY;
+  END IF;
+  IF to_regclass('public.entity_baselines') IS NOT NULL THEN TRUNCATE entity_baselines; END IF;
+  IF to_regclass('public.entity_journeys') IS NOT NULL THEN TRUNCATE entity_journeys; END IF;
+  IF to_regclass('public.graph_state') IS NOT NULL THEN
+    UPDATE graph_state SET events_watermark = to_timestamp(0),
+      conversations_watermark = to_timestamp(0), config_hash = NULL, updated_at = now() WHERE id = 1;
+  END IF;
+END $$;";
+
 pub async fn reset_db(ctx: &Ctx) -> Result<()> {
     sqlx::query(TRUNCATE_SQL)
         .execute(&ctx.pool)
         .await
         .context("TRUNCATE result/catalog/status tables")?;
+    // Reset the derived Gotham graph (guarded: no-op when the graph migrations aren't applied).
+    sqlx::query(RESET_GRAPH_SQL)
+        .execute(&ctx.pool)
+        .await
+        .context("reset Gotham graph tables")?;
     for f in ENSURE_PARTITIONS {
         // SAFE: `f` comes from a fixed const allowlist, never user input.
         sqlx::query(sqlx::AssertSqlSafe(format!("SELECT {f}(1)")))

@@ -1,0 +1,13 @@
+{
+  "case_id": "graph_face_voice_bind",
+  "config_hash": "d4acc862fd0ba577",
+  "git_sha": "4b8426a",
+  "metrics": {
+    "graph.edge.same_identity_candidate.alice__alice": 1.0,
+    "graph.entity.person.alice": 1.0,
+    "graph.entity.person.mallory": 1.0,
+    "graph.entity.speaker.alice": 1.0,
+    "graph.match": 1.0,
+    "graph.no_edge.same_identity_candidate.mallory__alice": 1.0
+  }
+}

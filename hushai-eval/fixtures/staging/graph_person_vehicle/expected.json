@@ -1,0 +1,24 @@
+{
+  "graph": {
+    "entities": [
+      { "kind": "person", "name": "Alice" },
+      { "kind": "plate", "name": "EMD774" }
+    ],
+    "edges": [
+      {
+        "from": { "kind": "person", "name": "Alice" },
+        "to": { "kind": "plate", "name": "EMD774" },
+        "kind": "arrived_with_vehicle",
+        "min_evidence": 2
+      }
+    ],
+    "no_edges": [
+      {
+        "from": { "kind": "person", "name": "Bob" },
+        "to": { "kind": "plate", "name": "EMD774" },
+        "kind": "arrived_with_vehicle",
+        "min_evidence": 2
+      }
+    ]
+  }
+}

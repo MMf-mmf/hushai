@@ -84,6 +84,11 @@ pub fn score_all(expected: &Expected, obs: &Observed, base_ns: i64, modalities: 
             m.extend(score_events(gt, obs));
         }
     }
+    if on("graph") {
+        if let Some(gt) = &expected.graph {
+            m.extend(score_graph(gt, obs));
+        }
+    }
     m
 }
 
@@ -626,6 +631,111 @@ fn score_events(gt: &EventsGt, obs: &Observed) -> Vec<Metric> {
     let frac = if gt.expected.is_empty() { 1.0 } else { satisfied as f64 / gt.expected.len() as f64 };
     vec![Metric::new("events.match", frac, Direction::HigherBetter, frac >= 1.0,
         format!("{satisfied}/{} expected events matched", gt.expected.len()))]
+}
+
+// ----- graph (Gotham G1) ------------------------------------------------------
+
+/// Score the materialized entity graph against `GraphGt`. ASSIGNMENT-INVARIANT: assertions name
+/// entities by enrolled `display_name` / `device_id`, resolved to catalog ids via `obs.entity_ids` —
+/// never a minted UUID (Gotham.md §3.1). Undirected edge types (`co_present`, `conversed_with`,
+/// `same_identity_candidate`) match in EITHER endpoint order. `expect_no_edge` is threshold-aware:
+/// it passes when no edge reaches `min_evidence` (a below-bar co-sighting is "did not bind").
+fn score_graph(gt: &GraphGt, obs: &Observed) -> Vec<Metric> {
+    let mut out = Vec::new();
+    let mut satisfied = 0usize;
+    let total = gt.entities.len() + gt.edges.len() + gt.no_edges.len();
+
+    for e in &gt.entities {
+        let ok = resolve_entity(e, &obs.entity_ids).is_some();
+        if ok {
+            satisfied += 1;
+        }
+        out.push(Metric::new(
+            format!("graph.entity.{}.{}", e.kind, key_name(&e.name)),
+            b2f(ok), Direction::Boolean, ok,
+            format!("entity {}:{} resolved={ok}", e.kind, e.name),
+        ));
+    }
+
+    for e in &gt.edges {
+        let m = match_edge(e, obs);
+        let ok = m.is_some_and(|edge| {
+            edge.observation_count >= e.min_evidence
+                && e.status.as_ref().is_none_or(|s| edge.status.as_deref() == Some(s.as_str()))
+        });
+        if ok {
+            satisfied += 1;
+        }
+        let obsn = m.map(|edge| edge.observation_count).unwrap_or(0);
+        let st = m.and_then(|edge| edge.status.clone());
+        out.push(Metric::new(
+            format!("graph.edge.{}.{}__{}", e.kind, key_name(&e.from.name), key_name(&e.to.name)),
+            b2f(ok), Direction::Boolean, ok,
+            format!(
+                "{} {}->{} obs={obsn} (>= {}) status={st:?}{}",
+                e.kind, e.from.name, e.to.name, e.min_evidence,
+                e.status.as_ref().map(|s| format!(" want={s}")).unwrap_or_default()
+            ),
+        ));
+    }
+
+    for e in &gt.no_edges {
+        let m = match_edge(e, obs);
+        let bound = m.is_some_and(|edge| edge.observation_count >= e.min_evidence);
+        let ok = !bound;
+        if ok {
+            satisfied += 1;
+        }
+        let obsn = m.map(|edge| edge.observation_count).unwrap_or(0);
+        out.push(Metric::new(
+            format!("graph.no_edge.{}.{}__{}", e.kind, key_name(&e.from.name), key_name(&e.to.name)),
+            b2f(ok), Direction::Boolean, ok,
+            format!(
+                "{} {}->{} must-not-bind: obs={obsn} (bar {}) bound={bound}",
+                e.kind, e.from.name, e.to.name, e.min_evidence
+            ),
+        ));
+    }
+
+    let frac = if total == 0 { 1.0 } else { satisfied as f64 / total as f64 };
+    out.insert(0, Metric::new("graph.match", frac, Direction::HigherBetter, frac >= 1.0,
+        format!("{satisfied}/{total} graph assertions satisfied")));
+    out
+}
+
+/// Resolve an [`EntityRef`] to its catalog id string. `device` ids are literal; the others map an
+/// enrolled `display_name` through `EntityIds` (None ⇒ never enrolled / never re-identified).
+fn resolve_entity(r: &EntityRef, ids: &EntityIds) -> Option<String> {
+    match r.kind.as_str() {
+        "device" => Some(r.name.clone()),
+        "person" => ids.person.get(&r.name).cloned(),
+        "speaker" => ids.speaker.get(&r.name).cloned(),
+        "plate" => ids.plate.get(&r.name).cloned(),
+        _ => None,
+    }
+}
+
+/// Find the observed edge matching an [`EdgeExpect`], accepting either endpoint order (undirected
+/// edges are producer-canonicalized; checking both orders is harmless for the directed types).
+/// None when either endpoint fails to resolve OR no such edge exists.
+fn match_edge<'a>(e: &EdgeExpect, obs: &'a Observed) -> Option<&'a EdgeObs> {
+    let from = resolve_entity(&e.from, &obs.entity_ids)?;
+    let to = resolve_entity(&e.to, &obs.entity_ids)?;
+    obs.graph_edges.iter().find(|edge| {
+        edge.edge_type == e.kind
+            && ((edge.src_type == e.from.kind && edge.src_id == from && edge.dst_type == e.to.kind && edge.dst_id == to)
+                || (edge.src_type == e.to.kind && edge.src_id == to && edge.dst_type == e.from.kind && edge.dst_id == from))
+    })
+}
+
+fn b2f(b: bool) -> f64 {
+    if b { 1.0 } else { 0.0 }
+}
+
+/// Metric-key-safe rendering of an entity name (lowercased, non-alnum → '_') so baseline keys stay
+/// stable and shell-clean.
+fn key_name(s: &str) -> String {
+    s.chars().map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '_' }).collect()
 }
 
 // ----- helpers ---------------------------------------------------------------
@@ -1519,5 +1629,114 @@ mod conversation_tests {
         assert_eq!(ce.value, 0.0);
         assert!(ce.floor_ok);
         assert!(find(&ms, "conversations.pairwise_f1").floor_ok);
+    }
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use super::*;
+
+    fn find<'a>(ms: &'a [Metric], key: &str) -> &'a Metric {
+        ms.iter().find(|m| m.key == key).unwrap_or_else(|| panic!("metric {key} not found in {:?}", ms.iter().map(|m| &m.key).collect::<Vec<_>>()))
+    }
+
+    fn edge(kind: &str, st: &str, si: &str, dt: &str, di: &str, obs: i64, status: Option<&str>) -> EdgeObs {
+        EdgeObs {
+            edge_type: kind.into(),
+            src_type: st.into(), src_id: si.into(),
+            dst_type: dt.into(), dst_id: di.into(),
+            observation_count: obs,
+            confidence: None,
+            status: status.map(|s| s.into()),
+        }
+    }
+    fn eref(kind: &str, name: &str) -> EntityRef {
+        EntityRef { kind: kind.into(), name: name.into() }
+    }
+    fn expect(from: EntityRef, to: EntityRef, kind: &str, min_evidence: i64, status: Option<&str>) -> EdgeExpect {
+        EdgeExpect { from, to, kind: kind.into(), min_evidence, status: status.map(|s| s.into()) }
+    }
+    /// Observed with the person "Alice"→A, speaker "Alice"→S, plate "EMD774"→P resolution seeded.
+    fn obs_with(edges: Vec<EdgeObs>) -> Observed {
+        let mut o = Observed { graph_edges: edges, ..Default::default() };
+        o.entity_ids.person.insert("Alice".into(), "A".into());
+        o.entity_ids.person.insert("Bob".into(), "B".into());
+        o.entity_ids.speaker.insert("Alice".into(), "S".into());
+        o.entity_ids.plate.insert("EMD774".into(), "P".into());
+        o
+    }
+
+    #[test]
+    fn edge_present_at_or_above_evidence_passes_below_fails() {
+        // visits_place person Alice(A) -> device front, obs 3.
+        let o = obs_with(vec![edge("visits_place", "person", "A", "device", "front", 3, None)]);
+        let e = expect(eref("person", "Alice"), eref("device", "front"), "visits_place", 3, None);
+        let gt = GraphGt { edges: vec![e.clone()], ..Default::default() };
+        assert!(find(&score_graph(&gt, &o), "graph.edge.visits_place.alice__front").floor_ok);
+
+        // Same edge, but demand 4 observations — fails.
+        let mut too_high = e;
+        too_high.min_evidence = 4;
+        let gt = GraphGt { edges: vec![too_high], ..Default::default() };
+        assert!(!find(&score_graph(&gt, &o), "graph.edge.visits_place.alice__front").floor_ok);
+    }
+
+    #[test]
+    fn undirected_edge_matches_either_endpoint_order() {
+        // Stored canonical (speaker S before person A alphabetically by (type,id)); the assertion
+        // names person→speaker (the opposite order) and must still match.
+        let o = obs_with(vec![edge("same_identity_candidate", "person", "A", "speaker", "S", 5, Some("candidate"))]);
+        let e = expect(eref("speaker", "Alice"), eref("person", "Alice"), "same_identity_candidate", 1, None);
+        let gt = GraphGt { edges: vec![e], ..Default::default() };
+        assert!(find(&score_graph(&gt, &o), "graph.edge.same_identity_candidate.alice__alice").floor_ok);
+    }
+
+    #[test]
+    fn status_pin_gates_binding() {
+        let o = obs_with(vec![edge("same_identity_candidate", "person", "A", "speaker", "S", 5, Some("candidate"))]);
+        // Want confirmed but it's only a candidate -> fail.
+        let e = expect(eref("person", "Alice"), eref("speaker", "Alice"), "same_identity_candidate", 1, Some("confirmed"));
+        let gt = GraphGt { edges: vec![e], ..Default::default() };
+        assert!(!find(&score_graph(&gt, &o), "graph.edge.same_identity_candidate.alice__alice").floor_ok);
+    }
+
+    #[test]
+    fn no_edge_is_threshold_aware() {
+        // A single co-sighting made a person->plate edge with obs=1. no_edge with bar 2 PASSES
+        // (below bar = did not bind); the SAME assertion with bar 1 FAILS (an edge exists at >=1).
+        let o = obs_with(vec![edge("arrived_with_vehicle", "person", "B", "plate", "P", 1, None)]);
+        let below = expect(eref("person", "Bob"), eref("plate", "EMD774"), "arrived_with_vehicle", 2, None);
+        let gt = GraphGt { no_edges: vec![below], ..Default::default() };
+        assert!(find(&score_graph(&gt, &o), "graph.no_edge.arrived_with_vehicle.bob__emd774").floor_ok);
+
+        let strict = expect(eref("person", "Bob"), eref("plate", "EMD774"), "arrived_with_vehicle", 1, None);
+        let gt = GraphGt { no_edges: vec![strict], ..Default::default() };
+        assert!(!find(&score_graph(&gt, &o), "graph.no_edge.arrived_with_vehicle.bob__emd774").floor_ok);
+    }
+
+    #[test]
+    fn no_edge_passes_when_endpoint_never_enrolled() {
+        // The silent face was never enrolled/named -> unresolvable -> no matching edge -> no_edge OK.
+        let o = obs_with(vec![]);
+        let e = expect(eref("person", "Ghost"), eref("speaker", "Alice"), "same_identity_candidate", 1, None);
+        let gt = GraphGt { no_edges: vec![e], ..Default::default() };
+        assert!(find(&score_graph(&gt, &o), "graph.no_edge.same_identity_candidate.ghost__alice").floor_ok);
+    }
+
+    #[test]
+    fn entity_resolution_and_aggregate() {
+        let o = obs_with(vec![]);
+        let gt = GraphGt {
+            entities: vec![eref("person", "Alice"), eref("device", "front"), eref("person", "Nobody")],
+            ..Default::default()
+        };
+        let ms = score_graph(&gt, &o);
+        assert!(find(&ms, "graph.entity.person.alice").floor_ok); // enrolled
+        assert!(find(&ms, "graph.entity.device.front").floor_ok); // device literal always resolves
+        assert!(!find(&ms, "graph.entity.person.nobody").floor_ok); // never enrolled
+        // aggregate: 2 of 3 satisfied.
+        let agg = find(&ms, "graph.match");
+        assert!((agg.value - 2.0 / 3.0).abs() < 1e-9);
+        assert!(!agg.floor_ok);
     }
 }

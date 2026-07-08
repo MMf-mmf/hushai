@@ -142,3 +142,52 @@ if [[ -d "$pdest" ]]; then
 else
   echo "[skip] $PLATE_CASE — no fixture dir (ground truth not committed?)"
 fi
+
+# --- Gotham entity-graph fixtures (F1–F3, `graph` eval modality, split=staging) ------------------
+# Reuse the proven PD substrates: the Judith Resnik portrait (face_id → "Alice"), a Sally Ride
+# portrait (→ "Bob"/"Mallory" — a DISTINCT face so re-ID mints a second person), the Auckland plate
+# crop (→ EMD774, which the ALPR reads as "EM0774"), and the JFK Rice speech (→ Alice's voice). Same
+# ffmpeg recipes as above so the pipeline output — and thus the frozen graph baselines — reproduce.
+STG="$ROOT/hushai-eval/fixtures/staging"
+BOB_URL="https://commons.wikimedia.org/wiki/Special:FilePath/Sally_Ride_(1984).jpg"
+if [[ -d "$STG/graph_cross_camera_fusion" ]]; then
+  # sources (cache-shared with face_id / plate_ocr / jfk_moon above)
+  jsrc="$CACHE/face_id.jpg"; bsrc="$CACHE/bob.jpg"; psrc="$CACHE/plate_ocr.jpg"; ssrc="$CACHE/jfk_moon.src"
+  [[ -s "$jsrc" ]] || curl -fSL -m 180 -o "$jsrc" "https://commons.wikimedia.org/wiki/Special:FilePath/Judith%20A.%20Resnik,%20official%20portrait%20(cropped).jpg"
+  [[ -s "$bsrc" ]] || { echo "[fetch] graph:bob ← $BOB_URL"; curl -fSL -m 180 -o "$bsrc" "$BOB_URL"; }
+  [[ -s "$psrc" ]] || curl -fSL -m 180 -o "$psrc" "$PLATE_URL"
+  [[ -s "$ssrc" ]] || curl -fSL -m 180 -o "$ssrc" "https://upload.wikimedia.org/wikipedia/commons/5/50/Jfk_rice_university_we_choose_to_go_to_the_moon.ogg"
+
+  # 6s silent ken-burns face clip (portrait stays large + detectable). $1=src $2=dst
+  kenburns_face() {
+    ffmpeg -y -loglevel error -loop 1 -i "$1" -f lavfi -i "anullsrc=r=16000:cl=mono" \
+      -vf "scale=2560:1440:force_original_aspect_ratio=increase,crop=2560:1440,zoompan=z='min(zoom+0.0008,1.3)':d=150:s=1280x720:fps=25,format=yuv420p" \
+      -t 6 -map 0:v -map 1:a -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -shortest "$2"
+  }
+
+  # F2 graph_cross_camera_fusion: Alice's face (one clip, injected on two devices).
+  mkdir -p "$STG/graph_cross_camera_fusion/clips"
+  echo "[graph] F2 alice_face.mp4"; kenburns_face "$jsrc" "$STG/graph_cross_camera_fusion/clips/alice_face.mp4"
+
+  # F3 graph_person_vehicle: Alice face + Bob face + the EMD774 plate crop.
+  mkdir -p "$STG/graph_person_vehicle/clips"
+  echo "[graph] F3 alice_face.mp4 + bob_face.mp4 + plate.mp4"
+  kenburns_face "$jsrc" "$STG/graph_person_vehicle/clips/alice_face.mp4"
+  kenburns_face "$bsrc" "$STG/graph_person_vehicle/clips/bob_face.mp4"
+  ffmpeg -y -loglevel error -loop 1 -i "$psrc" -f lavfi -i "anullsrc=r=16000:cl=mono" \
+    -vf "${PLATE_CROP},scale=1280:720:force_original_aspect_ratio=decrease,pad=1280:720:(ow-iw)/2:(oh-ih)/2,format=yuv420p" \
+    -t 6 -r 5 -map 0:v -map 1:a -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -shortest \
+    "$STG/graph_person_vehicle/clips/plate.mp4"
+
+  # F1 graph_face_voice_bind: Alice face + JFK speech (14s muxed) + a silent Mallory (Bob's) face.
+  mkdir -p "$STG/graph_face_voice_bind/clips"
+  echo "[graph] F1 alice_talks.mp4 + mallory_silent.mp4"
+  ffmpeg -y -loglevel error -loop 1 -i "$jsrc" -ss 334 -t 14 -i "$ssrc" \
+    -vf "scale=2560:1440:force_original_aspect_ratio=increase,crop=2560:1440,zoompan=z='min(zoom+0.0004,1.2)':d=350:s=1280x720:fps=25,format=yuv420p" \
+    -map 0:v -map 1:a -t 14 -af "loudnorm=I=-20:TP=-3:LRA=11" \
+    -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -b:a 192k "$STG/graph_face_voice_bind/clips/alice_talks.mp4"
+  kenburns_face "$bsrc" "$STG/graph_face_voice_bind/clips/mallory_silent.mp4"
+  echo "[done] regenerated Gotham graph fixture media under $STG"
+else
+  echo "[skip] graph_* — no staging fixture dirs"
+fi
