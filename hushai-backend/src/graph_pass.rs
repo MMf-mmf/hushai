@@ -95,6 +95,23 @@ pub struct GraphStats {
     pub anomaly_event_ids: Vec<Uuid>,
 }
 
+/// The 0→1 edge transitions + unknown-person clusters a single `drain_events` pass observed — the
+/// raw material for the Wave-2 EDGE anomalies (`first_time_pairing`, `new_vehicle_for_person`,
+/// `unknown_person_cluster`). Collected at drain time (the 0→1 signal lives here) but EMITTED in
+/// [`crate::patterns::flag_edge_anomalies`] after baselines are recomputed, so maturity is available
+/// for both the whole-scenario rebuild AND the incremental worker (§1.6). Batch-local, same as
+/// `co_present` (a rare cross-pass split costs one anomaly, never correctness).
+#[derive(Debug, Default)]
+pub struct EdgeTransitions {
+    /// `(a, b, device_id, t)` — a `co_present` edge that went 0→1 this pass (canonical endpoints).
+    pub new_copresent: Vec<(NodeRef, NodeRef, String, i64)>,
+    /// `(person, plate, device_id, t)` — an `arrived_with_vehicle` edge that went 0→1 this pass.
+    pub new_vehicle: Vec<(NodeRef, NodeRef, String, i64)>,
+    /// `(device_id, t, distinct_unknown_count)` — a window on one device with ≥ the cluster minimum
+    /// distinct UNKNOWN persons (display_name NULL) co-present.
+    pub unknown_clusters: Vec<(String, i64, i64)>,
+}
+
 /// One identity-carrying event, minimal fields for folding.
 #[derive(Debug, Clone)]
 struct EvRow {
@@ -133,16 +150,17 @@ pub async fn graph_pass(pool: &PgPool, opts: &GraphOpts) -> anyhow::Result<Graph
     }
 
     let mut stats = GraphStats::default();
-    let (ev_wm, touched_ev) =
+    let (ev_wm, touched_ev, transitions) =
         drain_events(&mut tx, opts, state.events_watermark_micros, &cfg_hash, &mut stats).await?;
     let (cv_wm, touched_cv) =
         drain_conversations(&mut tx, opts, state.conversations_watermark_micros, &cfg_hash, &mut stats)
             .await?;
 
-    // Step 4 (§1.5 / §1.6): recompute baselines for the subjects touched this pass and emit
-    // off-schedule anomalies. off_schedule is judged AS-OF (each visit vs the subject's
-    // strictly-earlier visits), independent of the baseline row written here (see
-    // patterns::recompute_and_flag).
+    // Step 4 (§1.5 / §1.6): recompute baselines for the subjects touched this pass and emit the
+    // pattern anomalies. off_schedule is judged AS-OF (each visit vs the subject's strictly-earlier
+    // visits) in recompute_and_flag; the three EDGE anomalies (first_time_pairing / new_vehicle /
+    // unknown_cluster) are judged in flag_edge_anomalies over the 0→1 transitions this pass observed,
+    // AFTER baselines are recomputed so endpoint maturity is available. Both run inside this pass tx.
     let mut touched = touched_ev;
     touched.extend(touched_cv);
     if !touched.is_empty() {
@@ -155,9 +173,17 @@ pub async fn graph_pass(pool: &PgPool, opts: &GraphOpts) -> anyhow::Result<Graph
         )
         .await?;
         stats.baselines_recomputed = touched.len() as u64;
-        stats.anomalies_emitted = ids.len() as u64;
         stats.anomaly_event_ids = ids;
     }
+    let edge_ids = crate::patterns::flag_edge_anomalies(
+        &mut tx,
+        &opts.cfg,
+        opts.tz_offset_secs,
+        &transitions,
+    )
+    .await?;
+    stats.anomaly_event_ids.extend(edge_ids);
+    stats.anomalies_emitted = stats.anomaly_event_ids.len() as u64;
 
     // Advance watermarks (max seen this pass; unchanged when nothing drained) + stamp config_hash.
     sqlx::query(
@@ -208,7 +234,8 @@ async fn drain_events(
     prior_wm_micros: i64,
     cfg_hash: &str,
     stats: &mut GraphStats,
-) -> anyhow::Result<(i64, BTreeSet<(String, Uuid)>)> {
+) -> anyhow::Result<(i64, BTreeSet<(String, Uuid)>, EdgeTransitions)> {
+    let mut transitions = EdgeTransitions::default();
     let slack_nanos = opts.cfg.copresence_slack_secs.max(1) * NANOS_PER_SEC;
     // DB-clock "now" for the in-progress guard (fixtures with pinned capture still settle).
     let now_ns: i64 = sqlx::query_scalar("SELECT (extract(epoch from now()) * 1e9)::bigint")
@@ -237,7 +264,7 @@ async fn drain_events(
     .await?;
 
     if rows.is_empty() {
-        return Ok((prior_wm_micros, BTreeSet::new()));
+        return Ok((prior_wm_micros, BTreeSet::new(), transitions));
     }
     let events: Vec<EvRow> = rows
         .into_iter()
@@ -316,7 +343,7 @@ async fn drain_events(
             by_device.entry(v.device_id.clone()).or_default().push(v.clone());
         }
     }
-    for visits in by_device.values() {
+    for (device, visits) in &by_device {
         let pairs = graph::co_present_pairs(visits, slack_nanos, opts.cfg.copresence_max_subjects);
         if visits.iter().map(|v| &v.node).collect::<std::collections::BTreeSet<_>>().len()
             > opts.cfg.copresence_max_subjects
@@ -324,22 +351,34 @@ async fn drain_events(
             crate::observe::counter("hushai_graph_copresence_capped_total", &[]);
         }
         for (a, b) in pairs {
-            let t = visits
-                .iter()
-                .filter(|v| v.node == a || v.node == b)
-                .map(|v| v.start_unix_nanos)
-                .max()
-                .unwrap_or(0);
-            upsert_edge(
+            // The actual co-presence moments — max of each overlapping visit PAIR's starts — NOT the
+            // batch-global max visit start. In a whole-history rebuild a and b may each keep visiting
+            // solo AFTER first meeting; the global max would misdate the edge's first_seen and the
+            // first_time_pairing anomaly's civil-day. `first_t` = the FIRST time they were together.
+            let mut first_co: Option<i64> = None;
+            let mut last_co: Option<i64> = None;
+            for va in visits.iter().filter(|v| v.node == a) {
+                for vb in visits.iter().filter(|v| v.node == b) {
+                    if graph::visits_overlap(va, vb, slack_nanos) {
+                        let moment = va.start_unix_nanos.max(vb.start_unix_nanos);
+                        first_co = Some(first_co.map_or(moment, |m| m.min(moment)));
+                        last_co = Some(last_co.map_or(moment, |m| m.max(moment)));
+                    }
+                }
+            }
+            // The pair came from co_present_pairs (an overlap exists), so these are Some; defensive fallback.
+            let first_t = first_co.unwrap_or(0);
+            let last_t = last_co.unwrap_or(first_t);
+            let prior = upsert_edge(
                 tx,
                 EdgeKind::CoPresent,
-                a,
-                b,
+                a.clone(),
+                b.clone(),
                 1,
-                t,
-                t,
+                first_t,
+                last_t,
                 None,
-                &[EvidenceSample { event_id: None, segment_id: None, t }],
+                &[EvidenceSample { event_id: None, segment_id: None, t: first_t }],
                 None,
                 None,
                 cfg_hash,
@@ -347,6 +386,62 @@ async fn drain_events(
             )
             .await?;
             stats.edges_upserted += 1;
+            // 0→1 this pass ⇒ a brand-new pairing → first_time_pairing candidate (maturity decided
+            // later in patterns::flag_edge_anomalies). A repeat (prior≥1, or a second device this
+            // pass) has prior≥1 and is not re-recorded. The anomaly is dated to first_t (first meeting).
+            if prior == 0 {
+                transitions.new_copresent.push((a, b, device.clone(), first_t));
+            }
+        }
+    }
+
+    // unknown_person_cluster (§1.6): a window on one device with ≥ GRAPH_ANOMALY_UNKNOWN_CLUSTER_MIN
+    // distinct UNKNOWN persons (display_name IS NULL) co-present. Batch-local like co_present. The
+    // "unknown" set is resolved once for this pass's person subjects (unknown = no display_name, the
+    // events_producer known/unknown rule).
+    let person_ids: Vec<String> = by_subject
+        .keys()
+        .filter(|(st, _)| st == "person")
+        .map(|(_, id)| id.to_string())
+        .collect();
+    if !person_ids.is_empty() && opts.cfg.anomaly_unknown_cluster_min >= 1 {
+        let unknown_ids: BTreeSet<String> = sqlx::query_scalar::<_, Uuid>(
+            "SELECT person_id FROM persons WHERE person_id = ANY($1::uuid[]) AND display_name IS NULL",
+        )
+        .bind(person_ids.iter().filter_map(|s| Uuid::parse_str(s).ok()).collect::<Vec<_>>())
+        .fetch_all(&mut **tx)
+        .await?
+        .into_iter()
+        .map(|u| u.to_string())
+        .collect();
+        for (device, visits) in &by_device {
+            // Only unknown-person visits, start-sorted (deterministic scan order).
+            let mut uv: Vec<&GraphVisit> = visits
+                .iter()
+                .filter(|v| v.node.node_type == NodeType::Person && unknown_ids.contains(&v.node.id))
+                .collect();
+            uv.sort_by(|a, b| a.start_unix_nanos.cmp(&b.start_unix_nanos).then_with(|| a.node.id.cmp(&b.node.id)));
+            let mut fired_days: BTreeSet<i64> = BTreeSet::new();
+            for anchor in &uv {
+                // Distinct unknown persons overlapping the anchor visit (includes the anchor).
+                let distinct: BTreeSet<&str> = uv
+                    .iter()
+                    .filter(|o| graph::visits_overlap(anchor, o, slack_nanos))
+                    .map(|o| o.node.id.as_str())
+                    .collect();
+                if graph::is_unknown_cluster(distinct.len(), &opts.cfg) {
+                    // One candidate per (device, civil day) — the emit dedups too, but recording once
+                    // keeps the reported count stable (the earliest-anchor window wins).
+                    let day = graph::civil_day(anchor.start_unix_nanos, opts.tz_offset_secs);
+                    if fired_days.insert(day) {
+                        transitions.unknown_clusters.push((
+                            device.clone(),
+                            anchor.start_unix_nanos,
+                            distinct.len() as i64,
+                        ));
+                    }
+                }
+            }
         }
     }
 
@@ -363,13 +458,14 @@ async fn drain_events(
                 continue;
             }
             if (plv.start_unix_nanos - pv.start_unix_nanos).abs() <= corr_nanos {
-                upsert_edge(
+                let t = pv.start_unix_nanos.min(plv.start_unix_nanos);
+                let prior = upsert_edge(
                     tx,
                     EdgeKind::ArrivedWithVehicle,
                     pv.node.clone(),
                     plv.node.clone(),
                     1,
-                    pv.start_unix_nanos.min(plv.start_unix_nanos),
+                    t,
                     pv.end_unix_nanos.max(plv.end_unix_nanos),
                     None,
                     &[(*plsample).clone()],
@@ -380,13 +476,23 @@ async fn drain_events(
                 )
                 .await?;
                 stats.edges_upserted += 1;
+                // 0→1 ⇒ a new person↔vehicle association → new_vehicle_for_person candidate (the
+                // "established OTHER vehicle" test is applied in patterns::flag_edge_anomalies).
+                if prior == 0 {
+                    transitions.new_vehicle.push((
+                        pv.node.clone(),
+                        plv.node.clone(),
+                        pv.device_id.clone(),
+                        t,
+                    ));
+                }
             }
         }
     }
 
     // Subjects touched this pass (drives the Wave-2 baseline recompute + anomaly judging).
     let touched: BTreeSet<(String, Uuid)> = by_subject.keys().cloned().collect();
-    Ok((new_wm, touched))
+    Ok((new_wm, touched, transitions))
 }
 
 /// Coalesce one subject's events into visits (interval-aware, same rule as
@@ -534,6 +640,10 @@ async fn drain_conversations(
 // Edge upsert (read-modify-write so evidence keeps its newest-N window deterministically)
 // ---------------------------------------------------------------------------------------------
 
+/// Upsert an edge (read-modify-write on evidence for a deterministic newest-N window). Returns the
+/// edge's PRIOR `observation_count` (0 when the row is new) — the 0→1 transition signal the Wave-2
+/// edge anomalies (`first_time_pairing`, `new_vehicle_for_person`) key on (§1.6). Callers that don't
+/// care simply drop the value.
 #[allow(clippy::too_many_arguments)]
 async fn upsert_edge(
     tx: &mut Transaction<'_, Postgres>,
@@ -549,7 +659,7 @@ async fn upsert_edge(
     metadata: Option<Value>,
     cfg_hash: &str,
     sample_cap: usize,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<i64> {
     // Read the existing evidence (FOR UPDATE) so the newest-N merge is race-free.
     let existing: Option<(Value, i64)> = sqlx::query_as(
         "SELECT evidence, observation_count FROM entity_edges \
@@ -564,6 +674,7 @@ async fn upsert_edge(
     .fetch_optional(&mut **tx)
     .await?;
 
+    let prior_count: i64 = existing.as_ref().map(|(_, c)| *c).unwrap_or(0);
     let prior_samples: Vec<EvidenceSample> = existing
         .as_ref()
         .and_then(|(v, _)| serde_json::from_value(v.clone()).ok())
@@ -604,7 +715,7 @@ async fn upsert_edge(
     .bind(cfg_hash)
     .execute(&mut **tx)
     .await?;
-    Ok(())
+    Ok(prior_count)
 }
 
 /// Upsert a binding candidate (`same_identity_candidate`), bumping the `together` counter and

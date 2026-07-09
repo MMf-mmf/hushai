@@ -223,3 +223,28 @@ if [[ -d "$G2_TRAIN/graph_baseline_rhythm" ]]; then
 else
   echo "[skip] graph G2 — no fixture dirs"
 fi
+
+# --- Gotham G2 first_time_pairing fixture (train) ------------------------------------------------
+# Two DISTINCT enrolled regulars (Judith→Alice, Sally→Bob) each staged 5× alone then once together;
+# the first co_present edge between two mature regulars fires first_time_pairing. Same face recipe as
+# F4-F6 so the pipeline output reproduces. Calibrated live + gate x2 → train. The deterministic
+# wiring proof is hushai-backend/tests/graph_db.rs.
+G2_PAIR="$ROOT/hushai-eval/fixtures/train"
+if [[ -d "$G2_PAIR/anomaly_first_pairing" ]]; then
+  jsrc="$CACHE/face_id.jpg"
+  bsrc="$CACHE/bob.jpg"
+  [[ -s "$jsrc" ]] || curl -fSL -m 180 -o "$jsrc" "https://commons.wikimedia.org/wiki/Special:FilePath/Judith%20A.%20Resnik,%20official%20portrait%20(cropped).jpg"
+  [[ -s "$bsrc" ]] || curl -fSL -m 180 -o "$bsrc" "https://commons.wikimedia.org/wiki/Special:FilePath/Sally_Ride_(1984).jpg"
+  kb_face_s() {
+    ffmpeg -y -loglevel error -loop 1 -i "$1" -f lavfi -i "anullsrc=r=16000:cl=mono" \
+      -vf "scale=2560:1440:force_original_aspect_ratio=increase,crop=2560:1440,zoompan=z='min(zoom+0.0008,1.3)':d=150:s=1280x720:fps=25,format=yuv420p" \
+      -t 6 -map 0:v -map 1:a -c:v libx264 -preset veryfast -pix_fmt yuv420p -c:a aac -shortest "$2"
+  }
+  mkdir -p "$G2_PAIR/anomaly_first_pairing/clips"
+  echo "[graph] G2 first_pairing alice_face.mp4 + bob_face.mp4"
+  kb_face_s "$jsrc" "$G2_PAIR/anomaly_first_pairing/clips/alice_face.mp4"
+  kb_face_s "$bsrc" "$G2_PAIR/anomaly_first_pairing/clips/bob_face.mp4"
+  echo "[done] regenerated Gotham G2 first_time_pairing fixture media"
+else
+  echo "[skip] graph G2 first_pairing — no train fixture dir"
+fi

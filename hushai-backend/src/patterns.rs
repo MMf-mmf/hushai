@@ -15,10 +15,13 @@
 //! post-commit: the alert evaluator lives in the worker crate and the backend cannot reach it, so
 //! the pass only PRODUCES the events + reports their ids (Gotham.md §1.6 / Phase D).
 //!
-//! WAVE-2 SCOPE: `off_schedule_presence` + the baseline recompute that feeds it — the Phase-D
-//! exemplar ("an off-schedule visit fires an alert rule end-to-end"). The other three predicates
-//! (`first_time_pairing`, `unknown_person_cluster`, `new_vehicle_for_person`) have pure cores in
-//! [`crate::graph`] already; wiring them is a documented follow-up.
+//! WAVE-2 SCOPE: all four §1.6 predicates. `off_schedule_presence` is judged per-subject AS-OF in
+//! [`recompute_and_flag`]; the three EDGE predicates — `first_time_pairing`, `new_vehicle_for_person`,
+//! `unknown_person_cluster` — are judged in [`flag_edge_anomalies`] over the 0→1 edge transitions +
+//! unknown-person clusters a pass observed (collected at drain time in
+//! [`crate::graph_pass::EdgeTransitions`], emitted here AFTER baselines are recomputed so endpoint
+//! maturity is available). All four emit ordinary `pattern_anomaly` `events` rows and ride the
+//! shipped A-pillar alert stack; `unknown_person_cluster` is DEVICE-keyed (no catalog subject).
 //!
 //! This file ALSO owns the G2 **daily digest** producer ([`build_and_upsert_digest`], Phase E): a
 //! deterministic structured summary of one civil day's activity (new entities, top visitors,
@@ -125,7 +128,7 @@ pub async fn recompute_and_flag(
                 if let Some(id) = emit_anomaly(
                     tx,
                     stype,
-                    *sid,
+                    Some(*sid),
                     label.as_deref(),
                     &v.device_id,
                     v.start_unix_nanos,
@@ -145,6 +148,153 @@ pub async fn recompute_and_flag(
         }
     }
     Ok(anomaly_ids)
+}
+
+/// Judge + emit the three EDGE anomalies over the 0→1 transitions a pass observed (§1.6). Runs INSIDE
+/// the pass transaction AFTER [`recompute_and_flag`], so endpoint baselines are fresh and the just-
+/// upserted edges are visible. Returns the genuinely-fresh anomaly event_ids (for the worker to
+/// alert-evaluate post-commit). Idempotent by the per-day dedup key: re-judging on a later pass (or a
+/// rebuild) inserts nothing.
+///
+/// - `first_time_pairing`: a `co_present` edge went 0→1 AND BOTH endpoints are established regulars
+///   (mature baselines). Emitted PER ENDPOINT (each subject gets its own row, dedup-keyed by that
+///   subject) so the assertion stays assignment-invariant — the edge's canonical `src`/`dst` split
+///   depends on minted-uuid ordering, which an eval must not depend on.
+/// - `new_vehicle_for_person`: an `arrived_with_vehicle` edge went 0→1 for a person who ALREADY has a
+///   different-plate edge whose `first_seen` predates it (Wave-2 reading of "established other
+///   vehicle": any prior different-vehicle association — no count threshold, so no new hashed knob).
+/// - `unknown_person_cluster`: a device window with ≥ the cluster minimum distinct unknown persons.
+///   Device-keyed (no single catalog subject): `subject_type='device'`, NULL `subject_id`, the device
+///   in `device_id`.
+pub async fn flag_edge_anomalies(
+    tx: &mut Transaction<'_, Postgres>,
+    cfg: &GraphCfg,
+    tz_offset_secs: i64,
+    transitions: &crate::graph_pass::EdgeTransitions,
+) -> anyhow::Result<Vec<Uuid>> {
+    let mut anomaly_ids: Vec<Uuid> = Vec::new();
+
+    // first_time_pairing — both endpoints must be mature regulars.
+    for (a, b, device, t) in &transitions.new_copresent {
+        let (Some(a_nt), Some(b_nt)) =
+            (NodeType::parse(a.node_type.as_str()), NodeType::parse(b.node_type.as_str()))
+        else {
+            continue;
+        };
+        let (Ok(a_id), Ok(b_id)) = (Uuid::parse_str(&a.id), Uuid::parse_str(&b.id)) else {
+            continue;
+        };
+        let a_mature = graph::baseline_mature(subject_visits(tx, a.node_type.as_str(), a_id).await?, cfg);
+        let b_mature = graph::baseline_mature(subject_visits(tx, b.node_type.as_str(), b_id).await?, cfg);
+        if !graph::is_first_time_pairing(0, a_mature, b_mature) {
+            continue;
+        }
+        let a_label = resolve_label(tx, a_nt, a_id).await?;
+        let b_label = resolve_label(tx, b_nt, b_id).await?;
+        let day = graph::civil_day(*t, tz_offset_secs);
+        for (nt, id, label, other) in [
+            (a_nt, a_id, &a_label, (b.node_type.as_str(), b_id, &b_label)),
+            (b_nt, b_id, &b_label, (a.node_type.as_str(), a_id, &a_label)),
+        ] {
+            let subject = format!("{}:{}", nt.as_str(), id);
+            let dedup = graph::anom_dedup_key(AnomalyKind::FirstTimePairing, &subject, &day.to_string());
+            let meta = json!({
+                "kind": AnomalyKind::FirstTimePairing.as_str(),
+                "counterpart": { "type": other.0, "id": other.1.to_string(), "label": other.2 },
+            });
+            if let Some(eid) =
+                emit_anomaly(tx, nt.as_str(), Some(id), label.as_deref(), device, *t, *t, &dedup, &meta)
+                    .await?
+            {
+                anomaly_ids.push(eid);
+            }
+        }
+    }
+
+    // new_vehicle_for_person — a new plate for a person with a prior different-vehicle association.
+    for (person, plate, device, t) in &transitions.new_vehicle {
+        let (Ok(person_id), Ok(plate_id)) = (Uuid::parse_str(&person.id), Uuid::parse_str(&plate.id))
+        else {
+            continue;
+        };
+        // "Established OTHER vehicle": a different-plate arrived_with_vehicle edge whose first_seen
+        // predates this one (the just-upserted new edge has first_seen == t).
+        let has_other: Option<i32> = sqlx::query_scalar(
+            "SELECT 1 FROM entity_edges \
+             WHERE edge_type = 'arrived_with_vehicle' AND src_type = 'person' AND src_id = $1 \
+               AND NOT (dst_type = 'plate' AND dst_id = $2) \
+               AND first_seen_unix_nanos IS NOT NULL AND first_seen_unix_nanos < $3 \
+             LIMIT 1",
+        )
+        .bind(&person.id)
+        .bind(&plate.id)
+        .bind(*t)
+        .fetch_optional(&mut **tx)
+        .await?;
+        if !graph::is_new_vehicle_for_person(true, has_other.is_some()) {
+            continue;
+        }
+        let plate_label = resolve_label(tx, NodeType::Plate, plate_id).await?;
+        let person_label = resolve_label(tx, NodeType::Person, person_id).await?;
+        let day = graph::civil_day(*t, tz_offset_secs);
+        let subject = format!("person:{person_id}");
+        let dedup = graph::anom_dedup_key(AnomalyKind::NewVehicleForPerson, &subject, &day.to_string());
+        let meta = json!({
+            "kind": AnomalyKind::NewVehicleForPerson.as_str(),
+            "new_plate": { "type": "plate", "id": plate.id, "label": plate_label },
+        });
+        if let Some(eid) = emit_anomaly(
+            tx,
+            "person",
+            Some(person_id),
+            person_label.as_deref(),
+            device,
+            *t,
+            *t,
+            &dedup,
+            &meta,
+        )
+        .await?
+        {
+            anomaly_ids.push(eid);
+        }
+    }
+
+    // unknown_person_cluster — device-keyed (no catalog subject).
+    for (device, t, count) in &transitions.unknown_clusters {
+        let day = graph::civil_day(*t, tz_offset_secs);
+        let subject = format!("device:{device}");
+        let dedup = graph::anom_dedup_key(AnomalyKind::UnknownPersonCluster, &subject, &day.to_string());
+        let meta = json!({
+            "kind": AnomalyKind::UnknownPersonCluster.as_str(),
+            "distinct_unknown": count,
+        });
+        if let Some(eid) =
+            emit_anomaly(tx, "device", None, None, device, *t, *t, &dedup, &meta).await?
+        {
+            anomaly_ids.push(eid);
+        }
+    }
+
+    Ok(anomaly_ids)
+}
+
+/// The subject's recomputed `entity_baselines.visits_in_window` (0 when no row yet) — the maturity
+/// input for the edge anomalies. Read from the table (not the in-memory recompute) so an endpoint
+/// established on a PRIOR pass (incremental worker) is still seen as mature.
+async fn subject_visits(
+    tx: &mut Transaction<'_, Postgres>,
+    subject_type: &str,
+    id: Uuid,
+) -> anyhow::Result<i64> {
+    let v: Option<i32> = sqlx::query_scalar(
+        "SELECT visits_in_window FROM entity_baselines WHERE subject_type = $1 AND subject_id = $2",
+    )
+    .bind(subject_type)
+    .bind(id)
+    .fetch_optional(&mut **tx)
+    .await?;
+    Ok(v.unwrap_or(0) as i64)
 }
 
 /// Coalesce `(device, start, end)` tuples into per-device visits (gap-merged, same rule as the edge
@@ -264,7 +414,7 @@ async fn resolve_label(
 async fn emit_anomaly(
     tx: &mut Transaction<'_, Postgres>,
     subject_type: &str,
-    subject_id: Uuid,
+    subject_id: Option<Uuid>,
     subject_label: Option<&str>,
     device_id: &str,
     start_ns: i64,

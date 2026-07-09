@@ -1,0 +1,15 @@
+{
+  "graph": {
+    "entities": [
+      { "kind": "person", "name": "Alice" },
+      { "kind": "person", "name": "Bob" }
+    ],
+    "edges": [
+      { "from": { "kind": "person", "name": "Alice" }, "to": { "kind": "person", "name": "Bob" }, "kind": "co_present", "min_evidence": 1 }
+    ],
+    "anomalies": [
+      { "subject": { "kind": "person", "name": "Alice" }, "kind": "first_time_pairing" },
+      { "subject": { "kind": "person", "name": "Bob" }, "kind": "first_time_pairing" }
+    ]
+  }
+}

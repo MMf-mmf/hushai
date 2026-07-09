@@ -784,6 +784,7 @@ mod tests {
             ("train", "graph_baseline_rhythm"),
             ("train", "anomaly_novel_time"),
             ("train", "briefing_daily"),
+            ("train", "anomaly_first_pairing"),
             ("holdout", "anomaly_negatives"),
         ];
         for (split, case) in cases {

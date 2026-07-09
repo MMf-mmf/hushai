@@ -377,8 +377,17 @@ dropped — **media is ALWAYS stored regardless of gating.**
   running prior histogram), so first appearances (incl. the enrollment clip an hour before a case)
   never fire — only a later rhythm violation does. The drain queries EXCLUDE
   `pattern_anomaly`/`gotham_briefing` so the graph never folds its own output. Eval: `expect_anomaly`
-  /`expect_no_anomaly`/`expect_baseline` on the graph modality; F4/F5/F6 gate under `d4acc862`. Only
-  `off_schedule_presence` is wired (the Phase-D exemplar); the other three predicates are follow-ups.
+  /`expect_no_anomaly`/`expect_baseline` on the graph modality; F4/F5/F6 gate under `d4acc862`.
+  **ALL FOUR predicates are now wired.** `off_schedule_presence` is per-subject AS-OF in
+  `recompute_and_flag`; the three EDGE predicates — `first_time_pairing`, `new_vehicle_for_person`,
+  `unknown_person_cluster` — are judged in `patterns::flag_edge_anomalies` over the 0→1 edge
+  transitions + unknown clusters a pass observes (collected at drain time in `graph_pass::EdgeTransitions`;
+  `upsert_edge` returns the prior `observation_count`), emitted AFTER the baseline recompute so endpoint
+  maturity (read from the `entity_baselines` table) is available for the rebuild AND the incremental
+  worker. `first_time_pairing` is emitted per-endpoint (assignment-invariant); `unknown_person_cluster`
+  is DEVICE-keyed (`subject_type='device'`, NULL `subject_id`). NO new `GraphCfg` field was added, so
+  `config_hash` stays `d4acc862` and F1–F7 baselines are untouched. Proof: `tests/graph_db.rs`
+  (deterministic, all three) + `anomaly_first_pairing` (train fixture, live gate ×2).
 - **Wave-2 / G2 daily digest (PR5, Phase E):** `patterns::build_and_upsert_digest` materializes one
   civil day's `daily_digests` row — deterministic `sections` jsonb (`new_entities`, `top_visitors`,
   `anomalies`, `conversations`, `first_time_pairings`, `journeys` + a `counts` sub-object) and a

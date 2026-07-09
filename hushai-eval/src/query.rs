@@ -58,11 +58,13 @@ pub struct EdgeObs {
 }
 
 /// One `pattern_anomaly` event (Gotham G2), reduced to what an assertion needs: which subject and
-/// which anomaly kind (`metadata.kind`). `subject_id` is the stringified catalog UUID.
+/// which anomaly kind (`metadata.kind`). `subject_id` is the stringified catalog UUID; `device_id`
+/// is set for device-keyed anomalies (`unknown_person_cluster`) which carry NO catalog subject.
 #[derive(Debug, Clone)]
 pub struct AnomalyObs {
     pub subject_type: Option<String>,
     pub subject_id: Option<String>,
+    pub device_id: Option<String>,
     pub kind: Option<String>,
 }
 
@@ -321,17 +323,19 @@ pub async fn observe(
         }
 
         // Pattern anomalies (Gotham G2) — ordinary events rows, unwindowed (the fold is
-        // capture-anchored; assertions resolve the subject by enrolled name → id + metadata.kind).
-        o.anomalies = sqlx::query_as::<_, (Option<String>, Option<Uuid>, Option<String>)>(
-            "SELECT subject_type, subject_id, metadata->>'kind' AS kind \
+        // capture-anchored; assertions resolve the subject by enrolled name → id + metadata.kind, or
+        // by device_id for the device-keyed unknown_person_cluster).
+        o.anomalies = sqlx::query_as::<_, (Option<String>, Option<Uuid>, Option<String>, Option<String>)>(
+            "SELECT subject_type, subject_id, device_id, metadata->>'kind' AS kind \
              FROM events WHERE event_type = 'pattern_anomaly'",
         )
         .fetch_all(&ctx.pool)
         .await?
         .into_iter()
-        .map(|(subject_type, subject_id, kind)| AnomalyObs {
+        .map(|(subject_type, subject_id, device_id, kind)| AnomalyObs {
             subject_type,
             subject_id: subject_id.map(|u| u.to_string()),
+            device_id,
             kind,
         })
         .collect();

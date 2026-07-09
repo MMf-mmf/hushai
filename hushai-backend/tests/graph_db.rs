@@ -109,6 +109,21 @@ async fn anomaly_present(pool: &PgPool, subject: Uuid, kind: &str) -> bool {
     row.is_some()
 }
 
+/// True when a device-keyed `pattern_anomaly` of `kind` exists (Gotham G2 unknown_person_cluster:
+/// no catalog subject, matched by `device_id`).
+async fn device_anomaly_present(pool: &PgPool, device: &str, kind: &str) -> bool {
+    let row = sqlx::query(
+        "SELECT 1 AS ok FROM events \
+         WHERE event_type = 'pattern_anomaly' AND subject_type = 'device' AND subject_id IS NULL \
+           AND device_id = $1 AND metadata->>'kind' = $2 LIMIT 1",
+    )
+    .bind(device).bind(kind)
+    .fetch_optional(pool)
+    .await
+    .unwrap();
+    row.is_some()
+}
+
 /// A subject's recomputed `entity_baselines.visits_in_window` (Gotham G2), if the row exists.
 async fn baseline_visits(pool: &PgPool, subject: Uuid) -> Option<i64> {
     let row = sqlx::query("SELECT visits_in_window FROM entity_baselines WHERE subject_id = $1")
@@ -132,7 +147,7 @@ async fn rebuild_correlates_cross_subject_edges_in_one_batch() {
     // respects the events→devices FK.
     sqlx::query("DELETE FROM events WHERE device_id LIKE 'graphtest-%'").execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM conversations WHERE primary_device_id LIKE 'graphtest-%'").execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM license_plates WHERE plate_text_norm = 'EMD774'").execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM license_plates WHERE plate_text_norm IN ('EMD774','GTAAA','GTBBB')").execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM devices WHERE device_id LIKE 'graphtest-%'").execute(&pool).await.unwrap();
 
     let device = format!("graphtest-{}", Uuid::now_v7());
@@ -143,15 +158,30 @@ async fn rebuild_correlates_cross_subject_edges_in_one_batch() {
     let dave = Uuid::now_v7(); // person for the voice↔face binding scenario
     let dave_spk = Uuid::now_v7(); // his speaker
     let erin = Uuid::now_v7(); // person for the G2 baseline / off_schedule scenario
+    // Wave-2 edge-anomaly scenarios (named ⇒ NOT "unknown"; time-isolated on the same device).
+    let frank = Uuid::now_v7(); // first_time_pairing: mature regular A
+    let gwen = Uuid::now_v7(); // first_time_pairing: mature regular B
+    let heidi = Uuid::now_v7(); // new_vehicle_for_person: a person with two plates
+    let plate_a = Uuid::now_v7(); // heidi's established vehicle
+    let plate_b = Uuid::now_v7(); // heidi's NEW vehicle
+    let unk = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()]; // unknown_person_cluster: 3 anon faces
     let base = now_ns() - 10 * 86_400 * SEC; // ~10 days ago: safely past the drain's slack guard.
 
     sqlx::query("INSERT INTO devices (device_id, source_kind) VALUES ($1,'test') ON CONFLICT DO NOTHING")
         .bind(&device).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO persons (person_id) VALUES ($1),($2),($3),($4),($5)")
         .bind(alice).bind(bob).bind(carol).bind(dave).bind(erin).execute(&pool).await.unwrap();
+    // Named persons for the pairing / vehicle scenarios (display_name set ⇒ excluded from the unknown
+    // cluster). The three `unk` persons stay display_name NULL ⇒ they ARE the unknown cluster.
+    sqlx::query("INSERT INTO persons (person_id, display_name) VALUES ($1,'Frank'),($2,'Gwen'),($3,'Heidi')")
+        .bind(frank).bind(gwen).bind(heidi).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO persons (person_id) VALUES ($1),($2),($3)")
+        .bind(unk[0]).bind(unk[1]).bind(unk[2]).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO speakers (speaker_id) VALUES ($1)").bind(dave_spk).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO license_plates (plate_id, plate_text, plate_text_norm) VALUES ($1,'EMD 774','EMD774')")
         .bind(plate).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO license_plates (plate_id, plate_text, plate_text_norm) VALUES ($1,'GT AAA','GTAAA'),($2,'GT BBB','GTBBB')")
+        .bind(plate_a).bind(plate_b).execute(&pool).await.unwrap();
 
     // Timeline (one device): Alice arrives with the plate TWICE (two visits, >slack apart), Bob once,
     // Carol overlaps Alice's first visit. Plate co-sighted with each within the 180s vehicle window.
@@ -186,6 +216,39 @@ async fn rebuild_correlates_cross_subject_edges_in_one_batch() {
     }
     let outlier = base_e + 29 * 86_400 * SEC; // a later, different-weekday bucket (rhythm established)
     seed_event(&pool, &device, "person", erin, outlier, outlier + 12 * SEC).await;
+
+    // --- Wave-2 EDGE anomalies (all time-isolated on `device`, ~150-200 days back) ---------------
+    // first_time_pairing: Frank + Gwen each visit 5× ALONE (mature, ≥ GRAPH_ANOMALY_MIN_VISITS=5),
+    // NON-overlapping (6h apart) so they don't co-occur until BOTH are established; then ONE
+    // overlapping co-visit forms the first co_present edge (0→1) between two mature regulars → a
+    // first_time_pairing anomaly fires for EACH endpoint. (off_schedule may also co-fire on the
+    // novel-weekday co-day; it is not asserted here — only the pairing is.)
+    let base_pair = now_ns() - 200 * 86_400 * SEC;
+    for k in 0..5i64 {
+        let tf = base_pair + k * 86_400 * SEC; // Frank, day k @ 00:00
+        seed_event(&pool, &device, "person", frank, tf, tf + 2 * SEC).await;
+        let tg = base_pair + k * 86_400 * SEC + 6 * 3600 * SEC; // Gwen, day k @ 06:00 (no overlap)
+        seed_event(&pool, &device, "person", gwen, tg, tg + 2 * SEC).await;
+    }
+    let co = base_pair + 5 * 86_400 * SEC; // day 5: Frank + Gwen overlap → first co_present
+    seed_event(&pool, &device, "person", frank, co, co + 2 * SEC).await;
+    seed_event(&pool, &device, "person", gwen, co, co + 2 * SEC).await;
+
+    // new_vehicle_for_person: Heidi arrives with plate_a (t0), then LATER with plate_b (t1). At t1 she
+    // already has an established DIFFERENT-plate edge (plate_a, first_seen < t1) → new_vehicle fires
+    // for the plate_b arrival. (No person-maturity requirement for this predicate.)
+    let base_veh = now_ns() - 150 * 86_400 * SEC;
+    seed_event(&pool, &device, "person", heidi, base_veh, base_veh + 2 * SEC).await;
+    seed_event(&pool, &device, "plate", plate_a, base_veh + 30 * SEC, base_veh + 32 * SEC).await;
+    seed_event(&pool, &device, "person", heidi, base_veh + 3600 * SEC, base_veh + 3602 * SEC).await;
+    seed_event(&pool, &device, "plate", plate_b, base_veh + 3630 * SEC, base_veh + 3632 * SEC).await;
+
+    // unknown_person_cluster: 3 distinct UNKNOWN persons (display_name NULL) overlap in one window on
+    // one device → a device-keyed unknown_person_cluster anomaly (≥ GRAPH_ANOMALY_UNKNOWN_CLUSTER_MIN=3).
+    let base_clu = now_ns() - 180 * 86_400 * SEC;
+    for u in &unk {
+        seed_event(&pool, &device, "person", *u, base_clu, base_clu + 4 * SEC).await;
+    }
 
     // One authoritative fold of the WHOLE scenario: grace 0 (fresh events eligible) + a huge budget
     // so everything drains in ONE batch (so cross-subject visits co-occur — the fix under test).
@@ -251,6 +314,38 @@ async fn rebuild_correlates_cross_subject_edges_in_one_batch() {
         "Alice's immature 2-visit baseline must NOT fire off_schedule (visits < GRAPH_ANOMALY_MIN_VISITS)"
     );
 
+    // G2 EDGE anomalies (the three Wave-2 predicates beyond off_schedule).
+    // first_time_pairing: the first co_present between two MATURE regulars fires for BOTH endpoints.
+    assert!(
+        anomaly_present(&pool, frank, "first_time_pairing").await,
+        "Frank (mature) meeting Gwen (mature) for the first time fires first_time_pairing"
+    );
+    assert!(
+        anomaly_present(&pool, gwen, "first_time_pairing").await,
+        "first_time_pairing is emitted per-endpoint — Gwen gets her own row too"
+    );
+    // Negative: a mature-vs-immature or single co-sighting must not fire it. Alice+Carol overlap once
+    // and are immature (2 and 1 visits) → no first_time_pairing.
+    assert!(
+        !anomaly_present(&pool, alice, "first_time_pairing").await,
+        "Alice's co-presence with Carol is between IMMATURE subjects → no first_time_pairing"
+    );
+    // new_vehicle_for_person: Heidi's SECOND, different plate fires exactly one anomaly for her.
+    assert!(
+        anomaly_present(&pool, heidi, "new_vehicle_for_person").await,
+        "Heidi arriving with plate_b after an established plate_a fires new_vehicle_for_person"
+    );
+    // Negative: a person with a SINGLE vehicle never fires it (Alice → one plate only).
+    assert!(
+        !anomaly_present(&pool, alice, "new_vehicle_for_person").await,
+        "Alice has only one vehicle → no new_vehicle_for_person"
+    );
+    // unknown_person_cluster: 3 anonymous faces co-present on one device → one device-keyed anomaly.
+    assert!(
+        device_anomaly_present(&pool, &device, "unknown_person_cluster").await,
+        "3 distinct unknown persons co-present on one device fire unknown_person_cluster (device-keyed)"
+    );
+
     // G2 Phase E: the daily digest for Erin's OUTLIER civil day surfaces exactly that anomaly and
     // nothing spurious. The outlier is temporally isolated (base_e + 29d = 1 day after her last
     // regular, 61d back), so that day holds ONLY her lone off-hours visit: 1 anomaly, 0 new entities
@@ -278,16 +373,26 @@ async fn rebuild_correlates_cross_subject_edges_in_one_batch() {
     );
 
     // cleanup (device-namespaced + our catalog ids; entity_edges is derived/global — drop ours).
+    let all_persons = vec![alice, bob, carol, dave, erin, frank, gwen, heidi, unk[0], unk[1], unk[2]];
+    let edge_ids: Vec<String> = [
+        alice, bob, carol, dave, erin, frank, gwen, heidi, plate, plate_a, plate_b, unk[0], unk[1],
+        unk[2], dave_spk,
+    ]
+    .iter()
+    .map(|u| u.to_string())
+    .chain(std::iter::once(device.clone()))
+    .collect();
     sqlx::query("DELETE FROM daily_digests WHERE digest_date = $1::date").bind(&digest_date).execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM entity_edges WHERE src_id = ANY($1) OR dst_id = ANY($1)")
-        .bind(vec![a, b, c, p, d, ds, device.clone()]).execute(&pool).await.unwrap();
+        .bind(&edge_ids).execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM conversations WHERE primary_device_id = $1").bind(&device).execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM events WHERE device_id = $1").bind(&device).execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM entity_baselines WHERE subject_id = ANY($1)")
-        .bind(vec![alice, bob, carol, dave, erin]).execute(&pool).await.unwrap();
+        .bind(&all_persons).execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM persons WHERE person_id = ANY($1)")
-        .bind(vec![alice, bob, carol, dave, erin]).execute(&pool).await.unwrap();
+        .bind(&all_persons).execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM speakers WHERE speaker_id = $1").bind(dave_spk).execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM license_plates WHERE plate_id = $1").bind(plate).execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM license_plates WHERE plate_id = ANY($1)")
+        .bind(vec![plate, plate_a, plate_b]).execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM devices WHERE device_id = $1").bind(&device).execute(&pool).await.unwrap();
 }

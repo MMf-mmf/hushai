@@ -802,12 +802,18 @@ fn score_graph(gt: &GraphGt, obs: &Observed) -> Vec<Metric> {
     out
 }
 
-/// True when a `pattern_anomaly` of `kind` exists for `(subject_kind, subject_id)`.
+/// True when a `pattern_anomaly` of `kind` exists for `(subject_kind, subject_id)`. Device-keyed
+/// anomalies (`unknown_person_cluster`) carry NO catalog subject, so a `device` ref matches on the
+/// anomaly's `device_id` (the resolved id for a device ref IS its literal `device_id`).
 fn anomaly_present(obs: &Observed, subject_kind: &str, subject_id: &str, kind: &str) -> bool {
     obs.anomalies.iter().any(|a| {
         a.subject_type.as_deref() == Some(subject_kind)
-            && a.subject_id.as_deref() == Some(subject_id)
             && a.kind.as_deref() == Some(kind)
+            && if subject_kind == "device" {
+                a.device_id.as_deref() == Some(subject_id)
+            } else {
+                a.subject_id.as_deref() == Some(subject_id)
+            }
     })
 }
 
@@ -1868,6 +1874,17 @@ mod graph_tests {
         crate::query::AnomalyObs {
             subject_type: Some("person".into()),
             subject_id: Some("A".into()), // Alice (person) resolves to "A" in obs_with
+            device_id: None,
+            kind: Some(kind.into()),
+        }
+    }
+
+    /// A device-keyed anomaly (`unknown_person_cluster`) — no catalog subject, matched by device_id.
+    fn anom_device(kind: &str, device: &str) -> crate::query::AnomalyObs {
+        crate::query::AnomalyObs {
+            subject_type: Some("device".into()),
+            subject_id: None,
+            device_id: Some(device.into()),
             kind: Some(kind.into()),
         }
     }
@@ -1899,6 +1916,30 @@ mod graph_tests {
         let ms = score_graph(&gt, &o);
         assert!(!find(&ms, "graph.no_anomaly.off_schedule_presence.alice").floor_ok);
         assert!(find(&ms, "graph.no_anomaly.first_time_pairing.alice").floor_ok);
+    }
+
+    #[test]
+    fn device_keyed_unknown_cluster_anomaly_matches_by_device_id() {
+        let mut o = obs_with(vec![]);
+        o.anomalies = vec![anom_device("unknown_person_cluster", "eval-cluster")];
+        // A device ref resolves to its literal id and matches on device_id.
+        let gt = GraphGt {
+            anomalies: vec![AnomalyExpect {
+                subject: eref("device", "eval-cluster"),
+                kind: "unknown_person_cluster".into(),
+            }],
+            ..Default::default()
+        };
+        assert!(find(&score_graph(&gt, &o), "graph.anomaly.unknown_person_cluster.eval_cluster").floor_ok);
+        // A different device id must NOT match.
+        let gt = GraphGt {
+            anomalies: vec![AnomalyExpect {
+                subject: eref("device", "eval-other"),
+                kind: "unknown_person_cluster".into(),
+            }],
+            ..Default::default()
+        };
+        assert!(!find(&score_graph(&gt, &o), "graph.anomaly.unknown_person_cluster.eval_other").floor_ok);
     }
 
     #[test]

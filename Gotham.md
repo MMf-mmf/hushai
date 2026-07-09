@@ -104,7 +104,7 @@ Dependency order: **G1 → {G2, G5}**; **G3** starts in parallel with G1 (existi
 ### G2 — Baselines, anomalies, daily briefing
 - [x] Migration 0029 (`entity_baselines`, `daily_digests`) — shipped in Wave 1
 - [x] `patterns.rs` — baseline recompute + anomaly predicates ✅ (PR4); **daily-digest producer ✅ (PR5)**
-- [x] Anomalies emitted as ordinary `events` rows (`event_type='pattern_anomaly'`) → ride the A1–A7 stack with zero new alert plumbing. **AS-OF `off_schedule_presence`** wired (each visit judged vs the subject's strictly-earlier visits — the incremental model); baselines recomputed per touched subject in the graph pass; the worker alert-evaluates fresh anomalies post-commit (the evaluator is worker-crate). The other three predicates have pure cores in `graph.rs`; wiring them is a follow-up.
+- [x] Anomalies emitted as ordinary `events` rows (`event_type='pattern_anomaly'`) → ride the A1–A7 stack with zero new alert plumbing. **ALL FOUR predicates now wired.** **AS-OF `off_schedule_presence`** (each visit judged vs the subject's strictly-earlier visits — the incremental model), plus the three EDGE predicates — **`first_time_pairing`** (a `co_present` edge 0→1 between two mature regulars, emitted per-endpoint so assertions stay assignment-invariant), **`new_vehicle_for_person`** (an `arrived_with_vehicle` 0→1 for a person with a prior different-plate edge), **`unknown_person_cluster`** (≥ `GRAPH_ANOMALY_UNKNOWN_CLUSTER_MIN` distinct unknown persons co-present in one device window — DEVICE-keyed, no catalog subject). The edge predicates key off the 0→1 transitions collected at drain time (`graph_pass::EdgeTransitions`) and are judged in `patterns::flag_edge_anomalies` AFTER the baseline recompute so endpoint maturity is available (for the rebuild AND the incremental worker). Baselines recomputed per touched subject in the graph pass; the worker alert-evaluates fresh anomalies post-commit (the evaluator is worker-crate). **No new `GraphCfg`/hashed knob** (reuses `anomaly_min_visits` / `anomaly_unknown_cluster_min`; "established other vehicle" = any prior different-plate edge that predates), so `config_hash` stays `d4acc862` and F1–F7 baselines are untouched. Deterministic wiring proof: `hushai-backend/tests/graph_db.rs`; E2E-through-perception fixture `anomaly_first_pairing` (staging).
 - [x] Digest producer + endpoints + fixtures F4–F7 — **ALL CALIBRATED live (gate ×2, frozen `d4acc862`)**. PR4: F4 `graph_baseline_rhythm` (baseline visits≥5 peak-hour 09, no anomaly), F5 `anomaly_novel_time` (off_schedule fires), F6 `anomaly_negatives` (sealed holdout, no over-fire). **PR5: `patterns::build_and_upsert_digest` (deterministic `sections` + template `rendered_text`, NO LLM), `POST /v1/graph/digests/{date}` force-generate + worker-0 wall-clock driver (`GRAPH_DIGEST_HOUR_LOCAL`, non-hashed), F7 `briefing_daily` (pinned-date structured `sections` — 8/8 assertions gate ×2).**
 
 **Shipped means**: an off-schedule visit fires an alert rule end-to-end; the briefing endpoint returns byte-stable structured facts for a *pinned* date; sealed anomaly-negative fixture green.
@@ -360,12 +360,12 @@ Advisory lock: `GRAPH_LOCK_KEY: i64 = 0x6867_7270_68` ("hgrph") — distinct fro
 
 **Anomalies are ordinary `events` rows** — `event_type='pattern_anomaly'`, `severity='warning'`, `metadata.kind`, idempotent `dedup_key = "anom:<kind>:<subject>:<bucket>"`. The 0014 event-type vocabulary is code-validated free text — no migration needed — and the entire A-pillar (rules matching, cooldowns, feed, webhook HMAC, Android push) carries them for free. Predicates (deterministic, gated on baseline maturity `visits_in_window ≥ GRAPH_ANOMALY_MIN_VISITS`):
 
-| kind | Fires when |
-|---|---|
-| `first_time_pairing` | `co_present` edge transitions 0→1 observations and BOTH entities are established regulars |
-| `off_schedule_presence` | visit lands in an hour-of-week bucket holding < `GRAPH_ANOMALY_HOUR_MIN_FRAC` of the subject's histogram mass |
-| `unknown_person_cluster` | ≥ `GRAPH_ANOMALY_UNKNOWN_CLUSTER_MIN` distinct unknown-person subjects co-present in one window on one device |
-| `new_vehicle_for_person` | new `arrived_with_vehicle` edge for a person with an established different vehicle edge |
+| kind | Fires when | Wave-2 status |
+|---|---|---|
+| `first_time_pairing` | `co_present` edge transitions 0→1 observations and BOTH entities are established regulars (mature baselines) | ✅ wired (`flag_edge_anomalies`, emitted per-endpoint; keyed by each subject) |
+| `off_schedule_presence` | visit lands in an hour-of-week bucket holding < `GRAPH_ANOMALY_HOUR_MIN_FRAC` of the subject's histogram mass | ✅ wired (`recompute_and_flag`, AS-OF) |
+| `unknown_person_cluster` | ≥ `GRAPH_ANOMALY_UNKNOWN_CLUSTER_MIN` distinct unknown-person subjects co-present in one window on one device | ✅ wired (`flag_edge_anomalies`, DEVICE-keyed — no catalog subject) |
+| `new_vehicle_for_person` | new `arrived_with_vehicle` edge for a person with an established different vehicle edge (Wave-2: any prior different-plate edge that predates — no count-threshold knob) | ✅ wired (`flag_edge_anomalies`, keyed by the person) |
 
 **Daily digest**: produced by `patterns.rs` in the worker-0 driver once wall clock passes `GRAPH_DIGEST_HOUR_LOCAL` and no row exists for yesterday's local date (idempotent by PK). `sections` jsonb: `{"new_entities":[...], "anomalies":[...], "top_visitors":[...], "conversations":{"count":N,..}, "first_time_pairings":[...], "journeys":[...]}`. `rendered_text` is a deterministic template render. The LLM narrates at read time (RAG/G3) — never at write time. The digest endpoint takes an explicit `date` parameter (bare form defaults to today for humans; **fixtures always pass the date** — eval invariant 3).
 
@@ -770,7 +770,7 @@ Executed after each wave's implementation; fenced commands + bold PASS criteria 
 | A | Build + clippy + unit totals (eval 30, graph 12, graph_db integration 1) | ✅ |
 | B | Graph API + auth (401) + rebuild determinism (identical edge set) | ✅ |
 | C | Graph fixtures F1–F3 ×2 (+ G2 F4/F5/F6 ×2, frozen `d4acc862`) | ✅ |
-| D | Anomaly detection + emission (F4/F5/F6 live ×2 + `graph_db` guard); alert-DELIVERY E2E (rule→feed/webhook) via the worker path | ◑ (detection ✅; delivery pending) |
+| D | Anomaly detection + emission — ALL FOUR predicates (`off_schedule_presence` F4/F5/F6 live ×2; `first_time_pairing`/`new_vehicle_for_person`/`unknown_person_cluster` via `graph_db` guard + `anomaly_first_pairing` staging fixture); alert-DELIVERY E2E (rule→feed/webhook) via the worker path | ◑ (detection ✅ all 4; delivery pending) |
 | E | Briefing byte-stable + F7 (`briefing_daily` 8/8 gate ×2, `d4acc862`; `graph_db` outlier-day digest guard) | ✅ |
 | F | Agent staging F8–F11 ×2 + cap + kill-switch + fallback | ⬜ |
 | G | Viewer investigation UX + e2e | ⬜ |
