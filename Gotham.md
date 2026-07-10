@@ -770,7 +770,7 @@ Executed after each wave's implementation; fenced commands + bold PASS criteria 
 | A | Build + clippy + unit totals (eval 30, graph 12, graph_db integration 1) | ✅ |
 | B | Graph API + auth (401) + rebuild determinism (identical edge set) | ✅ |
 | C | Graph fixtures F1–F3 ×2 (+ G2 F4/F5/F6 ×2, frozen `d4acc862`) | ✅ |
-| D | Anomaly detection + emission — ALL FOUR predicates (`off_schedule_presence` F4/F5/F6 live ×2; `first_time_pairing`/`new_vehicle_for_person`/`unknown_person_cluster` via `graph_db` guard + `anomaly_first_pairing` staging fixture); alert-DELIVERY E2E (rule→feed/webhook) via the worker path | ◑ (detection ✅ all 4; delivery pending) |
+| D | Anomaly detection + emission — ALL FOUR predicates (`off_schedule_presence` F4/F5/F6 live ×2; `first_time_pairing`/`new_vehicle_for_person`/`unknown_person_cluster` via `graph_db` guard + `anomaly_first_pairing` staging fixture); alert-DELIVERY E2E (rule→feed+webhook, HMAC intact + negatives) via `hushai-worker/tests/alert_anomaly_delivery.rs` (real PG + real POST) | ✅ |
 | E | Briefing byte-stable + F7 (`briefing_daily` 8/8 gate ×2, `d4acc862`; `graph_db` outlier-day digest guard) | ✅ |
 | F | Agent staging F8–F11 ×2 + cap + kill-switch + fallback | ⬜ |
 | G | Viewer investigation UX + e2e | ⬜ |
@@ -794,7 +794,7 @@ Executed after each wave's implementation; fenced commands + bold PASS criteria 
 1. **Migrations 0028–0030 + `graph.rs` pure core** — schema, deterministic derivation, unit tests, `migrations/README.md` rows. No consumers; smallest reviewable unit.
 2. **`graph_pass.rs` + worker-0 driver + `/v1/graph/*` read API** — merge/delete hooks, metrics, proxy route, AGENTS.md component row + this spec cross-linked.
 3. **Eval `graph` modality + F1–F3 + baselines** — makes Phases B/C executable.
-4. **Baselines/anomalies → events integration + F4–F6** — Phase D.
+4. **Baselines/anomalies → events integration + F4–F6** — Phase D. ✅ LANDED, incl. alert-DELIVERY E2E: `hushai-worker/tests/alert_anomaly_delivery.rs` proves `pattern_anomaly` event → `alerts::evaluate` (feed + webhook rows) → `delivery::run_once` (webhook sent + valid `X-Hushai-Signature` HMAC; feed left in-app) + negatives (wrong type / below-floor severity fire nothing). Gated on `DATABASE_URL`.
 5. **Digest + endpoints + F7** — Phase E. ✅ LANDED: `patterns::build_and_upsert_digest` (deterministic `sections`/`rendered_text`, no LLM), `POST /v1/graph/digests/{date}` force-generate + worker-0 wall-clock driver (`GRAPH_DIGEST_HOUR_LOCAL`), eval `expect_briefing` (`BriefingGt` counts + mentions), F7 `briefing_daily` gate ×2 under `d4acc862`.
 6. **`gotham/` module + rig runtime + probe + migration 0031 + slash row + AGENTS.md:386 correction + rig pin** — the G3 skeleton, read-only tools 1–14.
 7. **Eval `agent` modality + F8–F11** — Phase F.
