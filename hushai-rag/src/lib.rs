@@ -13,6 +13,7 @@ pub mod clip_text;
 pub mod config;
 pub mod context;
 pub mod embed;
+pub mod gotham;
 pub mod humanize;
 pub mod llm;
 pub mod persons;

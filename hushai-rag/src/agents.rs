@@ -74,6 +74,11 @@ pub const OBJECTS_AGENT_ID: &str = "objects";
 pub const PEOPLE_AGENT_ID: &str = "people";
 pub const PLATES_AGENT_ID: &str = "plates";
 pub const EVENTS_AGENT_ID: &str = "events";
+/// The Gotham "Detective" agentic runtime (G3). Reachable ONLY by explicit selection in Wave 1 —
+/// [`parse_agent_label`] never returns it and the auto-router never routes to it, so `auto` behavior
+/// is byte-identical. Its real dispatch lives in `crate::gotham::run_chat`; the registry entry's
+/// `AgentKind::Grounded` + recordings persona is the FALLBACK used only when `GOTHAM_ENABLED=false`.
+pub const GOTHAM_AGENT_ID: &str = "gotham";
 /// The unified assistant: not a pipeline of its own — the chat handler classifies each message
 /// (`llm::classify_agent` → [`parse_agent_label`]) and dispatches to one of the concrete agents.
 pub const AUTO_AGENT_ID: &str = "auto";
@@ -335,6 +340,27 @@ static AGENTS: &[Agent] = &[
         default_window_days: None,
         model: None,
     },
+    Agent {
+        // The "Detective" — an agentic, tool-calling investigator (Gotham.md Part 2, G3). Selected
+        // explicitly (viewer slash picker / voice keyword); the auto-router never routes to it. Its
+        // real behavior is `crate::gotham::run_chat` (rig/react tool loop). The fields below are the
+        // FALLBACK persona/scope used only when `GOTHAM_ENABLED=false` — a plain grounded answer, so
+        // a disabled Detective degrades to recordings behavior rather than erroring.
+        id: GOTHAM_AGENT_ID,
+        name: "Detective",
+        description: "Investigates across your recordings, people, plates, events, and the relationship graph — reasons step by step.",
+        system_prompt: PREAMBLE_RECORDINGS,
+        default_filters: DefaultFilters {
+            device_id: None,
+            after_unix_nanos: None,
+            before_unix_nanos: None,
+            speaker_name: None,
+        },
+        default_top_k: None,
+        kind: AgentKind::Grounded,
+        default_window_days: None,
+        model: None,
+    },
 ];
 
 /// Look up an agent by id.
@@ -439,7 +465,18 @@ mod tests {
         assert!(ids.contains(&PEOPLE_AGENT_ID));
         assert!(ids.contains(&PLATES_AGENT_ID));
         assert!(ids.contains(&EVENTS_AGENT_ID));
-        assert_eq!(list().len(), 7);
+        assert!(ids.contains(&GOTHAM_AGENT_ID));
+        assert_eq!(list().len(), 8);
+    }
+
+    #[test]
+    fn gotham_registered_but_never_auto_routed() {
+        // Selectable (so a session can bind to it) …
+        assert!(get(GOTHAM_AGENT_ID).is_some());
+        // … but the auto-router must NEVER produce it (Wave 1: explicit selection only).
+        assert_ne!(parse_agent_label("gotham"), GOTHAM_AGENT_ID);
+        assert_ne!(parse_agent_label("detective"), GOTHAM_AGENT_ID);
+        assert_ne!(parse_agent_label("investigate the graph"), GOTHAM_AGENT_ID);
     }
 
     #[test]

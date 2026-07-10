@@ -68,6 +68,9 @@ anyhow = "1"
 dotenvy = "0.15"
 uuid = { version = "1", features = ["v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
+# Outbound HTTP for the Gotham agent's backend `/v1/graph/*` tools + health probe (rustls, no
+# native-tls) — matches hushai-worker's delivery client posture.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
 
 [dev-dependencies]
 reqwest = { version = "0.12", features = ["json"] }

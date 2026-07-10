@@ -450,10 +450,20 @@ visual siblings of the speaker system.
 `POST /v1/rag/query` (single-shot) and `POST /v1/rag/chat` (multi-turn, SSE token-streaming;
 DB-backed `chat_sessions`/`chat_messages`, migration 0008) answer over pgvector retrieval with a
 `qwen2.5:7b` LLM (`RAG_LLM_MODEL`). Citations deep-link the viewer timeline.
-- **Agents** = a code registry (`agents.rs`): **7 registry entries** — `auto` (the synthetic
+- **Agents** = a code registry (`agents.rs`): **8 registry entries** — `auto` (the synthetic
   router) + 6 concrete `AgentKind`s: **Grounded** (`recordings`), **Reflection**, **Objects**,
-  **People**, **Plates**, **Events**. Each = persona + default retrieval scope; adding one =
-  appending a struct.
+  **People**, **Plates**, **Events** — plus **`gotham`** (the "Detective", G3). Each = persona +
+  default retrieval scope; adding one = appending a struct. `gotham` is explicit-selection-only (the
+  auto-router never returns it) and its real dispatch is the agentic runtime in `hushai-rag/src/gotham/`
+  (see below); its registry entry is a `Grounded` FALLBACK used only when `GOTHAM_ENABLED=false`.
+- **Gotham "Detective" runtime** (`hushai-rag/src/gotham/`, G3): an agentic tool-calling chat agent
+  over rig-core 0.38.2's `multi_turn` + `PromptHook` (with a hand-rolled `react` fallback behind the
+  same registry). `chat.rs` short-circuits to `gotham::run_chat` when `agent_id="gotham"` +
+  `GOTHAM_ENABLED`; it streams a SUPERSET of the chat SSE (`phase`/`tool_call`/`tool_result` added),
+  runs read-only tools 1–14 + graph tools (probe-gated) over the EXISTING retrieval fns, persists a
+  `tool_trace` (migration 0031), and falls back to a grounded recordings answer on any failure so the
+  chat surface never regresses. `GOTHAM_*` knobs in `config.rs`. Live tool-loop verification is the
+  eval `agent` modality (Phase F / PR7), not yet wired. See `Gotham.md` Part 2.
 - **Unified auto-routing:** the web/voice chat is ONE box bound to `auto`; per message the handler
   deterministically pre-routes some phrasings, else calls `llm::classify_agent` (a cheap
   qwen2.5:7b classification) and dispatches. The auto-router stays a classification prompt by

@@ -20,10 +20,10 @@ use std::convert::Infallible;
 use axum::Json;
 use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
-use axum::response::Sse;
 use axum::response::sse::{Event, KeepAlive};
+use axum::response::{IntoResponse, Sse};
 use chrono::{DateTime, Utc};
-use futures_util::{Stream, StreamExt};
+use futures_util::StreamExt;
 use rig::completion::Message;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -96,7 +96,7 @@ pub async fn rag_chat(
     State(st): State<AppState>,
     headers: HeaderMap,
     Json(req): Json<ChatRequest>,
-) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
+) -> Result<axum::response::Response, (StatusCode, String)> {
     check_auth(&headers, &st)?;
     hushai_backend::observe::counter("hushai_rag_requests_total", &[("endpoint", "chat")]);
 
@@ -304,6 +304,32 @@ pub async fn rag_chat(
     // unlocks the identity answer + the owner prompt line. Never touches retrieval filters.
     let is_voice = req.caller.as_ref().is_some_and(CallerContext::is_voice);
     let owner_verified = req.caller.as_ref().is_some_and(|c| c.owner_verified);
+
+    // Gotham "Detective": an explicit-selection-only agentic tool-calling runtime (Gotham.md Part 2).
+    // The auto-router never lands here (it only returns concrete non-gotham ids), so this fires ONLY
+    // when the session/request agent is `gotham` AND the kill switch is on — then Gotham owns the
+    // whole SSE stream. When `GOTHAM_ENABLED=false`, we fall through and the `gotham` registry entry's
+    // `AgentKind::Grounded` degrades it to an ordinary recordings answer (existing behavior).
+    if agent.id == crate::agents::GOTHAM_AGENT_ID && crate::gotham::enabled(&st.cfg) {
+        let device_id = req
+            .caller
+            .as_ref()
+            .filter(|c| c.is_voice())
+            .and_then(|c| c.device_id.clone());
+        return Ok(crate::gotham::run_chat(
+            st.clone(),
+            session_id,
+            agent_id.clone(),
+            message.clone(),
+            history.clone(),
+            tz,
+            is_voice,
+            owner_verified,
+            device_id,
+        )
+        .await);
+        // run_chat already returns an axum Response.
+    }
 
     // For reflection-with-no-target we skip the LLM entirely and stream a setup hint.
     let mut precomputed_answer: Option<String> = None;
@@ -1358,7 +1384,9 @@ pub async fn rag_chat(
         }
     };
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    Ok(Sse::new(stream)
+        .keep_alive(KeepAlive::default())
+        .into_response())
 }
 
 fn sse_event(name: &str, data: &serde_json::Value) -> Event {

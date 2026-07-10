@@ -796,7 +796,7 @@ Executed after each wave's implementation; fenced commands + bold PASS criteria 
 3. **Eval `graph` modality + F1–F3 + baselines** — makes Phases B/C executable.
 4. **Baselines/anomalies → events integration + F4–F6** — Phase D. ✅ LANDED, incl. alert-DELIVERY E2E: `hushai-worker/tests/alert_anomaly_delivery.rs` proves `pattern_anomaly` event → `alerts::evaluate` (feed + webhook rows) → `delivery::run_once` (webhook sent + valid `X-Hushai-Signature` HMAC; feed left in-app) + negatives (wrong type / below-floor severity fire nothing). Gated on `DATABASE_URL`.
 5. **Digest + endpoints + F7** — Phase E. ✅ LANDED: `patterns::build_and_upsert_digest` (deterministic `sections`/`rendered_text`, no LLM), `POST /v1/graph/digests/{date}` force-generate + worker-0 wall-clock driver (`GRAPH_DIGEST_HOUR_LOCAL`), eval `expect_briefing` (`BriefingGt` counts + mentions), F7 `briefing_daily` gate ×2 under `d4acc862`.
-6. **`gotham/` module + rig runtime + probe + migration 0031 + slash row + AGENTS.md:386 correction + rig pin** — the G3 skeleton, read-only tools 1–14.
+6. **`gotham/` module + rig runtime + probe + migration 0031 + slash row + AGENTS.md:386 correction + rig pin** — the G3 skeleton, read-only tools 1–14. ◑ LANDED (build/clippy/unit + kill-switch code-verified; live tool-loop deferred to PR7/Phase F): migration 0031 + rig exact-pin + AGENTS.md correction (part 1); then `hushai-rag/src/gotham/` (`mod.rs` `run_chat` streaming a SUPERSET SSE, `runtime.rs` rig `multi_turn`+`PromptHook` + `react` fallback + startup/graph probes + wall-clock watchdog, `tools.rs` a single `ToolDyn` over read tools 1–14 + `ask_user` + probe-gated graph tools, `preamble.rs`/`trace.rs`/`confirm.rs`), `GOTHAM_*` in `config.rs`, `chat.rs` dispatch (degrades to `Grounded` when `GOTHAM_ENABLED=false`, existing chat byte-identical), `agents.rs` `gotham` registry entry. 28 new unit tests green (react JSON parser, registry sizing, confirm yes/no, trace, schemas). **NOT done: viewer slash row (Phase G), voice keyword (Phase H), live tool-loop calibration (PR7).**
 7. **Eval `agent` modality + F8–F11** — Phase F.
 8. **Viewer investigation UI + binding queue + e2e** — Phase G (after advisor-v2 PR 2).
 9. **Voice route + confirmations + phone rig** — Phase H (after advisor-v2 PR 3).
@@ -805,8 +805,8 @@ Each PR updates this spec's result matrix for the phases it makes executable.
 
 ## Doc-deliverables checklist (same-change rule)
 
-- [ ] `AGENTS.md`: component-map row for the Gotham layer (PR 2); **:384–387 tool-calling correction** (PR 6); Testing section gains `graph`/`agent` modality names (PRs 3/7).
-- [ ] `hushai-backend/migrations/README.md`: rows for 0028–0031 (PRs 1/6).
+- [x] `AGENTS.md`: component-map row for the Gotham layer (PR 6 — added the "Gotham Detective runtime" row + bumped registry count 7→8); **:384–387 tool-calling correction** (PR 6 ✅). Testing section still to gain `graph`/`agent` modality names (PRs 3/7 — `graph` done, `agent` pending).
+- [x] `hushai-backend/migrations/README.md`: rows for 0028–0031 (0028–0030 prior; **0031 added PR 6**).
 - [ ] `CHANGELOG.md`: entry per landed wave.
 - [ ] `docs/feature-parity-roadmap.md`: one-line pointer under Pillar C — "intelligence layer → `Gotham.md`" (PR 2).
 - [ ] `local_dev/eval.env` + `run_stack.sh`: `GRAPH_*`/`GOTHAM_*` determinism pins (PRs 3/7).

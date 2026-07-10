@@ -181,6 +181,96 @@ pub struct RagConfig {
     /// enough to drag an entire unrelated conversation into the grounded prompt via
     /// expansion. Deterministic rows (distance 0.0) always survive. <= 0 disables.
     pub prune_rel_margin: f64,
+
+    /// Gotham "Detective" agentic runtime (G3). All `GOTHAM_*` knobs. When `gotham.enabled` is
+    /// false the chat handler never touches the runtime — existing chat is byte-identical.
+    pub gotham: GothamConfig,
+}
+
+/// The Gotham "Detective" agent's configuration (Gotham.md Part 2 §5). Its own struct so the chat
+/// handler can cheaply check `enabled` and the runtime borrows one bundle. Unlike `GRAPH_*` this
+/// family is NOT prefix-folded into any config hash — it carries a secret token + machine URLs.
+#[derive(Debug, Clone)]
+pub struct GothamConfig {
+    /// Kill switch. `false` ⇒ the chat handler skips Gotham entirely (existing chat byte-identical).
+    pub enabled: bool,
+    /// `rig` (rig ToolSet + multi_turn + PromptHook) or `react` (hand-rolled strict-JSON loop). The
+    /// startup probe downgrades `rig`→`react` if the model's Ollama template lacks tools.
+    pub runtime: String,
+    /// Loop model (Ollama tag; `qwen2.5:7b` default, `:14b` recommended where RAM allows).
+    pub llm_model: String,
+    /// Optional larger model for a Phase-2 grounding-critique pass.
+    pub judge_model: Option<String>,
+    pub temperature: f64,
+    pub seed: Option<i64>,
+    /// Explicit Ollama `options.num_ctx` — tool schemas + observations overflow the 4096 default
+    /// silently (the advisor lesson). Default 16384.
+    pub num_ctx: i64,
+    /// Hard bounds on the agent loop (§2.4). `max_turns` → rig `multi_turn(n)`.
+    pub max_turns: usize,
+    pub max_tool_calls: usize,
+    pub voice_max_tool_calls: usize,
+    pub tool_timeout_ms: u64,
+    pub wall_clock_secs: u64,
+    pub voice_wall_clock_secs: u64,
+    /// Context management (§2.4): per-result truncation + running observation budget.
+    pub tool_result_max_chars: usize,
+    pub obs_total_max_chars: usize,
+    /// Registers the mutating tools (Wave 3 of G3). Read-only Phase 1 leaves this false, so no
+    /// mutate tool is ever advertised to the model.
+    pub mutations_enabled: bool,
+    /// Pending-action expiry for the two-phase confirmation.
+    pub confirm_ttl_secs: i64,
+    /// Audit read-tool calls too (operator relief valve).
+    pub audit_reads: bool,
+    /// Outbound admin/graph target (loopback default) + its bearer. The token is a SECRET: never
+    /// hashed, never logged.
+    pub backend_base_url: String,
+    pub backend_token: Option<String>,
+    /// Proactive daily-briefing task (Wave 3 of G3).
+    pub briefing_enabled: bool,
+    pub briefing_hour: i64,
+    /// Phase-2 judge/critique pass toggle.
+    pub critique_enabled: bool,
+}
+
+impl GothamConfig {
+    pub fn from_env() -> anyhow::Result<Self> {
+        Ok(Self {
+            enabled: parse("GOTHAM_ENABLED", "true")?,
+            runtime: opt("GOTHAM_RUNTIME", "rig"),
+            llm_model: opt("GOTHAM_LLM_MODEL", "qwen2.5:7b"),
+            judge_model: std::env::var("GOTHAM_JUDGE_MODEL")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            temperature: parse("GOTHAM_TEMPERATURE", "0.0")?,
+            seed: std::env::var("GOTHAM_SEED")
+                .ok()
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().parse::<i64>())
+                .transpose()
+                .map_err(|e| anyhow!("env var GOTHAM_SEED is invalid: {e}"))?,
+            num_ctx: parse("GOTHAM_NUM_CTX", "16384")?,
+            max_turns: parse("GOTHAM_MAX_TURNS", "6")?,
+            max_tool_calls: parse("GOTHAM_MAX_TOOL_CALLS", "8")?,
+            voice_max_tool_calls: parse("GOTHAM_VOICE_MAX_TOOL_CALLS", "4")?,
+            tool_timeout_ms: parse("GOTHAM_TOOL_TIMEOUT_MS", "20000")?,
+            wall_clock_secs: parse("GOTHAM_WALL_CLOCK_SECS", "120")?,
+            voice_wall_clock_secs: parse("GOTHAM_VOICE_WALL_CLOCK_SECS", "45")?,
+            tool_result_max_chars: parse("GOTHAM_TOOL_RESULT_MAX_CHARS", "4000")?,
+            obs_total_max_chars: parse("GOTHAM_OBS_TOTAL_MAX_CHARS", "16000")?,
+            mutations_enabled: parse("GOTHAM_MUTATIONS_ENABLED", "false")?,
+            confirm_ttl_secs: parse("GOTHAM_CONFIRM_TTL_SECS", "300")?,
+            audit_reads: parse("GOTHAM_AUDIT_READS", "true")?,
+            backend_base_url: opt("GOTHAM_BACKEND_BASE_URL", "http://127.0.0.1:8080"),
+            backend_token: std::env::var("GOTHAM_BACKEND_TOKEN")
+                .ok()
+                .filter(|s| !s.trim().is_empty()),
+            briefing_enabled: parse("GOTHAM_BRIEFING_ENABLED", "false")?,
+            briefing_hour: parse("GOTHAM_BRIEFING_HOUR", "7")?,
+            critique_enabled: parse("GOTHAM_CRITIQUE_ENABLED", "false")?,
+        })
+    }
 }
 
 impl RagConfig {
@@ -266,6 +356,7 @@ impl RagConfig {
             expand_max_sentences_per_convo: parse("RAG_EXPAND_MAX_SENTENCES_PER_CONVO", "30")?,
             expand_max_total_chars: parse("RAG_EXPAND_MAX_TOTAL_CHARS", "6000")?,
             prune_rel_margin: parse("RAG_PRUNE_REL_MARGIN", "0.25")?,
+            gotham: GothamConfig::from_env()?,
         })
     }
 }
