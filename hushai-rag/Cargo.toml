@@ -11,8 +11,12 @@ hushai-backend = { path = "../hushai-backend" }
 # Constant-time bearer-token comparison (matches the backend's auth hardening).
 subtle = "2"
 
-# Rig: local embeddings + completion via the Ollama provider.
-rig = "0.37"
+# Rig: local embeddings + completion via the Ollama provider. PINNED EXACTLY: the `rig` facade
+# (0.37.1) re-exports `rig-core 0.38.2`, which carries the agent-loop / tool-calling semantics the
+# Gotham "Detective" runtime (hushai-rag/src/gotham/, G3) depends on. A floating `0.37` lets a
+# lockfile refresh pull a new rig-core minor and silently shift multi_turn/PromptHook behavior.
+# See Gotham.md Part 2 §2.1. Keep the committed Cargo.lock (rig-core 0.38.2) as the second guard.
+rig = "=0.37.1"
 
 # HTTP server.
 axum = { version = "0.8", features = ["macros"] }

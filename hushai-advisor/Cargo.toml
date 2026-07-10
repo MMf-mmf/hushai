@@ -11,8 +11,10 @@ hushai-backend = { path = "../hushai-backend" }
 # Constant-time bearer-token comparison (matches the backend's auth hardening).
 subtle = "2"
 
-# Rig: local embeddings + completion via the Ollama provider.
-rig = "0.37"
+# Rig: local embeddings + completion via the Ollama provider. PINNED EXACTLY — see the note in
+# hushai-rag/Cargo.toml: the `rig` facade floats rig-core minors, and the Gotham runtime depends on
+# rig-core 0.38.2's agent-loop semantics. Kept in lockstep with hushai-rag's pin. (Gotham.md §2.1.)
+rig = "=0.37.1"
 
 # HTTP server.
 axum = { version = "0.8", features = ["macros"] }

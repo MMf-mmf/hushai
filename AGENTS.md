@@ -456,8 +456,13 @@ DB-backed `chat_sessions`/`chat_messages`, migration 0008) answer over pgvector 
   appending a struct.
 - **Unified auto-routing:** the web/voice chat is ONE box bound to `auto`; per message the handler
   deterministically pre-routes some phrasings, else calls `llm::classify_agent` (a cheap
-  qwen2.5:7b classification) and dispatches. Rig has no tool-calling, so routing is a
-  classification prompt.
+  qwen2.5:7b classification) and dispatches. The auto-router stays a classification prompt by
+  DESIGN (one cheap call, no loop) — NOT because the runtime lacks tools. `rig = "0.37"` resolves
+  **`rig-core 0.38.2`**, which ships the full tool stack (`Tool` trait, `ToolSet`, agent
+  `.tool(..)`/`.multi_turn(n)`, `PromptHook`), wired to Ollama's native `tools` JSON. That
+  tool-calling machinery is what the **Gotham "Detective" agent** (`hushai-rag/src/gotham/`, G3)
+  uses for its plan→act→observe loop; see `Gotham.md` Part 2 §2.1. Pin `rig` EXACTLY (the facade
+  floats rig-core minors — a lockfile refresh would silently shift the agent-loop semantics).
 - **Deterministic-first answers** where a wrong number matters: identity ("what's my name"),
   recency ("what did we last discuss"), speaker roster, presence counts (`presence.rs`),
   co-occurrence, camera-clarify — all answered before/around the LLM so it narrates computed
