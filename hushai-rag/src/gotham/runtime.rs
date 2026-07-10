@@ -190,6 +190,16 @@ async fn drive_rig(
                 internal_call_id,
             }) => {
                 seq += 1;
+                // Hard tool-call cap: `GothamHook` already SKIPS execution once the budget is spent
+                // (`prior >= max_tool_calls`), but rig still emits a stream item for every REQUESTED
+                // call — so an adversarial "keep searching" prompt would stream many `tool_call`
+                // frames whose tools never ran (each returns a "budget exhausted" skip result). Drop
+                // those over-cap items here so the streamed + persisted trace honestly reflects only
+                // the tools that actually executed (≤ max_tool_calls). Not inserting into `pending`
+                // makes the matching ToolResult a no-op below.
+                if seq as usize > max_tool_calls {
+                    continue;
+                }
                 let tool = tool_call.function.name.clone();
                 let label = ToolKind::from_name(&tool).map(|k| k.ui_label().to_string()).unwrap_or_else(|| "working…".to_string());
                 let args_summary = summarize_args(&tool_call.function.arguments);
@@ -197,7 +207,8 @@ async fn drive_rig(
                 pending.insert(internal_call_id, (seq, tool, std::time::Instant::now()));
             }
             MultiTurnStreamItem::StreamUserItem(StreamedUserContent::ToolResult { tool_result, internal_call_id }) => {
-                let (tseq, tool, started) = pending.remove(&internal_call_id).unwrap_or((seq, "?".into(), std::time::Instant::now()));
+                // Over-cap (hook-skipped) calls were never recorded in `pending`; drop their result.
+                let Some((tseq, tool, started)) = pending.remove(&internal_call_id) else { continue };
                 let text = tool_result_text(&tool_result);
                 // ask_user terminates the turn: the question becomes the answer.
                 if let Some(q) = text.strip_prefix(tools::ASK_USER_PREFIX) {
@@ -207,7 +218,7 @@ async fn drive_rig(
                     let _ = tx.send(DriveMsg::ToolResult { seq: tseq, tool, ok: true, summary: "asked the user".into(), sources_added: 0, elapsed_ms: started.elapsed().as_millis() as u64 });
                     break;
                 }
-                let ok = !text.starts_with("ToolCallError");
+                let ok = tool_ok(&text);
                 let added = sinks.lock().unwrap().sources.len();
                 let elapsed_ms = started.elapsed().as_millis() as u64;
                 out.trace.record(&tool, json!({}), ok, elapsed_ms, text.len(), if ok { "ok" } else { "error" });
@@ -306,9 +317,10 @@ async fn drive_react(
                     let _ = tx.send(DriveMsg::ToolResult { seq, tool, ok: true, summary: "asked the user".into(), sources_added: 0, elapsed_ms });
                     return Ok(out);
                 }
+                let ok = tool_ok(&obs);
                 let added = sinks.lock().unwrap().sources.len().saturating_sub(before);
-                out.trace.record(&tool, args, true, elapsed_ms, obs.len(), "ok");
-                let _ = tx.send(DriveMsg::ToolResult { seq, tool: tool.clone(), ok: true, summary: first_line(&obs), sources_added: added, elapsed_ms });
+                out.trace.record(&tool, args, ok, elapsed_ms, obs.len(), if ok { "ok" } else { "error" });
+                let _ = tx.send(DriveMsg::ToolResult { seq, tool: tool.clone(), ok, summary: first_line(&obs), sources_added: added, elapsed_ms });
                 observations.push_str(&format!("[{tool}] {obs}\n"));
             }
             ReactStep::Unparseable => {
@@ -465,6 +477,22 @@ fn summarize_args(args: &Value) -> String {
 
 fn first_line(s: &str) -> String {
     clip_to(s.lines().next().unwrap_or("").trim(), 200)
+}
+
+/// Whether a tool's result text represents a SUCCESSFUL call, for the SSE `tool_result.ok` flag +
+/// the persisted trace `outcome`. A failed tool surfaces DIFFERENTLY per runtime, and none of the
+/// forms begins with a bare `ToolCallError`, so the original `!starts_with("ToolCallError")` check
+/// silently reported `ok:true` for a failed tool (e.g. a `plate_sightings` called with no plate arg
+/// streamed `ok:true` with a `"Toolset error: ToolCallError: …"` summary). Detect all three markers:
+///   * rig runtime — rig serializes a tool `Err(ToolError::ToolCallError(..))` as
+///     `"Toolset error: ToolCallError: …"`;
+///   * react runtime — a failed `tools::exec` is wrapped as `"(tool error: …)"`;
+///   * defensive — a bare `"ToolCallError"` prefix (the original check).
+/// The model never sees `ok` (it reasons over the tool OUTPUT text), so this only corrects
+/// trace/UI fidelity — it cannot change tool selection or the answer.
+fn tool_ok(text: &str) -> bool {
+    let t = text.trim_start();
+    !(t.starts_with("ToolCallError") || t.starts_with("Toolset error") || t.starts_with("(tool error:"))
 }
 
 fn tool_result_text(tr: &rig::completion::message::ToolResult) -> String {

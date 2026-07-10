@@ -463,7 +463,9 @@ DB-backed `chat_sessions`/`chat_messages`, migration 0008) answer over pgvector 
   runs read-only tools 1–14 + graph tools (probe-gated) over the EXISTING retrieval fns, persists a
   `tool_trace` (migration 0031), and falls back to a grounded recordings answer on any failure so the
   chat surface never regresses. `GOTHAM_*` knobs in `config.rs`. Live tool-loop verification is the
-  eval `agent` modality (Phase F / PR7), not yet wired. See `Gotham.md` Part 2.
+  eval `agent` modality (Phase F / PR7 — WIRED: `hushai-eval/src/query_agent.rs` + `score_agent`,
+  `staging` fixtures F8–F12; the graph tools were rewritten in PR7 to hit the REAL id-keyed
+  `/v1/graph/*` routes + render names, and `tool_ok` now reports a failed tool correctly). See `Gotham.md` Part 2.
 - **Unified auto-routing:** the web/voice chat is ONE box bound to `auto`; per message the handler
   deterministically pre-routes some phrasings, else calls `llm::classify_agent` (a cheap
   qwen2.5:7b classification) and dispatches. The auto-router stays a classification prompt by
@@ -580,8 +582,16 @@ fold — it waits for graph inputs to settle (`poll::wait_graph_inputs_settled`:
 + events committed) then triggers one authoritative `POST /v1/graph/rebuild` (whole-scenario single
 batch → deterministic). F1–F3 are in `train` (Phase-C calibrated on the rig, gate ×2, then promoted alongside the full-suite re-baseline the `GRAPH_` config-hash change forced — all baselines now under config_hash `d4acc862`). It REFUSES to run against a non-`*_test` DB (it TRUNCATEs
 result tables) — bring it up with `./local_dev/run_stack.sh --test-db` (determinism profile
-`local_dev/eval.env`), then `cargo run -p hushai-eval -- run --tier {fast|full}`. A physical
-camera-at-screen tier is `local_dev/physical_loopback.py`. Read the playbook before using the loop.
+`local_dev/eval.env`), then `cargo run -p hushai-eval -- run --tier {fast|full}`. An `agent` modality
+(Gotham G3 "Detective", Phase F — `staging` split only) drives `/v1/rag/chat` with `agent_id="gotham"`
+so the plan→act→observe tool loop runs, and scores the streamed answer PLUS the `tool_call`/`tool_result`
+trace (`expect_tool_calls_any|all`/`min|max_tool_calls`/`must_contain`/`expect_number`, `query_agent.rs`
++ `score_agent`). It is LLM-driven, so it is staging-only and its tool-trace metrics gate ONLY when the
+turn routed to `gotham` (a kill-switched / old binary Info-degrades, never FALSE-FAILs). Run it with the
+staging determinism layer sourced: `set -a; source local_dev/eval.env; source local_dev/eval.agent.env;
+set +a` for BOTH the rag launch and the eval run — those `GOTHAM_*` pins are kept OUT of the shared
+`eval.env` so a plain run's config-hash stays `d4acc862`; the agent suite mints its own lineage. A
+physical camera-at-screen tier is `local_dev/physical_loopback.py`. Read the playbook before using the loop.
 
 Unit + integration tests: `cargo test --workspace` (the DB-touching integration tests are
 `DATABASE_URL`-gated; the vision tests are additionally model-gated and SKIP until provisioned).

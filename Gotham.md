@@ -114,7 +114,7 @@ Dependency order: **G1 → {G2, G5}**; **G3** starts in parallel with G1 (existi
 - [ ] Phase-1 tool registry (read-only, ~15 tools) + SSE superset (`phase`/`tool_call`/`tool_result`/`confirm`)
 - [ ] Migration 0031 (`chat_messages.tool_trace`, `gotham_pending_actions`)
 - [ ] Whole-turn fallback to the auto pipeline; audit writes; `AGENTS.md:386` correction
-- [ ] Eval `agent` modality + fixtures F8–F11 (staging)
+- [x] Eval `agent` modality + fixtures F8–F12 (staging) ✅ (PR7 — live loop/cap/kill-switch/fallback verified)
 - [ ] Phase 2: graph tools (probe-gated), media links, voice keyword
 - [ ] Phase 3: mutating tools + two-phase confirmation, auto-router promotion, proactive briefing turn
 
@@ -623,9 +623,9 @@ Each becomes a `Metric` with `Direction` + `floor_ok` in `src/score.rs`, gated o
 
 Knob registration: add `"GRAPH_"` to `KNOB_PREFIXES` (`hushai-eval/src/manifest.rs:70`) — safe to prefix-fold (no secrets/URLs in the family). `GOTHAM_*` determinism knobs are **hand-listed** in `KNOBS` (`manifest.rs:19`) — see §5.
 
-## 3.3 Fixture bank F1–F11
+## 3.3 Fixture bank F1–F12
 
-Multi-clip scenarios via `Meta.injections[]` (`fixtures.rs:54`) staging one subject across days/cameras (the `repeat_visitor` recipe) are exactly the graph's input shape. All graph fixtures pin `base_capture_unix_nanos` (invariant 3); multi-day offsets are multiples of 86 400e9.
+Multi-clip scenarios via `Meta.injections[]` (`fixtures.rs:54`) staging one subject across days/cameras (the `repeat_visitor` recipe) are exactly the graph's input shape. All GRAPH fixtures pin `base_capture_unix_nanos` (invariant 3); multi-day offsets are multiples of 86 400e9. The `agent` fixtures instead use a **NEGATIVE** `base_capture_unix_nanos` (a now-relative offset, `Meta::effective_base_ns`) so their injected sightings stay inside the Detective's now-relative tool windows (`last_7d`) on every run — their metrics are counts/booleans invariant to the absolute base, so baselines stay stable.
 
 | # | Case | Split | Scenario | Key assertions |
 |---|---|---|---|---|
@@ -636,25 +636,27 @@ Multi-clip scenarios via `Meta.injections[]` (`fixtures.rs:54`) staging one subj
 | F5 | `anomaly_novel_time` | train | F4's ladder + one 03:00 appearance | `expect_anomaly{off_schedule_presence}` — scored via the existing events modality |
 | F6 | `anomaly_negatives` | **holdout, sealed** | known subject at usual time + one never-seen face once | known subject mints **0** anomalies; unknown-cluster fires at most per its gate (counter-fixture posture) |
 | F7 | `briefing_daily` | train | multi-day scenario (shares F4/F5 media) | `expect_briefing_counts{visits,…}` + `expect_briefing_mentions` for the pinned date |
-| F8 | `agent_single_tool` | staging | reuse a graph scenario | "how many times did Alice visit this week" → `expect_tool_calls_any[presence_count]`, `expect_number` |
-| F9 | `agent_multi_hop` | staging | person + plate + conversation staged | "did the person who drives EMD774 ever talk to Bob?" → tools ⊇ {plate_sightings, graph_connections, list_conversations}; `must_contain_any` planted token |
-| F10 | `agent_journey_narrate` | staging | F2's scenario | journey/graph tool called; cameras mentioned in order |
-| F11 | `agent_refusal_no_data` | staging | minimal | nonexistent entity → `must_not_contain` decoys, `max_tool_calls` honored, clean stream (no `error` event) |
+| F8 | `agent_single_tool` | staging | Alice ×3 sightings, one camera (now-relative base) | "how many times has Alice been recorded" → single-tool selection: `expect_tool_calls_any[presence_count, people_sightings, entity_profile]`, `min_tool_calls 1`, `max_tool_calls 8`, `must_contain[Alice]`, routed `gotham`. (The exact COUNT is Info-only via `reference_answer` similarity, NOT a gate — the Detective's count tools use NOW-relative windows, so a windowed count over a now-relative fixture crosses UTC-day boundaries by wall-clock and isn't reproducible; the single-tool selection + grounding IS.) |
+| F9 | `agent_multi_hop` | staging | F3's person↔plate scenario (Alice+EMD774+Bob) | "look up plate EMD774 in the relationship graph → which person is it connected to + count" → graph-backed cross-entity resolution: `expect_tool_calls_any[graph_entity, graph_connections, plate_sightings, …]`, `min_tool_calls 1` (the powerful `graph_entity` resolves plate→person in one call), `must_contain[Alice]`, routed `gotham`. (Calibration dropped a `must_not_contain[Bob]` assumption — the graph genuinely holds a below-bar Bob→plate edge and the Detective correctly surfaces it.) |
+| F10 | `agent_journey_narrate` | staging | F2's cross-camera scenario | "using the relationship graph, which cameras/places is Alice connected to" → graph tool called; `must_contain[front, garage]` |
+| F11 | `agent_refusal_no_data` | staging | minimal (1 Alice sighting) | nonexistent entity ("Zorquan Blyxen") → `must_contain_any` decline phrasing, `must_not_contain` fabricated-sighting decoys, `max_tool_calls 8`, clean stream (no `error`) |
+| F12 | `agent_runaway_capped` | staging (extension) | minimal (1 Alice sighting) | adversarial "keep searching forever" prompt → loop TERMINATES at `max_tool_calls ≤ GOTHAM_MAX_TOOL_CALLS` (regression guard; the definitive cap-fires proof is the low-cap procedural step) |
 
 **Calibration protocol** (carried verbatim from the advisor-v2 spec): first live run freezes observed values (widen, never narrow); two back-to-back runs with identical verdicts before freezing any content assertion; **never loosen a gate to go green** (RECURSIVE_TESTING §4 cardinal rule).
 
 ## 3.4 Harness touch points
 
-| # | File | Change |
+| # | File | Change (✅ = landed in PR7) |
 |---|---|---|
-| 1 | `hushai-eval/src/fixtures.rs` | `GraphGt` + agent assertion fields on `ChatQ` (`fixtures.rs:254`) |
-| 2 | `hushai-eval/src/score.rs` | `graph`/`agent` scorers, gated in `score_all` |
-| 3 | `hushai-eval/src/query.rs` | edge/baseline/digest queries |
-| 4 | `hushai-eval/src/query_rag.rs` | parse `tool_call`/`tool_result`/`confirm` SSE events |
-| 5 | `hushai-eval/src/poll.rs` | graph-fold quiescence check |
-| 6 | `hushai-eval/src/manifest.rs:19,70` | `GOTHAM_*` hand-list; `"GRAPH_"` prefix |
-| 7 | `local_dev/eval.env` | `GRAPH_GRACE_SECS=0`, low fold interval, `GOTHAM_TEMPERATURE=0`, `GOTHAM_SEED`, `GOTHAM_ENABLED=true` |
-| 8 | `fixtures/{train,holdout,staging}/<case>/` | F1–F11 `meta.json` + `expected.json` |
+| 1 | `hushai-eval/src/fixtures.rs` | `GraphGt`; **NEW `AgentGt`/`AgentQ`** (a dedicated struct, NOT `ChatQ` — adds `expect_tool_calls_any/all`, `min/max_tool_calls`, `expect_confirmation`) + `Expected.agent` + `needs_agent()` (OR'd into `needs_vision/needs_audio` for lane-drain) + `effective_base_ns()` (negative = now-relative) + `agent_fixtures_parse` unit test ✅ |
+| 2 | `hushai-eval/src/score.rs` | `graph` scorer in `score_all`; **`score_agent` called from `lib.rs::run_case`** (a LIVE-service scorer like `score_chat`, NOT in `score_all`) — deterministic answer gates + tool-trace metrics that gate ONLY when the turn routed to `gotham`, else Info ✅ |
+| 3 | `hushai-eval/src/query.rs` | edge/baseline/digest queries (graph modality) |
+| 4 | **`hushai-eval/src/query_agent.rs` (NEW)** | drives `/v1/rag/chat` with `agent_id="gotham"`; parses the SUPERSET SSE incl. `phase`/`tool_call`/`tool_result`/`confirm` into `AgentResult{answer, sources, tools[], phases, saw_confirm, routed_agent_id}` ✅ |
+| 5 | `hushai-eval/src/lib.rs` | `needs_agent()` block in `run_case` (after the RAG block); graph-rebuild gate extended to `needs_graph() ‖ needs_agent()`; `effective_base_ns()` wired ✅ |
+| 6 | `hushai-eval/src/manifest.rs:19` | `GOTHAM_*` output-knobs HAND-LISTED in `KNOBS` (NOT a `"GOTHAM_"` prefix-fold — would sweep the secret token/URL). Fold only when SET ⇒ absent from a plain run ⇒ `d4acc862` untouched ✅ |
+| 7 | **`local_dev/eval.agent.env` (staging-only layer; gitignored like `eval.env`, committed as `eval.agent.env.example` — `cp` to create)** | `GOTHAM_ENABLED=true`, `GOTHAM_RUNTIME=rig`, `GOTHAM_LLM_MODEL=qwen2.5:7b`, `GOTHAM_TEMPERATURE=0`, `GOTHAM_SEED=42`, loop bounds. Kept OUT of the shared `eval.env` so the frozen graph/perception `d4acc862` lineage is undisturbed; source on top of `eval.env` for the rag launch + the agent eval run ✅ |
+| 8 | `fixtures/{train,holdout,staging}/<case>/` | F1–F12 `meta.json` + `expected.json` (F8–F12 in `staging`; media copied from the graph fixtures by `fetch_eval_clips.sh`) ✅ |
+| 9 | **`hushai-rag/src/gotham/tools.rs` + `runtime.rs`** | PR7 runtime fixes (all caught by the live agent modality): (a) graph tools (`graph_entity`/`graph_connections`/`graph_neighborhood`) rewritten to resolve name→(type,id), hit the REAL id-keyed `/v1/graph/{neighbors/{t}/{id},path?from=&to=}` routes, and render ids→display names — the §2.3-imagined name routes never existed (handoff gotcha (c)); their descriptions sharpened so the 7B picks `graph_entity` over `graph_connections`; (b) the graph tools now send `GOTHAM_BACKEND_TOKEN` (were 401-ing silently); (c) `tool_ok` corrects the rig/react tool-error `ok` flag (was `ok:true` for a failed tool); (d) the `GOTHAM_MAX_TOOL_CALLS` cap now honestly bounds the STREAMED/persisted trace — `drive_rig` drops the over-cap items the hook already skips (rig emitted a `tool_call` frame per REQUESTED call, so an adversarial prompt streamed 18 frames though only 8 executed) ✅ |
 
 ---
 
@@ -750,6 +752,7 @@ Executed after each wave's implementation; fenced commands + bold PASS criteria 
 ## Risks / open questions
 
 1. **Local-7B tool-calling reliability** — the load-bearing bet of G3. Mitigations locked into the contract: lean per-phase catalog (~15 schemas); rig's in-loop invalid-call retry; hook budget feedback; `react` fallback runtime; whole-turn fallback to the auto pipeline (chat never regresses); 14b tiering. Open: final model choice is decided by Phase F calibration data, never blind-tuned.
+   **Phase-F calibration findings (qwen2.5:7b, `rig` runtime, temp 0 + seed 42):** RELIABLE — single-tool selection + a grounded answer (F8), refusal-on-no-data without hallucination (F11), and the loop terminating under an adversarial "search forever" prompt (F12). CROSS-ENTITY GRAPH resolution (F9/F10) works ONLY once the question EXPLICITLY names the relationship graph ("look up X in the relationship graph") — with a vague "who is X connected to" the 7B reaches for `graph_connections` (the two-entity path tool) with a placeholder second arg, or for `plate_sightings`, and never resolves the entity. Sharpening the `graph_entity`/`graph_connections` tool DESCRIPTIONS (single-entity lookup vs. two-named-entity path) fixed the selection. A windowed COUNT is NOT reproducibly gate-able (the count tools use now-relative windows; a now-relative fixture crosses UTC-day boundaries by wall-clock) — F8 gates single-tool selection + grounding, not the number. These are the data points for the 14b-tiering decision: the 7B is adequate for single-hop + refusal + bounded exploration, marginal for graph-backed multi-hop synthesis.
 2. **Binding false positives poison fusion** — a wrong voice↔face or person↔plate edge propagates into journeys and briefings. Mitigations: evidence hysteresis (min-sessions), margin gate, never-auto-confirm, evidence-carrying UI, sticky rejection, merge/delete reconciliation in-tx. Ambiguous pairs (always-together couples) correctly *never* surface — an empty review queue can be right.
 3. **Anonymous-identity churn** — unknown-person ids mint/merge frequently; edge correctness depends on the merge hooks firing inside *every* merge path (manual, auto_merge_recent, retro-attach). `recluster-deep` rewrites assignments wholesale — the safe response is an explicit graph rebuild; the runbook must say so.
 4. **Merge orphan window** (inherited, documented) — merges don't repoint `events.subject_id`; loser events not yet drained never become edges. Same accepted loss as profiles.
@@ -772,7 +775,7 @@ Executed after each wave's implementation; fenced commands + bold PASS criteria 
 | C | Graph fixtures F1–F3 ×2 (+ G2 F4/F5/F6 ×2, frozen `d4acc862`) | ✅ |
 | D | Anomaly detection + emission — ALL FOUR predicates (`off_schedule_presence` F4/F5/F6 live ×2; `first_time_pairing`/`new_vehicle_for_person`/`unknown_person_cluster` via `graph_db` guard + `anomaly_first_pairing` staging fixture); alert-DELIVERY E2E (rule→feed+webhook, HMAC intact + negatives) via `hushai-worker/tests/alert_anomaly_delivery.rs` (real PG + real POST) | ✅ |
 | E | Briefing byte-stable + F7 (`briefing_daily` 8/8 gate ×2, `d4acc862`; `graph_db` outlier-day digest guard) | ✅ |
-| F | Agent staging F8–F11 ×2 + cap + kill-switch + fallback | ⬜ |
+| F | Agent staging F8–F12 gate ×2 (frozen `a5bb8a7054745a55`) + cap + kill-switch + fallback | ✅ |
 | G | Viewer investigation UX + e2e | ⬜ |
 | H | Voice markers + phone rig | ⬜ |
 
@@ -796,8 +799,8 @@ Executed after each wave's implementation; fenced commands + bold PASS criteria 
 3. **Eval `graph` modality + F1–F3 + baselines** — makes Phases B/C executable.
 4. **Baselines/anomalies → events integration + F4–F6** — Phase D. ✅ LANDED, incl. alert-DELIVERY E2E: `hushai-worker/tests/alert_anomaly_delivery.rs` proves `pattern_anomaly` event → `alerts::evaluate` (feed + webhook rows) → `delivery::run_once` (webhook sent + valid `X-Hushai-Signature` HMAC; feed left in-app) + negatives (wrong type / below-floor severity fire nothing). Gated on `DATABASE_URL`.
 5. **Digest + endpoints + F7** — Phase E. ✅ LANDED: `patterns::build_and_upsert_digest` (deterministic `sections`/`rendered_text`, no LLM), `POST /v1/graph/digests/{date}` force-generate + worker-0 wall-clock driver (`GRAPH_DIGEST_HOUR_LOCAL`), eval `expect_briefing` (`BriefingGt` counts + mentions), F7 `briefing_daily` gate ×2 under `d4acc862`.
-6. **`gotham/` module + rig runtime + probe + migration 0031 + slash row + AGENTS.md:386 correction + rig pin** — the G3 skeleton, read-only tools 1–14. ◑ LANDED (build/clippy/unit + kill-switch code-verified; live tool-loop deferred to PR7/Phase F): migration 0031 + rig exact-pin + AGENTS.md correction (part 1); then `hushai-rag/src/gotham/` (`mod.rs` `run_chat` streaming a SUPERSET SSE, `runtime.rs` rig `multi_turn`+`PromptHook` + `react` fallback + startup/graph probes + wall-clock watchdog, `tools.rs` a single `ToolDyn` over read tools 1–14 + `ask_user` + probe-gated graph tools, `preamble.rs`/`trace.rs`/`confirm.rs`), `GOTHAM_*` in `config.rs`, `chat.rs` dispatch (degrades to `Grounded` when `GOTHAM_ENABLED=false`, existing chat byte-identical), `agents.rs` `gotham` registry entry. 28 new unit tests green (react JSON parser, registry sizing, confirm yes/no, trace, schemas). **NOT done: viewer slash row (Phase G), voice keyword (Phase H), live tool-loop calibration (PR7).**
-7. **Eval `agent` modality + F8–F11** — Phase F.
+6. **`gotham/` module + rig runtime + probe + migration 0031 + slash row + AGENTS.md:386 correction + rig pin** — the G3 skeleton, read-only tools 1–14. ◑ LANDED (build/clippy/unit + kill-switch code-verified; live tool-loop deferred to PR7/Phase F): migration 0031 + rig exact-pin + AGENTS.md correction (part 1); then `hushai-rag/src/gotham/` (`mod.rs` `run_chat` streaming a SUPERSET SSE, `runtime.rs` rig `multi_turn`+`PromptHook` + `react` fallback + startup/graph probes + wall-clock watchdog, `tools.rs` a single `ToolDyn` over read tools 1–14 + `ask_user` + probe-gated graph tools, `preamble.rs`/`trace.rs`/`confirm.rs`), `GOTHAM_*` in `config.rs`, `chat.rs` dispatch (degrades to `Grounded` when `GOTHAM_ENABLED=false`, existing chat byte-identical), `agents.rs` `gotham` registry entry. 28 new unit tests green (react JSON parser, registry sizing, confirm yes/no, trace, schemas). **PR7 (Phase F) later drove the live loop and found the G3 skeleton's tools were UNVERIFIED-and-broken: (1) all three graph tools hit imagined name-based routes (`/v1/graph/entities/{name}` etc.) that never existed — real API is id-keyed `{type}/{id}` (handoff gotcha (c)); (2) they sent no `GOTHAM_BACKEND_TOKEN` so 401'd; (3) their descriptions were too vague for the 7B to pick `graph_entity`; (4) `tool_result.ok` reported `true` for a failed tool (the rig error prefix check missed rig's `"Toolset error:"` wrapper); (5) `GOTHAM_MAX_TOOL_CALLS` bounded execution but rig still streamed a `tool_call` frame per REQUESTED call, so the trace showed 18 for an 8-cap. All five fixed in PR7. NOT done: viewer slash row (Phase G), voice keyword (Phase H).**
+7. **Eval `agent` modality + F8–F12** — Phase F. ✅ **LANDED + LIVE-VERIFIED (PR7).** `hushai-eval/src/query_agent.rs` (drives `/v1/rag/chat` with `agent_id="gotham"`, parses the SUPERSET SSE incl. `phase`/`tool_call`/`tool_result`/`confirm`), `score_agent` (answer gates + tool-trace metrics that gate only when the Detective ran — signalled by a streamed `phase`, so kill-switch/old-binary Info-degrades), `needs_agent()`, `effective_base_ns()` (negative = now-relative, keeps windowed-tool data fresh), `GOTHAM_*` hand-listed in manifest KNOBS, staging-only `local_dev/eval.agent.env`. Five staging fixtures **F8** (single-tool), **F9** (graph-backed plate→person), **F10** (cross-camera journey), **F11** (refusal/no-hallucination), **F12** (runaway-cap guard) calibrated to PASS and frozen **gate ×2** under a NEW lineage `a5bb8a7054745a55` (d4acc862 untouched — the pins are out of the shared `eval.env`). Procedural checks all confirmed live: kill-switch (`GOTHAM_ENABLED=false` → no tool frames, tool metrics Info-degrade), fallback (`WALL_CLOCK=1s` → `tool_trace=[{"tool":"(runtime)","outcome":"fell_back"}]`), runaway (`MAX_TOOL_CALLS=2` + adversarial → exactly 2 frames). **The live loop exposed + PR7 fixed FIVE real runtime bugs** — see PR6 note. **NOT done: viewer slash row (Phase G / G4), voice keyword (Phase H / G4), journeys (G5).**
 8. **Viewer investigation UI + binding queue + e2e** — Phase G (after advisor-v2 PR 2).
 9. **Voice route + confirmations + phone rig** — Phase H (after advisor-v2 PR 3).
 
@@ -805,7 +808,7 @@ Each PR updates this spec's result matrix for the phases it makes executable.
 
 ## Doc-deliverables checklist (same-change rule)
 
-- [x] `AGENTS.md`: component-map row for the Gotham layer (PR 6 — added the "Gotham Detective runtime" row + bumped registry count 7→8); **:384–387 tool-calling correction** (PR 6 ✅). Testing section still to gain `graph`/`agent` modality names (PRs 3/7 — `graph` done, `agent` pending).
+- [x] `AGENTS.md`: component-map row for the Gotham layer (PR 6 — added the "Gotham Detective runtime" row + bumped registry count 7→8); **:384–387 tool-calling correction** (PR 6 ✅). Testing section names both the `graph` and `agent` modalities (PRs 3/7 — both ✅; PR7 added the `agent` modality paragraph + the `eval.agent.env` run recipe + the PR7 runtime-fixes note at AGENTS.md:465).
 - [x] `hushai-backend/migrations/README.md`: rows for 0028–0031 (0028–0030 prior; **0031 added PR 6**).
 - [ ] `CHANGELOG.md`: entry per landed wave.
 - [ ] `docs/feature-parity-roadmap.md`: one-line pointer under Pillar C — "intelligence layer → `Gotham.md`" (PR 2).

@@ -248,3 +248,27 @@ if [[ -d "$G2_PAIR/anomaly_first_pairing" ]]; then
 else
   echo "[skip] graph G2 first_pairing — no train fixture dir"
 fi
+
+# --- Gotham G3 `agent` modality staging fixtures (F8-F11 + the runaway-cap guard) ----------------
+# The `agent` (Detective) staging fixtures deliberately REUSE the graph scenarios' media verbatim —
+# same enrolled faces (Judith→Alice, Sally→Bob) and the EMD774 plate — so the Detective is exercised
+# over data whose pipeline output is already understood. Rather than re-run the kenburns/plate
+# recipes, copy the just-regenerated graph clips into each staging/agent_* dir. MUST run after the
+# G1/G2 graph sections above (they produce train/graph_*/clips). Media is gitignored + regenerable.
+AGENT_STG="$ROOT/hushai-eval/fixtures/staging"
+GTRAIN="$ROOT/hushai-eval/fixtures/train"
+if [[ -d "$AGENT_STG/agent_single_tool" && -f "$GTRAIN/graph_person_vehicle/clips/alice_face.mp4" ]]; then
+  mkdir -p "$AGENT_STG"/agent_single_tool/clips "$AGENT_STG"/agent_multi_hop/clips \
+           "$AGENT_STG"/agent_journey_narrate/clips "$AGENT_STG"/agent_refusal_no_data/clips \
+           "$AGENT_STG"/agent_runaway_capped/clips
+  cp "$GTRAIN/graph_baseline_rhythm/clips/alice_face.mp4"    "$AGENT_STG/agent_single_tool/clips/"
+  cp "$GTRAIN/graph_person_vehicle/clips/alice_face.mp4"     "$AGENT_STG/agent_multi_hop/clips/"
+  cp "$GTRAIN/graph_person_vehicle/clips/bob_face.mp4"       "$AGENT_STG/agent_multi_hop/clips/"
+  cp "$GTRAIN/graph_person_vehicle/clips/plate.mp4"          "$AGENT_STG/agent_multi_hop/clips/"
+  cp "$GTRAIN/graph_cross_camera_fusion/clips/alice_face.mp4" "$AGENT_STG/agent_journey_narrate/clips/"
+  cp "$GTRAIN/graph_cross_camera_fusion/clips/alice_face.mp4" "$AGENT_STG/agent_refusal_no_data/clips/"
+  cp "$GTRAIN/graph_cross_camera_fusion/clips/alice_face.mp4" "$AGENT_STG/agent_runaway_capped/clips/"
+  echo "[done] copied Gotham G3 agent staging fixture media (F8-F11 + runaway guard)"
+else
+  echo "[skip] agent G3 — no staging dirs, or graph clips not built yet (run the graph sections first)"
+fi

@@ -8,6 +8,7 @@
 use crate::ctx::Ctx;
 use crate::fixtures::*;
 use crate::query::*;
+use crate::query_agent::AgentResult;
 use crate::query_rag::RagAnswer;
 use std::collections::{HashMap, HashSet};
 use uuid::Uuid;
@@ -1102,6 +1103,225 @@ pub async fn score_chat(
         }
     }
     m
+}
+
+/// Score the Gotham "Detective" agentic modality (`agent`; G3 / Phase F). Keyed `agent.q{i}.*`.
+///
+/// Two metric families:
+///   * ANSWER assertions — the same deterministic-first checks as `score_chat` (errored / contains /
+///     contains_any / clean / count_ok / routed / citations) plus the optional similarity/judge soft
+///     signals. These gate exactly like chat.
+///   * TOOL-TRACE assertions — `tools_any` / `tools_all` / `max_tools` / `confirm`, read from the
+///     streamed `tool_call`/`tool_result` frames. They GATE **only when the turn actually routed to
+///     `gotham`** (i.e. the Detective loop ran and the trace is authoritative). On any other routing
+///     — kill-switch off, an old binary with no tool frames, a rig→react degrade that still routes
+///     "gotham" (it does stream frames, so it still gates) — a NON-gotham route degrades every tool
+///     metric to Info so a rig-less / Detective-off machine can never redden a staging run.
+///
+/// `expect_number` reuses the shared `answer_has_number` (digits OR English number-word), so a count
+/// answer ("she visited five times") passes without pinning surface form.
+pub async fn score_agent(gt: &AgentGt, results: &[AgentResult], ctx: &Ctx) -> Vec<Metric> {
+    let mut m = Vec::new();
+    let embed_model = std::env::var("EMBED_MODEL").unwrap_or_else(|_| "mxbai-embed-large".into());
+    for (i, (q, a)) in gt.questions.iter().zip(results.iter()).enumerate() {
+        let p = |k: &str| format!("agent.q{i}.{k}");
+        let ans_norm = normalize(&a.answer);
+        // Did the Detective loop actually run this turn? Only then is the tool trace authoritative.
+        // The signal is a streamed `phase` event (`drive()` emits `phase:planning` unconditionally
+        // the moment the loop starts) — NOT `routed_agent_id`: when `GOTHAM_ENABLED=false` the chat
+        // handler degrades the `gotham` agent to a grounded recordings answer that STILL reports
+        // `routed_agent_id="gotham"` (same registry id) but streams NO phase/tool frames. Keying off
+        // phases makes the kill-switched / old-binary case Info-degrade (no false FAIL); a live
+        // Detective turn always has phases, so F8–F12 still gate normally.
+        let gotham_ran = !a.phases.is_empty();
+        let tool_names: Vec<String> = a.tools.iter().map(|t| normalize(&t.tool)).collect();
+
+        // --- answer assertions (mirror score_chat) ---
+        m.push(Metric::new(
+            p("errored"),
+            if a.errored { 0.0 } else { 1.0 },
+            Direction::Boolean,
+            !a.errored,
+            if a.errored { "stream reported an error event" } else { "clean stream" },
+        ));
+
+        if !q.must_contain.is_empty() {
+            let hits = q.must_contain.iter().filter(|s| ans_norm.contains(&normalize(s))).count();
+            let frac = hits as f64 / q.must_contain.len() as f64;
+            let detail = if hits < q.must_contain.len() {
+                let head: String = a.answer.chars().take(160).collect();
+                format!("{hits}/{} required phrases present; answer: {head:?}", q.must_contain.len())
+            } else {
+                format!("{hits}/{} required phrases present", q.must_contain.len())
+            };
+            m.push(Metric::new(p("contains"), frac, Direction::HigherBetter, frac >= 1.0, detail));
+        }
+        if !q.must_contain_any.is_empty() {
+            let hit = q.must_contain_any.iter().find(|s| ans_norm.contains(&normalize(s)));
+            let ok = hit.is_some();
+            let detail = match hit {
+                Some(h) => format!("matched {h:?} (1 of {} accepted variants)", q.must_contain_any.len()),
+                None => {
+                    let head: String = a.answer.chars().take(160).collect();
+                    format!("none of {} accepted variants present; answer: {head:?}", q.must_contain_any.len())
+                }
+            };
+            m.push(Metric::new(p("contains_any"), if ok { 1.0 } else { 0.0 }, Direction::Boolean, ok, detail));
+        }
+        if !q.must_not_contain.is_empty() {
+            let bad: Vec<&String> = q.must_not_contain.iter().filter(|s| ans_norm.contains(&normalize(s))).collect();
+            m.push(Metric::new(
+                p("clean"),
+                if bad.is_empty() { 1.0 } else { 0.0 },
+                Direction::Boolean,
+                bad.is_empty(),
+                if bad.is_empty() { "no forbidden phrases".to_string() } else { format!("forbidden phrase(s) present: {bad:?}") },
+            ));
+        }
+        if let Some(n) = q.expect_number {
+            let ok = answer_has_number(&ans_norm, n);
+            m.push(Metric::new(
+                p("count_ok"),
+                if ok { 1.0 } else { 0.0 },
+                Direction::Boolean,
+                ok,
+                format!("expected count {n} {}", if ok { "present" } else { "MISSING" }),
+            ));
+        }
+        if let Some(want) = &q.expect_routed_agent {
+            match &a.routed_agent_id {
+                Some(got) => {
+                    let ok = got.eq_ignore_ascii_case(want);
+                    m.push(Metric::new(
+                        p("routed"),
+                        if ok { 1.0 } else { 0.0 },
+                        Direction::Boolean,
+                        ok,
+                        format!("routed to '{got}', expected '{want}'"),
+                    ));
+                }
+                None => m.push(Metric::info(
+                    p("routed"),
+                    0.0,
+                    format!("routed_agent_id absent (RAG binary predates it); expected '{want}'"),
+                )),
+            }
+        }
+        if let Some(minc) = q.min_citations {
+            let n = a.sources.len() as f64;
+            m.push(Metric::new(
+                p("citations"),
+                n,
+                Direction::HigherBetter,
+                n >= minc as f64,
+                format!("{} citations (min {minc})", a.sources.len()),
+            ));
+        }
+
+        // --- tool-trace assertions (gate only when the Detective loop ran) ---
+        // Info-mirror of whether the trace is authoritative — always emitted for the dashboard.
+        m.push(Metric::info(
+            p("tool_count"),
+            a.tools.len() as f64,
+            format!(
+                "{} tool call(s): [{}]{}",
+                a.tools.len(),
+                a.tools.iter().map(|t| t.tool.as_str()).collect::<Vec<_>>().join(", "),
+                if gotham_ran { "" } else { " (routed elsewhere — tool metrics are Info)" },
+            ),
+        ));
+
+        if !q.expect_tool_calls_any.is_empty() {
+            let hit = q.expect_tool_calls_any.iter().find(|t| tool_names.contains(&normalize(t)));
+            let ok = hit.is_some();
+            let detail = format!(
+                "expected any of {:?}; trace={:?} ({})",
+                q.expect_tool_calls_any, tool_names, if gotham_ran { "gating" } else { "Info: non-gotham route" }
+            );
+            m.push(tool_metric(p("tools_any"), ok, gotham_ran, detail));
+        }
+        if !q.expect_tool_calls_all.is_empty() {
+            let missing: Vec<&String> = q
+                .expect_tool_calls_all
+                .iter()
+                .filter(|t| !tool_names.contains(&normalize(t)))
+                .collect();
+            let ok = missing.is_empty();
+            let detail = format!(
+                "expected all of {:?}; missing={:?}; trace={:?} ({})",
+                q.expect_tool_calls_all, missing, tool_names, if gotham_ran { "gating" } else { "Info: non-gotham route" }
+            );
+            m.push(tool_metric(p("tools_all"), ok, gotham_ran, detail));
+        }
+        if let Some(max) = q.max_tool_calls {
+            let n = a.tools.len();
+            let ok = n <= max;
+            let detail = format!(
+                "{n} tool call(s), cap {max} ({})",
+                if gotham_ran { "gating" } else { "Info: non-gotham route" }
+            );
+            m.push(tool_metric(p("max_tools"), ok, gotham_ran, detail));
+        }
+        if let Some(min) = q.min_tool_calls {
+            let n = a.tools.len();
+            let ok = n >= min;
+            let detail = format!(
+                "{n} tool call(s), min {min} for multi-hop ({})",
+                if gotham_ran { "gating" } else { "Info: non-gotham route" }
+            );
+            m.push(tool_metric(p("min_tools"), ok, gotham_ran, detail));
+        }
+        if let Some(want) = q.expect_confirmation {
+            let ok = a.saw_confirm == want;
+            let detail = format!(
+                "confirm event seen={}, expected={want} ({})",
+                a.saw_confirm, if gotham_ran { "gating" } else { "Info: non-gotham route" }
+            );
+            m.push(tool_metric(p("confirm"), ok, gotham_ran, detail));
+        }
+
+        // --- soft signals ---
+        if let Some(reference) = &q.reference_answer {
+            let sim = match (
+                embed(ctx, &embed_model, &a.answer).await,
+                embed(ctx, &embed_model, reference).await,
+            ) {
+                (Ok(x), Ok(y)) => cosine(&x, &y),
+                _ => f64::NAN,
+            };
+            if sim.is_nan() {
+                m.push(Metric::info(p("similarity"), 0.0, "similarity unavailable (embed failed)"));
+            } else if let Some(floor) = gt.similarity_floor {
+                m.push(Metric::new(
+                    p("similarity"),
+                    sim,
+                    Direction::HigherBetter,
+                    sim >= floor,
+                    format!("cosine {sim:.3} vs floor {floor:.3}"),
+                ));
+            } else {
+                m.push(Metric::info(p("similarity"), sim, format!("cosine {sim:.3} (Info)")));
+            }
+        }
+        if gt.judge_enabled {
+            if let Some(rubric) = &q.judge_rubric {
+                let score = judge(ctx, &q.ask, &a.answer, rubric).await.unwrap_or(0.0);
+                m.push(Metric::info(p("judge"), score, format!("LLM-judge {score:.2} (Info)")));
+            }
+        }
+    }
+    m
+}
+
+/// A tool-trace metric: a hard Boolean floor when the Detective loop ran (`gotham_ran`), else an
+/// Info metric carrying the same value so a rig-less / kill-switched machine never reddens.
+fn tool_metric(key: String, ok: bool, gotham_ran: bool, detail: String) -> Metric {
+    let v = if ok { 1.0 } else { 0.0 };
+    if gotham_ran {
+        Metric::new(key, v, Direction::Boolean, ok, detail)
+    } else {
+        Metric::info(key, v, detail)
+    }
 }
 
 /// `chat.q{i}.conv_scoped`: did the answer's citations stay inside ONE threaded conversation?

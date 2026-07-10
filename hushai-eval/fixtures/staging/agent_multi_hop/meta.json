@@ -1,0 +1,31 @@
+{
+  "case_id": "agent_multi_hop",
+  "description": "Gotham G3 fixture F9 (agent modality — multi-hop tool chaining). Reuses the F3 person<->vehicle scenario: Alice is co-staged with the plate EMD774 on the driveway camera TWICE (the arrived_with_vehicle bind), and Bob is co-sighted with the same plate ONCE (below the bind bar). The Detective is asked to resolve the plate to its associated PERSON via the relationship graph — a graph-backed cross-entity hop (plate -> arrived_with_vehicle edge -> person + count) it must reach for the graph to answer. Proves: the loop routes to gotham, selects a graph tool, and resolves plate EMD774 to Alice grounded in the graph (the powerful graph_entity call returns the person + counts in one shot; Bob's below-bar single co-sighting is also faithfully surfaced). NB the graph tools call the token-gated backend /v1/graph/* API — GOTHAM_BACKEND_TOKEN must be set (see local_dev/eval.agent.env) or the calls 401. NB the ALPR reads the plate as 'EM0774' (D->0); enroll seeds plate_text='EM0774' with display_name 'EMD774'. STAGING-only. Media shared with graph_person_vehicle, regenerable via local_dev/fetch_eval_clips.sh.",
+  "device_id": "eval-agent-drive",
+  "media_file": "clips/alice_face.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": -10800000000000,
+  "modalities": [
+    "agent"
+  ],
+  "tier": "full",
+  "enroll": [
+    { "modality": "person", "name": "Alice", "ref": "clips/alice_face.mp4" },
+    { "modality": "person", "name": "Bob", "ref": "clips/bob_face.mp4" },
+    { "modality": "plate", "name": "EMD774", "plate_text": "EM0774" }
+  ],
+  "injections": [
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-agent-drive", "capture_start_offset_ns": 0, "seed": "a1" },
+    { "media_file": "clips/plate.mp4", "device_id": "eval-agent-drive", "capture_start_offset_ns": 30000000000, "seed": "p1" },
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-agent-drive", "capture_start_offset_ns": 3600000000000, "seed": "a2" },
+    { "media_file": "clips/plate.mp4", "device_id": "eval-agent-drive", "capture_start_offset_ns": 3630000000000, "seed": "p2" },
+    { "media_file": "clips/bob_face.mp4", "device_id": "eval-agent-drive", "capture_start_offset_ns": 7200000000000, "seed": "b1" },
+    { "media_file": "clips/plate.mp4", "device_id": "eval-agent-drive", "capture_start_offset_ns": 7230000000000, "seed": "p3" }
+  ],
+  "poll": {
+    "timeout_secs": 300,
+    "interval_secs": 3,
+    "quiesce_polls": 2
+  }
+}

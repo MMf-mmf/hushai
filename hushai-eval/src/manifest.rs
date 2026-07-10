@@ -60,6 +60,32 @@ const KNOBS: &[&str] = &[
     "OWNER_SPEAKER_NAME",
     "OWNER_PERSON_ID",
     "OWNER_PERSON_NAME",
+    // Gotham "Detective" agentic runtime (G3, the `agent` eval modality). These SHAPE the streamed
+    // answer + tool trace the `agent` scorer asserts on, so a baseline is only comparable under the
+    // identical decode + loop-bound profile. HAND-LISTED (not a `GOTHAM_` prefix-fold) ON PURPOSE:
+    // prefix-folding would sweep the secret `GOTHAM_BACKEND_TOKEN` + the machine-specific
+    // `GOTHAM_BACKEND_BASE_URL` into every machine's hash and fragment baselines. Output-shaping
+    // knobs only — audit/mutation/briefing-wall-clock knobs (`GOTHAM_AUDIT_READS`,
+    // `GOTHAM_MUTATIONS_ENABLED`, `GOTHAM_BRIEFING_*`, `GOTHAM_CONFIRM_TTL_SECS`) are deliberately
+    // omitted (no effect on a Phase-1 read-only answer). NOTE: these fold into the hash ONLY when
+    // actually SET in the eval process env — they are pinned in a staging-only env layer, NOT the
+    // shared `local_dev/eval.env`, so the frozen `graph`/perception lineage (d4acc862) is untouched
+    // by a plain `--fixtures all` run.
+    "GOTHAM_ENABLED",
+    "GOTHAM_RUNTIME",
+    "GOTHAM_LLM_MODEL",
+    "GOTHAM_JUDGE_MODEL",
+    "GOTHAM_TEMPERATURE",
+    "GOTHAM_SEED",
+    "GOTHAM_NUM_CTX",
+    "GOTHAM_MAX_TURNS",
+    "GOTHAM_MAX_TOOL_CALLS",
+    "GOTHAM_VOICE_MAX_TOOL_CALLS",
+    "GOTHAM_TOOL_TIMEOUT_MS",
+    "GOTHAM_WALL_CLOCK_SECS",
+    "GOTHAM_TOOL_RESULT_MAX_CHARS",
+    "GOTHAM_OBS_TOTAL_MAX_CHARS",
+    "GOTHAM_CRITIQUE_ENABLED",
 ];
 
 /// Env-var PREFIXES whose vars change what the pipeline produces. Folded into the config-hash BY

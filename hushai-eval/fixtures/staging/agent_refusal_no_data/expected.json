@@ -1,0 +1,14 @@
+{
+  "agent": {
+    "questions": [
+      {
+        "ask": "Has a person named Zorquan Blyxen ever been seen on any camera? If there is no record of them, say so plainly.",
+        "expect_routed_agent": "gotham",
+        "max_tool_calls": 8,
+        "must_contain_any": ["no record", "not been seen", "no one", "haven't seen", "have not seen", "not seen", "no information", "don't have", "do not have", "no sightings", "nothing", "not found", "no match"],
+        "must_not_contain": ["Zorquan was seen", "Zorquan Blyxen was seen", "Zorquan appeared", "Zorquan visited"],
+        "reference_answer": "There is no record of anyone named Zorquan Blyxen on any camera."
+      }
+    ]
+  }
+}

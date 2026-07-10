@@ -17,6 +17,7 @@ pub mod poll;
 pub mod probe;
 pub mod query;
 pub mod query_advisor;
+pub mod query_agent;
 pub mod query_rag;
 pub mod report;
 pub mod reset;
@@ -80,7 +81,10 @@ async fn run_case(
     update_baseline: bool,
     force: bool,
 ) -> Result<CaseResult> {
-    let base_ns = fx.meta.base_capture_unix_nanos;
+    // `effective_base_ns` resolves a NEGATIVE meta base to a now-relative one (the `agent` modality
+    // needs its data "recent" because the Detective's tools use now-relative windows); positive
+    // bases (every other fixture) pass through unchanged.
+    let base_ns = fx.meta.effective_base_ns();
     let (cid, split, tier) = (fx.meta.case_id.as_str(), fx.split.as_str(), fx.meta.tier.as_str());
 
     // Advisor cases are SERVICE-level (the `advisor` modality): a scripted conversation against
@@ -211,8 +215,11 @@ async fn run_case(
     // then (2) trigger ONE authoritative rebuild that folds the whole scenario in a single batch —
     // deterministic and correct for every edge type (see `poll::wait_graph_inputs_settled`). Both
     // steps fail CLOSED to inconclusive, never a scored FAIL.
+    // The `agent` (Detective) modality ALSO folds the graph: its graph_* tools read `entity_edges`,
+    // so an agent fixture reusing a graph scenario (F9 person↔plate, F10 cross-camera journey) needs
+    // the same authoritative rebuild the `graph` modality triggers. Gate on either.
     let mut digest_sections: Option<serde_json::Value> = None;
-    if fx.meta.needs_graph() {
+    if fx.meta.needs_graph() || fx.meta.needs_agent() {
         let settled = poll::wait_graph_inputs_settled(
             ctx,
             &devices_vec,
@@ -303,6 +310,43 @@ async fn run_case(
                 )
                 .await,
             );
+        }
+    }
+
+    // AGENT step (Gotham Detective / Phase F): drive the SAME live `/v1/rag/chat` SSE with
+    // `agent_id="gotham"` so the plan→act→observe loop runs, and score the streamed answer + tool
+    // trace. Same fail-closed discipline as the RAG step: a down service / transport error is
+    // INFRASTRUCTURE (INCONCLUSIVE / exit 2), never a false regression. A kill-switched (or old)
+    // binary that never routes to "gotham" still answers cleanly — the tool-trace metrics degrade
+    // to Info inside `score_agent`, so a rig-less machine can't redden this. LLM-driven ⇒ these
+    // fixtures live only in `staging` (never in `--fixtures all`).
+    if fx.meta.needs_agent() {
+        if let Some(agent_gt) = &fx.expected.agent {
+            if !query_rag::rag_up(ctx).await {
+                return Ok(CaseResult::inconclusive(
+                    cid,
+                    split,
+                    tier,
+                    "RAG service unreachable (the agent modality needs the live :8090 stack + GOTHAM_ENABLED)".to_string(),
+                ));
+            }
+            let mut results = Vec::with_capacity(agent_gt.questions.len());
+            let mut sessions: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+            for (qi, q) in agent_gt.questions.iter().enumerate() {
+                let sid = q.session.as_ref().and_then(|label| sessions.get(label)).cloned();
+                match query_agent::ask(ctx, q, base_ns, sid.as_deref()).await {
+                    Ok(a) => {
+                        if let Some(label) = &q.session {
+                            if !a.session_id.is_empty() {
+                                sessions.entry(label.clone()).or_insert_with(|| a.session_id.clone());
+                            }
+                        }
+                        results.push(a);
+                    }
+                    Err(e) => return Ok(CaseResult::inconclusive(cid, split, tier, format!("gotham chat q{qi} transport error: {e:#}"))),
+                }
+            }
+            metrics.extend(score::score_agent(agent_gt, &results, ctx).await);
         }
     }
 

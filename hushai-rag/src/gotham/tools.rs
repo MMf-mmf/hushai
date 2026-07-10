@@ -242,9 +242,9 @@ impl ToolKind {
                 json!({"question": {"type": "string"}}),
                 vec!["question"],
             ),
-            GraphEntity => ("Look up an entity's node in the relationship graph.", json!({"entity_name": {"type": "string"}}), vec!["entity_name"]),
-            GraphConnections => ("How two entities are connected in the graph.", json!({"a": {"type": "string"}, "b": {"type": "string"}}), vec!["a", "b"]),
-            GraphNeighborhood => ("An entity's graph neighborhood.", json!({"entity": {"type": "string"}, "depth": {"type": "integer"}}), vec!["entity"]),
+            GraphEntity => ("Look up ONE named entity (a person, a license plate, or a place) in the relationship graph and get EVERYTHING it is connected to — the people, vehicles, companions and places linked to it. Use this to answer 'who/what is X connected to / associated with', e.g. which person a plate belongs to.", json!({"entity_name": {"type": "string", "description": "the ONE person/plate/place to look up, e.g. 'Alice' or 'EMD774'"}}), vec!["entity_name"]),
+            GraphConnections => ("Find the path between TWO SPECIFIC already-named entities (e.g. is Alice connected to Bob). Only use this when you have BOTH concrete names; to find what a SINGLE entity is connected to, use graph_entity instead.", json!({"a": {"type": "string", "description": "first named entity"}, "b": {"type": "string", "description": "second named entity"}}), vec!["a", "b"]),
+            GraphNeighborhood => ("Everything within one or two hops of ONE named entity in the relationship graph (a wider view than graph_entity).", json!({"entity": {"type": "string"}, "depth": {"type": "integer"}}), vec!["entity"]),
             GraphAnomalies => ("Recent pattern anomalies the system flagged.", json!({"window": window}), vec![]),
             GraphBriefing => ("The daily briefing for a date (YYYY-MM-DD).", json!({"date": {"type": "string"}}), vec![]),
         };
@@ -824,45 +824,353 @@ async fn tool_entity_profile(st: &AppState, args: &Value, ctx: &CallerCtx) -> an
     }
 }
 
-/// Graph tools: GET the backend `/v1/graph/*` read API (loopback + bearer). The observation is the
-/// compact JSON body; the model reasons over it. Errors surface as a plain observation, never a hard
-/// failure (the agent can try another approach).
+/// Graph tools: GET the backend `/v1/graph/*` read API (loopback + bearer). The three relationship
+/// tools (`graph_entity` / `graph_neighborhood` / `graph_connections`) resolve the user-facing NAME
+/// to the real `{type}/{id}` graph node, hit the correct backend route
+/// (`/v1/graph/neighbors/{type}/{id}?hops=`, `/v1/graph/path?from=&to=`), and render a NAME-based
+/// human-readable summary — the model never sees a raw UUID. `graph_anomalies` / `graph_briefing`
+/// pass through the raw (truncated) JSON body (they hit `/v1/events` + `/v1/graph/digests`, which are
+/// already fine). Errors surface as a plain observation, never a hard failure (the agent can retry).
 async fn tool_graph(kind: ToolKind, st: &AppState, args: &Value, ctx: &CallerCtx) -> anyhow::Result<String> {
     let base = st.cfg.gotham.backend_base_url.trim_end_matches('/');
-    let path = match kind {
-        ToolKind::GraphEntity => format!("/v1/graph/entities/{}", urlenc(&arg_str(args, "entity_name").unwrap_or_default())),
-        ToolKind::GraphConnections => format!("/v1/graph/path?a={}&b={}", urlenc(&arg_str(args, "a").unwrap_or_default()), urlenc(&arg_str(args, "b").unwrap_or_default())),
-        ToolKind::GraphNeighborhood => {
-            let depth = arg_i64(args, "depth").unwrap_or(1).clamp(1, 2);
-            format!("/v1/graph/neighbors/{}?depth={depth}", urlenc(&arg_str(args, "entity").unwrap_or_default()))
-        }
-        ToolKind::GraphAnomalies => {
-            let (after, before) = resolve_window(args, ctx);
-            let mut q = "/v1/events?type=pattern_anomaly".to_string();
-            if let Some(a) = after { q.push_str(&format!("&after={a}")); }
-            if let Some(b) = before { q.push_str(&format!("&before={b}")); }
-            q
-        }
-        ToolKind::GraphBriefing => {
-            let date = arg_str(args, "date").unwrap_or_else(|| civil_date(ctx.now_ns, ctx.tz));
-            format!("/v1/graph/digests/{date}")
-        }
-        _ => unreachable!("tool_graph called with a non-graph kind"),
-    };
+    let max = st.cfg.gotham.tool_result_max_chars;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_millis(st.cfg.gotham.tool_timeout_ms.max(1)))
         .build()?;
+    let token = st.cfg.gotham.backend_token.as_deref();
+    match kind {
+        // Both resolve a NAME → node, then read the origin's neighborhood; `graph_entity` is
+        // `graph_neighborhood` pinned to 1 hop.
+        ToolKind::GraphEntity | ToolKind::GraphNeighborhood => {
+            let (arg_key, hops) = if kind == ToolKind::GraphEntity {
+                ("entity_name", 1)
+            } else {
+                ("entity", arg_i64(args, "depth").unwrap_or(1).clamp(1, 3))
+            };
+            let name = arg_str(args, arg_key).unwrap_or_default();
+            let Some((ntype, id)) = resolve_node(st, &name).await else {
+                return Ok(format!("I don't have anyone or anything called \"{name}\" on record."));
+            };
+            let path = format!("/v1/graph/neighbors/{ntype}/{}?hops={hops}", urlenc(&id));
+            let (status, body) = graph_fetch(&client, base, token, &path).await?;
+            if !status.is_success() {
+                return Ok(format!("The graph service returned no usable result (status {}).", status.as_u16()));
+            }
+            Ok(truncate(&render_neighbors(st, ntype, &id, &body).await, max))
+        }
+        ToolKind::GraphConnections => {
+            let a = arg_str(args, "a").unwrap_or_default();
+            let b = arg_str(args, "b").unwrap_or_default();
+            let ra = resolve_node(st, &a).await;
+            let rb = resolve_node(st, &b).await;
+            let (ta, ia, tb, ib) = match (ra, rb) {
+                (Some((ta, ia)), Some((tb, ib))) => (ta, ia, tb, ib),
+                (None, _) => return Ok(format!("I don't have anyone or anything called \"{a}\" on record.")),
+                (_, None) => return Ok(format!("I don't have anyone or anything called \"{b}\" on record.")),
+            };
+            let path = format!(
+                "/v1/graph/path?from={}&to={}",
+                urlenc(&format!("{ta}:{ia}")),
+                urlenc(&format!("{tb}:{ib}"))
+            );
+            let (status, body) = graph_fetch(&client, base, token, &path).await?;
+            if !status.is_success() {
+                return Ok(format!("No connection found between {a} and {b}."));
+            }
+            Ok(truncate(&render_path(st, &a, &b, &body).await, max))
+        }
+        ToolKind::GraphAnomalies => {
+            let (after, before) = resolve_window(args, ctx);
+            let mut path = "/v1/events?type=pattern_anomaly".to_string();
+            if let Some(a) = after { path.push_str(&format!("&after={a}")); }
+            if let Some(b) = before { path.push_str(&format!("&before={b}")); }
+            let (status, body) = graph_fetch(&client, base, token, &path).await?;
+            if !status.is_success() {
+                return Ok(format!("The graph service returned no usable result (status {}).", status.as_u16()));
+            }
+            Ok(truncate(&body, max))
+        }
+        ToolKind::GraphBriefing => {
+            let date = arg_str(args, "date").unwrap_or_else(|| civil_date(ctx.now_ns, ctx.tz));
+            let path = format!("/v1/graph/digests/{date}");
+            let (status, body) = graph_fetch(&client, base, token, &path).await?;
+            if !status.is_success() {
+                return Ok(format!("The graph service returned no usable result (status {}).", status.as_u16()));
+            }
+            Ok(truncate(&body, max))
+        }
+        _ => unreachable!("tool_graph called with a non-graph kind"),
+    }
+}
+
+/// GET a `/v1/graph/*` path with the shared client + optional bearer; returns `(status, body)`.
+async fn graph_fetch(
+    client: &reqwest::Client,
+    base: &str,
+    token: Option<&str>,
+    path: &str,
+) -> anyhow::Result<(reqwest::StatusCode, String)> {
     let mut req = client.get(format!("{base}{path}"));
-    if let Some(tok) = st.cfg.gotham.backend_token.as_deref() {
+    if let Some(tok) = token {
         req = req.bearer_auth(tok);
     }
     let resp = req.send().await?;
     let status = resp.status();
     let body = resp.text().await.unwrap_or_default();
-    if !status.is_success() {
-        return Ok(format!("The graph service returned no usable result (status {}).", status.as_u16()));
+    Ok((status, body))
+}
+
+/// Resolve a user-facing NAME to a graph node `(type, id-string)`: person (`display_name`), then plate
+/// (`display_name` OR the normalized plate text — a plate's `display_name` e.g. "EMD774" often differs
+/// from its OCR-folded `plate_text_norm` e.g. "EM0774"), then speaker (`display_name`). Case-insensitive
+/// (ILIKE); first hit wins. Runtime sqlx (no `.sqlx` offline cache in this crate).
+async fn resolve_node(st: &AppState, name: &str) -> Option<(&'static str, String)> {
+    let name = name.trim();
+    if name.is_empty() {
+        return None;
     }
-    Ok(truncate(&body, st.cfg.gotham.tool_result_max_chars))
+    if let Ok(Some(id)) = sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT person_id FROM persons WHERE display_name ILIKE $1 LIMIT 1",
+    )
+    .bind(name)
+    .fetch_optional(&st.pool)
+    .await
+    {
+        return Some(("person", id.to_string()));
+    }
+    let norm = crate::plates::normalize_plate(name);
+    if let Ok(Some(id)) = sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT plate_id FROM license_plates \
+         WHERE display_name ILIKE $1 OR ($2 <> '' AND plate_text_norm = $2) LIMIT 1",
+    )
+    .bind(name)
+    .bind(&norm)
+    .fetch_optional(&st.pool)
+    .await
+    {
+        return Some(("plate", id.to_string()));
+    }
+    if let Ok(Some(id)) = sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT speaker_id FROM speakers WHERE display_name ILIKE $1 LIMIT 1",
+    )
+    .bind(name)
+    .fetch_optional(&st.pool)
+    .await
+    {
+        return Some(("speaker", id.to_string()));
+    }
+    None
+}
+
+/// The REVERSE of [`resolve_node`]: a graph node `(type, id)` → its human display name, so the model
+/// never sees a raw UUID. `device` ids are already human-readable (returned verbatim). A missing /
+/// unnamed / non-uuid catalog node falls back to a friendly phrase, never a bare id.
+async fn node_label(st: &AppState, ntype: &str, id: &str) -> String {
+    if ntype == "device" {
+        return id.to_string();
+    }
+    let Ok(uid) = uuid::Uuid::parse_str(id) else {
+        return unknown_node_phrase(ntype);
+    };
+    let looked_up: Option<String> = match ntype {
+        "person" => sqlx::query_scalar::<_, Option<String>>(
+            "SELECT display_name FROM persons WHERE person_id = $1",
+        )
+        .bind(uid)
+        .fetch_optional(&st.pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten(),
+        "plate" => sqlx::query_scalar::<_, Option<String>>(
+            "SELECT COALESCE(display_name, plate_text_norm) FROM license_plates WHERE plate_id = $1",
+        )
+        .bind(uid)
+        .fetch_optional(&st.pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten(),
+        "speaker" => sqlx::query_scalar::<_, Option<String>>(
+            "SELECT display_name FROM speakers WHERE speaker_id = $1",
+        )
+        .bind(uid)
+        .fetch_optional(&st.pool)
+        .await
+        .ok()
+        .flatten()
+        .flatten(),
+        _ => None,
+    };
+    match looked_up {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => unknown_node_phrase(ntype),
+    }
+}
+
+/// Friendly stand-in when a node has no display name (never a bare UUID).
+fn unknown_node_phrase(ntype: &str) -> String {
+    match ntype {
+        "person" => "an unidentified person",
+        "speaker" => "an unidentified voice",
+        "plate" => "an unknown plate",
+        "device" => "a device",
+        _ => "something unrecognized",
+    }
+    .to_string()
+}
+
+/// Cache-through wrapper over [`node_label`] so repeated endpoints in one neighborhood are labeled once.
+async fn labeled(
+    st: &AppState,
+    memo: &mut std::collections::HashMap<(String, String), String>,
+    ntype: &str,
+    id: &str,
+) -> String {
+    let key = (ntype.to_string(), id.to_string());
+    if let Some(v) = memo.get(&key) {
+        return v.clone();
+    }
+    let label = node_label(st, ntype, id).await;
+    memo.insert(key, label.clone());
+    label
+}
+
+/// Pull `(type, id)` from an `edge_json` endpoint object — `src`/`dst` are NESTED `{type,id}`.
+fn edge_endpoint(e: &Value, key: &str) -> (String, String) {
+    let obj = e.get(key);
+    let t = obj.and_then(|o| o.get("type")).and_then(Value::as_str).unwrap_or("").to_string();
+    let i = obj.and_then(|o| o.get("id")).and_then(Value::as_str).unwrap_or("").to_string();
+    (t, i)
+}
+
+/// A `" (N unit(s))"` count suffix, or empty when the count is unknown/zero.
+fn count_paren(n: i64, unit: &str) -> String {
+    if n <= 0 {
+        String::new()
+    } else {
+        format!(" ({n} {unit}{})", if n == 1 { "" } else { "s" })
+    }
+}
+
+/// One readable sentence for a single edge, worded from the origin's perspective. Directed types
+/// (`arrived_with_vehicle` person→plate, `visits_place` entity→device) keep natural src→dst order;
+/// undirected types read `origin <verb> other`.
+fn describe_edge(
+    edge_type: &str,
+    origin_label: &str,
+    other_label: &str,
+    src_label: &str,
+    dst_label: &str,
+    count: i64,
+) -> String {
+    match edge_type {
+        "co_present" => format!(
+            "{origin_label} was seen together with {other_label}{}",
+            count_paren(count, "time")
+        ),
+        "conversed_with" => format!(
+            "{origin_label} talked with {other_label}{}",
+            count_paren(count, "conversation")
+        ),
+        "arrived_with_vehicle" => format!(
+            "{src_label} arrived with the vehicle {dst_label}{}",
+            count_paren(count, "time")
+        ),
+        "visits_place" => format!(
+            "{src_label} was seen at {dst_label}{}",
+            count_paren(count, "time")
+        ),
+        "same_identity_candidate" => format!("{origin_label} may be the same as {other_label}"),
+        other => format!("{origin_label} {} {other_label}", other.replace('_', " ")),
+    }
+}
+
+/// Render `/v1/graph/neighbors/{type}/{id}` JSON as a NAME-based summary: one readable sentence per
+/// direct (depth-1) edge, plus any farther-out neighbors (depth ≥ 2, only present when hops > 1).
+async fn render_neighbors(st: &AppState, origin_type: &str, origin_id: &str, body: &str) -> String {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    let origin_label = node_label(st, origin_type, origin_id).await;
+    let mut memo: std::collections::HashMap<(String, String), String> = std::collections::HashMap::new();
+    memo.insert((origin_type.to_string(), origin_id.to_string()), origin_label.clone());
+
+    // Direct (depth-1) edges → one sentence each.
+    let empty = Vec::new();
+    let edges = v.get("edges").and_then(Value::as_array).unwrap_or(&empty);
+    let mut lines: Vec<String> = Vec::new();
+    for e in edges.iter().take(40) {
+        let edge_type = e.get("edge_type").and_then(Value::as_str).unwrap_or("");
+        // Skip identity candidates ruled out by review — they are not real relationships.
+        if edge_type == "same_identity_candidate"
+            && e.get("status").and_then(Value::as_str) == Some("rejected")
+        {
+            continue;
+        }
+        let (st_t, st_i) = edge_endpoint(e, "src");
+        let (dt_t, dt_i) = edge_endpoint(e, "dst");
+        let count = e.get("observation_count").and_then(Value::as_i64).unwrap_or(0);
+        let src_label = labeled(st, &mut memo, &st_t, &st_i).await;
+        let dst_label = labeled(st, &mut memo, &dt_t, &dt_i).await;
+        let origin_is_src = st_t == origin_type && st_i == origin_id;
+        let other_label = if origin_is_src { dst_label.clone() } else { src_label.clone() };
+        lines.push(describe_edge(edge_type, &origin_label, &other_label, &src_label, &dst_label, count));
+    }
+
+    // Farther-out neighbors (depth ≥ 2) — the backend records each node once at its minimum depth,
+    // so these never overlap the direct edges above.
+    let mut far: Vec<String> = Vec::new();
+    if let Some(ns) = v.get("neighbors").and_then(Value::as_array) {
+        for n in ns.iter().take(60) {
+            if n.get("depth").and_then(Value::as_i64).unwrap_or(1) < 2 {
+                continue;
+            }
+            let t = n.get("type").and_then(Value::as_str).unwrap_or("");
+            let i = n.get("id").and_then(Value::as_str).unwrap_or("");
+            far.push(labeled(st, &mut memo, t, i).await);
+        }
+    }
+
+    if lines.is_empty() && far.is_empty() {
+        return format!("{origin_label} has no recorded relationships in the graph yet.");
+    }
+    let mut out = String::new();
+    if lines.is_empty() {
+        out.push_str(&format!("{origin_label} has no direct relationships on record.\n"));
+    } else {
+        out.push_str(&format!("{origin_label} — relationships:\n"));
+        for l in &lines {
+            out.push_str("- ");
+            out.push_str(l);
+            out.push('\n');
+        }
+    }
+    if !far.is_empty() {
+        far.sort();
+        far.dedup();
+        out.push_str(&format!("Also connected further out: {}.\n", far.join(", ")));
+    }
+    out
+}
+
+/// Render `/v1/graph/path` JSON as a NAME-based chain ("Alice → EMD774 → Bob").
+async fn render_path(st: &AppState, a_name: &str, b_name: &str, body: &str) -> String {
+    let v: Value = serde_json::from_str(body).unwrap_or(Value::Null);
+    if !v.get("found").and_then(Value::as_bool).unwrap_or(false) {
+        return format!("No connection found between {a_name} and {b_name}.");
+    }
+    let mut labels: Vec<String> = Vec::new();
+    if let Some(path) = v.get("path").and_then(Value::as_array) {
+        for node in path {
+            if let Some((t, i)) = node.as_str().and_then(|s| s.split_once(':')) {
+                labels.push(node_label(st, t, i).await);
+            }
+        }
+    }
+    match labels.len() {
+        0 => format!("No connection found between {a_name} and {b_name}."),
+        1 => format!("{a_name} and {b_name} are the same entity in the graph."),
+        _ => format!("Connection: {}", labels.join(" → ")),
+    }
 }
 
 // ---- small utilities ----------------------------------------------------------------------------

@@ -1,0 +1,15 @@
+{
+  "agent": {
+    "questions": [
+      {
+        "ask": "In total, how many separate times has Alice been recorded on camera? Answer with the number.",
+        "expect_routed_agent": "gotham",
+        "expect_tool_calls_any": ["presence_count", "people_sightings", "entity_profile"],
+        "min_tool_calls": 1,
+        "max_tool_calls": 8,
+        "must_contain": ["Alice"],
+        "reference_answer": "Alice has been recorded 3 times."
+      }
+    ]
+  }
+}

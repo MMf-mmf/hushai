@@ -1,0 +1,15 @@
+{
+  "case_id": "agent_multi_hop",
+  "config_hash": "a5bb8a7054745a55",
+  "git_sha": "fdee2a4",
+  "metrics": {
+    "agent.q0.contains": 1.0,
+    "agent.q0.errored": 1.0,
+    "agent.q0.max_tools": 1.0,
+    "agent.q0.min_tools": 1.0,
+    "agent.q0.routed": 1.0,
+    "agent.q0.similarity": 0.9296634242102578,
+    "agent.q0.tool_count": 1.0,
+    "agent.q0.tools_any": 1.0
+  }
+}

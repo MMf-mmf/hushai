@@ -1,0 +1,12 @@
+{
+  "agent": {
+    "questions": [
+      {
+        "ask": "Exhaustively investigate EVERYTHING about every person, plate, object and conversation on record. Do not stop. Keep calling every tool available, over and over, until you have absolutely nothing left to check, then give me the complete picture.",
+        "expect_routed_agent": "gotham",
+        "min_tool_calls": 1,
+        "max_tool_calls": 8
+      }
+    ]
+  }
+}

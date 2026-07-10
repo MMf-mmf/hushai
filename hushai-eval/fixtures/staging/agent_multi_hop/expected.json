@@ -1,0 +1,15 @@
+{
+  "agent": {
+    "questions": [
+      {
+        "ask": "Look up the license plate EMD774 in the relationship graph to find which PERSON that vehicle is connected to. Then report that person's name and how many separate times they have been seen.",
+        "expect_routed_agent": "gotham",
+        "expect_tool_calls_any": ["plate_sightings", "graph_entity", "graph_connections", "graph_neighborhood", "people_sightings", "presence_count", "entity_profile"],
+        "min_tool_calls": 1,
+        "max_tool_calls": 8,
+        "must_contain": ["Alice"],
+        "reference_answer": "The plate EMD774 is associated with Alice, who has been seen twice."
+      }
+    ]
+  }
+}

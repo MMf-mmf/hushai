@@ -1,0 +1,26 @@
+{
+  "case_id": "agent_single_tool",
+  "description": "Gotham G3 fixture F8 (agent modality — single-tool selection + deterministic count). Alice's enrolled face is injected THREE times on one camera the same day (0, +2h, +4h), so re-ID collapses them to one person with 3 distinct visits. The Detective is asked 'how many times has Alice been seen', which should drive ONE counting tool (presence_count / people_sightings / entity_profile) and report the number. Proves: agent routes to gotham, picks a single sensible read tool, and reports a deterministic count grounded in the pipeline — the simplest end-to-end loop. STAGING-only (LLM-driven): opt-in, never gates. base_capture is NEGATIVE (now-relative, -5h) so the 3 visits stay inside the Detective's now-relative tool windows (last_7d) every run — the count metric is invariant to the absolute base. Media (clips/alice_face.mp4) shared with the graph fixtures, regenerable via local_dev/fetch_eval_clips.sh.",
+  "device_id": "eval-agent-single",
+  "media_file": "clips/alice_face.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": -18000000000000,
+  "modalities": [
+    "agent"
+  ],
+  "tier": "full",
+  "enroll": [
+    { "modality": "person", "name": "Alice", "ref": "clips/alice_face.mp4" }
+  ],
+  "injections": [
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-agent-single", "capture_start_offset_ns": 0, "seed": "v0" },
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-agent-single", "capture_start_offset_ns": 7200000000000, "seed": "v1" },
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-agent-single", "capture_start_offset_ns": 14400000000000, "seed": "v2" }
+  ],
+  "poll": {
+    "timeout_secs": 300,
+    "interval_secs": 3,
+    "quiesce_polls": 2
+  }
+}

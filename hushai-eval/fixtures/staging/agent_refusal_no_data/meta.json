@@ -1,0 +1,24 @@
+{
+  "case_id": "agent_refusal_no_data",
+  "description": "Gotham G3 fixture F11 (agent modality — refusal / no-hallucination + cap + clean stream). Minimal media: Alice's face injected once, so the catalog holds exactly one known person. The Detective is asked about a person who does NOT exist ('Zorquan Blyxen'); it must look, find nothing, and DECLINE rather than fabricate a sighting — while honoring the tool-call cap and finishing with a clean stream (no error event). Proves: the loop terminates cleanly on empty evidence, refuses instead of hallucinating, and never runs away. STAGING-only. Media shared with the graph fixtures, regenerable via local_dev/fetch_eval_clips.sh.",
+  "device_id": "eval-agent-refusal",
+  "media_file": "clips/alice_face.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": -3600000000000,
+  "modalities": [
+    "agent"
+  ],
+  "tier": "full",
+  "enroll": [
+    { "modality": "person", "name": "Alice", "ref": "clips/alice_face.mp4" }
+  ],
+  "injections": [
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-agent-refusal", "capture_start_offset_ns": 0, "seed": "only" }
+  ],
+  "poll": {
+    "timeout_secs": 300,
+    "interval_secs": 3,
+    "quiesce_polls": 2
+  }
+}

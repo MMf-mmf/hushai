@@ -81,6 +81,29 @@ impl Meta {
     pub fn seed(&self) -> String {
         self.segment_id_seed.clone().unwrap_or_else(|| self.case_id.clone())
     }
+
+    /// The effective capture-start base in unix nanos. A POSITIVE `base_capture_unix_nanos` is an
+    /// absolute pin (the default — keeps every existing fixture's timestamps + hour-of-week buckets
+    /// deterministic). A NEGATIVE value is an OFFSET BEFORE wall-clock now (`now + base`, e.g.
+    /// `-18000000000000` = 5 hours ago), for fixtures whose SCORED surface reads NOW-relative
+    /// windows: the Gotham `agent` (Detective) tools default to "last_7d"/"last_30d", so data pinned
+    /// to a fixed historical instant ages out of the window and the tool finds nothing. A relative
+    /// base keeps the injected sightings "recent" on every run. Safe because such fixtures assert
+    /// only counts/booleans/tool-selection — all invariant to the ABSOLUTE base — so their baselines
+    /// stay stable run-to-run even though the wall-clock timestamps shift. Fixtures that assert
+    /// absolute timestamps (graph hour-of-week baselines) MUST keep a positive base.
+    pub fn effective_base_ns(&self) -> i64 {
+        let b = self.base_capture_unix_nanos;
+        if b >= 0 {
+            b
+        } else {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as i64)
+                .unwrap_or(0);
+            now + b
+        }
+    }
     pub fn modality(&self, name: &str) -> bool {
         self.modalities.iter().any(|m| m == name)
     }
@@ -89,12 +112,12 @@ impl Meta {
     /// lanes to drain (a chat-only fixture used to wait on NOTHING — the poller quiesced at 0
     /// processed and the case went inconclusive with `audio_done=0 injected=N`).
     pub fn needs_vision(&self) -> bool {
-        ["persons", "faces", "objects", "plates"].iter().any(|m| self.modality(m)) || self.needs_rag() || self.needs_graph()
+        ["persons", "faces", "objects", "plates"].iter().any(|m| self.modality(m)) || self.needs_rag() || self.needs_graph() || self.needs_agent()
     }
     /// True if any scored modality requires the audio lane (see `needs_vision` on `chat`).
     /// `conversations` rides on transcript_sentences, so it waits on the audio lane too.
     pub fn needs_audio(&self) -> bool {
-        ["transcript", "speakers", "sentiment", "conversations"].iter().any(|m| self.modality(m)) || self.needs_rag() || self.needs_graph()
+        ["transcript", "speakers", "sentiment", "conversations"].iter().any(|m| self.modality(m)) || self.needs_rag() || self.needs_graph() || self.needs_agent()
     }
 
     /// True if this case scores the Gotham entity graph (the `graph` modality). The graph is FOLDED
@@ -118,12 +141,23 @@ impl Meta {
         self.modality("advisor")
     }
 
+    /// True if this case scores the live Gotham "Detective" agentic runtime (the `agent` modality;
+    /// G3 / Phase F). Structurally the SUPERSET of `chat`: it drives the SAME live `/v1/rag/chat`
+    /// SSE endpoint (with `agent_id="gotham"` + `GOTHAM_ENABLED`), rides on the perceived pipeline
+    /// AND the folded graph (so `run_case` triggers the authoritative rebuild for it just like
+    /// `graph`), then scores the streamed answer PLUS the `tool_call`/`tool_result` trace. LLM-driven
+    /// → staging-only (never in `--fixtures all`); a down runtime / kill-switch degrades tool metrics
+    /// to Info, never a false FAIL (see `score::score_agent`).
+    pub fn needs_agent(&self) -> bool {
+        self.modality("agent")
+    }
+
     /// The concrete list of clips to inject, in order. A single, fully-resolved plan whether the
     /// fixture is legacy single-clip (`injections` empty) or multi-clip. Legacy resolves to EXACTLY
     /// today's parameters (same device, base, seg_seconds, seed, label) so existing baselines are
     /// untouched; multi-clip specs inherit meta defaults and get an index-namespaced seed/label.
     pub fn effective_injections(&self) -> Vec<ResolvedInjection> {
-        let base = self.base_capture_unix_nanos;
+        let base = self.effective_base_ns();
         if self.injections.is_empty() {
             return vec![ResolvedInjection {
                 media_file: self.media_file.clone(),
@@ -240,6 +274,9 @@ pub struct Expected {
     pub advisor: Option<AdvisorGt>,
     /// Entity-graph ground truth (scored only when the `graph` modality is listed; Gotham G1).
     pub graph: Option<GraphGt>,
+    /// Gotham "Detective" agentic ground truth (scored only when the `agent` modality is listed;
+    /// G3 / Phase F). Reuses the chat answer-assertions and adds a tool-trace layer.
+    pub agent: Option<AgentGt>,
 }
 
 // ----- chat / rag ground truth -----------------------------------------------
@@ -368,6 +405,90 @@ pub struct ChatCaller {
     /// The on-device owner voice check passed for this turn.
     #[serde(default)]
     pub owner_verified: bool,
+}
+
+// ----- agent (Gotham Detective) ground truth -----------------------------------
+
+/// Gotham "Detective" agentic ground truth (the `agent` modality; G3 / Phase F). The runner drives
+/// the SAME live `/v1/rag/chat` SSE endpoint the `chat` modality does, but with `agent_id="gotham"`,
+/// so the Detective plan→act→observe loop runs and streams a `tool_call`/`tool_result` trace on top
+/// of the ordinary session/token/sources/done frames. Each question's answer-assertions are the same
+/// deterministic-first checks as `chat` (robust to LLM wording); the tool-trace assertions layer on
+/// top and, crucially, **only gate when the turn actually routed to `gotham`** — a kill-switched /
+/// old / react-degraded binary that never streams tool frames degrades every tool metric to Info
+/// (never a false FAIL). LLM-driven ⇒ staging-only (excluded from `--fixtures all`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentGt {
+    pub questions: Vec<AgentQ>,
+    /// When set, answer-vs-`reference_answer` cosine is a FLOORED (gating) metric; otherwise Info.
+    #[serde(default)]
+    pub similarity_floor: Option<f64>,
+    /// Run the LLM-as-judge per question (Info-only, never gates — same discipline as `chat`).
+    #[serde(default)]
+    pub judge_enabled: bool,
+}
+
+/// One Detective turn + its assertions. `agent_id` defaults to `"gotham"` (the whole point of this
+/// modality). The answer checks (`must_*` / `expect_number` / `expect_routed_agent` / `min_citations`)
+/// mirror [`ChatQ`]; the `expect_tool_*` / `max_tool_calls` / `expect_confirmation` fields assert the
+/// observed SSE tool trace. `filters` / `session` behave exactly as in `chat`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct AgentQ {
+    pub ask: String,
+    /// The persona to drive. Defaults to `"gotham"`; a fixture never needs to change this (it is the
+    /// modality's identity), but it stays overridable for a kill-switch negative that asks the same
+    /// question of a non-Detective agent.
+    #[serde(default = "d_gotham")]
+    pub agent_id: String,
+    #[serde(default)]
+    pub filters: Option<ChatFilters>,
+    #[serde(default)]
+    pub top_k: Option<i64>,
+    /// Session label — same threading semantics as [`ChatQ::session`] (shared label ⇒ one session).
+    #[serde(default)]
+    pub session: Option<String>,
+
+    // ---- answer assertions (mirror ChatQ; deterministic-first) ----
+    #[serde(default)]
+    pub must_contain: Vec<String>,
+    #[serde(default)]
+    pub must_contain_any: Vec<String>,
+    #[serde(default)]
+    pub must_not_contain: Vec<String>,
+    #[serde(default)]
+    pub expect_number: Option<i64>,
+    /// The concrete `routed_agent_id` expected — normally `"gotham"` for a Detective turn; a
+    /// kill-switch negative expects the fallback capability (e.g. `"recordings"`).
+    #[serde(default)]
+    pub expect_routed_agent: Option<String>,
+    #[serde(default)]
+    pub min_citations: Option<i64>,
+
+    // ---- tool-trace assertions (gate ONLY when the turn routed to gotham; else Info) ----
+    /// AT LEAST ONE of these tool names must appear in the streamed `tool_call` trace.
+    #[serde(default)]
+    pub expect_tool_calls_any: Vec<String>,
+    /// EVERY listed tool name must appear in the trace (multi-hop chaining).
+    #[serde(default)]
+    pub expect_tool_calls_all: Vec<String>,
+    /// The number of `tool_call` events must not exceed this (loop-cap / runaway assertion).
+    #[serde(default)]
+    pub max_tool_calls: Option<usize>,
+    /// The number of `tool_call` events must be AT LEAST this — the robust proof of multi-hop tool
+    /// CHAINING (≥2) without pinning exactly which tools the 7B model chose (that is what
+    /// `expect_tool_calls_any` covers). Gates only when the turn routed to `gotham`.
+    #[serde(default)]
+    pub min_tool_calls: Option<usize>,
+    /// Whether a `confirm` SSE event was expected (Wave-3 mutations; DORMANT in Phase 1 —
+    /// no mutating tools are registered, so leave unset in F8–F11).
+    #[serde(default)]
+    pub expect_confirmation: Option<bool>,
+
+    // ---- soft signals ----
+    #[serde(default)]
+    pub reference_answer: Option<String>,
+    #[serde(default)]
+    pub judge_rubric: Option<String>,
 }
 
 // ----- advisor ground truth ----------------------------------------------------
@@ -765,6 +886,45 @@ mod tests {
         }
     }
 
+    /// The Gotham G3 `agent` staging fixtures are only exercised by a live `--fixtures staging` rig
+    /// run, so parse them here so an `AgentGt` schema/typo drift fails fast. Also asserts every
+    /// `expect_tool_calls_*` name is a REAL registered Detective tool — a typo (`presnce_count`,
+    /// `graph_connect`) would otherwise silently never match the trace and look like a model failure
+    /// on the rig instead of a fixture bug. The tool-name list mirrors `hushai_rag`'s
+    /// `gotham::tools::ToolKind::name()` (Phase-1 read tools + graph tools + ask_user).
+    #[test]
+    fn agent_fixtures_parse() {
+        const TOOL_NAMES: &[&str] = &[
+            "search_transcripts", "latest_conversation", "list_conversations", "conversation_transcript",
+            "search_objects", "people_sightings", "who_was_i_with", "co_presence", "plate_sightings",
+            "presence_count", "footage_stats", "reflection_digest", "events_feed", "entity_profile",
+            "ask_user", "graph_entity", "graph_connections", "graph_neighborhood", "graph_anomalies",
+            "graph_briefing",
+        ];
+        let root = crate::ctx::repo_root().join("hushai-eval/fixtures/staging");
+        for case in [
+            "agent_single_tool",
+            "agent_multi_hop",
+            "agent_journey_narrate",
+            "agent_refusal_no_data",
+            "agent_runaway_capped",
+        ] {
+            let fx = load(&root.join(case), "staging").unwrap_or_else(|e| panic!("{case}: {e:#}"));
+            assert!(fx.meta.needs_agent(), "{case} must list the agent modality");
+            let gt = fx.expected.agent.as_ref().unwrap_or_else(|| panic!("{case}: agent GT block"));
+            assert!(!gt.questions.is_empty(), "{case} must script at least one question");
+            for q in &gt.questions {
+                assert_eq!(q.agent_id, "gotham", "{case}: an agent turn must drive the gotham persona");
+                for t in q.expect_tool_calls_any.iter().chain(q.expect_tool_calls_all.iter()) {
+                    assert!(TOOL_NAMES.contains(&t.as_str()), "{case}: unknown tool name in expectation: {t:?}");
+                }
+                if let (Some(min), Some(max)) = (q.min_tool_calls, q.max_tool_calls) {
+                    assert!(min <= max, "{case}: min_tool_calls {min} > max_tool_calls {max}");
+                }
+            }
+        }
+    }
+
     /// The graph (Gotham G1) staging fixtures are media-less until a live rig calibration run, so
     /// nothing else exercises their JSON — parse them here so a `GraphGt` schema/typo drift fails
     /// fast. Also asserts the every-edge invariant: a known set of edge kinds + resolvable endpoint
@@ -845,6 +1005,7 @@ mod tests {
 fn d_muxed() -> String { "muxed".into() }
 fn d_full() -> String { "full".into() }
 fn d_auto() -> String { "auto".into() }
+fn d_gotham() -> String { "gotham".into() }
 fn d_info() -> String { "info".into() }
 fn d_seg_seconds() -> u32 { 2 }
 fn d_poll_timeout() -> u64 { 180 }

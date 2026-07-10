@@ -1,0 +1,12 @@
+{
+  "case_id": "agent_runaway_capped",
+  "config_hash": "a5bb8a7054745a55",
+  "git_sha": "fdee2a4",
+  "metrics": {
+    "agent.q0.errored": 1.0,
+    "agent.q0.max_tools": 1.0,
+    "agent.q0.min_tools": 1.0,
+    "agent.q0.routed": 1.0,
+    "agent.q0.tool_count": 8.0
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "case_id": "agent_journey_narrate",
+  "description": "Gotham G3 fixture F10 (agent modality — journey narration over cross-camera fusion). Reuses the F2 scenario: the same enrolled Alice appears on the FRONT camera on day 1 and the GARAGE camera on day 2, so the graph holds a visits_place edge to BOTH devices from one identity. The Detective is asked to trace Alice's movements across cameras; it should consult a graph/journey tool and name BOTH cameras. Proves: the loop uses the relationship graph and narrates a cross-camera journey grounded in the fused identity (the join the raw pipeline never makes). STAGING-only. Media shared with graph_cross_camera_fusion, regenerable via local_dev/fetch_eval_clips.sh.",
+  "device_id": "eval-agent-front",
+  "media_file": "clips/alice_face.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": -90000000000000,
+  "modalities": [
+    "agent"
+  ],
+  "tier": "full",
+  "enroll": [
+    { "modality": "person", "name": "Alice", "ref": "clips/alice_face.mp4" }
+  ],
+  "injections": [
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-agent-front", "capture_start_offset_ns": 0, "seed": "front" },
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-agent-garage", "capture_start_offset_ns": 86400000000000, "seed": "garage" }
+  ],
+  "poll": {
+    "timeout_secs": 300,
+    "interval_secs": 3,
+    "quiesce_polls": 2
+  }
+}

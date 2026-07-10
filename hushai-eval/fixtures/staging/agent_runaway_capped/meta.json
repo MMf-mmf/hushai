@@ -1,0 +1,24 @@
+{
+  "case_id": "agent_runaway_capped",
+  "description": "Gotham G3 fixture (agent modality — runaway-cap regression guard; an EXTENSION beyond the F8-F11 spec set, per Gotham.md's Phase-F note that the cap assertion can be codified in CI rather than left a manual step). One Alice sighting, then an ADVERSARIAL prompt that begs the loop to keep calling tools forever. Asserts the loop still TERMINATES at or below GOTHAM_MAX_TOOL_CALLS (default 8) and answers cleanly — a guard against a broken hook/cap that would let the loop run away. The DEFINITIVE cap-fires proof (loop stops at exactly N under a low GOTHAM_MAX_TOOL_CALLS) is the separate procedural Phase-F step; this fixture is the durable regression net. STAGING-only. Media shared with the graph fixtures, regenerable via local_dev/fetch_eval_clips.sh.",
+  "device_id": "eval-agent-runaway",
+  "media_file": "clips/alice_face.mp4",
+  "media_kind": "muxed",
+  "seg_seconds": 2,
+  "base_capture_unix_nanos": -3600000000000,
+  "modalities": [
+    "agent"
+  ],
+  "tier": "full",
+  "enroll": [
+    { "modality": "person", "name": "Alice", "ref": "clips/alice_face.mp4" }
+  ],
+  "injections": [
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-agent-runaway", "capture_start_offset_ns": 0, "seed": "only" }
+  ],
+  "poll": {
+    "timeout_secs": 300,
+    "interval_secs": 3,
+    "quiesce_polls": 2
+  }
+}
