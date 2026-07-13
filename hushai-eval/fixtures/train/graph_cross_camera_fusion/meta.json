@@ -1,6 +1,6 @@
 {
   "case_id": "graph_cross_camera_fusion",
-  "description": "Gotham G1 fixture F2 (cross-camera fusion). The same enrolled person (Alice) is seen on the FRONT camera on day 1 and the GARAGE camera on day 2 (multi-injection, +86400s). The graph must materialize a visits_place edge to BOTH devices from the one identity — the fusion the perception pipeline perceives but never joins. TRAIN (Phase-C calibrated + promoted staging→train); the Wave-4 expect_journey [front, garage] assertion is added when the journey stitcher + expect_journey field land (Gotham.md F2).",
+  "description": "Gotham G1/G5 fixture F2 (cross-camera fusion + journey). The same enrolled person (Alice) is seen on the FRONT camera on day 1, the GARAGE camera 180s later on day 1 (within GRAPH_JOURNEY_GAP_SECS=600 → a stitched cross-camera JOURNEY front→garage), and the GARAGE camera again on day 2 (+86400s, a separate single-device visit). The graph must materialize a visits_place edge to BOTH devices from the one identity (the fusion the perception pipeline perceives but never joins) AND stitch the day-1 front→garage hops into one entity_journeys row. TRAIN (Phase-C calibrated + promoted staging→train); Wave-4 expect_journey [front, garage] promoted to gating (Gotham.md F2 / G5).",
   "device_id": "eval-graph-front",
   "media_file": "clips/alice_face.mp4",
   "media_kind": "muxed",
@@ -15,6 +15,7 @@
   ],
   "injections": [
     { "media_file": "clips/alice_face.mp4", "device_id": "eval-graph-front", "capture_start_offset_ns": 0 },
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-graph-garage", "capture_start_offset_ns": 180000000000, "seed": "day1garage" },
     { "media_file": "clips/alice_face.mp4", "device_id": "eval-graph-garage", "capture_start_offset_ns": 86400000000000, "seed": "day2" }
   ],
   "poll": {

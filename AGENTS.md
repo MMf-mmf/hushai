@@ -358,13 +358,21 @@ dropped — **media is ALWAYS stored regardless of gating.**
   new eval lineage. DERIVED/rebuildable: `POST /v1/graph/rebuild` truncates + refolds byte-stable.
 - **API (`graph_api.rs`, `/v1/graph/*`, bearer-authed, proxied via viewer `is_backend_path`):**
   entity page, timeline, edges, neighbors (bounded recursive CTE, hops ≤ 3), path (≤ 4), binding
-  queue + confirm/reject, rebuild. `journeys`/`digests` endpoints ship their table contract now;
-  their producers (`patterns.rs` baselines/anomalies/digests = 0029/Wave 2; journey stitcher =
-  0030/Wave 4) are later waves.
+  queue + confirm/reject, rebuild. `digests`/`journeys` endpoints + their producers now ship
+  (`patterns.rs` baselines/anomalies/digests = 0029/Wave 2; `patterns::stitch_and_upsert_journeys`
+  = 0030/Wave 4 / G5).
 - **Wave-1 scope note:** co-presence is batch-local (the `profiles::co_present` precedent — a rare
   batch split costs one observation, converges as events drain); binding accumulates
-  `together`+`speaker_only` (person_only is a documented follow-up). Journeys (0030) NOT populated
-  yet (Wave 4).
+  `together`+`speaker_only` (person_only is a documented follow-up).
+- **Wave-4 / G5 (cross-camera journeys):** `patterns::stitch_and_upsert_journeys` runs in the
+  `graph_pass` step-4 block for every touched person/plate: reads the subject's events across ALL
+  devices in the trailing baseline window, stitches them with `graph::stitch_journeys` (a hop extends
+  while the next device visit starts within `GRAPH_JOURNEY_GAP_SECS` of the last departure; ≥ 2
+  distinct devices persist), upserts each into `entity_journeys` idempotently (`dedup_key =
+  journey:<subject_id>:<first_hop_start_ns>`; `open/closed` = the `conversations` two-part settle).
+  `merge_in_tx` drops a loser's journeys. NO new hashed knob (`journey_gap_secs` was already in
+  `config_hash`). Consumed by the digest `journeys` section, the `graph_journeys` Detective tool, and
+  the eval `expect_journey` gate.
 - **Wave-2 / G2 (baselines + anomalies):** `hushai-backend/src/patterns.rs` is the "patterns"
   producer, called inside the `graph_pass` transaction for every subject touched this pass:
   recompute the `entity_baselines` row (168 hour-of-week histogram, dwell p50/p90, device/companion
@@ -462,10 +470,16 @@ DB-backed `chat_sessions`/`chat_messages`, migration 0008) answer over pgvector 
   `GOTHAM_ENABLED`; it streams a SUPERSET of the chat SSE (`phase`/`tool_call`/`tool_result` added),
   runs read-only tools 1–14 + graph tools (probe-gated) over the EXISTING retrieval fns, persists a
   `tool_trace` (migration 0031), and falls back to a grounded recordings answer on any failure so the
-  chat surface never regresses. `GOTHAM_*` knobs in `config.rs`. Live tool-loop verification is the
-  eval `agent` modality (Phase F / PR7 — WIRED: `hushai-eval/src/query_agent.rs` + `score_agent`,
-  `staging` fixtures F8–F12; the graph tools were rewritten in PR7 to hit the REAL id-keyed
-  `/v1/graph/*` routes + render names, and `tool_ok` now reports a failed tool correctly). See `Gotham.md` Part 2.
+  chat surface never regresses. `GOTHAM_*` knobs in `config.rs`. **Graph tools (probe-gated): 6 —
+  `graph_entity`/`graph_connections`/`graph_neighborhood`/`graph_anomalies`/`graph_briefing` +
+  `graph_journeys` (G5: resolve name → `/v1/graph/journeys?subject=`, renders the ordered camera path;
+  called with no `entity_name` → recent journeys system-wide). Active-tool count 15 read + 6 graph =
+  21.** Live tool-loop verification is the eval `agent` modality (Phase F / PR7 — WIRED:
+  `hushai-eval/src/query_agent.rs` + `score_agent`, `staging` fixtures F8–F12; the graph tools were
+  rewritten in PR7 to hit the REAL id-keyed `/v1/graph/*` routes + render names, and `tool_ok` now
+  reports a failed tool correctly). **Graph tools authenticate with `GOTHAM_BACKEND_TOKEN` — the
+  stack rag must have it set (via `local_dev/eval.agent.env`, now sourced by `run_stack.sh --test-db`),
+  else every graph tool 401s.** See `Gotham.md` Part 2.
 - **Unified auto-routing:** the web/voice chat is ONE box bound to `auto`; per message the handler
   deterministically pre-routes some phrasings, else calls `llm::classify_agent` (a cheap
   qwen2.5:7b classification) and dispatches. The auto-router stays a classification prompt by
@@ -574,9 +588,12 @@ both perception AND the RAG chat ANSWER (the `chat`/`rag` modality: `must_contai
 `--fixtures staging`) scripts multi-turn consultations against hushai-advisor
 (`expect_questions`/`expect_final_answer`/`expect_chapters_any|all`/`expect_substrings`;
 `HUSHAI_ADVISOR_URL`/`ADVISOR_TOKEN`) — absent service or un-ingested corpus yields
-INCONCLUSIVE, never FAIL. A `graph` modality (Gotham G1, DB-direct + deterministic like
-perception) scores the materialized `entity_edges`: `expect_entity`/`expect_edge`/`expect_no_edge`,
-assignment-invariant (assert by enrolled name/device_id, never a minted UUID). Because `graph_pass`
+INCONCLUSIVE, never FAIL. A `graph` modality (Gotham G1/G2/G5, DB-direct + deterministic like
+perception) scores the materialized graph: `expect_entity`/`expect_edge`/`expect_no_edge` (G1),
+`expect_anomaly`/`expect_no_anomaly`/`expect_baseline`/`expect_briefing` (G2), and
+**`expect_journey {subject, cameras[]}`** (G5 — a subject's stitched `entity_journeys` must contain
+`cameras` as an ORDERED device-id subsequence of ONE journey's hops). All assignment-invariant
+(assert by enrolled name/device_id, never a minted UUID). Because `graph_pass`
 correlates cross-subject edges BATCH-LOCALLY, the harness doesn't observe the worker's incremental
 fold — it waits for graph inputs to settle (`poll::wait_graph_inputs_settled`: conversations sealed
 + events committed) then triggers one authoritative `POST /v1/graph/rebuild` (whole-scenario single
@@ -588,9 +605,12 @@ so the plan→act→observe tool loop runs, and scores the streamed answer PLUS 
 trace (`expect_tool_calls_any|all`/`min|max_tool_calls`/`must_contain`/`expect_number`, `query_agent.rs`
 + `score_agent`). It is LLM-driven, so it is staging-only and its tool-trace metrics gate ONLY when the
 turn routed to `gotham` (a kill-switched / old binary Info-degrades, never FALSE-FAILs). Run it with the
-staging determinism layer sourced: `set -a; source local_dev/eval.env; source local_dev/eval.agent.env;
-set +a` for BOTH the rag launch and the eval run — those `GOTHAM_*` pins are kept OUT of the shared
-`eval.env` so a plain run's config-hash stays `d4acc862`; the agent suite mints its own lineage. A
+staging determinism layer sourced for BOTH the rag launch and the eval run. `run_stack.sh --test-db`
+now sources `eval.agent.env` into the stack automatically (so the rag process gets
+`GOTHAM_BACKEND_TOKEN` — without it every Detective graph tool 401s); the eval RUN still needs `set -a;
+source local_dev/eval.env; source local_dev/eval.agent.env; set +a`. Those `GOTHAM_*` pins are kept OUT
+of the shared `eval.env` so a plain run's config-hash stays `d4acc862`; the agent suite mints its own
+lineage (`a5bb8a7054745a55`). A
 physical camera-at-screen tier is `local_dev/physical_loopback.py`. Read the playbook before using the loop.
 
 Unit + integration tests: `cargo test --workspace` (the DB-touching integration tests are

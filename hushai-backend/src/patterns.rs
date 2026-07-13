@@ -279,6 +279,112 @@ pub async fn flag_edge_anomalies(
     Ok(anomaly_ids)
 }
 
+/// Stitch + upsert cross-camera journeys for every TOUCHED person/plate subject, inside the
+/// `graph_pass` transaction (Wave 4 / Pillar G5, §1.3). For each subject it re-reads the subject's
+/// events across ALL devices in the trailing baseline window (capture-anchored — the window ends at
+/// the subject's latest event, so pinned-capture fixtures settle deterministically, never wall
+/// clock), stitches them with [`graph::stitch_journeys`] (a chain extends while the next device
+/// visit starts within `journey_gap_secs` of the last departure; consecutive same-device visits
+/// collapse into one hop; only chains spanning ≥ 2 distinct devices persist), and upserts each one.
+///
+/// Idempotency rides the `dedup_key = "journey:<subject_id>:<first_hop_start_ns>"` partial-unique
+/// index (0030): a re-drain re-stitches the SAME journey with the same first-hop start ⇒ same key ⇒
+/// `DO UPDATE` grows `ended_at`/`hops` in place (no fragmentation — the stable first-hop anchor
+/// avoids the conversations mint-new-id-on-close trap). `status` copies the `conversations` two-part
+/// settle (`close_stale`): `closed` once the journey's tail is older than `journey_gap + grace` in
+/// capture time (a later in-gap hop just append-extends the same keyed row, so a premature close can
+/// never fragment), else `open`.
+///
+/// Vision lanes only (schema CHECK `person`/`plate`); speakers/devices carry no journey. Uses NO new
+/// hashed knob (`journey_gap_secs` is already in `config_hash`). Returns the number of journey rows
+/// inserted-or-updated this pass.
+pub async fn stitch_and_upsert_journeys(
+    tx: &mut Transaction<'_, Postgres>,
+    cfg: &GraphCfg,
+    cfg_hash: &str,
+    touched: &BTreeSet<(String, Uuid)>,
+) -> anyhow::Result<u64> {
+    let window_nanos = cfg.baseline_window_days.max(1) * 86_400 * NANOS_PER_SEC;
+    let gap_nanos = cfg.journey_gap_secs.max(1) * NANOS_PER_SEC;
+    let grace_nanos = cfg.grace_secs.max(0) * NANOS_PER_SEC;
+    // DB-clock "now" for the open/closed settle (mirrors drain_events + conversations::close_stale).
+    let now_ns: i64 = sqlx::query_scalar("SELECT (extract(epoch from now()) * 1e9)::bigint")
+        .fetch_one(&mut **tx)
+        .await?;
+    let close_cutoff = now_ns - (gap_nanos + grace_nanos);
+
+    let mut upserted = 0u64;
+    for (stype, sid) in touched {
+        // Journeys are vision-lane only (schema CHECK): person/plate. Speakers/devices skip.
+        if stype != "person" && stype != "plate" {
+            continue;
+        }
+        // The subject's events across ALL devices; trailing window ends at its latest event
+        // (capture-anchored, same discipline as the baseline recompute). Same event exclusion — the
+        // graph must never fold its own output (`pattern_anomaly`/`gotham_briefing`).
+        let rows = sqlx::query(
+            "SELECT device_id, start_unix_nanos, end_unix_nanos, event_id FROM events \
+             WHERE subject_type = $1 AND subject_id = $2 AND device_id IS NOT NULL \
+               AND event_type NOT IN ('pattern_anomaly', 'gotham_briefing') \
+             ORDER BY start_unix_nanos ASC",
+        )
+        .bind(stype)
+        .bind(sid)
+        .fetch_all(&mut **tx)
+        .await?;
+        if rows.len() < 2 {
+            continue; // a single visit can never span two devices
+        }
+        let max_end = rows.iter().map(|r| r.get::<i64, _>("end_unix_nanos")).max().unwrap_or(0);
+        let win_lo = max_end - window_nanos;
+        let visits: Vec<graph::JourneyVisit> = rows
+            .iter()
+            .filter_map(|r| {
+                let end: i64 = r.get("end_unix_nanos");
+                if end < win_lo {
+                    return None;
+                }
+                Some(graph::JourneyVisit {
+                    device_id: r.get::<String, _>("device_id"),
+                    arrive_ns: r.get::<i64, _>("start_unix_nanos"),
+                    depart_ns: end,
+                    event_id: Some(r.get::<Uuid, _>("event_id").to_string()),
+                })
+            })
+            .collect();
+
+        for j in graph::stitch_journeys(&visits, gap_nanos) {
+            let dedup = format!("journey:{sid}:{}", j.started_at_unix_nanos);
+            let hops = serde_json::to_value(&j.hops)?;
+            let status = if j.ended_at_unix_nanos < close_cutoff { "closed" } else { "open" };
+            let res = sqlx::query(
+                "INSERT INTO entity_journeys \
+                   (journey_id, subject_type, subject_id, started_at_unix_nanos, ended_at_unix_nanos, \
+                    hop_count, hops, status, dedup_key, config_hash, created_at, updated_at) \
+                 VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10, now(), now()) \
+                 ON CONFLICT (dedup_key) WHERE dedup_key IS NOT NULL DO UPDATE SET \
+                   ended_at_unix_nanos = EXCLUDED.ended_at_unix_nanos, \
+                   hop_count = EXCLUDED.hop_count, hops = EXCLUDED.hops, \
+                   status = EXCLUDED.status, config_hash = EXCLUDED.config_hash, updated_at = now()",
+            )
+            .bind(Uuid::now_v7())
+            .bind(stype)
+            .bind(sid)
+            .bind(j.started_at_unix_nanos)
+            .bind(j.ended_at_unix_nanos)
+            .bind(j.hops.len() as i32)
+            .bind(&hops)
+            .bind(status)
+            .bind(&dedup)
+            .bind(cfg_hash)
+            .execute(&mut **tx)
+            .await?;
+            upserted += res.rows_affected();
+        }
+    }
+    Ok(upserted)
+}
+
 /// The subject's recomputed `entity_baselines.visits_in_window` (0 when no row yet) — the maturity
 /// input for the edge anomalies. Read from the table (not the in-memory recompute) so an endpoint
 /// established on a PRIOR pass (incremental worker) is still seen as mature.

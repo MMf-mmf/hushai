@@ -364,6 +364,16 @@ if [[ "$TEST_DB" -eq 1 ]]; then
   [[ -f "$SCRIPT_DIR/eval.env" ]] || die "missing $SCRIPT_DIR/eval.env (the eval determinism profile)."
   log boot "eval mode: sourcing eval.env (hushai_test DB + determinism lockdown)"
   set -a; source "$SCRIPT_DIR/eval.env"; set +a
+  # The Gotham Detective (Gotham G3 `agent` modality) needs its GOTHAM_* runtime knobs in the SERVICE
+  # env — most importantly GOTHAM_BACKEND_TOKEN, which its graph tools bear when they call
+  # /v1/graph/* (without it every graph tool 401s). Source the staging agent profile into the stack
+  # too so `agent`-modality fixtures work against it. This does NOT touch the eval's config_hash (the
+  # eval runner computes that from ITS own env; the graph `d4acc862` lineage never sources this file).
+  # Absent ⇒ skip (graph/perception evals don't need the Detective).
+  if [[ -f "$SCRIPT_DIR/eval.agent.env" ]]; then
+    log boot "eval mode: sourcing eval.agent.env (Gotham Detective runtime + backend token)"
+    set -a; source "$SCRIPT_DIR/eval.agent.env"; set +a
+  fi
 fi
 # DB-exists hint (migrations auto-apply on startup, but the database must exist).
 if command -v psql >/dev/null 2>&1; then

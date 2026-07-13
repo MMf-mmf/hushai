@@ -1,6 +1,6 @@
 {
   "case_id": "agent_journey_narrate",
-  "description": "Gotham G3 fixture F10 (agent modality — journey narration over cross-camera fusion). Reuses the F2 scenario: the same enrolled Alice appears on the FRONT camera on day 1 and the GARAGE camera on day 2, so the graph holds a visits_place edge to BOTH devices from one identity. The Detective is asked to trace Alice's movements across cameras; it should consult a graph/journey tool and name BOTH cameras. Proves: the loop uses the relationship graph and narrates a cross-camera journey grounded in the fused identity (the join the raw pipeline never makes). STAGING-only. Media shared with graph_cross_camera_fusion, regenerable via local_dev/fetch_eval_clips.sh.",
+  "description": "Gotham G3/G5 fixture F10 (agent modality — journey narration over a stitched cross-camera journey). The same enrolled Alice appears on the FRONT camera then the GARAGE camera 180s later (within GRAPH_JOURNEY_GAP_SECS=600 → a stitched entity_journeys row front→garage). The Detective is asked to trace Alice's path across the cameras; it should consult graph_journeys (or another graph tool) and name BOTH cameras in order. Proves: the loop uses the journey/relationship graph and narrates a cross-camera path grounded in the fused identity (the join the raw pipeline never makes). Now-relative base so the hops stay inside the tool windows. STAGING-only. Media shared with graph_cross_camera_fusion, regenerable via local_dev/fetch_eval_clips.sh.",
   "device_id": "eval-agent-front",
   "media_file": "clips/alice_face.mp4",
   "media_kind": "muxed",
@@ -15,7 +15,7 @@
   ],
   "injections": [
     { "media_file": "clips/alice_face.mp4", "device_id": "eval-agent-front", "capture_start_offset_ns": 0, "seed": "front" },
-    { "media_file": "clips/alice_face.mp4", "device_id": "eval-agent-garage", "capture_start_offset_ns": 86400000000000, "seed": "garage" }
+    { "media_file": "clips/alice_face.mp4", "device_id": "eval-agent-garage", "capture_start_offset_ns": 180000000000, "seed": "garage" }
   ],
   "poll": {
     "timeout_secs": 300,

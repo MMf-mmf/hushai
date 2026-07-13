@@ -97,6 +97,7 @@ pub enum ToolKind {
     GraphNeighborhood,
     GraphAnomalies,
     GraphBriefing,
+    GraphJourneys,
 }
 
 impl ToolKind {
@@ -123,6 +124,7 @@ impl ToolKind {
             GraphNeighborhood => "graph_neighborhood",
             GraphAnomalies => "graph_anomalies",
             GraphBriefing => "graph_briefing",
+            GraphJourneys => "graph_journeys",
         }
     }
 
@@ -155,6 +157,7 @@ impl ToolKind {
             GraphNeighborhood => "mapping the neighborhood…",
             GraphAnomalies => "reviewing anomalies…",
             GraphBriefing => "reading the daily briefing…",
+            GraphJourneys => "tracing a path across cameras…",
         }
     }
 
@@ -166,7 +169,12 @@ impl ToolKind {
         use ToolKind::*;
         matches!(
             self,
-            GraphEntity | GraphConnections | GraphNeighborhood | GraphAnomalies | GraphBriefing
+            GraphEntity
+                | GraphConnections
+                | GraphNeighborhood
+                | GraphAnomalies
+                | GraphBriefing
+                | GraphJourneys
         )
     }
 
@@ -247,6 +255,7 @@ impl ToolKind {
             GraphNeighborhood => ("Everything within one or two hops of ONE named entity in the relationship graph (a wider view than graph_entity).", json!({"entity": {"type": "string"}, "depth": {"type": "integer"}}), vec!["entity"]),
             GraphAnomalies => ("Recent pattern anomalies the system flagged.", json!({"window": window}), vec![]),
             GraphBriefing => ("The daily briefing for a date (YYYY-MM-DD).", json!({"date": {"type": "string"}}), vec![]),
+            GraphJourneys => ("The cross-camera journeys of ONE named person or vehicle — the ordered camera-to-camera path(s) they moved along (e.g. 'front door → garage'). Use this to answer 'walk me through where X went', 'which cameras did X move between', 'trace X's path across the property'. You MUST pass entity_name — the person or plate to trace.", json!({"entity_name": {"type": "string", "description": "REQUIRED — the ONE person or plate whose movements to trace, e.g. 'Alice' or 'EMD774'"}}), vec!["entity_name"]),
         };
         ToolDefinition {
             name: self.name().to_string(),
@@ -281,7 +290,7 @@ pub fn phase1_read_tools() -> Vec<ToolKind> {
 /// The graph tools, registered only when `/v1/graph/*` probes healthy.
 pub fn graph_tools() -> Vec<ToolKind> {
     use ToolKind::*;
-    vec![GraphEntity, GraphConnections, GraphNeighborhood, GraphAnomalies, GraphBriefing]
+    vec![GraphEntity, GraphConnections, GraphNeighborhood, GraphAnomalies, GraphBriefing, GraphJourneys]
 }
 
 /// Assemble the active tool set for this turn's caller. `graph_healthy` comes from the startup/turn
@@ -377,9 +386,8 @@ pub async fn exec(
         ReflectionDigest => tool_reflection_digest(st, args, ctx).await,
         EventsFeed => tool_events_feed(st, args, ctx, sinks).await,
         EntityProfile => tool_entity_profile(st, args, ctx).await,
-        GraphEntity | GraphConnections | GraphNeighborhood | GraphAnomalies | GraphBriefing => {
-            tool_graph(kind, st, args, ctx).await
-        }
+        GraphEntity | GraphConnections | GraphNeighborhood | GraphAnomalies | GraphBriefing
+        | GraphJourneys => tool_graph(kind, st, args, ctx).await,
     }
 }
 
@@ -899,6 +907,27 @@ async fn tool_graph(kind: ToolKind, st: &AppState, args: &Value, ctx: &CallerCtx
             }
             Ok(truncate(&body, max))
         }
+        // Resolve a NAME → node, then read the subject's cross-camera journeys and render the ordered
+        // camera path(s) — never a raw UUID. When NO subject is named (the 7B sometimes calls this
+        // tool without an entity), fall back to the recent journeys across everyone — still grounded,
+        // never a dead end. A speaker / anything without journeys renders as "no path".
+        ToolKind::GraphJourneys => {
+            let name = arg_str(args, "entity_name").or_else(|| arg_str(args, "entity"));
+            let path = match &name {
+                Some(n) => {
+                    let Some((ntype, id)) = resolve_node(st, n).await else {
+                        return Ok(format!("I don't have anyone or anything called \"{n}\" on record."));
+                    };
+                    format!("/v1/graph/journeys?subject={}&limit=20", urlenc(&format!("{ntype}:{id}")))
+                }
+                None => "/v1/graph/journeys?limit=20".to_string(),
+            };
+            let (status, body) = graph_fetch(&client, base, token, &path).await?;
+            if !status.is_success() {
+                return Ok(format!("The graph service returned no usable result (status {}).", status.as_u16()));
+            }
+            Ok(truncate(&render_journeys(name.as_deref(), &body), max))
+        }
         _ => unreachable!("tool_graph called with a non-graph kind"),
     }
 }
@@ -1173,6 +1202,45 @@ async fn render_path(st: &AppState, a_name: &str, b_name: &str, body: &str) -> S
     }
 }
 
+/// Render `/v1/graph/journeys` JSON (an array of journey rows) as a NAME-based summary of ordered
+/// camera-to-camera paths. `hops[].device_id` IS the camera identifier — rendered directly (no UUID).
+/// `subject` is `Some(name)` for a per-subject query or `None` for the system-wide recent list. Empty
+/// ⇒ a plain "no cross-camera journeys" line (single-camera sightings are not journeys). Newest first.
+fn render_journeys(subject: Option<&str>, body: &str) -> String {
+    let rows: Vec<Value> = serde_json::from_str(body).unwrap_or_default();
+    if rows.is_empty() {
+        return match subject {
+            Some(name) => format!(
+                "{name} has no cross-camera journeys on record (only ever seen at a single camera, \
+                 or not enough movement between cameras to trace a path)."
+            ),
+            None => "No cross-camera journeys on record yet.".to_string(),
+        };
+    }
+    let header = match subject {
+        Some(name) => format!("{name}'s cross-camera journeys ({}):\n", rows.len()),
+        None => format!("Recent cross-camera journeys ({}):\n", rows.len()),
+    };
+    let mut out = header;
+    for j in &rows {
+        let path: Vec<String> = j
+            .get("hops")
+            .and_then(Value::as_array)
+            .map(|hops| {
+                hops.iter()
+                    .filter_map(|h| h.get("device_id").and_then(Value::as_str).map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        if path.is_empty() {
+            continue;
+        }
+        let status = j.get("status").and_then(Value::as_str).unwrap_or("open");
+        out.push_str(&format!("- {} [{status}]\n", path.join(" → ")));
+    }
+    out
+}
+
 // ---- small utilities ----------------------------------------------------------------------------
 
 async fn resolve_owner_person(st: &AppState) -> anyhow::Result<Vec<String>> {
@@ -1254,8 +1322,8 @@ mod tests {
     #[test]
     fn graph_tools_add_only_when_healthy() {
         assert_eq!(active_kinds(false).len(), 15);
-        assert_eq!(active_kinds(true).len(), 20, "15 + 5 graph tools");
-        assert!(active_kinds(true).iter().filter(|k| k.is_graph()).count() == 5);
+        assert_eq!(active_kinds(true).len(), 21, "15 + 6 graph tools");
+        assert!(active_kinds(true).iter().filter(|k| k.is_graph()).count() == 6);
     }
 
     #[test]

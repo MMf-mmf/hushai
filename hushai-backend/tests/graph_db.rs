@@ -134,6 +134,36 @@ async fn baseline_visits(pool: &PgPool, subject: Uuid) -> Option<i64> {
     row.map(|r| r.get::<i32, _>("visits_in_window") as i64)
 }
 
+/// A subject's cross-camera journeys (G5): each journey's ORDERED hop device_ids + its open/closed
+/// status, ordered by journey start. Empty when the subject never spanned ≥ 2 devices.
+async fn subject_journeys(pool: &PgPool, subject: Uuid) -> Vec<(Vec<String>, String)> {
+    let rows = sqlx::query(
+        "SELECT hops, status FROM entity_journeys WHERE subject_id = $1 \
+         ORDER BY started_at_unix_nanos ASC",
+    )
+    .bind(subject)
+    .fetch_all(pool)
+    .await
+    .unwrap();
+    rows.iter()
+        .map(|r| {
+            let hops: serde_json::Value =
+                r.try_get("hops").unwrap_or_else(|_| serde_json::json!([]));
+            let devs: Vec<String> = hops
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|h| {
+                            h.get("device_id").and_then(|d| d.as_str()).map(String::from)
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            (devs, r.get::<String, _>("status"))
+        })
+        .collect()
+}
+
 #[tokio::test]
 async fn rebuild_correlates_cross_subject_edges_in_one_batch() {
     let Some(pool) = connect().await else {
@@ -151,6 +181,8 @@ async fn rebuild_correlates_cross_subject_edges_in_one_batch() {
     sqlx::query("DELETE FROM devices WHERE device_id LIKE 'graphtest-%'").execute(&pool).await.unwrap();
 
     let device = format!("graphtest-{}", Uuid::now_v7());
+    let device_b = format!("graphtest-{}", Uuid::now_v7()); // 2nd camera for the G5 journey scenario
+    let ivan = Uuid::now_v7(); // person who hops device → device_b within the journey gap
     let alice = Uuid::now_v7();
     let bob = Uuid::now_v7();
     let carol = Uuid::now_v7();
@@ -167,10 +199,10 @@ async fn rebuild_correlates_cross_subject_edges_in_one_batch() {
     let unk = [Uuid::now_v7(), Uuid::now_v7(), Uuid::now_v7()]; // unknown_person_cluster: 3 anon faces
     let base = now_ns() - 10 * 86_400 * SEC; // ~10 days ago: safely past the drain's slack guard.
 
-    sqlx::query("INSERT INTO devices (device_id, source_kind) VALUES ($1,'test') ON CONFLICT DO NOTHING")
-        .bind(&device).execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO persons (person_id) VALUES ($1),($2),($3),($4),($5)")
-        .bind(alice).bind(bob).bind(carol).bind(dave).bind(erin).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO devices (device_id, source_kind) VALUES ($1,'test'),($2,'test') ON CONFLICT DO NOTHING")
+        .bind(&device).bind(&device_b).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO persons (person_id) VALUES ($1),($2),($3),($4),($5),($6)")
+        .bind(alice).bind(bob).bind(carol).bind(dave).bind(erin).bind(ivan).execute(&pool).await.unwrap();
     // Named persons for the pairing / vehicle scenarios (display_name set ⇒ excluded from the unknown
     // cluster). The three `unk` persons stay display_name NULL ⇒ they ARE the unknown cluster.
     sqlx::query("INSERT INTO persons (person_id, display_name) VALUES ($1,'Frank'),($2,'Gwen'),($3,'Heidi')")
@@ -249,6 +281,14 @@ async fn rebuild_correlates_cross_subject_edges_in_one_batch() {
     for u in &unk {
         seed_event(&pool, &device, "person", *u, base_clu, base_clu + 4 * SEC).await;
     }
+
+    // G5 cross-camera JOURNEY: Ivan is seen on `device` then on `device_b` 120s later (< the 600s
+    // GRAPH_JOURNEY_GAP_SECS) → the two visits stitch into ONE journey spanning both cameras, hops
+    // [device, device_b], closed (historical). Time-isolated ~120 days back. The negative is Alice:
+    // she visits ONLY `device` (twice) → single-device → NO journey row (events/profiles territory).
+    let base_j = now_ns() - 120 * 86_400 * SEC;
+    seed_event(&pool, &device, "person", ivan, base_j, base_j + 4 * SEC).await; // front camera
+    seed_event(&pool, &device_b, "person", ivan, base_j + 120 * SEC, base_j + 124 * SEC).await; // garage
 
     // One authoritative fold of the WHOLE scenario: grace 0 (fresh events eligible) + a huge budget
     // so everything drains in ONE batch (so cross-subject visits co-occur — the fix under test).
@@ -372,21 +412,46 @@ async fn rebuild_correlates_cross_subject_edges_in_one_batch() {
         "the digest's anomalies section must name the anomaly kind"
     );
 
+    // G5: Ivan's device → device_b hop stitches into exactly ONE cross-camera journey, hops in
+    // capture order, status closed (historical). Alice (single device) has none.
+    let ivan_journeys = subject_journeys(&pool, ivan).await;
+    assert_eq!(
+        ivan_journeys.len(),
+        1,
+        "Ivan's two-camera hop must stitch into exactly one journey (got {ivan_journeys:?})"
+    );
+    assert_eq!(
+        ivan_journeys[0].0,
+        vec![device.clone(), device_b.clone()],
+        "the journey hops must be [device, device_b] in capture order"
+    );
+    assert_eq!(
+        ivan_journeys[0].1, "closed",
+        "a historical journey (tail far past the settle cutoff) must be closed"
+    );
+    assert!(
+        subject_journeys(&pool, alice).await.is_empty(),
+        "Alice visits a single device → no journey (single-device is events/profiles territory)"
+    );
+
     // cleanup (device-namespaced + our catalog ids; entity_edges is derived/global — drop ours).
-    let all_persons = vec![alice, bob, carol, dave, erin, frank, gwen, heidi, unk[0], unk[1], unk[2]];
+    let all_persons = vec![alice, bob, carol, dave, erin, ivan, frank, gwen, heidi, unk[0], unk[1], unk[2]];
+    let devices = vec![device.clone(), device_b.clone()];
     let edge_ids: Vec<String> = [
-        alice, bob, carol, dave, erin, frank, gwen, heidi, plate, plate_a, plate_b, unk[0], unk[1],
-        unk[2], dave_spk,
+        alice, bob, carol, dave, erin, ivan, frank, gwen, heidi, plate, plate_a, plate_b, unk[0],
+        unk[1], unk[2], dave_spk,
     ]
     .iter()
     .map(|u| u.to_string())
-    .chain(std::iter::once(device.clone()))
+    .chain(devices.iter().cloned())
     .collect();
     sqlx::query("DELETE FROM daily_digests WHERE digest_date = $1::date").bind(&digest_date).execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM entity_journeys WHERE subject_id = ANY($1)")
+        .bind(&all_persons).execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM entity_edges WHERE src_id = ANY($1) OR dst_id = ANY($1)")
         .bind(&edge_ids).execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM conversations WHERE primary_device_id = $1").bind(&device).execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM events WHERE device_id = $1").bind(&device).execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM events WHERE device_id = ANY($1)").bind(&devices).execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM entity_baselines WHERE subject_id = ANY($1)")
         .bind(&all_persons).execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM persons WHERE person_id = ANY($1)")
@@ -394,5 +459,5 @@ async fn rebuild_correlates_cross_subject_edges_in_one_batch() {
     sqlx::query("DELETE FROM speakers WHERE speaker_id = $1").bind(dave_spk).execute(&pool).await.unwrap();
     sqlx::query("DELETE FROM license_plates WHERE plate_id = ANY($1)")
         .bind(vec![plate, plate_a, plate_b]).execute(&pool).await.unwrap();
-    sqlx::query("DELETE FROM devices WHERE device_id = $1").bind(&device).execute(&pool).await.unwrap();
+    sqlx::query("DELETE FROM devices WHERE device_id = ANY($1)").bind(&devices).execute(&pool).await.unwrap();
 }

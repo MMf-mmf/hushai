@@ -2,13 +2,13 @@
   "agent": {
     "questions": [
       {
-        "ask": "Using the relationship graph, which cameras or places is Alice connected to? List every location the graph links her to.",
+        "ask": "Trace Alice's path across the cameras: walk me through the journey she took from one camera to the next, in order.",
         "expect_routed_agent": "gotham",
-        "expect_tool_calls_any": ["graph_entity", "graph_connections", "graph_neighborhood", "people_sightings"],
+        "expect_tool_calls_any": ["graph_journeys", "graph_entity", "graph_neighborhood", "graph_connections", "people_sightings"],
         "min_tool_calls": 1,
         "max_tool_calls": 8,
         "must_contain": ["front", "garage"],
-        "reference_answer": "Alice appeared on the front camera and then the garage camera."
+        "reference_answer": "Alice moved from the front camera to the garage camera."
       }
     ]
   }

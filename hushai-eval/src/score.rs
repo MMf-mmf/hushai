@@ -645,7 +645,7 @@ fn score_graph(gt: &GraphGt, obs: &Observed) -> Vec<Metric> {
     let mut out = Vec::new();
     let mut satisfied = 0usize;
     let mut total = gt.entities.len() + gt.edges.len() + gt.no_edges.len()
-        + gt.anomalies.len() + gt.no_anomalies.len() + gt.baselines.len();
+        + gt.anomalies.len() + gt.no_anomalies.len() + gt.baselines.len() + gt.journeys.len();
 
     for e in &gt.entities {
         let ok = resolve_entity(e, &obs.entity_ids).is_some();
@@ -753,6 +753,27 @@ fn score_graph(gt: &GraphGt, obs: &Observed) -> Vec<Metric> {
         ));
     }
 
+    // Journeys (G5 / Wave 4): resolve the subject by enrolled name; ONE of its stitched journeys must
+    // visit `cameras` as an ORDERED subsequence of its hop device_ids (assignment-invariant).
+    for j in &gt.journeys {
+        let sid = resolve_entity(&j.subject, &obs.entity_ids);
+        let ok = sid.as_ref().is_some_and(|id| {
+            obs.journeys.iter().any(|r| {
+                r.subject_type == j.subject.kind
+                    && &r.subject_id == id
+                    && is_subsequence(&r.hop_devices, &j.cameras)
+            })
+        });
+        if ok {
+            satisfied += 1;
+        }
+        out.push(Metric::new(
+            format!("graph.journey.{}.{}", j.subject.kind, key_name(&j.subject.name)),
+            b2f(ok), Direction::Boolean, ok,
+            format!("journey {}:{} cameras {:?} present={ok}", j.subject.kind, j.subject.name, j.cameras),
+        ));
+    }
+
     // Briefing (G2 / Phase E): assert the pinned-date digest's structured `sections` — exact counts
     // + label mentions. NEVER the prose `rendered_text` (a narration surface). `digest_sections` is
     // Some here (the runner returns INCONCLUSIVE before scoring when the digest can't be produced).
@@ -806,6 +827,14 @@ fn score_graph(gt: &GraphGt, obs: &Observed) -> Vec<Metric> {
 /// True when a `pattern_anomaly` of `kind` exists for `(subject_kind, subject_id)`. Device-keyed
 /// anomalies (`unknown_person_cluster`) carry NO catalog subject, so a `device` ref matches on the
 /// anomaly's `device_id` (the resolved id for a device ref IS its literal `device_id`).
+/// True when `needles` appear within `hay` in order, as a (not necessarily contiguous) subsequence —
+/// the cross-camera path check (a journey may pass through cameras not asserted, between the ones
+/// that are). Empty `needles` trivially matches.
+fn is_subsequence(hay: &[String], needles: &[String]) -> bool {
+    let mut it = hay.iter();
+    needles.iter().all(|n| it.any(|h| h == n))
+}
+
 fn anomaly_present(obs: &Observed, subject_kind: &str, subject_id: &str, kind: &str) -> bool {
     obs.anomalies.iter().any(|a| {
         a.subject_type.as_deref() == Some(subject_kind)
@@ -2196,6 +2225,53 @@ mod graph_tests {
             ..Default::default()
         };
         assert!(!find(&score_graph(&gt, &o), "graph.baseline.person.alice").floor_ok);
+    }
+
+    #[test]
+    fn journey_cameras_ordered_subsequence() {
+        let mut o = obs_with(vec![]);
+        o.journeys = vec![JourneyObs {
+            subject_type: "person".into(),
+            subject_id: "A".into(),
+            hop_devices: vec!["front".into(), "porch".into(), "garage".into()],
+            status: "closed".into(),
+        }];
+        // In-order subsequence (front then garage, skipping porch) -> pass.
+        let gt = GraphGt {
+            journeys: vec![JourneyExpect {
+                subject: eref("person", "Alice"),
+                cameras: vec!["front".into(), "garage".into()],
+            }],
+            ..Default::default()
+        };
+        assert!(find(&score_graph(&gt, &o), "graph.journey.person.alice").floor_ok);
+        // Wrong ORDER (garage before front) -> fail (a journey is directional).
+        let gt = GraphGt {
+            journeys: vec![JourneyExpect {
+                subject: eref("person", "Alice"),
+                cameras: vec!["garage".into(), "front".into()],
+            }],
+            ..Default::default()
+        };
+        assert!(!find(&score_graph(&gt, &o), "graph.journey.person.alice").floor_ok);
+        // A camera not in the journey -> fail.
+        let gt = GraphGt {
+            journeys: vec![JourneyExpect {
+                subject: eref("person", "Alice"),
+                cameras: vec!["front".into(), "driveway".into()],
+            }],
+            ..Default::default()
+        };
+        assert!(!find(&score_graph(&gt, &o), "graph.journey.person.alice").floor_ok);
+        // Right cameras, WRONG subject (Bob has no journey) -> fail.
+        let gt = GraphGt {
+            journeys: vec![JourneyExpect {
+                subject: eref("person", "Bob"),
+                cameras: vec!["front".into(), "garage".into()],
+            }],
+            ..Default::default()
+        };
+        assert!(!find(&score_graph(&gt, &o), "graph.journey.person.bob").floor_ok);
     }
 
     #[test]

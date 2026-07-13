@@ -90,6 +90,8 @@ pub struct GraphStats {
     pub baselines_recomputed: u64,
     /// `pattern_anomaly` events emitted this pass (Wave 2).
     pub anomalies_emitted: u64,
+    /// Cross-camera journey rows inserted-or-updated this pass (Wave 4 / G5).
+    pub journeys_upserted: u64,
     /// The emitted anomaly event_ids — the worker driver alert-evaluates these post-commit (the
     /// backend can't reach the worker's `alerts::evaluate`). Empty for a no-anomaly pass.
     pub anomaly_event_ids: Vec<Uuid>,
@@ -174,6 +176,11 @@ pub async fn graph_pass(pool: &PgPool, opts: &GraphOpts) -> anyhow::Result<Graph
         .await?;
         stats.baselines_recomputed = touched.len() as u64;
         stats.anomaly_event_ids = ids;
+        // Step 4b (§1.3 / G5): re-stitch cross-camera journeys for the touched person/plate subjects.
+        // Independent of baselines; runs in the same pass tx over the same capture-anchored window.
+        stats.journeys_upserted =
+            crate::patterns::stitch_and_upsert_journeys(&mut tx, &opts.cfg, &cfg_hash, &touched)
+                .await?;
     }
     let edge_ids = crate::patterns::flag_edge_anomalies(
         &mut tx,
@@ -995,6 +1002,15 @@ pub async fn merge_in_tx(
         .bind(&ev_json).bind(&new_meta).bind(&new_status)
         .execute(&mut **tx)
         .await?;
+    }
+    // Journeys (0030) are per-subject DERIVED rows; drop the loser's (the survivor re-stitches when
+    // next drained, folding in the repointed events). Vision lanes only — speaker/device carry none.
+    if node_type == "person" || node_type == "plate" {
+        sqlx::query("DELETE FROM entity_journeys WHERE subject_type = $1 AND subject_id = $2")
+            .bind(node_type)
+            .bind(loser)
+            .execute(&mut **tx)
+            .await?;
     }
     Ok(())
 }

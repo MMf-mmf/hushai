@@ -16,6 +16,12 @@
         "kind": "visits_place",
         "min_evidence": 1
       }
+    ],
+    "journeys": [
+      {
+        "subject": { "kind": "person", "name": "Alice" },
+        "cameras": ["eval-graph-front", "eval-graph-garage"]
+      }
     ]
   }
 }

@@ -728,6 +728,10 @@ pub struct GraphGt {
     /// `expect_briefing` (G2 / Phase E): assert the pinned-date daily digest's structured `sections`.
     #[serde(default)]
     pub briefing: Option<BriefingGt>,
+    /// `expect_journey` (G5 / Wave 4): the subject took a cross-camera journey visiting `cameras` as
+    /// an ORDERED subsequence of its stitched hops.
+    #[serde(default)]
+    pub journeys: Vec<JourneyExpect>,
 }
 
 /// A daily-digest assertion (G2 / Phase E) against `daily_digests.sections` for a PINNED civil date.
@@ -784,6 +788,17 @@ pub struct BaselineExpect {
     /// weekday-agnostic so a weekly-cadence fixture asserts "arrives ~09:00" without pinning the day.
     #[serde(default)]
     pub peak_hour_of_day: Option<i64>,
+}
+
+/// A cross-camera journey assertion (G5). `subject` names a person/plate (enrolled `display_name`,
+/// resolved to a catalog id). `cameras` are `device_id`s that must appear — in this order, as a
+/// SUBSEQUENCE (not necessarily contiguous) — among the hops of ONE of the subject's stitched
+/// journeys. Assignment-invariant: same clips + pinned timestamps ⇒ the same stitched path.
+#[derive(Debug, Clone, Deserialize)]
+pub struct JourneyExpect {
+    pub subject: EntityRef,
+    /// Ordered `device_id` subsequence the journey's hops must contain.
+    pub cameras: Vec<String>,
 }
 
 /// One graph node reference. For `person`/`speaker`/`plate` the `name` is the enrolled `display_name`
@@ -899,7 +914,7 @@ mod tests {
             "search_objects", "people_sightings", "who_was_i_with", "co_presence", "plate_sightings",
             "presence_count", "footage_stats", "reflection_digest", "events_feed", "entity_profile",
             "ask_user", "graph_entity", "graph_connections", "graph_neighborhood", "graph_anomalies",
-            "graph_briefing",
+            "graph_briefing", "graph_journeys",
         ];
         let root = crate::ctx::repo_root().join("hushai-eval/fixtures/staging");
         for case in [
@@ -959,8 +974,9 @@ mod tests {
                     || !gt.anomalies.is_empty()
                     || !gt.no_anomalies.is_empty()
                     || !gt.baselines.is_empty()
-                    || gt.briefing.is_some(),
-                "{case} must assert at least one entity/edge/anomaly/baseline/briefing"
+                    || gt.briefing.is_some()
+                    || !gt.journeys.is_empty(),
+                "{case} must assert at least one entity/edge/anomaly/baseline/briefing/journey"
             );
             for e in gt.edges.iter().chain(gt.no_edges.iter()) {
                 assert!(EDGE_KINDS.contains(&e.kind.as_str()), "{case}: bad edge kind {}", e.kind);
@@ -977,6 +993,16 @@ mod tests {
             }
             for b in &gt.baselines {
                 assert!(NODE_KINDS.contains(&b.subject.kind.as_str()), "{case}: bad baseline subject kind {}", b.subject.kind);
+            }
+            for j in &gt.journeys {
+                // Journeys are vision-lane subjects (person/plate) with ≥ 2 cameras (single-camera is
+                // not a journey).
+                assert!(
+                    j.subject.kind == "person" || j.subject.kind == "plate",
+                    "{case}: journey subject must be person/plate, got {}",
+                    j.subject.kind
+                );
+                assert!(j.cameras.len() >= 2, "{case}: a journey must assert >= 2 cameras");
             }
             if let Some(br) = &gt.briefing {
                 let d = br.date.as_bytes();

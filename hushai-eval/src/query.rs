@@ -78,6 +78,17 @@ pub struct BaselineObs {
     pub hour_histogram: Vec<i32>,
 }
 
+/// One stitched `entity_journeys` row (Gotham G5). `subject_id` is the stringified catalog UUID;
+/// `hop_devices` is the ORDERED `device_id` sequence of its hops (a cross-camera assertion checks its
+/// `cameras` against this as a subsequence); `status` is `open`/`closed`.
+#[derive(Debug, Clone)]
+pub struct JourneyObs {
+    pub subject_type: String,
+    pub subject_id: String,
+    pub hop_devices: Vec<String>,
+    pub status: String,
+}
+
 /// Name→id resolution for graph assertions (assignment-invariance): the enrolled `display_name` of a
 /// person/speaker/plate maps to its catalog id. Device endpoints resolve to their literal id, so they
 /// need no map. Empty when the `graph` modality isn't scored.
@@ -108,6 +119,8 @@ pub struct Observed {
     pub anomalies: Vec<AnomalyObs>,
     /// Recomputed `entity_baselines` rows (Gotham G2), read when the `graph` modality is scored.
     pub baselines: Vec<BaselineObs>,
+    /// Stitched `entity_journeys` rows (Gotham G5), read when the `graph` modality is scored.
+    pub journeys: Vec<JourneyObs>,
     /// The pinned-date daily-digest `sections` jsonb (Gotham G2 / Phase E). Populated by
     /// [`generate_digest`] (a backend `POST /v1/graph/digests/{date}`) ONLY when the fixture carries
     /// an `expect_briefing` assertion; `None` otherwise. `None` at score time means the fixture
@@ -352,6 +365,29 @@ pub async fn observe(
             subject_id: subject_id.to_string(),
             visits_in_window: visits as i64,
             hour_histogram: hist,
+        })
+        .collect();
+
+        // Stitched cross-camera journeys (Gotham G5). hops jsonb → ordered device_id list.
+        o.journeys = sqlx::query_as::<_, (String, Uuid, serde_json::Value, String)>(
+            "SELECT subject_type, subject_id, hops, status FROM entity_journeys \
+             ORDER BY started_at_unix_nanos ASC",
+        )
+        .fetch_all(&ctx.pool)
+        .await?
+        .into_iter()
+        .map(|(subject_type, subject_id, hops, status)| JourneyObs {
+            subject_type,
+            subject_id: subject_id.to_string(),
+            hop_devices: hops
+                .as_array()
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|h| h.get("device_id").and_then(|d| d.as_str()).map(String::from))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            status,
         })
         .collect();
     }
