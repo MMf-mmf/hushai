@@ -664,18 +664,20 @@ audio).
 | Phase | Check | Result |
 |---|---|---|
 | 0 | preconditions delta (2 test corpora, Chrome, phone, ports) | ◑ (viewer track only: `hushai_test` corpus + Chrome present) |
-| A | viewer clippy 0 · eval ≥31 tests · Android suite + 3 new test classes | ◑ (viewer builds + clippy-clean; **eval track ✅** — PR1 landed: eval 48 tests / 0 failed / clippy net-0 incl. all §3.1 test intents; Android track = later PR) |
+| A | viewer clippy 0 · eval ≥31 tests · Android suite + 3 new test classes | ✅ (viewer builds + clippy-clean; **eval ✅** PR1 `e72bfcd` eval 48/0 incl. all §3.1 intents; **Android ✅** PR3 `32beb77` gradlew 99/0 — AdvisorClientTest 10 / AssistantRoutingTest 8 / VoiceSessionTest 9) |
 | B | proxy 200/SSE-live/counter/no-secret (+ --tls variant) | ✅ (Part 1 landed: `/v1/advisor/sessions` → 200 via proxy, live `questions` frame streamed through, `upstream="advisor"` counter, no `ADVISOR_TOKEN` in the UI tree) |
 | C | 8-step manual UX + e2e advisor checks PASS | ✅ (viewer track: `AdvisorPane` + slash picker + phase pill + questions render; e2e advisor checks green — full-answer step behind `E2E_ADVISOR_FULL`) |
-| D | 9-step spoken script, marker contract honored | ⬜ (Android voice PR) |
-| E | advisor session survives app restart | ⬜ (Android voice PR) |
-| F | staging gating run exit 0, 2× identical verdicts | ⬜ (needs the rig; harness capabilities ✅ landed in PR1 — the `memory` SSE event, `new_session` + the 4 richer assertions + 2 structural metrics, manifest advisor-gated `ADVISOR_KNOBS` + corpus fingerprint. Fixture bank F1–F6 + live calibration remain = fixture-bank PR) |
-| G | voice smoke: direct consult, no gate round | ⬜ (phone-rig PR) |
-| H | voice multi-turn: marker order + session continuity + DB shape | ⬜ (phone-rig PR) |
+| D | 9-step spoken script, marker contract honored | ⬜ (PR3 `32beb77` landed — rig-gated: phone) |
+| E | advisor session survives app restart | ⬜ (PR3 `32beb77` landed — rig-gated: phone) |
+| F | staging gating run exit 0, 2× identical verdicts | ⬜ (needs the rig; harness ✅ PR1, fixtures F1–F6 ✅ PR4 `00cfe82` — live calibration remains) |
+| G | voice smoke: direct consult, no gate round | ⬜ (PR4 `00cfe82` `voice_advisor_loop.py --smoke` landed — rig-gated: phone) |
+| H | voice multi-turn: marker order + session continuity + DB shape | ⬜ (PR4 `00cfe82` `voice_advisor_loop.py` landed — rig-gated: phone) |
 
-**Part 1 (viewer web chat) LANDED** alongside Gotham G4 / Phase G — the slash picker + `ChatPane`
-seams + `AdvisorPane` are the shared infra both consume (`Gotham.md` §2.7, PR-slicing #9). Tracks 2
-(Android voice) and 3 (eval fixtures + phone rig) remain.
+**All three tracks now LANDED at the unit level** (2026-07-13): Part 1 viewer (`72d95be`, alongside
+Gotham G4 / Phase G — the slash picker + `ChatPane` seams + `AdvisorPane` are shared infra, `Gotham.md`
+§2.7, PR-slicing #9), Track 2 Android voice (PR3 `32beb77`, gradlew 99/0), Track 3 harness (PR1
+`e72bfcd`) + fixtures F1–F6 (PR4 `00cfe82`). **Everything that remains — Phases D/E/F/G/H — is
+rig-gated** (physical phone + a free stack for live calibration).
 
 ## Troubleshooting
 
@@ -733,19 +735,23 @@ seams + `AdvisorPane` are the shared infra both consume (`Gotham.md` §2.7, PR-s
    rig** (staging calibration is INCONCLUSIVE without the running advisor service).
 2. **PR: viewer integration** (Part 1 + Phase B/C e2e checks) — fastest human-visible demo.
    **✅ LANDED** with Gotham G4 Phase G (`72d95be`).
-3. **PR: Android voice integration** (Part 2 + unit tests; Phase D/E run on the rig). **⬜ NOT
-   STARTED on mainline.** Pickup: the full-v2 branch `feat/advisor-v2-pr1-eval-memory` (`c3400ac`,
-   origin) already has this coded + live-verified (2026-07-07) — and Gotham (G1–G5) NEVER touched
-   `hushai-android`, so its Android commits (`AssistantRouting.kt`, `AWAIT_FOLLOWUP`,
-   `AdvisorClient.kt`, `VoiceSession` idle-window param, the consult loop, §2.7 markers, 3 test
-   classes) should **cherry-pick ~clean** onto mainline rather than be rewritten. Verify at the unit
-   level here (`./gradlew :app:testDebugUnitTest`); Phase D/E are spoken/phone → a rig session.
-   Unblocks Gotham G4 Phase H (the "detective" keyword reuses this seam).
+3. **PR: Android voice integration** (Part 2 + unit tests; Phase D/E run on the rig). **✅ LANDED
+   (2026-07-13, `32beb77`).** Surgically extracted from `feat/advisor-v2-pr1-eval-memory` (`c3400ac`) —
+   Gotham (G1–G5) never touched `hushai-android` and mainline had **zero drift** from fork `f30c5fa`,
+   so the 13 Android files (`AssistantRouting.kt`, `AWAIT_FOLLOWUP`, `AdvisorClient.kt`, `VoiceSession`
+   idle-window param, the consult loop, §2.7 markers, 3 test classes) + `run_hushai_app.sh` applied
+   onto an identical base rather than being cherry-picked whole (which would drag the stale eval/viewer
+   bits). Unit gate: `./gradlew :app:testDebugUnitTest` → **99 / 0 failed** (the 27 spec Phase A tests);
+   all 9 §2.7 markers byte-exact. **Phases D/E are spoken/phone → a rig session.** Unblocks Gotham G4
+   Phase H (the "detective" keyword reuses this seam).
 4. **PR: fixture bank + phone rig** (§3.2 + §3.4 + `voice_advisor_loop.py`; Phases F/G/H
-   executed and the result matrix filled). **⬜ NOT STARTED on mainline.** Pickup: do NOT cherry-pick
-   the old branch's eval/manifest bits — they are 19 Gotham commits stale AND fold the corpus into
-   ALL cases (would clobber `d4acc862`). The harness this PR needs already landed d4acc862-safe in
-   PR1; only add the 6 fixtures F1–F6 (§3.2) + the phone rig, then run Phases F/G/H on the rig.
+   executed and the result matrix filled). **✅ LANDED (2026-07-13, `00cfe82`) — unit level.** Did NOT
+   cherry-pick the old branch's eval/manifest bits (19 Gotham commits stale + they fold the corpus into
+   ALL cases → would clobber `d4acc862`); the harness landed d4acc862-safe in PR1. Added only the 6
+   fixtures F1–F6 (pure data), extended `advisor_staging_fixtures_parse` to all 8 + `new_session`
+   assertions (eval 48/0, clippy net-0), and `voice_advisor_loop.py` (`.advisor_rig/` gitignored — clips
+   re-render each run). `run_stack.sh` TLS export + `phys.env` `:8097` were already on mainline (Part 1).
+   **Phases F/G/H remain rig-gated** (live calibration + phone).
 
 > **Branch note (2026-07-13):** `feat/advisor-v2-pr1-eval-memory` (`c3400ac`) holds a complete,
 > once-live-verified v2 but forked at `f30c5fa`, now 19 Gotham commits behind mainline; its
