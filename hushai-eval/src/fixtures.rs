@@ -919,12 +919,45 @@ mod tests {
     #[test]
     fn advisor_staging_fixtures_parse() {
         let root = crate::ctx::repo_root().join("hushai-eval/fixtures/staging");
-        for case in ["advisor_followup", "advisor_direct"] {
+        // The two pre-v2 fixtures plus the F1–F6 bank (§3.2). All are media-less, so this parse is
+        // the only thing that exercises their JSON until a live `--fixtures staging` rig run.
+        for case in [
+            "advisor_followup",
+            "advisor_direct",
+            "advisor_gate_negotiation",        // F1
+            "advisor_memory_cross_session",    // F2
+            "advisor_memory_selectivity",      // F3
+            "advisor_direct_hardnews",         // F4
+            "advisor_followup_two_rounds",     // F5
+            "advisor_offtopic_recovery",       // F6
+        ] {
             let fx = load(&root.join(case), "staging").expect(case);
             assert!(fx.meta.needs_advisor(), "{case} must list the advisor modality");
             let gt = fx.expected.advisor.as_ref().expect("advisor GT block");
             assert!(!gt.turns.is_empty(), "{case} must script at least one turn");
         }
+
+        // The multi-conversation fixtures are the whole point of `new_session` — assert the flag
+        // lands on the intended turns (t0 always continues, the later sessions opt in) and that the
+        // planted-token assertions the memory proof relies on actually parsed onto those turns.
+        let f2 = load(&root.join("advisor_memory_cross_session"), "staging").unwrap();
+        let f2 = f2.expected.advisor.as_ref().unwrap();
+        assert!(!f2.turns[0].new_session, "F2 t0 opens session 1");
+        assert!(f2.turns[1].new_session, "F2 t1 must fork a fresh session");
+        assert_eq!(f2.turns[1].expect_memory_recall_min, Some(1));
+        assert!(
+            f2.turns[1].must_contain_any.iter().any(|s| s == "Menashe"),
+            "F2 t1 must assert the planted cross-session token",
+        );
+
+        let f3 = load(&root.join("advisor_memory_selectivity"), "staging").unwrap();
+        let f3 = f3.expected.advisor.as_ref().unwrap();
+        assert!(!f3.turns[0].new_session, "F3 S1 opens session 1");
+        assert!(f3.turns[1].new_session && f3.turns[2].new_session, "F3 S2+S3 each fork");
+        assert!(
+            !f3.turns[2].must_not_contain.is_empty(),
+            "F3 S3 must carry the cross-memory leak negative",
+        );
     }
 
     /// Test #1: the new `AdvisorTurn` fields (`new_session` + the richer assertions + memory floors)

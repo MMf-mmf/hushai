@@ -1,0 +1,11 @@
+{
+  "case_id": "advisor_followup_two_rounds",
+  "description": "F5 — the gate cap end-to-end. t0 and t1 stay thin enough to keep the gate asking; t2 supplies goal + constraints + deadline. At ADVISOR_MAX_FOLLOWUP_ROUNDS=2 the t2 answer is cap-forced (judge-independent). If the judge PROCEEDs at t1 at temp 0 during calibration, DROP the t1 assertion rather than fatten t1. Service-level advisor case: no media is injected.",
+  "device_id": "eval-advisor",
+  "media_file": "",
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "advisor"
+  ],
+  "tier": "full"
+}

@@ -1,0 +1,19 @@
+{
+  "advisor": {
+    "turns": [
+      {
+        "message": "My 50-50 business partner Menashe at Silverstein Lighting has blocked our showroom renovation in three meetings running. A bank matching grant that would fund it expires at the end of the month, and our family dinners have gotten tense because he's also my brother-in-law. How should I approach him?",
+        "expect_questions": false,
+        "expect_final_answer": true,
+        "expect_memory_rows_min": 1
+      },
+      {
+        "message": "I have a follow-up meeting tomorrow morning about that business disagreement with my brother-in-law and business partner that I consulted you about before. My goal is to propose a concrete compromise, get the renovation unblocked before the grant deadline, and repair our working relationship. Remind me who and what was involved and the core of the approach you recommended, then help me prepare what to say to him.",
+        "new_session": true,
+        "expect_final_answer": true,
+        "expect_memory_recall_min": 1,
+        "must_contain_any": ["Menashe", "Silverstein"]
+      }
+    ]
+  }
+}

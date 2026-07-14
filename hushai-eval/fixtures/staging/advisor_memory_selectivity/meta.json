@@ -1,0 +1,11 @@
+{
+  "case_id": "advisor_memory_selectivity",
+  "description": "F3 — three sessions; retrieval must pick the RIGHT memory. S1 plants token set A (lease / Mrs. Okonkwo / Maple Street bakery), S2 (new_session) plants an unrelated token set B (son Tuvia / violin), S3 (new_session) references the LEASE situation and must resurface set A while NOT leaking set B. If the leak negative proves flaky at calibration, shorten only must_not_contain; keep the positive. Service-level advisor case: no media is injected.",
+  "device_id": "eval-advisor",
+  "media_file": "",
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "advisor"
+  ],
+  "tier": "full"
+}

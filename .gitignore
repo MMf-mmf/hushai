@@ -33,6 +33,9 @@ local_dev/captures/
 # Regenerable HLS output written by local_dev/feed_segments.py (segments + sidecars).
 local_dev/.feed_work/
 
+# Regenerable voice-consult rig clips (say → 16k mono loudnorm) from local_dev/voice_advisor_loop.py.
+local_dev/.advisor_rig/
+
 # Synthesized object-lane test fixture (make_object_clip.sh) — regenerable, operator-provisioned.
 object_clip.mp4
 

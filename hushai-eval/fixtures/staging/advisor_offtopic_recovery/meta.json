@@ -1,0 +1,11 @@
+{
+  "case_id": "advisor_offtopic_recovery",
+  "description": "F6 — robustness. t0 is off-topic with an instruction to skip questions; the day-one invariant is only 'no error event, no crash' (the automatic clean-stream gate advisor.t0.errored), so t0 carries no other assertion — off-topic behavior is observed then frozen. t1 is a real situation the advisor must answer. (Empty-input cannot be a fixture: 400 becomes a transport error and INCONCLUSIVE; it stays in v1_spec's curl checks.) Service-level advisor case: no media is injected.",
+  "device_id": "eval-advisor",
+  "media_file": "",
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "advisor"
+  ],
+  "tier": "full"
+}

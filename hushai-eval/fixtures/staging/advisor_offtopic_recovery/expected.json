@@ -1,0 +1,13 @@
+{
+  "advisor": {
+    "turns": [
+      {
+        "message": "What is the capital of France? Don't ask me any questions, just answer."
+      },
+      {
+        "message": "My co-founder and I disagree about whether to take an outside investment that would dilute us both but fund a real growth push. We have ten days before the term sheet expires, and I want to reach a decision together. I'd like to structure a meeting to work through it. How should I approach it?",
+        "expect_final_answer": true
+      }
+    ]
+  }
+}

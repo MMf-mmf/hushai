@@ -1,0 +1,25 @@
+{
+  "advisor": {
+    "turns": [
+      {
+        "message": "I want to renew the lease with my landlord Mrs. Okonkwo for the Maple Street bakery. She's been fair but slow to respond, and my current term ends in two months. How should I open the conversation to get a multi-year renewal at a fair rent?",
+        "expect_final_answer": true,
+        "expect_memory_rows_min": 1
+      },
+      {
+        "message": "Different topic entirely. My ten-year-old son Tuvia has been resisting his daily violin practice for the past month, and it's turned into a nightly fight — I nag, he digs in, and we both end up upset. My goal is to get him practicing willingly again without me being the bad guy, and to protect our relationship. I have his next lesson on Sunday. How should I handle it?",
+        "new_session": true,
+        "expect_final_answer": true,
+        "expect_memory_rows_min": 2
+      },
+      {
+        "message": "About the lease situation I consulted you on earlier — the landlord countered with a shorter term at a higher rent. How should I respond to still land a fair multi-year deal?",
+        "new_session": true,
+        "expect_final_answer": true,
+        "expect_memory_recall_min": 1,
+        "must_contain_any": ["Okonkwo", "Maple Street", "bakery"],
+        "must_not_contain": ["Tuvia", "violin"]
+      }
+    ]
+  }
+}

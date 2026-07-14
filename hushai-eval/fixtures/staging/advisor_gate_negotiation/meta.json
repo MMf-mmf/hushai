@@ -1,0 +1,11 @@
+{
+  "case_id": "advisor_gate_negotiation",
+  "description": "F1 — gate-exercising negotiation consult: a thin opener MUST trigger a follow-up round; a supplier-renewal detail turn may legitimately trigger a second (cap is 2); the goals turn produces the final grounded answer. Service-level advisor case: no media is injected (media fields below are unused placeholders). expect_chapters_any is a calibration draft (widen-never-narrow on the first live run).",
+  "device_id": "eval-advisor",
+  "media_file": "",
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "advisor"
+  ],
+  "tier": "full"
+}

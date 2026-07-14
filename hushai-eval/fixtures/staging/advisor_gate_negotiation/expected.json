@@ -1,0 +1,21 @@
+{
+  "advisor": {
+    "turns": [
+      {
+        "message": "I have a big negotiation coming up next month and I'm nervous about it.",
+        "expect_questions": true,
+        "expect_final_answer": false
+      },
+      {
+        "message": "It's a renewal with our largest packaging supplier. Our volume with them has doubled since we signed, they opened at a 9 percent price increase, and I've had a good six-year relationship with their account manager. My CFO wants me to threaten to switch suppliers, but switching would take us about four months to qualify a new vendor."
+      },
+      {
+        "message": "My goals: land under a 4 percent increase, sign this quarter, and keep our priority production slots. I can offer a two-year term and act as a reference account as sweeteners.",
+        "expect_questions": false,
+        "expect_final_answer": true,
+        "expect_chapters_any": [7, 21, 31, 44],
+        "must_not_contain": ["as an AI", "I cannot help"]
+      }
+    ]
+  }
+}

@@ -1,0 +1,21 @@
+{
+  "advisor": {
+    "turns": [
+      {
+        "message": "I need advice about a person at work.",
+        "expect_questions": true,
+        "expect_final_answer": false
+      },
+      {
+        "message": "It's my manager. Things have been difficult lately.",
+        "expect_questions": true,
+        "expect_final_answer": false
+      },
+      {
+        "message": "I was passed over for a promotion my manager had encouraged me to expect, and it went to a less experienced peer. My goal is to get a concrete development plan and a timeline for the next opening without burning the relationship. I have my quarterly one-on-one with her next Tuesday.",
+        "expect_questions": false,
+        "expect_final_answer": true
+      }
+    ]
+  }
+}

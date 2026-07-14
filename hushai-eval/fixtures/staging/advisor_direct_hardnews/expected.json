@@ -1,0 +1,13 @@
+{
+  "advisor": {
+    "turns": [
+      {
+        "message": "I run a twelve-person manufacturer. We shipped a batch with an 8 percent failure rate that took down our biggest customer's production line for two days. It was our own quality process at fault, not theirs. I'm meeting their VP on Friday. I want to keep the account and make it right, including compensation. How should I handle the conversation?",
+        "expect_questions": false,
+        "expect_final_answer": true,
+        "expect_chapters_any": [26, 27, 28, 33],
+        "must_contain_any": ["apolog", "admit", "responsib"]
+      }
+    ]
+  }
+}

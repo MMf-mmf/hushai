@@ -1,0 +1,11 @@
+{
+  "case_id": "advisor_direct_hardnews",
+  "description": "F4 — direct-sufficient, hard conversation: enough context is given up front that the gate should PROCEED to a grounded answer. must_contain_any uses normalized stems (apolog / admit / responsib) — structural anchors any competent grounding of the admit-mistakes cluster produces. expect_chapters_any is a calibration draft (widen-never-narrow). Service-level advisor case: no media is injected.",
+  "device_id": "eval-advisor",
+  "media_file": "",
+  "base_capture_unix_nanos": 1781784000000000000,
+  "modalities": [
+    "advisor"
+  ],
+  "tier": "full"
+}
