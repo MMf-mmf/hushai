@@ -664,12 +664,12 @@ audio).
 | Phase | Check | Result |
 |---|---|---|
 | 0 | preconditions delta (2 test corpora, Chrome, phone, ports) | ◑ (viewer track only: `hushai_test` corpus + Chrome present) |
-| A | viewer clippy 0 · eval ≥31 tests · Android suite + 3 new test classes | ◑ (viewer builds + clippy-clean; eval/Android tracks = later PRs) |
+| A | viewer clippy 0 · eval ≥31 tests · Android suite + 3 new test classes | ◑ (viewer builds + clippy-clean; **eval track ✅** — PR1 landed: eval 48 tests / 0 failed / clippy net-0 incl. all §3.1 test intents; Android track = later PR) |
 | B | proxy 200/SSE-live/counter/no-secret (+ --tls variant) | ✅ (Part 1 landed: `/v1/advisor/sessions` → 200 via proxy, live `questions` frame streamed through, `upstream="advisor"` counter, no `ADVISOR_TOKEN` in the UI tree) |
 | C | 8-step manual UX + e2e advisor checks PASS | ✅ (viewer track: `AdvisorPane` + slash picker + phase pill + questions render; e2e advisor checks green — full-answer step behind `E2E_ADVISOR_FULL`) |
 | D | 9-step spoken script, marker contract honored | ⬜ (Android voice PR) |
 | E | advisor session survives app restart | ⬜ (Android voice PR) |
-| F | staging gating run exit 0, 2× identical verdicts | ⬜ (fixture-bank PR) |
+| F | staging gating run exit 0, 2× identical verdicts | ⬜ (needs the rig; harness capabilities ✅ landed in PR1 — the `memory` SSE event, `new_session` + the 4 richer assertions + 2 structural metrics, manifest advisor-gated `ADVISOR_KNOBS` + corpus fingerprint. Fixture bank F1–F6 + live calibration remain = fixture-bank PR) |
 | G | voice smoke: direct consult, no gate round | ⬜ (phone-rig PR) |
 | H | voice multi-turn: marker order + session continuity + DB shape | ⬜ (phone-rig PR) |
 
@@ -715,6 +715,22 @@ seams + `AdvisorPane` are the shared infra both consume (`Gotham.md` §2.7, PR-s
 
 1. **PR: advisor `memory` SSE event + eval harness capabilities** (§3.1) — smallest,
    unblocks fixture calibration; includes the 8 unit tests + manifest KNOBS/fingerprint.
+   **✅ LANDED (2026-07-13).** Advisor service emits `memory {recalled, nearest_distance}` after
+   `recalling` (`pipeline.rs`/`chat.rs`/`memory.rs`; `Memory.distance` added). Eval: `AdvisorTurn`
+   gains `new_session` + `must_contain_any`/`must_not_contain`/`expect_memory_rows_min`/
+   `expect_memory_recall_min`; `AdvisorTurnResult` gains `memories_recalled`/`memory_nearest_distance`/
+   `memory_rows` + `handle_block` `memory` parse; `score_advisor` adds `session_isolated`/
+   `session_continuous` (structural Boolean) + `contains_any`/`clean` (Boolean) + `memory_rows`/
+   `memory_recalled` (HigherBetter, Info-degrade when absent) + `memory_nearest_distance` (Info
+   calibration); `run_advisor_case` resets+re-learns the session on `new_session` and probes the
+   row count when asserted; pure `thread_advisor_sessions` models the loop. **11 new unit tests
+   (all 8 §3.1 intents + 3 threading), eval 48/0-failed, clippy net-0.** Manifest: `ADVISOR_KNOBS`
+   (18 vars) + corpus fingerprint fold **only for advisor cases** (`include_corpus =
+   needs_advisor()`) — because `eval.env` pins the advisor SERVICE's `ADVISOR_LLM_TEMPERATURE`/`SEED`,
+   a global fold would clobber the frozen perception/graph `d4acc862` lineage; a const guard test
+   locks in both regression vectors (KNOB_PREFIXES + global KNOBS). Adversarially reviewed
+   (4 finders → 1 confirmed low finding = test-coverage gap, fixed). **Live Phase F still needs the
+   rig** (staging calibration is INCONCLUSIVE without the running advisor service).
 2. **PR: viewer integration** (Part 1 + Phase B/C e2e checks) — fastest human-visible demo.
 3. **PR: Android voice integration** (Part 2 + unit tests; Phase D/E run on the rig).
 4. **PR: fixture bank + phone rig** (§3.2 + §3.4 + `voice_advisor_loop.py`; Phases F/G/H

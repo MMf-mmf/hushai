@@ -88,6 +88,39 @@ const KNOBS: &[&str] = &[
     "GOTHAM_CRITIQUE_ENABLED",
 ];
 
+/// Ahithophel advisor knobs (the `advisor` eval modality). These SHAPE the streamed consultation +
+/// its grounding + the memory recall the advisor scorer asserts on, so an advisor baseline is only
+/// comparable under the identical decode + gate/route/memory profile. HAND-LISTED (not an
+/// `ADVISOR_` prefix-fold) ON PURPOSE: prefix-folding would sweep the secret `ADVISOR_TOKEN` and
+/// the machine-specific `ADVISOR_BIND_ADDR`/`ADVISOR_TLS_*` into every machine's hash.
+///
+/// Folded into the config-hash ONLY for advisor cases (`include_corpus`), NOT globally — because
+/// UNLIKE the GOTHAM knobs (kept OUT of the shared `local_dev/eval.env`), the advisor determinism
+/// pins `ADVISOR_LLM_TEMPERATURE`/`ADVISOR_LLM_SEED` ARE set in `eval.env` (they configure the live
+/// advisor SERVICE). A global fold would therefore sweep them into every perception/graph
+/// `--fixtures all` run and clobber the frozen `d4acc862` lineage. Gating on advisor-ness keeps
+/// `d4acc862` byte-stable while still minting a fresh lineage the moment an advisor knob changes.
+const ADVISOR_KNOBS: &[&str] = &[
+    "ADVISOR_LLM_MODEL",
+    "ADVISOR_JUDGE_MODEL",
+    "ADVISOR_LLM_TEMPERATURE",
+    "ADVISOR_LLM_SEED",
+    "ADVISOR_NUM_CTX",
+    "ADVISOR_MAX_FOLLOWUP_ROUNDS",
+    "ADVISOR_MAX_QUESTIONS_PER_ROUND",
+    "ADVISOR_MAX_REFINE_ITERS",
+    "ADVISOR_MAX_CHAPTERS_PER_ROUTE",
+    "ADVISOR_MAX_TOTAL_CHAPTERS",
+    "ADVISOR_HISTORY_TURNS",
+    "ADVISOR_CHAPTER_MAX_CHARS",
+    "ADVISOR_CONTEXT_MAX_TOTAL_CHARS",
+    "ADVISOR_ROUTE_SEMANTIC_TOP_K",
+    "ADVISOR_MEMORY_TOP_K",
+    "ADVISOR_MEMORY_DISTANCE_THRESHOLD",
+    "ADVISOR_MEMORY_ENABLED",
+    "ADVISOR_MAX_MESSAGE_CHARS",
+];
+
 /// Env-var PREFIXES whose vars change what the pipeline produces. Folded into the config-hash BY
 /// PREFIX (not only the hand-list above) so a NEW knob is captured automatically. A hand-maintained
 /// allowlist previously omitted many output-determining knobs (OBJECT_*/PLATE_*/FACE_*/AUDIO_SILENCE_*/
@@ -143,7 +176,15 @@ struct HashSurface<'a> {
 }
 
 impl EnvManifest {
-    pub async fn collect(ctx: &Ctx, per_case_config: &serde_json::Map<String, serde_json::Value>) -> Result<Self> {
+    /// `include_corpus` folds the advisor book-corpus fingerprint into the hash — passed `true`
+    /// ONLY for advisor cases (`FixtureMeta::needs_advisor`). A perception/graph `--fixtures all`
+    /// run passes `false`, so its config-hash never sees the corpus key even when the shared
+    /// `hushai_test` DB also holds an ingested book — the frozen `d4acc862` lineage is preserved.
+    pub async fn collect(
+        ctx: &Ctx,
+        per_case_config: &serde_json::Map<String, serde_json::Value>,
+        include_corpus: bool,
+    ) -> Result<Self> {
         let models = fingerprint_models(&ctx.repo_root.join("models"));
         let ollama = ollama_digests(ctx).await;
         let ort_dylib = find_ort_dylib(&ctx.repo_root);
@@ -166,6 +207,19 @@ impl EnvManifest {
         // Per-case worker-config overrides participate in the hash too (a case can pin a knob).
         for (k, v) in per_case_config {
             knobs.insert(format!("case::{k}"), v.to_string());
+        }
+        // Advisor determinism knobs + corpus lineage — folded ONLY for advisor cases so the frozen
+        // perception/graph `d4acc862` lineage is byte-stable even though `eval.env` sets the advisor
+        // service's `ADVISOR_LLM_TEMPERATURE`/`SEED` (see `ADVISOR_KNOBS`). A re-clean / re-ingest /
+        // different book (the corpus fingerprint) or any advisor knob change mints a fresh advisor
+        // lineage; a media/graph `--fixtures all` run carries NEITHER key.
+        if include_corpus {
+            for k in ADVISOR_KNOBS {
+                if let Ok(v) = std::env::var(k) {
+                    knobs.insert((*k).to_string(), v);
+                }
+            }
+            knobs.insert("corpus::book".to_string(), corpus_fingerprint(ctx).await);
         }
 
         let surface = HashSurface {
@@ -296,4 +350,59 @@ async fn migration_head(ctx: &Ctx) -> Result<String> {
 
 fn env_bool(k: &str, default: bool) -> bool {
     std::env::var(k).ok().map(|v| v == "true" || v == "1").unwrap_or(default)
+}
+
+/// Fingerprint the ingested advisor book corpus: chapter count + an md5 over the synopses (the
+/// routing surface every answer is grounded through). `"absent"` when `book_chapters` doesn't
+/// exist (a DB without the advisor migrations). Folded into the hash only for advisor cases.
+async fn corpus_fingerprint(ctx: &Ctx) -> String {
+    match sqlx::query_as::<_, (i64, Option<String>)>(
+        "SELECT count(*), md5(string_agg(synopsis, '' ORDER BY chapter_no)) FROM book_chapters",
+    )
+    .fetch_one(&ctx.pool)
+    .await
+    {
+        Ok((n, md5)) => format!("{n}:{}", md5.unwrap_or_default()),
+        Err(_) => "absent".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ADVISOR_KNOBS, KNOBS, KNOB_PREFIXES};
+
+    /// Guard the d4acc862-preservation contract at the const level. The advisor knobs are folded
+    /// ONLY for advisor cases (`eval.env` pins the advisor service's `ADVISOR_LLM_TEMPERATURE`/
+    /// `SEED`, so a GLOBAL fold would sweep them into every perception/graph `--fixtures all` hash).
+    /// This test asserts every path that could regress that:
+    ///   1. `ADVISOR_KNOBS` are well-formed and free of the secret/machine-specific vars a prefix
+    ///      fold would have swept (`ADVISOR_TOKEN`, `ADVISOR_BIND_ADDR`, `ADVISOR_TLS_*`).
+    ///   2. No `ADVISOR_KNOBS` entry is ALSO in the global `KNOBS` (double-fold).
+    ///   3. No global `KNOBS` entry is `ADVISOR_`-prefixed (a new advisor knob added to the wrong
+    ///      list would fold into every perception hash).
+    ///   4. No `KNOB_PREFIXES` entry matches an `ADVISOR_` var — the exact trap the `ADVISOR_KNOBS`
+    ///      docstring warns against; the prefix fold (unlike the hand-list) is NOT advisor-gated, so
+    ///      an `"ADVISOR_"` prefix here would clobber d4acc862 for every run.
+    #[test]
+    fn advisor_knobs_isolated_and_secret_free() {
+        for k in ADVISOR_KNOBS {
+            assert!(k.starts_with("ADVISOR_"), "{k} misfiled in ADVISOR_KNOBS");
+            assert!(!KNOBS.contains(k), "{k} must not also be in global KNOBS (would clobber d4acc862)");
+        }
+        for forbidden in ["ADVISOR_TOKEN", "ADVISOR_BIND_ADDR", "ADVISOR_TLS_CERT", "ADVISOR_TLS_KEY"] {
+            assert!(!ADVISOR_KNOBS.contains(&forbidden), "{forbidden} is a secret/machine var — must never fold");
+        }
+        assert_eq!(ADVISOR_KNOBS.len(), 18, "the spec hand-lists 18 output-shaping advisor knobs");
+        // The two regression vectors that would silently breach d4acc862 (both fold GLOBALLY, not
+        // advisor-gated): a raw ADVISOR_ var in the global KNOBS, or an ADVISOR_ prefix fold.
+        for k in KNOBS {
+            assert!(!k.starts_with("ADVISOR_"), "{k}: advisor knobs belong in ADVISOR_KNOBS (advisor-gated), not the global KNOBS");
+        }
+        for p in KNOB_PREFIXES {
+            for k in ADVISOR_KNOBS {
+                assert!(!k.starts_with(p), "prefix {p} captures advisor knob {k} — the prefix fold is NOT advisor-gated, so it would clobber d4acc862");
+            }
+            assert!(!p.starts_with("ADVISOR"), "{p} is ADVISOR-scoped — the prefix fold would sweep ADVISOR_TOKEN + eval.env's ADVISOR_LLM_* into every perception hash and clobber d4acc862");
+        }
+    }
 }

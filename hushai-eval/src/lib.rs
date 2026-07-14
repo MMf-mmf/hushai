@@ -64,7 +64,7 @@ pub async fn run(opts: RunOpts) -> Result<SuiteResult> {
     let mut cases = Vec::new();
     let mut last_manifest: Option<EnvManifest> = None;
     for fx in &fixtures {
-        let manifest = EnvManifest::collect(&ctx, &fx.meta.config).await?;
+        let manifest = EnvManifest::collect(&ctx, &fx.meta.config, fx.meta.needs_advisor()).await?;
         let case = run_case(&ctx, fx, &manifest, opts.update_baseline, opts.force).await?;
         cases.push(case);
         last_manifest = Some(manifest);
@@ -450,15 +450,27 @@ async fn run_advisor_case(
         return Ok(CaseResult::inconclusive(cid, split, tier, format!("advisor state reset failed: {e:#}")));
     }
 
-    // The scripted conversation: turn 1's `session` event mints the session; every later turn
-    // continues it, so follow-up rounds and memory are exercised for real.
+    // The scripted conversation: turn 1's `session` event mints the session; a continued turn
+    // threads it (follow-up rounds + memory exercised for real). A `new_session` turn drops the id
+    // FIRST so the service mints a fresh one, re-learned below — that is how the cross-session
+    // memory feature is exercised: memories written in session 1 must resurface in session 2.
     let mut turns = Vec::with_capacity(gt.turns.len());
     let mut session_id: Option<String> = None;
     for (ti, t) in gt.turns.iter().enumerate() {
+        if t.new_session {
+            session_id = None;
+        }
         match query_advisor::ask(ctx, &t.message, session_id.as_deref()).await {
-            Ok(r) => {
+            Ok(mut r) => {
+                // Re-learn whenever we hold no id (the first turn, and every `new_session` turn).
                 if session_id.is_none() && !r.session_id.is_empty() {
                     session_id = Some(r.session_id.clone());
+                }
+                // Memorizer WRITE proof: probe the cumulative row count only when this turn asserts
+                // it (keeps the scorer pure and adds no query to fixtures that don't use it). A probe
+                // error leaves `memory_rows` None → the scorer Info-degrades rather than false-FAILs.
+                if t.expect_memory_rows_min.is_some() {
+                    r.memory_rows = query_advisor::advisor_memory_row_count(ctx).await.ok();
                 }
                 turns.push(r);
             }
@@ -471,4 +483,66 @@ async fn run_advisor_case(
     let metrics = score::score_advisor(gt, &turns);
     // injected/processed = scripted/completed turns (the advisor analog of segment counts).
     finalize_case(ctx, manifest, cid, split, tier, gt.turns.len(), turns.len() as i64, metrics, update_baseline, force)
+}
+
+/// Pure model of `run_advisor_case`'s per-turn session threading — the executable spec of the
+/// multi-session contract, extracted so it is testable without a live service. Given each turn's
+/// `new_session` flag and the id its response MINTED (the `session` event; `None` if the turn
+/// produced none), returns the id SENT to each turn: a `new_session` turn (and the very first
+/// turn) sends `None` and re-learns from its own response; a continued turn sends the id currently
+/// held. The runner loop above mirrors this rule; drift would break cross-session memory fixtures.
+pub fn thread_advisor_sessions(new_session_flags: &[bool], minted: &[Option<String>]) -> Vec<Option<String>> {
+    let mut current: Option<String> = None;
+    let mut sent = Vec::with_capacity(new_session_flags.len());
+    for (i, &new_session) in new_session_flags.iter().enumerate() {
+        if new_session {
+            current = None;
+        }
+        sent.push(current.clone());
+        // Re-learn from this turn's own mint whenever we hold no id (first turn / new_session turn);
+        // a turn that minted nothing (`None`) leaves us None so the NEXT turn re-learns.
+        if current.is_none() {
+            current = minted.get(i).cloned().flatten();
+        }
+    }
+    sent
+}
+
+#[cfg(test)]
+mod advisor_threading_tests {
+    use super::thread_advisor_sessions;
+
+    /// Test #7: `[t0, t1{new_session}, t2]` sends `[None, None, Some(id_from_t1)]` — the first turn
+    /// and the `new_session` turn both send None (and re-learn); the continued turn sends the id
+    /// the `new_session` turn minted, NOT the one from before the boundary.
+    #[test]
+    fn new_session_resets_then_continues_the_fresh_id() {
+        let flags = [false, true, false];
+        let minted = [Some("id0".to_string()), Some("id1".to_string()), Some("id1".to_string())];
+        let sent = thread_advisor_sessions(&flags, &minted);
+        assert_eq!(sent, vec![None, None, Some("id1".to_string())]);
+    }
+
+    /// All-continued: only the first turn sends None; every later turn threads the first minted id.
+    #[test]
+    fn all_continued_threads_one_id() {
+        let flags = [false, false, false];
+        let minted = [Some("s".to_string()), Some("s".to_string()), Some("s".to_string())];
+        assert_eq!(
+            thread_advisor_sessions(&flags, &minted),
+            vec![None, Some("s".to_string()), Some("s".to_string())]
+        );
+    }
+
+    /// A turn that mints no id (a transport hiccup that still returned) leaves `current` None, so the
+    /// next turn re-learns rather than threading a stale id.
+    #[test]
+    fn missing_mint_defers_learning() {
+        let flags = [false, false, false];
+        let minted = [None, Some("s".to_string()), Some("s".to_string())];
+        assert_eq!(
+            thread_advisor_sessions(&flags, &minted),
+            vec![None, None, Some("s".to_string())]
+        );
+    }
 }

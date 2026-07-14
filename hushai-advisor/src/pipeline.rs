@@ -34,6 +34,11 @@ pub enum AdvisorEvent {
     Questions { round: i64, questions: Vec<String> },
     /// The accumulated chapter grounding after a routing iteration.
     Chapters { iteration: usize, chapters: Vec<ChapterRef> },
+    /// Long-term memory retrieval outcome (fired once, right after `recalling`): how many past
+    /// consultations cleared the distance cutoff, and the nearest one's cosine distance (`None`
+    /// when nothing was recalled). Calibration telemetry + the retrieval-proof signal the eval
+    /// harness gates on; UI clients ignore it (unknown-event tolerant by design).
+    Memory { recalled: i64, nearest_distance: Option<f64> },
     Token { delta: String },
     Done { message_id: Uuid },
     Error { message: String },
@@ -165,10 +170,21 @@ pub fn run_turn(st: AppState, ctx: TurnCtx) -> impl Stream<Item = AdvisorEvent> 
             )
             .await
             {
-                Ok(m) => memory::render_memory_context(&m),
+                Ok(m) => {
+                    // Retrieval proof (SSE): count + nearest distance, BEFORE rendering (render
+                    // borrows, doesn't consume). `None` distance ⇒ nothing cleared the cutoff.
+                    yield AdvisorEvent::Memory {
+                        recalled: m.len() as i64,
+                        nearest_distance: m.first().map(|x| x.distance),
+                    };
+                    memory::render_memory_context(&m)
+                }
                 Err(e) => {
-                    // Best-effort: advise without memory rather than fail the turn.
+                    // Best-effort: advise without memory rather than fail the turn. Still emit the
+                    // event (recalled=0) so a retrieval error reads as "no recall" downstream
+                    // rather than looking like an old binary that never shipped the event.
                     tracing::warn!(error = format!("{e:#}"), "memory retrieval failed");
+                    yield AdvisorEvent::Memory { recalled: 0, nearest_distance: None };
                     String::new()
                 }
             }

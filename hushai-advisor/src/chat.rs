@@ -6,6 +6,8 @@
 //!                                              routing/drafting/reviewing/polishing/memorizing)
 //!   `questions` {round, questions[]}         — a Yenta round; terminal for a gathering turn
 //!   `chapters`  {iteration, chapters:[{no,title}]} — citation chips render before tokens
+//!   `memory`    {recalled, nearest_distance}  — retrieval telemetry after 'recalling' (clients
+//!                                              ignore it; the eval harness gates on `recalled`)
 //!   `token`     {delta} …                    — the streamed final answer
 //!   `done`      {message_id} | `error` {message}
 //!
@@ -143,6 +145,10 @@ pub async fn advisor_chat(
                         "iteration": iteration,
                         "chapters": serde_json::to_value(&chapters).unwrap_or_else(|_| json!([])),
                     }),
+                ),
+                AdvisorEvent::Memory { recalled, nearest_distance } => sse_event(
+                    "memory",
+                    &json!({ "recalled": recalled, "nearest_distance": nearest_distance }),
                 ),
                 AdvisorEvent::Token { delta } => sse_event("token", &json!({ "delta": delta })),
                 AdvisorEvent::Done { message_id } => {

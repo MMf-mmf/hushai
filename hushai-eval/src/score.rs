@@ -1568,6 +1568,38 @@ pub fn score_advisor(gt: &AdvisorGt, turns: &[crate::query_advisor::AdvisorTurnR
             if r.errored { "stream reported an error event" } else { "clean stream" },
         ));
 
+        // Free structural session-threading proof. A `new_session` turn must land on a DISTINCT
+        // session id (the memory feature under test crossed a session boundary); a continued turn
+        // must land on the SAME id as the turn before it. These are New (non-gating) against
+        // pre-existing baselines, but a genuine violation (a leaked/reused id) is a real floor
+        // breach — that is the point: the session_isolated proof is what lets F2/F3 claim a
+        // recalled planted token could only have come from cross-session MEMORY, not one long
+        // session. Emitted only where a comparison is defined (skip t0's non-existent predecessor).
+        let prev_session_id = i
+            .checked_sub(1)
+            .and_then(|j| turns.get(j))
+            .map(|p| p.session_id.as_str())
+            .unwrap_or("");
+        if t.new_session {
+            let ok = !r.session_id.is_empty() && r.session_id != prev_session_id;
+            m.push(Metric::new(
+                p("session_isolated"),
+                if ok { 1.0 } else { 0.0 },
+                Direction::Boolean,
+                ok,
+                format!("session {:?} vs previous {:?} (new_session ⇒ must differ)", r.session_id, prev_session_id),
+            ));
+        } else if i > 0 {
+            let ok = !r.session_id.is_empty() && r.session_id == prev_session_id;
+            m.push(Metric::new(
+                p("session_continuous"),
+                if ok { 1.0 } else { 0.0 },
+                Direction::Boolean,
+                ok,
+                format!("session {:?} vs previous {:?} (continued ⇒ must match)", r.session_id, prev_session_id),
+            ));
+        }
+
         if let Some(want) = t.expect_questions {
             let ok = r.saw_questions == want;
             let detail = match (want, r.saw_questions) {
@@ -1628,6 +1660,77 @@ pub fn score_advisor(gt: &AdvisorGt, turns: &[crate::query_advisor::AdvisorTurnR
             };
             m.push(Metric::new(p("contains"), frac, Direction::HigherBetter, frac >= 1.0, detail));
         }
+        // At-least-one variant present (the memory-recall CONTENT proof — planted tokens with ASR/
+        // spelling variants). Mirrors `score_chat`'s `contains_any`; a miss quotes the answer head.
+        if !t.must_contain_any.is_empty() {
+            let hit = t.must_contain_any.iter().find(|s| ans_norm.contains(&normalize(s)));
+            let ok = hit.is_some();
+            let detail = match hit {
+                Some(h) => format!("matched {h:?} (1 of {} accepted variants)", t.must_contain_any.len()),
+                None => {
+                    let head: String = r.answer.chars().take(160).collect();
+                    format!("none of {} accepted variants present; answer: {head:?}", t.must_contain_any.len())
+                }
+            };
+            m.push(Metric::new(p("contains_any"), if ok { 1.0 } else { 0.0 }, Direction::Boolean, ok, detail));
+        }
+        // Forbidden phrases absent (hallucination / wrong-memory-leak negatives). Mirrors `score_chat`.
+        if !t.must_not_contain.is_empty() {
+            let bad: Vec<&String> = t.must_not_contain.iter().filter(|s| ans_norm.contains(&normalize(s))).collect();
+            m.push(Metric::new(
+                p("clean"),
+                if bad.is_empty() { 1.0 } else { 0.0 },
+                Direction::Boolean,
+                bad.is_empty(),
+                if bad.is_empty() { "no forbidden phrases".to_string() } else { format!("forbidden phrase(s) present: {bad:?}") },
+            ));
+        }
+        // Memorizer WRITE proof: `advisor_memories` row count after the turn (probed by the runner).
+        // Info-degrades if the probe was skipped/failed (never a false FAIL on an infra hiccup).
+        if let Some(minr) = t.expect_memory_rows_min {
+            match r.memory_rows {
+                Some(got) => m.push(Metric::new(
+                    p("memory_rows"),
+                    got as f64,
+                    Direction::HigherBetter,
+                    got >= minr,
+                    format!("advisor_memories rows={got} (min {minr})"),
+                )),
+                None => m.push(Metric::info(
+                    p("memory_rows"),
+                    0.0,
+                    format!("memory-row count not probed; expected ≥{minr}"),
+                )),
+            }
+        }
+        // Retrieval proof: the `memory` SSE event's recalled count. Info-degrades to non-gating when
+        // the event is absent (a service binary predating it) — the `routed` degradation pattern.
+        if let Some(minrec) = t.expect_memory_recall_min {
+            match r.memories_recalled {
+                Some(got) => m.push(Metric::new(
+                    p("memory_recalled"),
+                    got as f64,
+                    Direction::HigherBetter,
+                    got >= minrec,
+                    format!("{got} past consultation(s) recalled (min {minrec})"),
+                )),
+                None => m.push(Metric::info(
+                    p("memory_recalled"),
+                    0.0,
+                    format!("no `memory` SSE event (advisor binary predates it); expected ≥{minrec}"),
+                )),
+            }
+        }
+        // Calibration telemetry (Info, never gates): the nearest recalled memory's cosine distance
+        // vs the recall cutoff — the number risk-item #4 reads to confirm a ≥0.1 margin. Emitted
+        // only when the event carried a distance (⇒ something was recalled).
+        if let Some(d) = r.memory_nearest_distance {
+            m.push(Metric::info(
+                p("memory_nearest_distance"),
+                d,
+                format!("nearest recalled memory distance {d:.4} (recall-cutoff calibration)"),
+            ));
+        }
     }
     m
 }
@@ -1640,11 +1743,16 @@ mod advisor_tests {
     fn turn(msg: &str) -> AdvisorTurn {
         AdvisorTurn {
             message: msg.into(),
+            new_session: false,
             expect_questions: None,
             expect_final_answer: None,
             expect_chapters_any: vec![],
             expect_chapters_all: vec![],
             expect_substrings: vec![],
+            must_contain_any: vec![],
+            must_not_contain: vec![],
+            expect_memory_rows_min: None,
+            expect_memory_recall_min: None,
         }
     }
 
@@ -1664,6 +1772,16 @@ mod advisor_tests {
             session_id: "s".into(),
             answer: answer.into(),
             chapters: chapters.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    /// An answer turn landing on a specific session id (for the structural threading proofs).
+    fn ans_sess(session_id: &str) -> AdvisorTurnResult {
+        AdvisorTurnResult {
+            message: "m".into(),
+            session_id: session_id.into(),
+            answer: "advice".into(),
             ..Default::default()
         }
     }
@@ -1757,6 +1875,149 @@ mod advisor_tests {
         r.errored = true;
         assert!(!find(&score_advisor(&gt, &[r]), "advisor.t0.errored").floor_ok);
         assert!(find(&score_advisor(&gt, &[answer_turn("ok", &[])]), "advisor.t0.errored").floor_ok);
+    }
+
+    /// Test #2: `must_contain_any` — at-least-one variant, both polarities (a miss quotes the head).
+    #[test]
+    fn contains_any_both_polarities() {
+        let mut t = turn("q");
+        t.must_contain_any = vec!["Menashe".into(), "Menashy".into()];
+        let gt = AdvisorGt { turns: vec![t] };
+
+        // Any one variant present (normalized, case-insensitive) → pass.
+        let ms = score_advisor(&gt, &[answer_turn("Speak with menashe directly.", &[])]);
+        assert!(find(&ms, "advisor.t0.contains_any").floor_ok);
+
+        // None present → fail; the miss quotes the answer head (diagnosable).
+        let ms = score_advisor(&gt, &[answer_turn("Have a calm conversation.", &[])]);
+        let c = find(&ms, "advisor.t0.contains_any");
+        assert!(!c.floor_ok);
+        assert!(c.detail.contains("answer:"));
+    }
+
+    /// Test #3: `must_not_contain` — forbidden phrases (wrong-memory leak / hallucination), both polarities.
+    #[test]
+    fn clean_both_polarities() {
+        let mut t = turn("q");
+        t.must_not_contain = vec!["Tuvia".into(), "violin".into()];
+        let gt = AdvisorGt { turns: vec![t] };
+
+        // No forbidden phrase → pass.
+        assert!(find(&score_advisor(&gt, &[answer_turn("Renew the lease.", &[])]), "advisor.t0.clean").floor_ok);
+        // A forbidden phrase leaks → fail, and the detail names it.
+        let ms = score_advisor(&gt, &[answer_turn("Ask about Tuvia's schedule.", &[])]);
+        let c = find(&ms, "advisor.t0.clean");
+        assert!(!c.floor_ok);
+        assert!(c.detail.to_lowercase().contains("forbidden"));
+    }
+
+    /// Test #4: `session_isolated` (new_session turns) / `session_continuous` (continued turns) from
+    /// scripted ids — fresh, continued, and silently-dropped/leaked.
+    #[test]
+    fn session_isolated_and_continuous_from_scripted_ids() {
+        // t0 (first, no predecessor), t1 new_session (must differ), t2 continued (must match t1).
+        let mut t1 = turn("s2");
+        t1.new_session = true;
+        let gt = AdvisorGt { turns: vec![turn("s1"), t1, turn("s3")] };
+
+        // Fresh id on t1, continued id on t2 → both structural proofs pass.
+        let ms = score_advisor(&gt, &[ans_sess("A"), ans_sess("B"), ans_sess("B")]);
+        assert!(find(&ms, "advisor.t1.session_isolated").floor_ok);
+        assert!(find(&ms, "advisor.t2.session_continuous").floor_ok);
+        // t0 has no predecessor → neither structural metric exists for it.
+        assert!(ms.iter().all(|m| m.key != "advisor.t0.session_isolated" && m.key != "advisor.t0.session_continuous"));
+
+        // Leaked id (t1 reused t0's) → isolation FAILS; reminted id (t2) → continuity FAILS.
+        let ms = score_advisor(&gt, &[ans_sess("A"), ans_sess("A"), ans_sess("C")]);
+        assert!(!find(&ms, "advisor.t1.session_isolated").floor_ok);
+        assert!(!find(&ms, "advisor.t2.session_continuous").floor_ok);
+
+        // Empty ids are never a valid distinct/continued session.
+        let ms = score_advisor(&gt, &[ans_sess("A"), ans_sess(""), ans_sess("")]);
+        assert!(!find(&ms, "advisor.t1.session_isolated").floor_ok);
+        assert!(!find(&ms, "advisor.t2.session_continuous").floor_ok);
+    }
+
+    /// Test #5 (part 1): `memory_recalled` gates when the event is present, Info-degrades when absent.
+    #[test]
+    fn memory_recall_gates_when_present_info_degrades_when_absent() {
+        let mut t = turn("q");
+        t.expect_memory_recall_min = Some(1);
+        let gt = AdvisorGt { turns: vec![t] };
+
+        // recalled ≥ min → gate passes.
+        let mut r = answer_turn("advice", &[]);
+        r.memories_recalled = Some(2);
+        assert!(find(&score_advisor(&gt, &[r]), "advisor.t0.memory_recalled").floor_ok);
+
+        // recalled < min → gate fails (a real HigherBetter metric).
+        let mut r = answer_turn("advice", &[]);
+        r.memories_recalled = Some(0);
+        let ms = score_advisor(&gt, &[r]);
+        let m = find(&ms, "advisor.t0.memory_recalled");
+        assert!(!m.floor_ok);
+        assert_eq!(m.direction, Direction::HigherBetter);
+
+        // event absent (old advisor binary) → Info, non-gating (floor_ok stays true).
+        let r = answer_turn("advice", &[]); // memories_recalled defaults None
+        let ms = score_advisor(&gt, &[r]);
+        let m = find(&ms, "advisor.t0.memory_recalled");
+        assert!(m.floor_ok);
+        assert_eq!(m.direction, Direction::Info);
+    }
+
+    /// Test #5 (part 2): `memory_rows` floors at the min; Info-degrades when the probe was skipped.
+    #[test]
+    fn memory_rows_floors_at_min() {
+        let mut t = turn("q");
+        t.expect_memory_rows_min = Some(2);
+        let gt = AdvisorGt { turns: vec![t] };
+
+        let mut r = answer_turn("advice", &[]);
+        r.memory_rows = Some(3);
+        assert!(find(&score_advisor(&gt, &[r]), "advisor.t0.memory_rows").floor_ok);
+
+        let mut r = answer_turn("advice", &[]);
+        r.memory_rows = Some(1);
+        assert!(!find(&score_advisor(&gt, &[r]), "advisor.t0.memory_rows").floor_ok);
+
+        // probe skipped/failed → Info, non-gating.
+        let r = answer_turn("advice", &[]); // memory_rows None
+        let ms = score_advisor(&gt, &[r]);
+        let m = find(&ms, "advisor.t0.memory_rows");
+        assert!(m.floor_ok);
+        assert_eq!(m.direction, Direction::Info);
+    }
+
+    /// Test #8: appending a turn never changes the metric keys of the earlier turns — an executable
+    /// guard for the "never reorder, only append" contract that keeps position-indexed baselines lined up.
+    #[test]
+    fn metric_keys_stable_when_appending_a_turn() {
+        let mut t0 = turn("s1");
+        t0.expect_questions = Some(true);
+        let mut t1 = turn("s2");
+        t1.expect_final_answer = Some(true);
+        t1.must_contain_any = vec!["plan".into()];
+        let t2 = turn("s3"); // the appended turn
+
+        let short = AdvisorGt { turns: vec![t0.clone(), t1.clone()] };
+        let long = AdvisorGt { turns: vec![t0, t1, t2] };
+
+        let rs = [questions_turn(), answer_turn("here is a plan", &[]), answer_turn("more", &[])];
+        let short_ms = score_advisor(&short, &rs[..2]);
+        let long_ms = score_advisor(&long, &rs);
+
+        let prefix_keys = |ms: &[Metric]| -> std::collections::BTreeSet<String> {
+            ms.iter()
+                .map(|m| m.key.clone())
+                .filter(|k| k.starts_with("advisor.t0.") || k.starts_with("advisor.t1."))
+                .collect()
+        };
+        assert_eq!(
+            prefix_keys(&short_ms),
+            prefix_keys(&long_ms),
+            "appending a turn must not change earlier turns' metric keys (never-reorder contract)"
+        );
     }
 }
 

@@ -19,6 +19,10 @@ pub struct Memory {
     pub question: String,
     pub answer_summary: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Cosine distance of this memory to the current refined question (`<=>`); the nearest
+    /// retrieved memory's distance is surfaced on the `memory` SSE event as calibration
+    /// telemetry against the recall cutoff (`memory_distance_threshold`).
+    pub distance: f64,
 }
 
 /// Nearest past consultations to the refined question (cosine top-k + distance cutoff).
@@ -46,6 +50,7 @@ pub async fn retrieve_memories(
             question: r.get("question"),
             answer_summary: r.get("answer_summary"),
             created_at: r.get("created_at"),
+            distance: r.get("distance"),
         })
         .collect())
 }

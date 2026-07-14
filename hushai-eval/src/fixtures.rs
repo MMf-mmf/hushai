@@ -512,6 +512,12 @@ pub struct AdvisorGt {
 #[derive(Debug, Clone, Deserialize)]
 pub struct AdvisorTurn {
     pub message: String,
+    /// Start this turn on a FRESH advisor session (send no `session_id`, re-learn the one the
+    /// service mints). The cross-session memory feature under test: memories persist in the DB
+    /// across sessions within a case, so a `new_session` turn that still recalls a planted token
+    /// proves retrieval crossed the session boundary. Default `false` (continue the same session).
+    #[serde(default)]
+    pub new_session: bool,
     /// A `questions` follow-up round must (true) / must not (false) fire this turn.
     #[serde(default)]
     pub expect_questions: Option<bool>,
@@ -530,6 +536,26 @@ pub struct AdvisorTurn {
     /// Case-insensitive (normalized) substrings that must each appear in the final answer text.
     #[serde(default)]
     pub expect_substrings: Vec<String>,
+    /// At-least-one (normalized) substring must appear in the final answer — for planted tokens
+    /// with ASR/spelling variants or accepted synonyms (the memory-recall content proof). Mirrors
+    /// `ChatQ::must_contain_any`; distinct from `expect_substrings`, which requires ALL.
+    #[serde(default)]
+    pub must_contain_any: Vec<String>,
+    /// (Normalized) substrings that must NOT appear in the final answer — hallucination /
+    /// wrong-memory-leak negatives (e.g. the OTHER session's tokens must not surface). Mirrors
+    /// `ChatQ::must_not_contain`.
+    #[serde(default)]
+    pub must_not_contain: Vec<String>,
+    /// After this turn, `advisor_memories` must hold AT LEAST this many rows (the memorizer WRITE
+    /// proof; the count is cumulative within the case, reset once per case). Probed via `ctx.pool`
+    /// in the runner and stashed on the turn result so the scorer stays pure.
+    #[serde(default)]
+    pub expect_memory_rows_min: Option<i64>,
+    /// This turn's `memory` SSE event must report AT LEAST this many recalled past consultations
+    /// (the retrieval proof). Info-degrades to non-gating when the event is absent (a service
+    /// binary predating it), so it never false-FAILs an old stack.
+    #[serde(default)]
+    pub expect_memory_recall_min: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -899,6 +925,43 @@ mod tests {
             let gt = fx.expected.advisor.as_ref().expect("advisor GT block");
             assert!(!gt.turns.is_empty(), "{case} must script at least one turn");
         }
+    }
+
+    /// Test #1: the new `AdvisorTurn` fields (`new_session` + the richer assertions + memory floors)
+    /// deserialize on the turns that use them, and omitting them keeps the pre-existing serde
+    /// defaults so the already-frozen `advisor_followup`/`advisor_direct` fixtures are unchanged.
+    /// (Extends to the F1–F6 cross-session fixtures once the fixture-bank PR adds them.)
+    #[test]
+    fn advisor_turn_new_fields_parse() {
+        // Full form — every new field set, mirroring the F2 cross-session-memory shape.
+        let gt: AdvisorGt = serde_json::from_str(
+            r#"{
+                "turns": [
+                    { "message": "session one, plant a token",
+                      "expect_final_answer": true, "expect_memory_rows_min": 1 },
+                    { "message": "session two, recall it obliquely",
+                      "new_session": true, "expect_final_answer": true,
+                      "expect_memory_recall_min": 1,
+                      "must_contain_any": ["Menashe", "Silverstein"],
+                      "must_not_contain": ["Tuvia"] }
+                ]
+            }"#,
+        )
+        .expect("advisor GT with the new fields must parse");
+        assert_eq!(gt.turns.len(), 2);
+        assert!(!gt.turns[0].new_session, "t0 defaults new_session=false");
+        assert_eq!(gt.turns[0].expect_memory_rows_min, Some(1));
+        assert!(gt.turns[1].new_session, "t1 opts into a fresh session");
+        assert_eq!(gt.turns[1].expect_memory_recall_min, Some(1));
+        assert_eq!(gt.turns[1].must_contain_any, vec!["Menashe".to_string(), "Silverstein".to_string()]);
+        assert_eq!(gt.turns[1].must_not_contain, vec!["Tuvia".to_string()]);
+
+        // Minimal form — only `message`; all new fields fall back to defaults (old-fixture shape).
+        let gt: AdvisorGt = serde_json::from_str(r#"{"turns":[{"message":"hi"}]}"#).unwrap();
+        let t = &gt.turns[0];
+        assert!(!t.new_session);
+        assert!(t.must_contain_any.is_empty() && t.must_not_contain.is_empty());
+        assert!(t.expect_memory_rows_min.is_none() && t.expect_memory_recall_min.is_none());
     }
 
     /// The Gotham G3 `agent` staging fixtures are only exercised by a live `--fixtures staging` rig

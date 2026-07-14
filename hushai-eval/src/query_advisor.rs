@@ -38,6 +38,18 @@ pub struct AdvisorTurnResult {
     pub answer: String,
     /// Saw an `error` SSE event (the advisor hit an internal error mid-stream).
     pub errored: bool,
+    /// From the `memory` SSE event (`recalled`): how many past consultations cleared the recall
+    /// cutoff this turn. `None` when the event never arrived (a service binary predating it) —
+    /// the scorer Info-degrades the recall metric rather than false-FAILing.
+    pub memories_recalled: Option<i64>,
+    /// From the `memory` SSE event (`nearest_distance`): the nearest recalled memory's cosine
+    /// distance — calibration telemetry against the recall cutoff. `None` when nothing recalled
+    /// or the event is absent.
+    pub memory_nearest_distance: Option<f64>,
+    /// `count(*)` of `advisor_memories` AFTER this turn — the memorizer WRITE proof. Probed by the
+    /// runner (needs the pool) only when the turn asserts `expect_memory_rows_min`, so the scorer
+    /// stays pure; `None` when not probed.
+    pub memory_rows: Option<i64>,
 }
 
 /// Preflight: is the advisor service reachable? `/healthz` first (the liveness convention shared
@@ -62,6 +74,17 @@ pub async fn book_chunk_count(ctx: &Ctx) -> Result<i64> {
         .fetch_one(&ctx.pool)
         .await
         .context("SELECT count(*) FROM book_chunks")?;
+    Ok(n)
+}
+
+/// `count(*)` of `advisor_memories` — the memorizer WRITE proof (`expect_memory_rows_min`).
+/// Probed AFTER a turn via the same DB-direct access `book_chunk_count` uses (`ctx.pool`), so the
+/// scorer stays pure. Cumulative within a case (the once-per-case `reset_advisor` clears it).
+pub async fn advisor_memory_row_count(ctx: &Ctx) -> Result<i64> {
+    let (n,): (i64,) = sqlx::query_as("SELECT count(*) FROM advisor_memories")
+        .fetch_one(&ctx.pool)
+        .await
+        .context("SELECT count(*) FROM advisor_memories")?;
     Ok(n)
 }
 
@@ -163,6 +186,15 @@ fn handle_block(block: &str, out: &mut AdvisorTurnResult) -> bool {
             }
             false
         }
+        "memory" => {
+            // Retrieval proof + calibration telemetry. Absent on a service binary predating the
+            // event ⇒ both fields stay `None` ⇒ the scorer Info-degrades (no false FAIL).
+            if let Ok(v) = serde_json::from_str::<Value>(&data) {
+                out.memories_recalled = v.get("recalled").and_then(|x| x.as_i64());
+                out.memory_nearest_distance = v.get("nearest_distance").and_then(|x| x.as_f64());
+            }
+            false
+        }
         "token" => {
             if let Ok(v) = serde_json::from_str::<Value>(&data) {
                 if let Some(delta) = v.get("delta").and_then(|x| x.as_str()) {
@@ -177,5 +209,54 @@ fn handle_block(block: &str, out: &mut AdvisorTurnResult) -> bool {
         }
         "done" => true,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn feed(blocks: &[&str]) -> AdvisorTurnResult {
+        let mut out = AdvisorTurnResult::default();
+        for b in blocks {
+            handle_block(b, &mut out);
+        }
+        out
+    }
+
+    /// Test #6: `handle_block` parses the `memory` event (recalled + nearest_distance); an event
+    /// the scorer doesn't know (an OLD binary would simply never send `memory`, but a NEWER one
+    /// might emit extra frames) is ignored without disturbing the parsed fields — the old-binary
+    /// regression guard.
+    #[test]
+    fn parses_memory_event_and_ignores_unknown() {
+        // Both fields captured.
+        let out = feed(&["event: memory\ndata: {\"recalled\": 2, \"nearest_distance\": 0.31}"]);
+        assert_eq!(out.memories_recalled, Some(2));
+        assert_eq!(out.memory_nearest_distance, Some(0.31));
+
+        // Nothing recalled: recalled=0, null distance.
+        let out = feed(&["event: memory\ndata: {\"recalled\": 0, \"nearest_distance\": null}"]);
+        assert_eq!(out.memories_recalled, Some(0));
+        assert_eq!(out.memory_nearest_distance, None);
+
+        // Old binary (no `memory` frame at all): the fields stay `None` so the scorer Info-degrades.
+        let out = feed(&[
+            "event: session\ndata: {\"session_id\": \"s1\", \"phase\": \"gathering\"}",
+            "event: token\ndata: {\"delta\": \"hi\"}",
+        ]);
+        assert_eq!(out.memories_recalled, None);
+        assert_eq!(out.memory_nearest_distance, None);
+        assert_eq!(out.answer, "hi");
+
+        // A brand-new event the harness doesn't model must not corrupt state or terminate early.
+        let out = feed(&[
+            "event: memory\ndata: {\"recalled\": 1, \"nearest_distance\": 0.5}",
+            "event: some_future_event\ndata: {\"whatever\": true}",
+            "event: token\ndata: {\"delta\": \"ok\"}",
+        ]);
+        assert_eq!(out.memories_recalled, Some(1));
+        assert_eq!(out.answer, "ok");
+        assert!(!out.errored);
     }
 }
