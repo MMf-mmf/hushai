@@ -300,6 +300,9 @@ if [[ "$TLS" -eq 1 ]]; then
   # trust the LAN CA (its reqwest client otherwise rejects the self-signed cert).
   export RAG_BASE_URL="https://127.0.0.1:8090"
   export BACKEND_BASE_URL="https://127.0.0.1:8080"
+  # The advisor serves TLS off the shared cert fallback too — without this the viewer
+  # would proxy http:// into an https listener on 8095.
+  export ADVISOR_BASE_URL="https://127.0.0.1:8095"
   export VIEWER_UPSTREAM_CA="$CERT_DIR/ca.crt"
   log infra "TLS on — all services serve https (trust CA: $CERT_DIR/ca.crt)"
 fi

@@ -89,7 +89,11 @@ A change touching any of these deserves a closer look; a large change touching t
   Runtime). Any new launch path for the worker/rag must set `DYLD_FALLBACK_LIBRARY_PATH`
   (`LD_LIBRARY_PATH` on Linux) — see AGENTS.md.
 - **Viewer:** vanilla ES modules, no build step; no `alert()`/`confirm()`/`innerHTML` sinks (render
-  user text via `textContent`). New proxied backend paths must be added to `proxy.rs::is_backend_path`.
+  user text via `textContent`). New proxied paths route by prefix in `proxy.rs` — `is_backend_path`
+  (hushai-backend admin surface) or `is_advisor_path` (`/v1/advisor*` → hushai-advisor); everything
+  else falls through to hushai-rag. Only backend MUTATING requests are gateway-audited — advisor and
+  rag chat are deliberately un-audited (privacy), so a new upstream that carries private payloads
+  must NOT be added to the audit predicate.
 - **Docs:** if a change makes `AGENTS.md`, `REVIEW.md`, a crate README, or the migrations index
   inaccurate, fix it in the same change.
 

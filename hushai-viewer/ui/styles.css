@@ -3034,3 +3034,364 @@ a.watch-sighting:hover {
     grid-template-columns: 100%;
   }
 }
+
+/* ---- chat plugins: slash picker, mode chip, advisor + Detective rendering -------- */
+/* Popover anchor for the slash picker (composer-relative). */
+.chat-input {
+  position: relative;
+}
+.slash-pop {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 10px;
+  right: 10px;
+  z-index: var(--z-popover);
+  background: var(--panel2);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.45);
+  padding: 4px;
+  overflow: hidden;
+}
+.slash-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.slash-row:hover,
+.slash-row.hi {
+  background: rgba(46, 230, 214, 0.08);
+}
+.slash-row.hi {
+  outline: 1px solid var(--accent-dim);
+}
+.slash-ico {
+  width: 20px;
+  text-align: center;
+  flex-shrink: 0;
+}
+.slash-label {
+  font-weight: 600;
+}
+.slash-sub {
+  color: var(--muted);
+  font-size: 12px;
+  margin-left: auto;
+  text-align: right;
+}
+.slash-empty {
+  padding: 8px 10px;
+  color: var(--muted);
+}
+
+/* Active-mode chip (`📖 Advisor ✕`) in the composer of non-default panes. */
+.chat-input .agent-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  align-self: center;
+  white-space: nowrap;
+}
+.agent-chip-x {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  padding: 0 2px;
+  font-size: 12px;
+}
+.agent-chip-x:hover {
+  color: var(--text);
+}
+
+/* Advisor follow-up questions render as a numbered list inside the bubble. */
+.chat-text ol {
+  margin: 6px 0 2px 18px;
+  padding: 0;
+}
+/* Chapter chips reuse the citation-chip look but aren't clickable. */
+.chat-chapters .chapter-chip {
+  cursor: default;
+}
+
+/* Phase pill (`⟳ planning…`) pinned above the streaming answer text. */
+.chat-msg .chat-phase {
+  align-self: flex-start;
+  margin-bottom: 6px;
+}
+
+/* Detective tool steps: one row per tool_call, finalized by its tool_result. */
+.chat-tools {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  margin-bottom: 6px;
+}
+.chat-tool-step {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  border-left: 2px solid var(--line);
+  padding: 2px 8px;
+  min-width: 0;
+}
+.chat-tool-step .tool-ico {
+  flex-shrink: 0;
+}
+.chat-tool-step.is-running .tool-ico {
+  display: inline-block;
+  animation: ai-spin 1.2s linear infinite;
+}
+.chat-tool-step.is-ok {
+  border-left-color: var(--accent-dim);
+}
+.chat-tool-step.is-err {
+  border-left-color: #c96a6a;
+}
+.chat-tool-step .tool-label {
+  font-weight: 600;
+  color: var(--text);
+  flex-shrink: 0;
+}
+.chat-tool-step .tool-args,
+.chat-tool-step .tool-sum {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+@media (prefers-reduced-motion: reduce) {
+  .chat-tool-step.is-running .tool-ico {
+    animation: none;
+  }
+}
+
+/* Two-phase confirmation bubble: Confirm/Cancel just send "yes"/"no". */
+.chat-confirm {
+  margin-top: 8px;
+  border: 1px solid var(--accent-dim);
+  border-radius: 10px;
+  padding: 10px;
+  background: rgba(46, 230, 214, 0.05);
+}
+.chat-confirm-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 8px;
+}
+.chat-confirm-actions button {
+  padding: 4px 14px;
+  border-radius: 8px;
+  cursor: pointer;
+}
+.chat-confirm-actions .confirm-yes {
+  background: var(--accent);
+  color: #04211e;
+  border: none;
+  font-weight: 700;
+}
+.chat-confirm-actions .confirm-no {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--text);
+}
+.chat-confirm-actions button[disabled] {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* ---- Investigate page (Gotham G4): entity explorer · journeys · bindings --------- */
+.entity-card {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+.entity-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.entity-title {
+  font-size: 16px;
+  font-weight: 700;
+}
+.entity-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--panel2);
+  color: var(--text);
+  cursor: pointer;
+  font-size: 13px;
+}
+.entity-chip:hover {
+  border-color: var(--accent-dim);
+  background: rgba(46, 230, 214, 0.06);
+}
+.edge-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.edge-kind {
+  font-weight: 600;
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.edge-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.edge-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+/* Journey timeline strip: ordered camera hops, each a deep link into the player. */
+.journey-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.journey-strip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.journey-hop {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--panel2);
+  color: var(--text);
+  text-decoration: none;
+  font-size: 13px;
+}
+.journey-hop:hover {
+  border-color: var(--accent-dim);
+  background: rgba(46, 230, 214, 0.06);
+}
+.journey-arrow {
+  color: var(--accent-dim);
+  font-weight: 700;
+}
+.journey-meta {
+  margin-left: 6px;
+}
+.evidence-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.evidence-row {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  color: var(--text);
+  text-decoration: none;
+  padding: 3px 6px;
+  border-radius: 6px;
+}
+.evidence-row:hover {
+  background: rgba(46, 230, 214, 0.06);
+}
+.entity-profile summary {
+  cursor: pointer;
+  color: var(--muted);
+}
+.entity-profile div {
+  white-space: pre-wrap;
+  margin-top: 6px;
+}
+
+/* Binding review cards: sample voice + sample face side by side. */
+.binding-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.binding-card {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: wrap;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel2);
+  padding: 10px 12px;
+}
+.binding-side {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 180px;
+}
+.binding-side audio {
+  width: 210px;
+  height: 32px;
+}
+.binding-name {
+  font-weight: 600;
+}
+.binding-face {
+  width: 96px;
+  height: 96px;
+  object-fit: cover;
+  border-radius: 8px;
+  border: 1px solid var(--line);
+}
+.binding-mid {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+  min-width: 140px;
+  text-align: center;
+}
+.binding-eq {
+  font-size: 20px;
+  color: var(--accent);
+}
+.binding-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.binding-actions .binding-confirm {
+  background: var(--accent);
+  color: #04211e;
+  border: none;
+  border-radius: 8px;
+  padding: 5px 14px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.binding-actions .binding-reject {
+  border-radius: 8px;
+  padding: 5px 14px;
+  cursor: pointer;
+}
+.path-result {
+  margin-top: 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}

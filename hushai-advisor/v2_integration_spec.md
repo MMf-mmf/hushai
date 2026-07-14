@@ -663,15 +663,19 @@ audio).
 
 | Phase | Check | Result |
 |---|---|---|
-| 0 | preconditions delta (2 test corpora, Chrome, phone, ports) | ⬜ |
-| A | viewer clippy 0 · eval ≥31 tests · Android suite + 3 new test classes | ⬜ |
-| B | proxy 200/SSE-live/counter/no-secret (+ --tls variant) | ⬜ |
-| C | 8-step manual UX + e2e advisor checks PASS | ⬜ |
-| D | 9-step spoken script, marker contract honored | ⬜ |
-| E | advisor session survives app restart | ⬜ |
-| F | staging gating run exit 0, 2× identical verdicts | ⬜ |
-| G | voice smoke: direct consult, no gate round | ⬜ |
-| H | voice multi-turn: marker order + session continuity + DB shape | ⬜ |
+| 0 | preconditions delta (2 test corpora, Chrome, phone, ports) | ◑ (viewer track only: `hushai_test` corpus + Chrome present) |
+| A | viewer clippy 0 · eval ≥31 tests · Android suite + 3 new test classes | ◑ (viewer builds + clippy-clean; eval/Android tracks = later PRs) |
+| B | proxy 200/SSE-live/counter/no-secret (+ --tls variant) | ✅ (Part 1 landed: `/v1/advisor/sessions` → 200 via proxy, live `questions` frame streamed through, `upstream="advisor"` counter, no `ADVISOR_TOKEN` in the UI tree) |
+| C | 8-step manual UX + e2e advisor checks PASS | ✅ (viewer track: `AdvisorPane` + slash picker + phase pill + questions render; e2e advisor checks green — full-answer step behind `E2E_ADVISOR_FULL`) |
+| D | 9-step spoken script, marker contract honored | ⬜ (Android voice PR) |
+| E | advisor session survives app restart | ⬜ (Android voice PR) |
+| F | staging gating run exit 0, 2× identical verdicts | ⬜ (fixture-bank PR) |
+| G | voice smoke: direct consult, no gate round | ⬜ (phone-rig PR) |
+| H | voice multi-turn: marker order + session continuity + DB shape | ⬜ (phone-rig PR) |
+
+**Part 1 (viewer web chat) LANDED** alongside Gotham G4 / Phase G — the slash picker + `ChatPane`
+seams + `AdvisorPane` are the shared infra both consume (`Gotham.md` §2.7, PR-slicing #9). Tracks 2
+(Android voice) and 3 (eval fixtures + phone rig) remain.
 
 ## Troubleshooting
 

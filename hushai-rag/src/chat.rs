@@ -1537,6 +1537,11 @@ pub struct MessageInfo {
     pub role: String,
     pub content: String,
     pub sources: Vec<Source>,
+    /// Detective (gotham) turns persist their tool-call trace (migration 0031) so a
+    /// reopened investigation re-renders its tool steps. `None` for every other turn;
+    /// omitted from the JSON entirely so pre-Gotham clients see the exact old shape.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_trace: Option<serde_json::Value>,
     pub created_at: DateTime<Utc>,
 }
 
@@ -1549,7 +1554,7 @@ pub async fn list_messages(
 ) -> Result<Json<Vec<MessageInfo>>, (StatusCode, String)> {
     check_auth(&headers, &st)?;
     let rows = sqlx::query(
-        "SELECT message_id, role, content, sources, created_at \
+        "SELECT message_id, role, content, sources, tool_trace, created_at \
          FROM chat_messages WHERE session_id = $1 ORDER BY seq ASC",
     )
     .bind(session_id)
@@ -1565,11 +1570,16 @@ pub async fn list_messages(
                 .flatten()
                 .map(|j| j.0)
                 .unwrap_or_default();
+            let tool_trace = r
+                .try_get::<Option<serde_json::Value>, _>("tool_trace")
+                .ok()
+                .flatten();
             MessageInfo {
                 message_id: r.get("message_id"),
                 role: r.get("role"),
                 content: r.get("content"),
                 sources,
+                tool_trace,
                 created_at: r.get("created_at"),
             }
         })

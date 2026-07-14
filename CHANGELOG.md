@@ -7,6 +7,47 @@ Newest first. Dates are when the work landed on the current development branch
 
 ## Unreleased (in-flight)
 
+- **Gotham G4 / Phase G — viewer investigation UX + advisor-v2 viewer seam (2026-07-13, specs
+  `Gotham.md` §2.7 / Part 4 Phase G + `hushai-advisor/v2_integration_spec.md` Part 1)** — the
+  browser surface for the Detective, built on the advisor-v2 slash/pane infrastructure (Part 1 of
+  the advisor integration spec, landed here). **Proxy:** `hushai-viewer/src/proxy.rs` gains a third
+  upstream — `is_advisor_path` routes `/v1/advisor*` to hushai-advisor with a server-side
+  `ADVISOR_TOKEN` bearer (`config.rs`: `advisor_base_url`/`advisor_token`, `ADVISOR_BASE_URL` default
+  `:8095`), deliberately kept OUT of the gateway audit (consults are the most private payloads —
+  mirrors the rag-chat no-audit posture); the `hushai_viewer_proxy_total{upstream="advisor"}` counter
+  is added. `run_stack.sh`'s TLS block now exports `ADVISOR_BASE_URL=https://…`. **Chat UI:** `api.js`
+  extracts the SSE pump into `streamSse(url, body, onEvent)` (shared by rag chat + advisor) and adds
+  `streamAdvisorChat`/`getAdvisorSessions`/`getAdvisorSessionMessages` + `/v1/graph/*` read helpers;
+  `ChatPane` is refactored into overridable seams (`_fetchSessions`/`_fetchMessages`/`_stream`/
+  `_payload`/`_handleEvent`/`_renderRestored`) with **no rag behavior change** (verified: plain
+  `auto` chat renders byte-identically) plus additive Detective rendering — a `⟳ planning…` phase
+  pill, per-tool `tool_call`/`tool_result` step rows (spinner→✓/✕ + summary), and a two-phase
+  `confirm` bubble whose Confirm/Cancel send `yes`/`no`. `AdvisorPane extends ChatPane` overrides the
+  seams for the advisor's own SSE vocabulary (`phase`/`questions`/`chapters`, 409 busy-session
+  specialization). New `slash.js` composer picker (`/` as the first char of an empty composer →
+  `auto | advisor | gotham`, arrow/Enter/Tab/Esc, capture-phase Enter interception) and rewritten
+  `workspace.js` (three live panes, per-agent `sessionStorage` keys + session-list filters, mode chip
+  exit, `window.chatDebug` e2e hooks; omni "Ask the AI" surfaces the auto pane so it never streams
+  into a hidden one). **rag:** `GET /v1/rag/chat/sessions/{id}/messages` now returns
+  `chat_messages.tool_trace` (migration 0031; additive, `skip_serializing_if none` so pre-Gotham
+  clients see the old shape) — a reopened Detective session re-renders its tool steps. **Investigate
+  page** (`investigate.html` + `js/investigate.js`, nav link added): entity/link explorer (edges
+  grouped by relationship + baseline summary + recent evidence, all deep-linking `/?device=&t=`),
+  cross-camera **journey timeline strips** (ordered camera hops → player deep-links), shortest-path
+  connections, and the **voice↔face binding review queue** (candidate/confirmed/rejected filter,
+  sample audio + sample face/plate side by side, Confirm/Reject → audit-logged
+  `/v1/graph/bindings/{id}/{confirm,reject}`). **e2e:** 8 headless-Chrome checks appended to
+  `hushai-viewer/e2e/run.mjs` (slash rows, pane switch + chip exit, live advisor gate turn,
+  `E2E_GOTHAM_FULL` live Detective tool-step turn, investigate sections + deep-linkable entity page).
+  Live-verified on the `--test-db` stack (advisor proxy curl 200 + counter + no browser token;
+  Detective turn streamed 4 tool_call/tool_result + persisted+restored trace; binding confirm →
+  audit_log row; journey strip player deep-links). Adversarially reviewed (workflow: 4 finders → 11
+  confirmed findings, all fixed — plate-label field name, omni-ask-to-hidden-pane, `exhaustive` leak
+  into hideScope panes, two vacuous e2e waits, `allSettled` catalog loading, no per-answer actions on
+  terminal question turns, slash Enter swallow, entity-explorer stale-request guard, composer
+  placeholder reset). **NOT in this change:** Phase H (Android "detective" voice keyword +
+  `AWAIT_FOLLOWUP`) — waits on the advisor-v2 Android voice PRs.
+
 - **Gotham Wave 2 / Pillar G2 — daily briefing / digest (PR5, 2026-07-08, spec `Gotham.md` §1.6,
   Phase E, uses migration 0029 `daily_digests`)** — new `patterns::build_and_upsert_digest`: for a
   pinned civil day it materializes a deterministic `daily_digests` row — `sections` jsonb

@@ -43,6 +43,8 @@ function relTime(iso) {
 export class ChatPane {
   constructor(container, agent) {
     this.agent = agent;
+    // Last streamed `phase` (Detective/advisor turns) — exposed via window.chatDebug for e2e.
+    this.lastPhase = null;
     // Legacy cleanup: the pointer used to live in localStorage (origin-wide, shared across
     // tabs). Drop it rather than adopt it — adopting would resurrect the cross-tab bleed once.
     localStorage.removeItem(SESSION_KEY(agent.id));
@@ -62,17 +64,21 @@ export class ChatPane {
     this._loadScopeOptions();
     this._ready = this.sessionId ? this._restore() : Promise.resolve();
 
-    // Omni-search "Ask the AI" (same page): fill the composer and send when idle.
-    on("chatAsk", (e) => this._onAsk(e.detail?.text));
-    // Cross-page handoff: /?ask=<question> sends on arrival, then cleans the URL so a
-    // reload doesn't re-ask. Runs after restore so history renders above the new turn.
-    const params = new URLSearchParams(location.search);
-    const ask = params.get("ask");
-    if (ask) {
-      params.delete("ask");
-      const qs = params.toString();
-      history.replaceState(null, "", location.pathname + (qs ? `?${qs}` : "") + location.hash);
-      this._ready.then(() => this._onAsk(ask));
+    // Omni-search "Ask the AI" + /?ask= handoffs target the recordings assistant only —
+    // with multiple panes constructed, an unguarded listener would fire in every one.
+    if (agent.acceptsAsk) {
+      // Omni-search "Ask the AI" (same page): fill the composer and send when idle.
+      on("chatAsk", (e) => this._onAsk(e.detail?.text));
+      // Cross-page handoff: /?ask=<question> sends on arrival, then cleans the URL so a
+      // reload doesn't re-ask. Runs after restore so history renders above the new turn.
+      const params = new URLSearchParams(location.search);
+      const ask = params.get("ask");
+      if (ask) {
+        params.delete("ask");
+        const qs = params.toString();
+        history.replaceState(null, "", location.pathname + (qs ? `?${qs}` : "") + location.hash);
+        this._ready.then(() => this._onAsk(ask));
+      }
     }
   }
 
@@ -106,6 +112,14 @@ export class ChatPane {
     });
     thorough.append(this.thoroughCb, document.createTextNode("Thorough"));
 
+    // Panes whose agent doesn't consume camera scope / exhaustive retrieval (advisor,
+    // Detective — their tools take their own arguments) hide the knobs instead of
+    // shipping dead controls.
+    if (this.agent.hideScope) {
+      this.scopeSelect.style.display = "none";
+      thorough.style.display = "none";
+    }
+
     const spacer = document.createElement("span");
     spacer.className = "spacer";
 
@@ -132,14 +146,29 @@ export class ChatPane {
 
     this.log = document.createElement("div");
     this.log.className = "chat-log";
-    this.placeholder = this._note(PLACEHOLDER);
+    this.placeholder = this._note(this._placeholderText());
     this.log.appendChild(this.placeholder);
 
     const form = document.createElement("form");
     form.className = "chat-input";
+    // Active-mode chip (`📖 Advisor ✕`) for non-default panes; ✕ hands control back to
+    // the workspace (which flips panes — the conversation itself is never cleared).
+    if (this.agent.chip) {
+      const chip = document.createElement("span");
+      chip.className = "agent-tab active agent-chip";
+      chip.append(document.createTextNode(`${this.agent.icon || ""} ${this.agent.name}`));
+      const x = document.createElement("button");
+      x.type = "button";
+      x.className = "agent-chip-x";
+      x.textContent = "✕";
+      x.title = "Back to the Assistant";
+      x.addEventListener("click", () => this.agent.onExit?.());
+      chip.appendChild(x);
+      form.appendChild(chip);
+    }
     this.input = document.createElement("textarea");
     this.input.rows = 1;
-    this.input.placeholder = "Ask anything…";
+    this.input.placeholder = this.agent.composerPlaceholder || "Ask anything…";
     this.sendBtn = document.createElement("button");
     this.sendBtn.type = "submit";
     this.sendBtn.textContent = "Send";
@@ -164,6 +193,7 @@ export class ChatPane {
   // Populate the camera scope dropdown from the same device list the player uses.
   // Best-effort: on failure the dropdown just keeps the "All cameras" option.
   async _loadScopeOptions() {
+    if (this.agent.hideScope) return; // scope hidden — don't fetch devices for nothing
     let devices;
     try {
       devices = await getDevices();
@@ -185,11 +215,71 @@ export class ChatPane {
     if (this.busy) return;
     this.sessionId = null;
     sessionStorage.removeItem(SESSION_KEY(this.agent.id));
-    this.placeholder = this._note(PLACEHOLDER);
+    this.placeholder = this._note(this._placeholderText());
     this.log.replaceChildren(this.placeholder);
     this.input.value = "";
+    // Restore the composer placeholder — a mid-consult "Answer the questions above…"
+    // flip must not survive into a fresh conversation.
+    this.input.placeholder = this.agent.composerPlaceholder || "Ask anything…";
     this._autosize();
     this.input.focus();
+  }
+
+  // ---- agent seams -----------------------------------------------------------------
+  // Overridable per agent (AdvisorPane swaps all four for the advisor service's own
+  // endpoints/vocabulary). The defaults ARE today's rag behavior, byte-for-byte.
+
+  _placeholderText() {
+    return this.agent.placeholder || PLACEHOLDER;
+  }
+
+  // Saved conversations for the 🕘 dropdown. `agent.sessionFilter` scopes a pane to its
+  // own sessions (the rag list is shared across agents and isn't server-filterable).
+  async _fetchSessions() {
+    const all = await getSessions();
+    return this.agent.sessionFilter ? all.filter(this.agent.sessionFilter) : all;
+  }
+
+  async _fetchMessages(sessionId) {
+    return getSessionMessages(sessionId);
+  }
+
+  _stream(payload, onEvent) {
+    return streamChat(payload, onEvent);
+  }
+
+  // The request the default pane sends: full rag body (scope/playback/thorough).
+  _payload(message) {
+    const filters = this.scope ? { device_id: this.scope } : null;
+    // What the viewer is showing right now (camera + wall-clock playhead), so the server can
+    // scope deictic questions ("who was speaking in this clip") to the open video. Sent every
+    // turn; the server only consults it for deictic questions, and an explicit scope above
+    // still wins for the device. Null when nothing is playing.
+    const pb = playbackContext();
+    const playback = pb
+      ? { device_id: pb.deviceId, playhead_unix_nanos: Math.round(pb.playheadMs * 1e6) }
+      : null;
+    return {
+      sessionId: this.sessionId,
+      agentId: this.agent.id,
+      message,
+      filters,
+      playback,
+      // Panes that hide the Thorough control must not leak the shared localStorage
+      // toggle into their requests (the Detective/advisor take their own tool args).
+      exhaustive: this.agent.hideScope ? null : this.thoroughCb.checked ? true : null,
+    };
+  }
+
+  // Transport-failure bubble text; AdvisorPane specializes the 409 busy-session case.
+  _errorText(e) {
+    return "Chat failed: " + e.message;
+  }
+
+  // Hook fired right after the assistant bubble is created (AdvisorPane raises its
+  // "⟳ gathering…" pill here — advisor turns are long and must never look silent).
+  _onSendStart(ctx) {
+    void ctx;
   }
 
   _autosize() {
@@ -284,7 +374,7 @@ export class ChatPane {
 
     let sessions;
     try {
-      sessions = await getSessions();
+      sessions = await this._fetchSessions();
     } catch {
       if (this.histDrop === dd) loading.textContent = "Couldn't load conversations.";
       return;
@@ -339,7 +429,7 @@ export class ChatPane {
     await this._restore(true);
     // An empty (or failed-to-load) session falls back to the standard placeholder.
     if (!this.log.querySelector(".chat-msg")) {
-      this.placeholder = this._note(PLACEHOLDER);
+      this.placeholder = this._note(this._placeholderText());
       this.log.replaceChildren(this.placeholder);
     }
     this.input.focus();
@@ -350,7 +440,7 @@ export class ChatPane {
   async _restore(explicitOpen = false) {
     let messages;
     try {
-      messages = await getSessionMessages(this.sessionId);
+      messages = await this._fetchMessages(this.sessionId);
     } catch {
       // Stale/forgotten session id — start fresh.
       sessionStorage.removeItem(SESSION_KEY(this.agent.id));
@@ -366,15 +456,20 @@ export class ChatPane {
         return;
       }
     }
-    for (const m of messages) {
-      const { msg, text } = this._bubble(m.role === "assistant" ? "assistant" : "user");
-      text.textContent = m.content;
-      if (m.role === "assistant") {
-        this._renderCitations(msg, m.sources);
-        this._addActions(msg, m.content || "", m.sources || []);
-      }
-    }
+    for (const m of messages) this._renderRestored(m);
     this._scroll();
+  }
+
+  // Render one persisted message on restore. AdvisorPane overrides (its transcript rows
+  // carry a `kind`, not sources/tool traces).
+  _renderRestored(m) {
+    const { msg, text } = this._bubble(m.role === "assistant" ? "assistant" : "user");
+    text.textContent = m.content;
+    if (m.role === "assistant") {
+      if (m.tool_trace) this._renderTraceSteps(msg, m.tool_trace);
+      this._renderCitations(msg, m.sources);
+      this._addActions(msg, m.content || "", m.sources || []);
+    }
   }
 
   _submit() {
@@ -407,75 +502,232 @@ export class ChatPane {
     user.text.textContent = message;
 
     const assistant = this._bubble("assistant");
-    let gotToken = false;
-    let errored = false;
-    let sources = [];
+    // Per-turn stream state, threaded through `_handleEvent` so subclasses share it.
+    // `terminal` = the turn legitimately ended without answer text (questions/confirm),
+    // so the "(no answer)" fallback must not fire.
+    const ctx = {
+      assistant,
+      message,
+      gotToken: false,
+      errored: false,
+      terminal: false,
+      sources: [],
+    };
+    this._onSendStart(ctx);
 
     try {
-      const filters = this.scope ? { device_id: this.scope } : null;
-      // What the viewer is showing right now (camera + wall-clock playhead), so the server can
-      // scope deictic questions ("who was speaking in this clip") to the open video. Sent every
-      // turn; the server only consults it for deictic questions, and an explicit scope above
-      // still wins for the device. Null when nothing is playing.
-      const pb = playbackContext();
-      const playback = pb
-        ? { device_id: pb.deviceId, playhead_unix_nanos: Math.round(pb.playheadMs * 1e6) }
-        : null;
-      await streamChat(
-        {
-          sessionId: this.sessionId,
-          agentId: this.agent.id,
-          message,
-          filters,
-          playback,
-          exhaustive: this.thoroughCb.checked ? true : null,
-        },
-        (ev) => {
-          switch (ev.event) {
-            case "session":
-              if (ev.data?.session_id) {
-                this.sessionId = ev.data.session_id;
-                sessionStorage.setItem(SESSION_KEY(this.agent.id), this.sessionId);
-              }
-              break;
-            case "sources":
-              sources = Array.isArray(ev.data) ? ev.data : [];
-              this._renderCitations(assistant.msg, sources);
-              break;
-            case "token":
-              gotToken = true;
-              assistant.text.textContent += ev.data?.delta ?? "";
-              this._scroll();
-              break;
-            case "error":
-              errored = true;
-              assistant.msg.classList.remove("assistant");
-              assistant.msg.classList.add("error");
-              assistant.text.textContent = ev.data?.message || "Something went wrong.";
-              break;
-            case "done":
-            default:
-              break;
-          }
-        },
-      );
-      if (!gotToken && !assistant.text.textContent) {
+      await this._stream(this._payload(message), (ev) => this._handleEvent(ev, ctx));
+      if (!ctx.gotToken && !ctx.terminal && !assistant.text.textContent) {
         assistant.text.textContent = "(no answer)";
       }
     } catch (e) {
-      errored = true;
+      ctx.errored = true;
       assistant.msg.classList.remove("assistant");
       assistant.msg.classList.add("error");
-      assistant.text.textContent = "Chat failed: " + e.message;
+      assistant.text.textContent = this._errorText(e);
     } finally {
+      this._clearPhasePill(ctx);
       // A failed turn keeps the question and offers a one-click resend; a completed
-      // answer grows its hover actions (copy / download / read aloud).
-      if (errored) this._addRetry(assistant.msg, message);
-      else this._addActions(assistant.msg, assistant.text.textContent, sources);
+      // answer grows its hover actions (copy / download / read aloud). A terminal turn
+      // that ended in questions/confirm (not an answer) gets neither — copy/read-aloud
+      // over a numbered questions list is noise.
+      if (ctx.errored) this._addRetry(assistant.msg, message);
+      else if (!ctx.terminal) this._addActions(assistant.msg, assistant.text.textContent, ctx.sources);
       this.busy = false;
       this.sendBtn.disabled = false;
       this.input.focus();
     }
+  }
+
+  // One streamed SSE frame. The base vocabulary is today's rag set (session/sources/
+  // token/error/done) plus the Detective superset (`phase`/`tool_call`/`tool_result`/
+  // `confirm`) — the extra events are only ever emitted for an agent_id="gotham" turn,
+  // so plain rag chat renders byte-identically. Unknown events are ignored.
+  _handleEvent(ev, ctx) {
+    const { assistant } = ctx;
+    switch (ev.event) {
+      case "session":
+        if (ev.data?.session_id) {
+          this.sessionId = ev.data.session_id;
+          sessionStorage.setItem(SESSION_KEY(this.agent.id), this.sessionId);
+        }
+        break;
+      case "sources":
+        ctx.sources = Array.isArray(ev.data) ? ev.data : [];
+        this._renderCitations(assistant.msg, ctx.sources);
+        break;
+      case "token":
+        ctx.gotToken = true;
+        this._clearPhasePill(ctx);
+        assistant.text.textContent += ev.data?.delta ?? "";
+        this._scroll();
+        break;
+      case "phase":
+        this.lastPhase = ev.data?.phase || "";
+        this._setPhasePill(ctx, this.lastPhase);
+        break;
+      case "tool_call":
+        this._toolCall(ctx, ev.data || {});
+        break;
+      case "tool_result":
+        this._toolResult(ctx, ev.data || {});
+        break;
+      case "confirm":
+        this._renderConfirm(ctx, ev.data || {});
+        break;
+      case "error":
+        ctx.errored = true;
+        this._clearPhasePill(ctx);
+        assistant.msg.classList.remove("assistant");
+        assistant.msg.classList.add("error");
+        assistant.text.textContent = ev.data?.message || "Something went wrong.";
+        break;
+      case "done":
+      default:
+        break;
+    }
+  }
+
+  // ---- streamed-turn adornments (phase pill · tool steps · confirm bubble) ----------
+  // Shared by the Detective pane and AdvisorPane; inert for plain rag turns.
+
+  // `⟳ planning…` pill above the answer text — created on the first phase event,
+  // relabeled by later ones, removed on the first token / error / turn end.
+  _setPhasePill(ctx, label) {
+    if (!ctx.pill) {
+      ctx.pill = document.createElement("span");
+      ctx.pill.className = "ai-badge is-processing chat-phase";
+      const ico = document.createElement("span");
+      ico.className = "ai-ico";
+      ctx.pillTxt = document.createElement("span");
+      ctx.pillTxt.className = "ai-txt";
+      ctx.pill.append(ico, ctx.pillTxt);
+      ctx.assistant.msg.insertBefore(ctx.pill, ctx.assistant.text);
+      this._scroll();
+    }
+    ctx.pillTxt.textContent = `${label}…`;
+  }
+
+  _clearPhasePill(ctx) {
+    if (ctx.pill) {
+      ctx.pill.remove();
+      ctx.pill = null;
+    }
+  }
+
+  _toolsWrap(ctx) {
+    if (!ctx.tools) {
+      ctx.tools = document.createElement("div");
+      ctx.tools.className = "chat-tools";
+      ctx.assistant.msg.insertBefore(ctx.tools, ctx.assistant.text);
+    }
+    return ctx.tools;
+  }
+
+  _toolStepEl(tool, label, args) {
+    const step = document.createElement("div");
+    step.className = "chat-tool-step";
+    const ico = document.createElement("span");
+    ico.className = "tool-ico";
+    const lbl = document.createElement("span");
+    lbl.className = "tool-label";
+    lbl.textContent = label || tool || "tool";
+    step.append(ico, lbl);
+    if (args) {
+      const sub = document.createElement("span");
+      sub.className = "tool-args";
+      sub.textContent = args;
+      step.appendChild(sub);
+    }
+    if (tool) step.title = tool;
+    return step;
+  }
+
+  // A Detective tool invocation ("consulting the people catalog…"), spinner until its
+  // matching tool_result lands (matched by seq).
+  _toolCall(ctx, d) {
+    const step = this._toolStepEl(d.tool, d.label, d.args_summary);
+    step.classList.add("is-running");
+    step.querySelector(".tool-ico").textContent = "⟳";
+    if (d.seq != null) step.dataset.seq = String(d.seq);
+    this._toolsWrap(ctx).appendChild(step);
+    this._scroll();
+  }
+
+  _toolResult(ctx, d) {
+    const wrap = this._toolsWrap(ctx);
+    let step =
+      d.seq != null ? wrap.querySelector(`[data-seq="${CSS.escape(String(d.seq))}"]`) : null;
+    if (!step) {
+      // Result without its call frame (shouldn't happen, but never drop information).
+      step = this._toolStepEl(d.tool, d.tool, "");
+      wrap.appendChild(step);
+    }
+    const failed = d.ok === false;
+    step.classList.remove("is-running");
+    step.classList.add(failed ? "is-err" : "is-ok");
+    step.querySelector(".tool-ico").textContent = failed ? "✕" : "✓";
+    const sum = document.createElement("span");
+    sum.className = "tool-sum";
+    const ms = typeof d.elapsed_ms === "number" ? `${(d.elapsed_ms / 1000).toFixed(1)}s` : "";
+    sum.textContent = [d.summary, ms].filter(Boolean).join(" · ");
+    step.appendChild(sum);
+    this._scroll();
+  }
+
+  // A mutating tool proposed an action: the turn ended awaiting the user's word. The
+  // buttons just send "yes"/"no" as ordinary messages — the server's deterministic
+  // detector executes or cancels (anything but an affirmative cancels).
+  _renderConfirm(ctx, d) {
+    ctx.terminal = true;
+    this._clearPhasePill(ctx);
+    const box = document.createElement("div");
+    box.className = "chat-confirm";
+    const txt = document.createElement("div");
+    txt.className = "chat-confirm-text";
+    txt.textContent = d.summary || "Confirm this action?";
+    const row = document.createElement("div");
+    row.className = "chat-confirm-actions";
+    const mk = (label, reply, cls) => {
+      const b = document.createElement("button");
+      b.type = "button";
+      b.className = cls;
+      b.textContent = label;
+      b.addEventListener("click", () => {
+        if (this.busy) return;
+        for (const btn of row.querySelectorAll("button")) btn.disabled = true;
+        this._send(reply);
+      });
+      row.appendChild(b);
+    };
+    mk("Confirm", "yes", "confirm-yes");
+    mk("Cancel", "no", "confirm-no");
+    box.append(txt, row);
+    ctx.assistant.msg.appendChild(box);
+    this._scroll();
+  }
+
+  // Persisted tool trace (chat_messages.tool_trace, migration 0031) → completed steps
+  // on restore, so a reopened investigation still shows how the answer was assembled.
+  // Stored shape is a bare entries array (gotham/trace.rs); tolerate an {entries} wrapper.
+  _renderTraceSteps(msg, trace) {
+    const entries = Array.isArray(trace) ? trace : trace?.entries;
+    if (!Array.isArray(entries) || !entries.length) return;
+    const wrap = document.createElement("div");
+    wrap.className = "chat-tools";
+    for (const t of entries) {
+      const failed = t.ok === false;
+      const step = this._toolStepEl(t.tool, t.tool, "");
+      step.classList.add(failed ? "is-err" : "is-ok");
+      step.querySelector(".tool-ico").textContent = failed ? "✕" : "✓";
+      const sum = document.createElement("span");
+      sum.className = "tool-sum";
+      const ms = typeof t.elapsed_ms === "number" ? `${(t.elapsed_ms / 1000).toFixed(1)}s` : "";
+      sum.textContent = [t.outcome, ms].filter(Boolean).join(" · ");
+      step.appendChild(sum);
+      wrap.appendChild(step);
+    }
+    msg.insertBefore(wrap, msg.querySelector(".chat-text"));
   }
 
   _addRetry(msg, message) {

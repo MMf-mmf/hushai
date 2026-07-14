@@ -278,6 +278,187 @@ await check("dashboard loads KPIs + audit section", async () => {
   }
 });
 
+// --- chat slash picker + plugin panes (advisor-v2 seam + Gotham G4) ----------------------
+// Back to the viewer page for the composer checks.
+await check("slash picker lists the plugin rows in the composer", async () => {
+  await page.goto(`${VIEWER_URL}/`, { waitUntil: "domcontentloaded" });
+  await until(page, () => !!window.chatDebug, { timeout: 15000 });
+  await page.click("#chatPanes .chat-pane:not([style*='none']) .chat-input textarea");
+  await page.keyboard.type("/");
+  await until(page, () => !!document.querySelector(".slash-pop [data-cmd='advisor']"));
+  const cmds = await page.evaluate(() =>
+    [...document.querySelectorAll(".slash-pop [data-cmd]")].map((r) => r.dataset.cmd),
+  );
+  for (const want of ["auto", "advisor", "gotham"]) {
+    if (!cmds.includes(want)) throw new Error(`missing row ${want} (got ${cmds.join(",")})`);
+  }
+  // Composer owns "/" while focused — the omni palette must NOT have opened.
+  if (await page.evaluate(() => !!document.querySelector(".omni-card"))) {
+    throw new Error("omni palette hijacked the composer's /");
+  }
+});
+
+await check("selecting /gotham switches to the Detective pane (chip + debug mode)", async () => {
+  await page.evaluate(() => {
+    document.querySelector(".slash-pop [data-cmd='gotham']")?.dispatchEvent(
+      new MouseEvent("mousedown", { bubbles: true, cancelable: true }),
+    );
+  });
+  await until(page, () => window.chatDebug?.mode === "gotham");
+  await until(page, () => {
+    const pane = [...document.querySelectorAll("#chatPanes .chat-pane")].find(
+      (p) => p.style.display !== "none",
+    );
+    return !!pane?.querySelector(".agent-chip");
+  });
+});
+
+await check("Detective pane exit (✕) returns to the Assistant", async () => {
+  await page.click("#chatPanes .chat-pane:not([style*='none']) .agent-chip-x");
+  await until(page, () => window.chatDebug?.mode === "auto");
+});
+
+await check("selecting /advisor switches panes; sessions stay isolated per agent", async () => {
+  await page.click("#chatPanes .chat-pane:not([style*='none']) .chat-input textarea");
+  await page.keyboard.type("/adv");
+  await until(page, () => !!document.querySelector(".slash-pop [data-cmd='advisor']"));
+  await page.keyboard.press("Enter");
+  await until(page, () => window.chatDebug?.mode === "advisor");
+  // The advisor pane keys its server session under its own sessionStorage slot.
+  const keys = await page.evaluate(() => ({
+    advisor: sessionStorage.getItem("hushai.chat.session.advisor"),
+    auto: sessionStorage.getItem("hushai.chat.session.auto"),
+  }));
+  if (keys.advisor && keys.advisor === keys.auto) throw new Error("advisor session bled into auto");
+  await page.click("#chatPanes .chat-pane:not([style*='none']) .agent-chip-x");
+  await until(page, () => window.chatDebug?.mode === "auto");
+});
+
+// Live advisor turn — needs the advisor service up behind the proxy; SKIP (not PASS)
+// when absent. A thin opener is the cheapest real turn (one judge call → questions).
+await check("advisor thin message → phase pill, then a questions round", async () => {
+  const probe = await page.evaluate(async () => {
+    try {
+      const r = await fetch("/v1/advisor/sessions");
+      return r.status;
+    } catch {
+      return 0;
+    }
+  });
+  if (probe !== 200) return { skip: `advisor absent behind proxy (status ${probe})` };
+  await page.click("#chatPanes .chat-pane:not([style*='none']) .chat-input textarea");
+  await page.keyboard.type("/adv");
+  await until(page, () => !!document.querySelector(".slash-pop [data-cmd='advisor']"));
+  await page.keyboard.press("Enter");
+  await until(page, () => window.chatDebug?.mode === "advisor");
+  await page.type(
+    "#chatPanes .chat-pane:not([style*='none']) .chat-input textarea",
+    "I walked into my house.",
+  );
+  await page.keyboard.press("Enter");
+  // Phase pill goes up immediately, then the gate turns into a 1–3 item questions list.
+  await until(page, () => {
+    const pane = [...document.querySelectorAll("#chatPanes .chat-pane")].find(
+      (p) => p.style.display !== "none",
+    );
+    return !!pane?.querySelector(".chat-phase");
+  });
+  await until(
+    page,
+    () => {
+      const pane = [...document.querySelectorAll("#chatPanes .chat-pane")].find(
+        (p) => p.style.display !== "none",
+      );
+      const items = pane?.querySelectorAll(".chat-msg.assistant .chat-text ol li")?.length || 0;
+      return items >= 1 && items <= 3;
+    },
+    { timeout: 180_000 },
+  );
+  await page.click("#chatPanes .chat-pane:not([style*='none']) .agent-chip-x");
+});
+
+// Live Detective turn — needs GOTHAM_ENABLED + Ollama on the stack; opt-in via
+// E2E_GOTHAM_FULL=1 because a tool loop is 30–90 s of LLM time.
+await check("Detective turn streams tool steps (E2E_GOTHAM_FULL=1)", async () => {
+  if (process.env.E2E_GOTHAM_FULL !== "1") return { skip: "set E2E_GOTHAM_FULL=1 to run" };
+  await page.click("#chatPanes .chat-pane:not([style*='none']) .chat-input textarea");
+  await page.keyboard.type("/got");
+  await until(page, () => !!document.querySelector(".slash-pop [data-cmd='gotham']"));
+  await page.keyboard.press("Enter");
+  await until(page, () => window.chatDebug?.mode === "gotham");
+  await page.type(
+    "#chatPanes .chat-pane:not([style*='none']) .chat-input textarea",
+    "How many cameras are there? Use your tools.",
+  );
+  await page.keyboard.press("Enter");
+  await until(
+    page,
+    () => {
+      const pane = [...document.querySelectorAll("#chatPanes .chat-pane")].find(
+        (p) => p.style.display !== "none",
+      );
+      return !!pane?.querySelector(".chat-tools .chat-tool-step");
+    },
+    { timeout: 180_000 },
+  );
+  await until(page, () => ["planning", "answering"].includes(window.chatDebug?.lastPhase), {
+    timeout: 5000,
+  });
+  await page.click("#chatPanes .chat-pane:not([style*='none']) .agent-chip-x");
+});
+
+// --- investigate page (entity explorer · connections · binding queue) ---------------------
+await check("investigate page loads (explorer, connections, bindings sections)", async () => {
+  await page.goto(`${VIEWER_URL}/investigate.html`, { waitUntil: "domcontentloaded" });
+  await until(page, () => {
+    const live = document.getElementById("liveDot");
+    return live && live.classList.contains("live");
+  }, { timeout: 15000 });
+  const missing = await page.evaluate(() =>
+    ["entitySelect", "pathFrom", "pathTo", "bindings"].filter((id) => !document.getElementById(id)),
+  );
+  if (missing.length) throw new Error(`missing sections: ${missing.join(",")}`);
+  // The bindings section must resolve to rows or the "awaiting review" empty state —
+  // never the error state. errorState() also carries .empty, so exclude .is-error
+  // explicitly (a plain .empty match would pass even on a backend failure).
+  await until(page, () => {
+    const host = document.getElementById("bindings");
+    if (!host || host.querySelector(".empty.is-error")) return false;
+    return host.querySelector(".binding-card") || host.querySelector(".empty");
+  }, { timeout: 15000 });
+});
+
+await check("entity explorer renders an entity page with deep-linkable evidence", async () => {
+  const picked = await page.evaluate(() => {
+    const sel = document.getElementById("entitySelect");
+    const first = [...sel.options].find((o) => o.value);
+    if (!first) return null;
+    sel.value = first.value;
+    sel.dispatchEvent(new Event("change"));
+    return first.value;
+  });
+  if (!picked) return { skip: "no catalog entities in this stack" };
+  // Wait for the loaded card (.entity-head), NOT the synchronous "Loading…"/.empty
+  // placeholder — and fail on the error state. A plain .empty match would resolve
+  // instantly against the placeholder and scan an anchor-less card.
+  await until(page, () => {
+    const card = document.getElementById("entityCard");
+    if (!card || card.querySelector(".empty.is-error")) return false;
+    if (card.querySelector(".entity-head")) return true;
+    // A graph with no edges legitimately shows a non-error .empty note — accept it
+    // only once the loading placeholder has been replaced.
+    const note = card.querySelector(".empty");
+    return note && !/Loading/.test(note.textContent);
+  }, { timeout: 15000 });
+  // Any evidence/journey link must target the player's /?device=&t= deep-link shape.
+  const badLink = await page.evaluate(() =>
+    [...document.querySelectorAll("#entityCard a")].find(
+      (a) => !/\/\?device=.+&t=\d+/.test(a.getAttribute("href") || ""),
+    )?.outerHTML,
+  );
+  if (badLink) throw new Error(`non-deep-link evidence anchor: ${badLink.slice(0, 120)}`);
+});
+
 // --- native-dialog guard (must be last) ---------------------------------------------------
 await check("no native alert()/confirm() fired anywhere", async () => {
   if (dialogSeen) throw new Error(dialogSeen);

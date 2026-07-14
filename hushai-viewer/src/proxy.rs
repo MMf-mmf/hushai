@@ -1,9 +1,10 @@
 //! Reverse proxy: forward `/v1/*` to the right backing service.
 //!
 //! Most of `/v1/*` is the chat/RAG API, proxied to **hushai-rag**. The speaker-admin
-//! surface (`/v1/speakers*`) lives in **hushai-backend** instead (its own bind + token),
-//! so we dispatch by path: one `/v1/*` route, two upstreams. A second axum wildcard at the
-//! same position would conflict, hence the in-handler branch.
+//! surface (`/v1/speakers*`) lives in **hushai-backend** (its own bind + token), and the
+//! advisor consult surface (`/v1/advisor*`) in **hushai-advisor** (ditto), so we dispatch
+//! by path: one `/v1/*` route, three upstreams. A second axum wildcard at the same
+//! position would conflict, hence the in-handler branch.
 //!
 //! Why proxy instead of letting the browser hit the services directly:
 //!   - One origin ⇒ no CORS and SSE streaming "just works".
@@ -159,18 +160,29 @@ fn is_backend_path(path: &str) -> bool {
         || path.starts_with("/v1/graph/")
 }
 
+/// `/v1/advisor*` is the hushai-advisor consult service (its own bind + token). Advisor
+/// consultations stay OUT of the gateway audit — they are the most private payloads in the
+/// system, so we mirror the rag-chat no-audit posture (`audit_worthy` keys off
+/// `is_backend_path`, which is false here by construction).
+fn is_advisor_path(path: &str) -> bool {
+    path == "/v1/advisor" || path.starts_with("/v1/advisor/")
+}
+
 async fn forward_inner(state: ViewerState, req: Request) -> Result<Response, String> {
     let method = req.method().clone();
     // Pick the upstream (base URL + bearer) by path before consuming the request.
-    let to_backend = is_backend_path(req.uri().path());
-    hushai_backend::observe::counter(
-        "hushai_viewer_proxy_total",
-        &[("upstream", if to_backend { "backend" } else { "rag" })],
-    );
-    let (base_url, token) = if to_backend {
-        (&state.cfg.backend_base_url, state.cfg.backend_token.as_ref())
+    let upstream_kind = if is_backend_path(req.uri().path()) {
+        "backend"
+    } else if is_advisor_path(req.uri().path()) {
+        "advisor"
     } else {
-        (&state.cfg.rag_base_url, state.cfg.rag_token.as_ref())
+        "rag"
+    };
+    hushai_backend::observe::counter("hushai_viewer_proxy_total", &[("upstream", upstream_kind)]);
+    let (base_url, token) = match upstream_kind {
+        "backend" => (&state.cfg.backend_base_url, state.cfg.backend_token.as_ref()),
+        "advisor" => (&state.cfg.advisor_base_url, state.cfg.advisor_token.as_ref()),
+        _ => (&state.cfg.rag_base_url, state.cfg.rag_token.as_ref()),
     };
     let path_and_query = req
         .uri()

@@ -96,6 +96,13 @@ pub struct ViewerConfig {
     /// (the token the backend enforces, already dotenv-loaded from `hushai-backend/.env`),
     /// overridable via `BACKEND_TOKEN`. `None` = no auth (backend will 401 if it requires one).
     pub backend_token: Option<String>,
+    /// Base URL of the hushai-advisor service. The advisor chat surface (`/v1/advisor/*`)
+    /// is its own service (book-grounded consults, port 8095), proxied here so the browser
+    /// stays same-origin and never holds the advisor token.
+    pub advisor_base_url: String,
+    /// Bearer injected on proxied `/v1/advisor/*` requests (the `ADVISOR_TOKEN` the advisor
+    /// enforces). `None` = no auth (advisor will 401 if it requires one).
+    pub advisor_token: Option<String>,
     /// Optional CA bundle (PEM) the proxy + dashboard-probe HTTP client trusts when the
     /// sibling backend/rag serve TLS with a private LAN CA (`VIEWER_UPSTREAM_CA`). Needed
     /// when `RAG_BASE_URL`/`BACKEND_BASE_URL` are `https://` with the self-signed CA.
@@ -193,6 +200,10 @@ impl ViewerConfig {
             backend_token: std::env::var("BACKEND_TOKEN")
                 .ok()
                 .or_else(|| std::env::var("DEVICE_TOKEN").ok())
+                .filter(|s| !s.trim().is_empty()),
+            advisor_base_url: opt("ADVISOR_BASE_URL", "http://127.0.0.1:8095"),
+            advisor_token: std::env::var("ADVISOR_TOKEN")
+                .ok()
                 .filter(|s| !s.trim().is_empty()),
             upstream_ca: std::env::var("VIEWER_UPSTREAM_CA")
                 .ok()

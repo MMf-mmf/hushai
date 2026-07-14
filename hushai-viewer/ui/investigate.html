@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Hushai · Investigate</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Ccircle cx='8' cy='8' r='6' fill='%232ee6d6'/%3E%3C/svg%3E"
+    />
+    <link rel="stylesheet" href="/styles.css" />
+    <!-- Page styles live in the shared styles.css ("Investigate page" section). -->
+  </head>
+  <body class="dash-body">
+    <!-- Rendered by js/nav.js initTopbar() — the shared brand/navlinks/live-chip/logout bar. -->
+    <header class="topbar" data-topbar></header>
+
+    <main class="dash">
+      <div id="banner" class="dash-banner loading">Loading the entity graph…</div>
+
+      <!-- Entity explorer: pick anyone/anything the graph knows and see its edges,
+           journeys and recent evidence. Everything deep-links into the player timeline. -->
+      <section class="dash-section">
+        <div class="dash-head">
+          <h2>🕸 Entity explorer</h2>
+          <span id="entityCount" class="count-chip"></span>
+        </div>
+        <div class="filters">
+          <label>Entity
+            <select id="entitySelect"><option value="">Pick a person, voice, plate or camera…</option></select>
+          </label>
+        </div>
+        <div id="entityCard" class="entity-card"></div>
+      </section>
+
+      <!-- Link explorer: how are two entities connected? Bounded shortest evidence path
+           (may route through a shared camera). -->
+      <section class="dash-section">
+        <div class="dash-head"><h2>🔗 Connections</h2></div>
+        <div class="filters">
+          <label>From
+            <select id="pathFrom"><option value="">Entity A…</option></select>
+          </label>
+          <label>To
+            <select id="pathTo"><option value="">Entity B…</option></select>
+          </label>
+          <button id="pathGo" class="ghost" type="button">Find path</button>
+        </div>
+        <div id="pathResult" class="path-result"></div>
+      </section>
+
+      <!-- Voice↔face binding review queue: the graph PROPOSES that a voice and a face are
+           the same person; only you confirm. Sample audio + face side by side. -->
+      <section class="dash-section">
+        <div class="dash-head">
+          <h2>🪪 Identity bindings</h2>
+          <span id="bindingCount" class="count-chip"></span>
+        </div>
+        <div class="filters">
+          <label>Show
+            <select id="bindingStatus">
+              <option value="candidate" selected>Awaiting review</option>
+              <option value="confirmed">Confirmed</option>
+              <option value="rejected">Rejected</option>
+            </select>
+          </label>
+        </div>
+        <div id="bindings" class="binding-list"></div>
+      </section>
+    </main>
+
+    <script type="module" src="/js/investigate.js"></script>
+  </body>
+</html>

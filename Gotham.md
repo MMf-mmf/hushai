@@ -121,13 +121,13 @@ Dependency order: **G1 → {G2, G5}**; **G3** starts in parallel with G1 (existi
 **Shipped means**: a multi-hop question ("did the person who drives EMD774 ever talk to Bob?") answered over live SSE with an observable tool trace and citations; runaway loop stopped at the cap; staging fixtures pass twice back-to-back; existing chat byte-identical when `GOTHAM_ENABLED=false`.
 
 ### G4 — Investigation UI + voice
-- [ ] Viewer: slash-picker row `gotham` (advisor-v2 registry seam), tool-step rendering, confirm bubbles
-- [ ] Entity/investigation panes: entity page, link explorer, evidence chips deep-linking into the HLS timeline
-- [ ] Binding review queue UI (confirm/reject, sample-audio + sample-face side by side)
-- [ ] Android: voice keyword route (`AssistantRouting.kt` seam), `AWAIT_FOLLOWUP` confirmations, SSE unknown-event tolerance verified
-- [ ] Headless-Chrome e2e + phone-rig markers
+- [x] Viewer: slash-picker row `gotham` (advisor-v2 registry seam), tool-step rendering, confirm bubbles — **Phase G, LANDED + live-verified.** `ui/js/chat/slash.js` (composer `/` picker: `auto | advisor | gotham`), `workspace.js` (three panes, per-agent sessions, `window.chatDebug`), `ChatPane` overridable seams + additive Detective rendering (phase pill, `tool_call`/`tool_result` steps, two-phase `confirm` bubble that sends yes/no), `AdvisorPane extends ChatPane` (advisor SSE: `phase`/`questions`/`chapters`). Reopened Detective sessions re-render their persisted `tool_trace` (rag `GET /sessions/{id}/messages` now returns it).
+- [x] Entity/investigation panes: entity page, link explorer, evidence chips deep-linking into the HLS timeline — **`investigate.html` + `js/investigate.js`**: entity explorer (edges grouped by relationship + baseline summary + recent evidence), shortest-path connections, **cross-camera journey strips** (ordered camera hops, each a `/?device=&t=` player deep-link). Reads `/v1/graph/*`; names joined client-side from catalog lists.
+- [x] Binding review queue UI (confirm/reject, sample-audio + sample-face side by side) — in `investigate.html`: candidate/confirmed/rejected filter, each card shows the two endpoints' sample media (`/v1/speakers/{id}/sample-audio` + `/v1/persons/{id}/sample-face` / `/v1/plates/{id}/sample-crop`) with the evidence counters; Confirm/Reject POST the audit-logged `/v1/graph/bindings/{id}/{confirm,reject}`.
+- [ ] Android: voice keyword route (`AssistantRouting.kt` seam), `AWAIT_FOLLOWUP` confirmations, SSE unknown-event tolerance verified — **Phase H, still open** (needs the advisor-v2 Android voice PRs first).
+- [x] Headless-Chrome e2e (viewer half) — 8 checks appended to `hushai-viewer/e2e/run.mjs` (slash rows, `/gotham` + `/advisor` pane switch + chip exit, live advisor gate turn, `E2E_GOTHAM_FULL` live Detective tool-step turn, investigate page sections + deep-linkable entity page); phone-rig markers = Phase H.
 
-**Hard dependency**: advisor-v2 PRs (slash picker, `AWAIT_FOLLOWUP`) land first — Gotham appends registry rows and reuses the phase machinery, never rebuilds it (`hushai-advisor/v2_integration_spec.md`).
+**Hard dependency**: advisor-v2 slash picker infra — **built here as Part 1 of `v2_integration_spec.md`** (the viewer seam), which Gotham's G4 rows append to. `AWAIT_FOLLOWUP` + the Android voice half of advisor-v2 remain for Phase H.
 
 ### G5 — Cross-camera journeys — ◑ **Wave-4 producer + tool + gate LANDED (timeline strip = G4/Phase G, still open)**
 - [x] Migration 0030 (`entity_journeys`, `camera_adjacency` view)
@@ -678,7 +678,14 @@ Executed after each wave's implementation; fenced commands + bold PASS criteria 
 
 **Phase F — Agent runtime live (staging).** Startup tools-probe logs runtime selection; F8–F11 via `--fixtures staging`; live SSE shows `tool_call` trace; adversarial runaway prompt ("keep searching until you find…") stops at `GOTHAM_MAX_TOOL_CALLS`; kill-switch test: `GOTHAM_ENABLED=false` → existing chat fixtures byte-identical; fallback test: unreachable backend tool target → turn completes via auto pipeline, `outcome='fell_back'` in trace. **PASS:** exit 0 twice, cap honored, kill-switch + fallback proven.
 
-**Phase G — Viewer investigation UX (Wave 3).** Manual numbered script (slash row → Detective pane → tool steps render → confirm bubble; binding queue confirm/reject with sample audio+face) + headless-Chrome checks appended to the committed e2e harness (`data-cmd` hooks; token-never-in-browser assertion). SKIP ≠ PASS. **PASS:** all observations + e2e 0 failed.
+**Phase G — Viewer investigation UX (Wave 3). ✅ DONE + live-verified.** Slash row (`data-cmd`
+hooks) → Detective pane → tool steps render → (confirm bubble is wired but Phase-1 mutations stay
+off, so no live confirm turn) → `investigate.html` binding queue confirm/reject with sample audio +
+face, entity explorer + journey timeline strips. Headless-Chrome checks appended to the committed
+e2e harness (8 new, `data-cmd` hooks + the token-never-in-browser assertion via the curl step); the
+lone e2e FAIL (`hover preview thumbnail`) is a **pre-existing flake** reproduced on the unmodified
+baseline tree, not a regression. **PASS:** all new checks green; advisor proxy curl (200 + counter +
+no browser token) + live Detective tool-trace + binding-confirm→audit + journey deep-links observed.
 
 **Phase H — Voice (Wave 3).** Logcat marker contract under `HUSHAI_TX` (grep-stable strings: keyword routed, owner verified, confirm spoken, `AWAIT_FOLLOWUP` entered/expired) + phone rig loop on the phys stack (`hushai_test_phys`, +2 ports). **PASS:** marker order + DB shape.
 
@@ -777,8 +784,8 @@ Executed after each wave's implementation; fenced commands + bold PASS criteria 
 | E | Briefing byte-stable + F7 (`briefing_daily` 8/8 gate ×2, `d4acc862`; `graph_db` outlier-day digest guard) | ✅ |
 | F | Agent staging F8–F12 gate ×2 (frozen `a5bb8a7054745a55`) + cap + kill-switch + fallback | ✅ |
 | G5 | Cross-camera journeys — producer (`patterns::stitch_and_upsert_journeys`) + Detective `graph_journeys` + `expect_journey`: F2 graph journey gate ×2 PASS, F10 agent narration PASS (`graph_journeys` picked, both cameras named), `graph_db` guard (2-device stitch + single-device skip). *Env config-hash drifted `d4acc862`→`7963897c` pre-existingly (model-digest surface, proven by an untouched control) — journey gate passes via `floor_ok`, not committed under the drifted lineage.* | ✅ |
-| G | Viewer investigation UX + e2e (incl. journey **timeline strip / deep links**) | ⬜ |
-| H | Voice markers + phone rig | ⬜ |
+| G | Viewer investigation UX + e2e — slash-picker (`auto`/`advisor`/`gotham`), Detective pane (phase pill, tool-step trace, confirm bubble, `tool_trace` restore), `investigate.html` (entity/link explorer, journey **timeline strips w/ player deep-links**, binding review queue w/ sample audio+face confirm/reject). 8 headless-Chrome checks green (hover-preview FAIL is a pre-existing flake, proven on baseline); curl: advisor proxy 200 + `upstream="advisor"` counter + no browser-side token; live: advisor gate turn, Detective tool trace (4 tool_call/tool_result + persisted trace), binding confirm→audit_log, journey strip deep-links. Adversarial-reviewed (11 confirmed findings fixed). *(Android voice half = Phase H.)* | ✅ |
+| H | Voice markers + phone rig (Android "detective" keyword — needs advisor-v2 Android voice PRs) | ⬜ |
 
 ## Troubleshooting
 
@@ -803,17 +810,30 @@ Executed after each wave's implementation; fenced commands + bold PASS criteria 
 6. **`gotham/` module + rig runtime + probe + migration 0031 + slash row + AGENTS.md:386 correction + rig pin** — the G3 skeleton, read-only tools 1–14. ◑ LANDED (build/clippy/unit + kill-switch code-verified; live tool-loop deferred to PR7/Phase F): migration 0031 + rig exact-pin + AGENTS.md correction (part 1); then `hushai-rag/src/gotham/` (`mod.rs` `run_chat` streaming a SUPERSET SSE, `runtime.rs` rig `multi_turn`+`PromptHook` + `react` fallback + startup/graph probes + wall-clock watchdog, `tools.rs` a single `ToolDyn` over read tools 1–14 + `ask_user` + probe-gated graph tools, `preamble.rs`/`trace.rs`/`confirm.rs`), `GOTHAM_*` in `config.rs`, `chat.rs` dispatch (degrades to `Grounded` when `GOTHAM_ENABLED=false`, existing chat byte-identical), `agents.rs` `gotham` registry entry. 28 new unit tests green (react JSON parser, registry sizing, confirm yes/no, trace, schemas). **PR7 (Phase F) later drove the live loop and found the G3 skeleton's tools were UNVERIFIED-and-broken: (1) all three graph tools hit imagined name-based routes (`/v1/graph/entities/{name}` etc.) that never existed — real API is id-keyed `{type}/{id}` (handoff gotcha (c)); (2) they sent no `GOTHAM_BACKEND_TOKEN` so 401'd; (3) their descriptions were too vague for the 7B to pick `graph_entity`; (4) `tool_result.ok` reported `true` for a failed tool (the rig error prefix check missed rig's `"Toolset error:"` wrapper); (5) `GOTHAM_MAX_TOOL_CALLS` bounded execution but rig still streamed a `tool_call` frame per REQUESTED call, so the trace showed 18 for an 8-cap. All five fixed in PR7. NOT done: viewer slash row (Phase G), voice keyword (Phase H).**
 7. **Eval `agent` modality + F8–F12** — Phase F. ✅ **LANDED + LIVE-VERIFIED (PR7).** `hushai-eval/src/query_agent.rs` (drives `/v1/rag/chat` with `agent_id="gotham"`, parses the SUPERSET SSE incl. `phase`/`tool_call`/`tool_result`/`confirm`), `score_agent` (answer gates + tool-trace metrics that gate only when the Detective ran — signalled by a streamed `phase`, so kill-switch/old-binary Info-degrades), `needs_agent()`, `effective_base_ns()` (negative = now-relative, keeps windowed-tool data fresh), `GOTHAM_*` hand-listed in manifest KNOBS, staging-only `local_dev/eval.agent.env`. Five staging fixtures **F8** (single-tool), **F9** (graph-backed plate→person), **F10** (cross-camera journey), **F11** (refusal/no-hallucination), **F12** (runaway-cap guard) calibrated to PASS and frozen **gate ×2** under a NEW lineage `a5bb8a7054745a55` (d4acc862 untouched — the pins are out of the shared `eval.env`). Procedural checks all confirmed live: kill-switch (`GOTHAM_ENABLED=false` → no tool frames, tool metrics Info-degrade), fallback (`WALL_CLOCK=1s` → `tool_trace=[{"tool":"(runtime)","outcome":"fell_back"}]`), runaway (`MAX_TOOL_CALLS=2` + adversarial → exactly 2 frames). **The live loop exposed + PR7 fixed FIVE real runtime bugs** — see PR6 note. **NOT done: viewer slash row (Phase G / G4), voice keyword (Phase H / G4).**
 8. **G5 cross-camera journeys — producer + Detective tool + eval gate** — ✅ **LANDED + LIVE-VERIFIED.** `patterns::stitch_and_upsert_journeys` (called in `graph_pass` step-4 for every touched person/plate: reads the subject's events across all devices in the trailing window, `graph::stitch_journeys` pure core, idempotent upsert keyed `journey:<sid>:<first_hop_start_ns>`, `open/closed` = conversations two-part settle, `merge_in_tx` drops loser journeys; NO new hashed knob). Detective **`graph_journeys`** tool (resolve name → `/v1/graph/journeys?subject=`, renders ordered camera path; **no-subject fallback → recent journeys**; count 20→21 / graph 5→6). Eval **`expect_journey {subject, cameras[]}`** (ordered subsequence of ONE journey's hops; `JourneyExpect`/`JourneyObs`/`is_subsequence` across fixtures.rs/query.rs/score.rs; `TOOL_NAMES += graph_journeys`). **F2** stitches a real front→garage journey (gate ×2 PASS); **F10** agent-narrates it via `graph_journeys` (PASS, both cameras named, matches `a5bb8a7`). `graph_db` guard: 2-device Ivan journey stitched + single-device negative. **The live loop caught + fixed 2 real bugs: (a) `run_stack.sh --test-db` never sourced `eval.agent.env` ⇒ the stack rag had no `GOTHAM_BACKEND_TOKEN` ⇒ every Detective graph tool 401'd (now sourced); (b) the 7B calls `graph_journeys` with no entity arg ⇒ arg renamed `entity`→`entity_name` (the arg the 7B fills reliably) + a no-subject "recent journeys" fallback.** Note: the eval config-hash drifted `d4acc862`→`7963897c` on this machine (pre-existing model-digest surface drift, proven by an untouched control fixture) — the journey gate passes via `floor_ok`; NOT re-frozen under the drifted lineage. Remaining G5: viewer **timeline strip / deep links** (folds into Phase G / G4).
-9. **Viewer investigation UI + binding queue + e2e** — Phase G (after advisor-v2 PR 2).
-10. **Voice route + confirmations + phone rig** — Phase H (after advisor-v2 PR 3).
+9. **Viewer investigation UI + binding queue + e2e** — Phase G. ✅ **LANDED + live-verified.** The
+   advisor-v2 viewer seam (Part 1 of `v2_integration_spec.md`) built here first: proxy 3rd upstream
+   `/v1/advisor*` (`is_advisor_path`, server-side `ADVISOR_TOKEN`, un-audited), `api.js::streamSse`
+   extraction + advisor helpers, `ChatPane` overridable seams (`_fetchSessions`/`_fetchMessages`/
+   `_stream`/`_payload`/`_handleEvent`/`_renderRestored`) with NO rag behavior change, `AdvisorPane`,
+   `slash.js` composer picker, `workspace.js` 3-pane registry + `chatDebug`. Then Gotham G4:
+   Detective additive rendering (phase pill, `tool_call`/`tool_result` steps, `confirm` bubble →
+   yes/no; `chat_messages.tool_trace` now returned by rag `GET /sessions/{id}/messages` so reopened
+   investigations re-render their steps), `investigate.html`/`js/investigate.js` (entity/link
+   explorer, journey timeline strips with player deep-links, binding review queue w/ sample audio +
+   face). 8 e2e checks in `run.mjs`. Adversarial-reviewed (workflow: 4 finders → 12 candidates → 11
+   confirmed + fixed — plate-label field, omni-ask-to-hidden-pane, exhaustive-leak, two vacuous e2e
+   waits, allSettled catalogs, terminal-turn actions, slash Enter swallow, stale-request guard,
+   composer-placeholder reset).
+10. **Voice route + confirmations + phone rig** — Phase H (after advisor-v2 Android voice PRs).
 
 Each PR updates this spec's result matrix for the phases it makes executable.
 
 ## Doc-deliverables checklist (same-change rule)
 
-- [x] `AGENTS.md`: component-map row for the Gotham layer (PR 6 — added the "Gotham Detective runtime" row + bumped registry count 7→8); **:384–387 tool-calling correction** (PR 6 ✅). Testing section names both the `graph` and `agent` modalities (PRs 3/7 — both ✅; PR7 added the `agent` modality paragraph + the `eval.agent.env` run recipe + the PR7 runtime-fixes note at AGENTS.md:465).
+- [x] `AGENTS.md`: component-map row for the Gotham layer (PR 6 — added the "Gotham Detective runtime" row + bumped registry count 7→8); **:384–387 tool-calling correction** (PR 6 ✅). Testing section names both the `graph` and `agent` modalities (PRs 3/7 — both ✅; PR7 added the `agent` modality paragraph + the `eval.agent.env` run recipe + the PR7 runtime-fixes note at AGENTS.md:465). **G4 (Phase G): viewer component row updated (slash-plugin chat + Investigate page + 3-upstream proxy); REVIEW.md viewer-proxy note extended (`is_advisor_path`, un-audited privacy upstreams).**
 - [x] `hushai-backend/migrations/README.md`: rows for 0028–0031 (0028–0030 prior; **0031 added PR 6**).
-- [ ] `CHANGELOG.md`: entry per landed wave.
+- [x] `CHANGELOG.md`: entry per landed wave (G4 Phase G / advisor-v2 viewer seam added).
 - [ ] `docs/feature-parity-roadmap.md`: one-line pointer under Pillar C — "intelligence layer → `Gotham.md`" (PR 2).
-- [ ] `local_dev/eval.env` + `run_stack.sh`: `GRAPH_*`/`GOTHAM_*` determinism pins (PRs 3/7).
+- [ ] `local_dev/eval.env` + `run_stack.sh`: `GRAPH_*`/`GOTHAM_*` determinism pins (PRs 3/7); **`run_stack.sh` TLS block gains `ADVISOR_BASE_URL=https://…` (G4).**
 
 

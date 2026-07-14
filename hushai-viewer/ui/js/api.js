@@ -506,31 +506,15 @@ export function posterUrl(deviceId) {
   return `/api/devices/${encodeURIComponent(deviceId)}/poster.jpg`;
 }
 
-// POST a chat turn and stream the answer as Server-Sent Events. `onEvent({event, data})`
-// is called per SSE frame: `session` {session_id, agent_id}, `sources` [Source...],
-// `token` {delta}, `done` {message_id}, or `error` {message}. EventSource can't POST a
-// body, so we read the streaming fetch response and parse SSE frames by hand.
-// `playback` = the viewer's live {device_id, playhead_unix_nanos} so the server can scope
-// deictic questions ("who was speaking in this clip") to the open video; null when idle.
-export async function streamChat(
-  { sessionId, agentId, message, filters, playback, exhaustive },
-  onEvent,
-) {
-  const res = await fetch("/v1/rag/chat", {
+// POST a JSON body to `url` and stream the response as Server-Sent Events.
+// `onEvent({event, data})` is called per SSE frame. EventSource can't POST a body, so we
+// read the streaming fetch response and parse SSE frames by hand. Shared by the rag chat
+// and the advisor consult streams (same wire format, different endpoints/vocabularies).
+async function streamSse(url, body, onEvent) {
+  const res = await fetch(url, {
     method: "POST",
     headers: { "content-type": "application/json", accept: "text/event-stream" },
-    body: JSON.stringify({
-      session_id: sessionId ?? null,
-      agent_id: agentId ?? null,
-      message,
-      filters: filters ?? null,
-      playback: playback ?? null,
-      // "Thorough" toggle: exhaustive speaker attribution instead of semantic top-k.
-      exhaustive: exhaustive ?? null,
-      // The user's live local UTC offset (seconds) so spoken times ("today at 4:06 PM") match
-      // their clock. getTimezoneOffset() is minutes-behind-UTC with inverted sign → negate.
-      tz_offset_secs: -new Date().getTimezoneOffset() * 60,
-    }),
+    body: JSON.stringify(body),
   });
   if (redirectIfUnauth(res)) throw new Error("unauthorized");
   if (!res.ok || !res.body) {
@@ -561,7 +545,64 @@ export async function streamChat(
   }
   buf += decoder.decode(); // flush any buffered multi-byte tail
   if (buf.trim()) feed(buf); // a final frame may arrive without its trailing blank line
-  if (skipped) console.warn(`streamChat: skipped ${skipped} malformed SSE frame(s)`);
+  if (skipped) console.warn(`streamSse: skipped ${skipped} malformed SSE frame(s)`);
+}
+
+// POST a chat turn and stream the answer as Server-Sent Events. `onEvent({event, data})`
+// is called per SSE frame: `session` {session_id, agent_id, routed_agent_id},
+// `sources` [Source...], `token` {delta}, `done` {message_id}, or `error` {message}.
+// A Detective (agent_id "gotham") turn additionally streams `phase` {phase},
+// `tool_call` {seq, tool, label, args_summary}, `tool_result` {seq, tool, ok, summary,
+// sources_added, elapsed_ms}, and (once mutations ship) `confirm` {action_id, tool,
+// summary, expires_at} — unknown events must be ignored by callers.
+// `playback` = the viewer's live {device_id, playhead_unix_nanos} so the server can scope
+// deictic questions ("who was speaking in this clip") to the open video; null when idle.
+export async function streamChat(
+  { sessionId, agentId, message, filters, playback, exhaustive },
+  onEvent,
+) {
+  await streamSse(
+    "/v1/rag/chat",
+    {
+      session_id: sessionId ?? null,
+      agent_id: agentId ?? null,
+      message,
+      filters: filters ?? null,
+      playback: playback ?? null,
+      // "Thorough" toggle: exhaustive speaker attribution instead of semantic top-k.
+      exhaustive: exhaustive ?? null,
+      // The user's live local UTC offset (seconds) so spoken times ("today at 4:06 PM") match
+      // their clock. getTimezoneOffset() is minutes-behind-UTC with inverted sign → negate.
+      tz_offset_secs: -new Date().getTimezoneOffset() * 60,
+    },
+    onEvent,
+  );
+}
+
+// ---- advisor consults (proxied to hushai-advisor at /v1/advisor/*) --------------
+// The advisor is its own service (book-grounded personal advice) with its own SSE
+// vocabulary: `session` {session_id, phase} → `phase` {phase} heartbeats → either
+// `questions` {round, questions[]} (turn ends awaiting detail) or `chapters`
+// {iteration, chapters:[{no,title}]} + `token` {delta}× → `done` {message_id};
+// `error` {message}. The body is slim on purpose — no filters/playback/exhaustive.
+
+export async function streamAdvisorChat({ sessionId, message }, onEvent) {
+  await streamSse(
+    "/v1/advisor/chat",
+    { session_id: sessionId ?? null, message },
+    onEvent,
+  );
+}
+
+// Saved consults, newest first: [{session_id, title, phase, created_at, updated_at}].
+export async function getAdvisorSessions() {
+  return getJson("/v1/advisor/sessions");
+}
+
+// Messages of one consult, oldest first: [{message_id, role, kind, content, chapters,
+// created_at}] — kind ∈ message | followup_questions | final_answer.
+export async function getAdvisorSessionMessages(sessionId) {
+  return getJson(`/v1/advisor/sessions/${encodeURIComponent(sessionId)}/messages`);
 }
 
 function nextFrameBreak(buf) {
@@ -588,6 +629,64 @@ function parseFrame(frame) {
     /* leave as string */
   }
   return { event, data: payload };
+}
+
+// ---- entity graph (Gotham data layer, proxied to hushai-backend at /v1/graph/*) --------
+// Read surface for the Investigate page: entity pages (edges grouped by type + baseline +
+// profile), bounded path/neighbor traversal, cross-camera journeys, and the voice↔face
+// binding review queue. The graph API returns bare {type, id} endpoints — display names
+// are joined client-side from the catalog lists (speakers/persons/plates/devices).
+
+export async function getGraphEntity(type, id) {
+  return getJson(`/v1/graph/entities/${encodeURIComponent(type)}/${encodeURIComponent(id)}`);
+}
+
+export async function getGraphEntityTimeline(type, id, limit = 60) {
+  return getJson(
+    `/v1/graph/entities/${encodeURIComponent(type)}/${encodeURIComponent(id)}/timeline?limit=${limit}`,
+  );
+}
+
+export async function getGraphNeighbors(type, id, hops = 2) {
+  return getJson(
+    `/v1/graph/neighbors/${encodeURIComponent(type)}/${encodeURIComponent(id)}?hops=${hops}`,
+  );
+}
+
+// `from`/`to` are "type:id" refs. Returns {found, hops, path: ["type:id", ...]}.
+export async function getGraphPath(from, to, maxHops = 4) {
+  return getJson(
+    `/v1/graph/path?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}&max_hops=${maxHops}`,
+  );
+}
+
+// `subject` is a "type:id" ref (person/plate). Rows carry ordered camera hops
+// [{device_id, arrive_ns, depart_ns, event_id?}] — the journey timeline strip.
+export async function getGraphJourneys(subject, limit = 20) {
+  return getJson(`/v1/graph/journeys?subject=${encodeURIComponent(subject)}&limit=${limit}`);
+}
+
+// Voice↔face binding review queue. status: candidate | confirmed | rejected.
+export async function getGraphBindings(status = "candidate") {
+  return getJson(`/v1/graph/bindings?status=${encodeURIComponent(status)}`);
+}
+
+async function postGraphBinding(edgeId, action) {
+  const res = await fetch(`/v1/graph/bindings/${encodeURIComponent(edgeId)}/${action}`, {
+    method: "POST",
+  });
+  if (redirectIfUnauth(res)) throw new Error("unauthorized");
+  if (!res.ok) throw new Error(`binding ${action} -> ${res.status}`);
+  return res.json().catch(() => ({}));
+}
+
+export async function confirmGraphBinding(edgeId) {
+  return postGraphBinding(edgeId, "confirm");
+}
+
+// Sticky negative: evidence keeps accumulating but the pass never re-surfaces the pair.
+export async function rejectGraphBinding(edgeId) {
+  return postGraphBinding(edgeId, "reject");
 }
 
 // ---- events & alerts (proxied to hushai-backend at /v1/events* and /v1/alert-rules*) ----------
