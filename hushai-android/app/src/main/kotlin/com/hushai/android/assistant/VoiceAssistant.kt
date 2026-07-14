@@ -2,6 +2,7 @@ package com.hushai.android.assistant
 
 import android.content.Context
 import com.hushai.android.capture.PcmSink
+import com.hushai.android.net.AdvisorClient
 import com.hushai.android.net.RagChatClient
 import com.hushai.android.net.RagClient
 import com.hushai.android.net.TtsClient
@@ -48,6 +49,9 @@ class VoiceAssistant(
     private val ragClient: RagClient,
     private val ttsClient: TtsClient,
     private val voiceSession: VoiceSession,
+    /** The advisor consult client + its own (30-min) session — invoked by name ("advisor …"). */
+    private val advisorClient: AdvisorClient,
+    private val advisorSession: VoiceSession,
     initialOwnerProfile: SpeakerMath.OwnerProfile?,
     /** Persist the SERIALIZED multi-vector profile (SpeakerMath.formatProfile). Called on a
      *  verified enrollment commit and on each guarded adaptation append. */
@@ -72,7 +76,15 @@ class VoiceAssistant(
 
     // Cross-thread control flags, acted on by the worker only.
     @Volatile private var pendingEnroll = false
-    @Volatile private var pendingResume = false
+    // The phase to resume into once the current TTS playback finishes (set by the speak thread,
+    // consumed by the worker) — answer-TTS resumes LISTENING, questions-TTS resumes AWAIT_FOLLOWUP,
+    // the bare-advisor prompt resumes AWAIT_QUESTION. Null = nothing pending.
+    @Volatile private var pendingResumeTarget: AssistantPhase? = null
+    // A bare "⟨wake⟩ advisor" is awaiting its question: the next verified AWAIT_QUESTION utterance
+    // routes to the advisor rather than the rag assistant. Worker-thread only.
+    private var advisorPending = false
+    // The follow-up round the advisor is currently on (for the followup-captured marker). Worker only.
+    private var advisorRound = 0
 
     // Guided-enrollment state (worker thread only): accepted core samples, the current prompt
     // index, reject strikes, whether we're at the final self-verification step, and whether
@@ -127,7 +139,8 @@ class VoiceAssistant(
         // Only capture while listening — never during THINKING/SPEAKING (avoids
         // hearing our own spoken answer and wasting CPU).
         val p = phase
-        if (p != AssistantPhase.LISTENING && p != AssistantPhase.AWAIT_QUESTION && p != AssistantPhase.ENROLLING) return
+        if (p != AssistantPhase.LISTENING && p != AssistantPhase.AWAIT_QUESTION &&
+            p != AssistantPhase.AWAIT_FOLLOWUP && p != AssistantPhase.ENROLLING) return
         val copy = data.copyOf(length)
         if (!queue.offer(copy)) {
             queue.poll() // drop oldest to bound latency
@@ -139,11 +152,25 @@ class VoiceAssistant(
         val rec = recognizer ?: return
         while (running) {
             if (pendingEnroll) { pendingEnroll = false; beginEnroll(rec) }
-            if (pendingResume) { pendingResume = false; resumeListening(rec) }
+            val target = pendingResumeTarget
+            if (target != null) {
+                pendingResumeTarget = null
+                // Only resume FROM speaking — if the watchdog already bailed us out, drop the stale
+                // signal so a completed-late TTS can't reopen a window we already left.
+                if (phase == AssistantPhase.SPEAKING) resumeInto(rec, target)
+            }
             val now = System.nanoTime()
             if (phase == AssistantPhase.AWAIT_QUESTION && awaitDeadlineNanos > 0L && now >= awaitDeadlineNanos) {
                 awaitDeadlineNanos = 0
                 resumeListening(rec, note = "no question heard")
+            }
+            // Follow-up window: the owner has a wake-word-free window to answer the advisor's
+            // questions; on timeout resume listening — the consult survives in advisorSession, so
+            // a wake-prefixed "advisor …" continues the same server session.
+            if (phase == AssistantPhase.AWAIT_FOLLOWUP && awaitDeadlineNanos > 0L && now >= awaitDeadlineNanos) {
+                awaitDeadlineNanos = 0
+                HushaiLog.info("advisor followup timeout — resuming listen")
+                resumeListening(rec)
             }
             // Watchdog: never get stuck SPEAKING if synth/playback hangs past the deadline.
             if (phase == AssistantPhase.SPEAKING && speakDeadlineNanos > 0L && now >= speakDeadlineNanos) {
@@ -186,24 +213,78 @@ class VoiceAssistant(
                 val at = SpeakerMath.subsequenceIndex(lower, wake)
                 if (at < 0) return
                 publish { it.copy(lastHeard = text, note = null) }
-                val tail = if (at + wake.size < orig.size) {
-                    orig.subList(at + wake.size, orig.size).joinToString(" ")
-                } else ""
-                if (SpeakerMath.tokens(tail).size >= MIN_QUESTION_WORDS) {
-                    // Single utterance: wake + question together — verify on it.
-                    if (verifyOwner(spk)) answer(rec, tail, ownerVerified(spk)) else reject(rec)
-                } else {
-                    // Bare wake word: wait for the question (a longer, better voice sample).
-                    rec.reset()
-                    phase = AssistantPhase.AWAIT_QUESTION
-                    awaitDeadlineNanos = System.nanoTime() + QUESTION_TIMEOUT_NANOS
-                    publish { it.copy(phase = AssistantPhase.AWAIT_QUESTION, note = null) }
+                val tailTokens =
+                    if (at + wake.size < orig.size) orig.subList(at + wake.size, orig.size) else emptyList()
+                when (val route = AssistantRouting.route(tailTokens)) {
+                    is AssistantRouting.Route.Advisor -> {
+                        // "⟨wake⟩ advisor ⟨question⟩" in one utterance — verify on it, then consult.
+                        if (verifyOwner(spk)) advisorConsult(rec, route.question, continueSession = true)
+                        else reject(rec)
+                    }
+                    AssistantRouting.Route.AdvisorBare -> {
+                        // Bare "⟨wake⟩ advisor": prompt for the question; the next VERIFIED utterance
+                        // routes to the advisor (verify happens on that longer, better voice sample).
+                        HushaiLog.info("advisor route: awaiting question")
+                        advisorPending = true
+                        speakThen("What would you like advice on?", AssistantPhase.AWAIT_QUESTION)
+                    }
+                    is AssistantRouting.Route.Rag -> {
+                        if (tailTokens.size >= MIN_QUESTION_WORDS) {
+                            // Single utterance: wake + question together — verify on it.
+                            if (verifyOwner(spk)) answer(rec, route.question, ownerVerified(spk)) else reject(rec)
+                        } else {
+                            // Bare wake word: wait for the question (a longer, better voice sample).
+                            advisorPending = false
+                            rec.reset()
+                            phase = AssistantPhase.AWAIT_QUESTION
+                            awaitDeadlineNanos = System.nanoTime() + QUESTION_TIMEOUT_NANOS
+                            publish { it.copy(phase = AssistantPhase.AWAIT_QUESTION, note = null) }
+                        }
+                    }
                 }
             }
             AssistantPhase.AWAIT_QUESTION -> {
                 if (text.isBlank()) return
                 publish { it.copy(lastHeard = text) }
-                if (verifyOwner(spk)) answer(rec, text, ownerVerified(spk)) else reject(rec)
+                if (!verifyOwner(spk)) { reject(rec); return }
+                // A pending bare-advisor invocation ("⟨wake⟩ advisor" → prompt) routes this whole
+                // utterance to the advisor as the question.
+                if (advisorPending) {
+                    advisorPending = false
+                    advisorConsult(rec, text, continueSession = true)
+                    return
+                }
+                // Otherwise re-route the utterance: this also covers the two-clip rig path, where the
+                // wake ("computer") and "advisor ⟨question⟩" arrive as SEPARATE utterances — the wake
+                // lands here as a bare AWAIT_QUESTION, and the "advisor …" utterance must still route
+                // by name rather than becoming a rag question.
+                when (val route = AssistantRouting.route(SpeakerMath.tokens(text))) {
+                    is AssistantRouting.Route.Advisor -> advisorConsult(rec, route.question, continueSession = true)
+                    AssistantRouting.Route.AdvisorBare -> {
+                        HushaiLog.info("advisor route: awaiting question")
+                        advisorPending = true
+                        speakThen("What would you like advice on?", AssistantPhase.AWAIT_QUESTION)
+                    }
+                    is AssistantRouting.Route.Rag -> answer(rec, text, ownerVerified(spk))
+                }
+            }
+            AssistantPhase.AWAIT_FOLLOWUP -> {
+                if (text.isBlank()) return
+                // Per-turn owner verify: a rejected speaker is IGNORED and the phase stays
+                // AWAIT_FOLLOWUP until the deadline — a stranger must not consume the owner's window.
+                if (!verifyOwner(spk)) {
+                    HushaiLog.info("speaker rejected (advisor follow-up) — ignoring, still awaiting")
+                    return
+                }
+                // "cancel"/"never mind" aborts the round (server session kept), returning to LISTENING.
+                if (AssistantRouting.isAbort(text)) {
+                    HushaiLog.info("advisor follow-up aborted by user")
+                    speakAnswer("Okay.")
+                    return
+                }
+                publish { it.copy(lastHeard = text) }
+                HushaiLog.info("advisor followup captured (round=$advisorRound, words=${SpeakerMath.tokens(text).size})")
+                advisorConsult(rec, text, continueSession = true)
             }
             else -> {}
         }
@@ -274,13 +355,19 @@ class VoiceAssistant(
         }
     }
 
-    /** Transition to SPEAKING and play `text` (resumes LISTENING once playback finishes). */
-    private fun speakAnswer(text: String) {
+    /** Transition to SPEAKING and play `text`, then resume into `resumeTo` once playback finishes. */
+    private fun speakThen(text: String, resumeTo: AssistantPhase) {
         phase = AssistantPhase.SPEAKING
         speakDeadlineNanos = System.nanoTime() + SPEAK_TIMEOUT_NANOS
         publish { it.copy(phase = AssistantPhase.SPEAKING, lastAnswer = text) }
-        speak(text) // resumes LISTENING once playback finishes (pendingResume)
+        speak(text, resumeTo)
     }
+
+    /** Speak an answer, then return to LISTENING (the default terminal spoken reply). */
+    private fun speakAnswer(text: String) = speakThen(text, AssistantPhase.LISTENING)
+
+    /** Speak the advisor's follow-up questions, then open the wake-word-free answer window. */
+    private fun speakQuestions(text: String) = speakThen(text, AssistantPhase.AWAIT_FOLLOWUP)
 
     private fun verifyOwner(spk: FloatArray?): Boolean {
         val owner = ownerProfile ?: run {
@@ -332,6 +419,7 @@ class VoiceAssistant(
         rec.reset()
         phase = AssistantPhase.LISTENING
         awaitDeadlineNanos = 0
+        advisorPending = false
         HushaiLog.info("speaker rejected (cosine below threshold)")
         publish { it.copy(phase = AssistantPhase.LISTENING, note = "speaker not recognized — ignoring") }
     }
@@ -342,15 +430,46 @@ class VoiceAssistant(
      * the assistant returns to LISTENING; if audio is unavailable the answer text is
      * still shown.
      */
-    private fun speak(text: String) {
+    private fun speak(text: String, resumeTo: AssistantPhase) {
         speakExecutor.execute {
             val played = runCatching {
                 val wav = ttsClient.synthesize(text)
                 wav != null && audioPlayer.play(wav)
             }.getOrElse { e -> HushaiLog.error("speak failed", e); false }
             if (!played) HushaiLog.warn("spoken answer unavailable — showing text only")
-            pendingResume = true
+            // Always signal (success or not) so we never wedge in SPEAKING — the worker resumes
+            // into the requested phase; the follow-up window opens even if TTS playback failed.
+            pendingResumeTarget = resumeTo
         }
+    }
+
+    /** Post-TTS transition on the worker thread: LISTENING (answer), AWAIT_FOLLOWUP (questions),
+     *  or AWAIT_QUESTION (the bare-advisor prompt). */
+    private fun resumeInto(rec: Recognizer, target: AssistantPhase) {
+        when (target) {
+            AssistantPhase.AWAIT_FOLLOWUP -> beginFollowupWindow(rec)
+            AssistantPhase.AWAIT_QUESTION -> {
+                rec.reset()
+                queue.clear()
+                speakDeadlineNanos = 0
+                phase = AssistantPhase.AWAIT_QUESTION
+                awaitDeadlineNanos = System.nanoTime() + QUESTION_TIMEOUT_NANOS
+                publish { it.copy(phase = AssistantPhase.AWAIT_QUESTION, note = null) }
+            }
+            else -> resumeListening(rec)
+        }
+    }
+
+    /** Open the wake-word-free follow-up window. The marker fires HERE (after TTS playback), the
+     *  moment the window actually opens — never at synthesis start (the rig's sequencing anchor). */
+    private fun beginFollowupWindow(rec: Recognizer) {
+        rec.reset()
+        queue.clear()
+        speakDeadlineNanos = 0
+        phase = AssistantPhase.AWAIT_FOLLOWUP
+        awaitDeadlineNanos = System.nanoTime() + FOLLOWUP_TIMEOUT_NANOS
+        HushaiLog.info("advisor questions spoken — awaiting answer")
+        publish { it.copy(phase = AssistantPhase.AWAIT_FOLLOWUP, note = null) }
     }
 
     private fun resumeListening(rec: Recognizer, note: String? = null) {
@@ -358,8 +477,93 @@ class VoiceAssistant(
         queue.clear()
         awaitDeadlineNanos = 0
         speakDeadlineNanos = 0
+        advisorPending = false
         phase = AssistantPhase.LISTENING
         publish { it.copy(phase = AssistantPhase.LISTENING, note = note) }
+    }
+
+    // --- Advisor consult (the "advisor …" route; §2.3 loop) -----------------------
+    //
+    // LISTENING --"⟨wake⟩ advisor ⟨q⟩"--> [verify] --> THINKING (advisor chat)
+    //   THINKING --Questions--> SPEAKING (intro + numbered questions) --done--> AWAIT_FOLLOWUP (30 s)
+    //   AWAIT_FOLLOWUP --owner utterance--> THINKING (same session_id)   [server-capped rounds]
+    //   THINKING --Answer--> SPEAKING (advice) --> LISTENING
+    // A completed consult returns to LISTENING (the wake word starts the next turn); only follow-up
+    // ROUNDS are wake-free. The worker BLOCKS on the advisor call — PCM is dropped during THINKING,
+    // so the phone never transcribes its own reply (accepted: the thread is deaf 30–300 s per turn).
+
+    private fun advisorConsult(rec: Recognizer, question: String, continueSession: Boolean) {
+        // "new chat"/"start over" resets the consult on-device (never sent to the server).
+        if (VoiceSession.isResetCommand(question)) {
+            advisorSession.reset()
+            HushaiLog.info("advisor session reset by spoken command")
+            publish { it.copy(lastQuestion = question) }
+            speakAnswer("Okay, starting fresh.")
+            return
+        }
+        phase = AssistantPhase.THINKING
+        val now = System.currentTimeMillis()
+        val sid = if (continueSession) advisorSession.currentOrNull(now) else null
+        HushaiLog.info("advisor route (session=${sid ?: "new"})")
+        publish { it.copy(phase = AssistantPhase.THINKING, lastQuestion = question, note = null) }
+        deliverAdvisorResult(rec, advisorClient.chat(question, sid), now, question, allowRetry = true)
+    }
+
+    /** Dispatch one advisor turn's result: speak questions (→ follow-up window) or the answer,
+     *  retry once on a lost session, and speak the graceful fallbacks for Busy/Error. */
+    private fun deliverAdvisorResult(
+        rec: Recognizer,
+        result: AdvisorClient.Result,
+        now: Long,
+        question: String,
+        allowRetry: Boolean,
+    ) {
+        when (result) {
+            is AdvisorClient.Result.Questions -> {
+                advisorSession.record(result.sessionId, now)
+                advisorRound = result.round
+                HushaiLog.info("advisor questions round=${result.round} count=${result.questions.size} (session=${result.sessionId})")
+                speakQuestions(buildQuestionsTts(result.questions))
+            }
+            is AdvisorClient.Result.Answer -> {
+                advisorSession.record(result.sessionId, now)
+                val chapters = result.chapters.joinToString(",") { it.no.toString() }
+                HushaiLog.info("advisor answer ok (session=${result.sessionId} chapters=[$chapters])")
+                speakAnswer(result.text)
+            }
+            AdvisorClient.Result.SessionNotFound -> {
+                if (allowRetry) {
+                    // The stored session was pruned / the DB wiped — forget it and retry once fresh.
+                    HushaiLog.info("advisor session gone — retrying sessionless")
+                    advisorSession.reset()
+                    deliverAdvisorResult(rec, advisorClient.chat(question, null), now, question, allowRetry = false)
+                } else {
+                    HushaiLog.info("advisor error: session lost")
+                    speakAnswer("Sorry — the advisor isn't available right now.")
+                }
+            }
+            AdvisorClient.Result.Busy -> {
+                HushaiLog.info("advisor busy (409)")
+                speakAnswer("The advisor is still thinking about your last question — give it a moment.")
+            }
+            is AdvisorClient.Result.Error -> {
+                // Empty answers map to Error upstream — treated identically (spoken fallback → LISTENING).
+                HushaiLog.info("advisor error: ${result.reason}")
+                speakAnswer("Sorry — the advisor isn't available right now.")
+            }
+        }
+    }
+
+    /** One TTS synthesis call for a whole gate round: intro + numbered, period-joined questions
+     *  (natural pauses; fits the speak watchdog). */
+    private fun buildQuestionsTts(questions: List<String>): String {
+        if (questions.isEmpty()) return "I need a bit more detail. Could you tell me more about your situation?"
+        val sb = StringBuilder("I need a bit more detail.")
+        questions.forEachIndexed { i, q ->
+            val ordinal = ADVISOR_ORDINALS.getOrElse(i) { (i + 1).toString() }
+            sb.append(" Question ").append(ordinal).append(": ").append(q.trim().trimEnd('.')).append(" .")
+        }
+        return sb.toString()
     }
 
     // --- Guided enrollment --------------------------------------------------------
@@ -503,8 +707,12 @@ class VoiceAssistant(
         private const val SPEAKER_THRESHOLD = 0.5f
         private const val MIN_QUESTION_WORDS = 2
         private const val QUESTION_TIMEOUT_NANOS = 8_000_000_000L
+        // The owner composes an answer to up to 3 follow-up questions — 8 s is too tight, 30 s fits.
+        private const val FOLLOWUP_TIMEOUT_NANOS = 30_000_000_000L
         // Watchdog backstop covering backend synthesis + network + playback.
         private const val SPEAK_TIMEOUT_NANOS = 60_000_000_000L
+        // Spoken ordinals for the numbered follow-up questions ("Question one: …").
+        private val ADVISOR_ORDINALS = listOf("one", "two", "three", "four", "five")
 
         // Guided enrollment: six prompted samples + a held-out verification.
         private const val ENROLL_TARGET = 6

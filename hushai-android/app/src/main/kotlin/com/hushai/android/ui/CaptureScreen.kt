@@ -609,6 +609,7 @@ private fun phaseLabel(status: AssistantStatus): String = when (status.phase) {
     AssistantPhase.OFF -> "off"
     AssistantPhase.LISTENING -> "listening for wake word"
     AssistantPhase.AWAIT_QUESTION -> "listening for your question"
+    AssistantPhase.AWAIT_FOLLOWUP -> "listening for your answer"
     AssistantPhase.THINKING -> "thinking…"
     AssistantPhase.SPEAKING -> "speaking"
     AssistantPhase.ENROLLING -> "enrolling your voice"

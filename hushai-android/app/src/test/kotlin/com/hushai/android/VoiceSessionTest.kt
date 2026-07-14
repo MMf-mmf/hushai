@@ -69,6 +69,16 @@ class VoiceSessionTest {
         assertNull(s.currentOrNull(123L))
     }
 
+    /** The advisor instance passes a 30-min window: 29 min in reuses the id, 31 min in starts fresh. */
+    @Test fun parameterizedIdleWindow() {
+        val thirtyMin = 30L * 60L * 1000L
+        val s = VoiceSession(load = { null }, save = { _, _ -> }, clear = {}, idleWindowMillis = thirtyMin)
+        val t0 = 1_000_000L
+        s.record("adv-1", t0)
+        assertEquals("adv-1", s.currentOrNull(t0 + 29L * 60L * 1000L))
+        assertNull(s.currentOrNull(t0 + 31L * 60L * 1000L))
+    }
+
     @Test fun resetCommandsMatchWholePhrase() {
         for (cmd in listOf(
             "new chat", "New Chat", "new conversation", "start over", "Start fresh!",

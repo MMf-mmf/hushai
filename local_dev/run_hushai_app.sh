@@ -32,10 +32,15 @@ URL=""
 URL_SET=0
 RAG_URL=""
 RAG_URL_SET=0
+ADVISOR_URL=""
+ADVISOR_URL_SET=0
 TOKEN="dev-secret-token"
 # Voice-assistant bearer for hushai-rag; defaults to $RAG_TOKEN from the environment
 # (run_stack.sh exports one) so the assistant matches a rag started with auth on.
 RAG_TOKEN="${RAG_TOKEN:-}"
+# Advisor consult bearer; defaults to $ADVISOR_TOKEN from the environment (run_stack.sh exports
+# one) so the voice consult matches an advisor started with auth on (the rag_token lesson).
+ADVISOR_TOKEN="${ADVISOR_TOKEN:-}"
 DEVICE=""
 NO_BUILD=0
 DURATION=120
@@ -53,8 +58,10 @@ while [[ $# -gt 0 ]]; do
   case "$1" in
     --url) URL="$2"; URL_SET=1; shift 2 ;;
     --rag-url) RAG_URL="$2"; RAG_URL_SET=1; shift 2 ;;
+    --advisor-url) ADVISOR_URL="$2"; ADVISOR_URL_SET=1; shift 2 ;;
     --token) TOKEN="$2"; shift 2 ;;
     --rag-token) RAG_TOKEN="$2"; shift 2 ;;
+    --advisor-token) ADVISOR_TOKEN="$2"; shift 2 ;;
     --device) DEVICE="$2"; shift 2 ;;
     --no-build) NO_BUILD=1; shift ;;
     --duration) DURATION="$2"; shift 2 ;;
@@ -121,12 +128,15 @@ fi
 if [[ "$DEVICE" == emulator-* ]]; then
   [[ "$URL_SET" -eq 0 ]] && URL="http://10.0.2.2:8080"
   [[ "$RAG_URL_SET" -eq 0 ]] && RAG_URL="http://10.0.2.2:8090"
+  [[ "$ADVISOR_URL_SET" -eq 0 ]] && ADVISOR_URL="http://10.0.2.2:8095"
 else
   [[ "$URL_SET" -eq 0 ]] && URL="http://localhost:8080"
   [[ "$RAG_URL_SET" -eq 0 ]] && RAG_URL="http://localhost:8090"
-  echo "[usb] adb reverse tcp:8080 + tcp:8090 (full loop over the cable, no shared network)"
+  [[ "$ADVISOR_URL_SET" -eq 0 ]] && ADVISOR_URL="http://localhost:8095"
+  echo "[usb] adb reverse tcp:8080 + tcp:8090 + tcp:8095 (full loop over the cable, no shared network)"
   adb reverse tcp:8080 tcp:8080 >/dev/null
   adb reverse tcp:8090 tcp:8090 >/dev/null
+  adb reverse tcp:8095 tcp:8095 >/dev/null
 fi
 
 # --- Build -------------------------------------------------------------------
@@ -149,18 +159,22 @@ for perm in "${PERMS[@]}"; do
 done
 
 # --- Launch + configure + autostart via Intent extras (no UI taps) ----------
-echo "[launch] url=$URL rag_url=$RAG_URL token=*** rag_token=${RAG_TOKEN:+***} autostart=true audio_only=$AUDIO_ONLY"
+echo "[launch] url=$URL rag_url=$RAG_URL advisor_url=$ADVISOR_URL token=*** rag_token=${RAG_TOKEN:+***} advisor_token=${ADVISOR_TOKEN:+***} autostart=true audio_only=$AUDIO_ONLY"
 AUDIO_ONLY_EXTRA=()
 [[ "$AUDIO_ONLY" -eq 1 ]] && AUDIO_ONLY_EXTRA=(--ez audio_only true)
 # Only pass the rag bearer when one is set, so we don't clobber a stored token with "".
 RAG_TOKEN_EXTRA=()
 [[ -n "$RAG_TOKEN" ]] && RAG_TOKEN_EXTRA=(--es rag_token "$RAG_TOKEN")
+# Same for the advisor bearer (a stale DataStore advisor_token 401s every consult otherwise).
+ADVISOR_TOKEN_EXTRA=()
+[[ -n "$ADVISOR_TOKEN" ]] && ADVISOR_TOKEN_EXTRA=(--es advisor_token "$ADVISOR_TOKEN")
 # ${arr[@]+...} guards against "unbound variable" when the array is empty under
-# `set -u` on bash 3.2 (macOS default). rag_url forces the voice-assistant host
+# `set -u` on bash 3.2 (macOS default). rag_url/advisor_url force the voice-assistant hosts
 # (overrides any stale LAN-IP left in DataStore by a prior wireless session).
 adb shell am start -n "$ACTIVITY" \
-  --es url "$URL" --es rag_url "$RAG_URL" --es token "$TOKEN" \
+  --es url "$URL" --es rag_url "$RAG_URL" --es advisor_url "$ADVISOR_URL" --es token "$TOKEN" \
   ${RAG_TOKEN_EXTRA[@]+"${RAG_TOKEN_EXTRA[@]}"} \
+  ${ADVISOR_TOKEN_EXTRA[@]+"${ADVISOR_TOKEN_EXTRA[@]}"} \
   ${AUDIO_ONLY_EXTRA[@]+"${AUDIO_ONLY_EXTRA[@]}"} --ez autostart true >/dev/null
 
 # --- Observe footage flow ----------------------------------------------------

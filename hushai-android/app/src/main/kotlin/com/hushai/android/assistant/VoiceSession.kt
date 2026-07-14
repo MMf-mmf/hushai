@@ -17,6 +17,10 @@ class VoiceSession(
     private val load: () -> Pair<String, Long>?,
     private val save: (String, Long) -> Unit,
     private val clear: () -> Unit,
+    /** How long a session survives silence before the next turn starts fresh. Defaults to the rag
+     *  voice window ([IDLE_WINDOW_MILLIS]); the advisor instance passes 30 min — consults are
+     *  weightier, and cross-session pgvector memory covers anything past the window. */
+    private val idleWindowMillis: Long = IDLE_WINDOW_MILLIS,
 ) {
     private var sessionId: String? = null
     private var lastTurnAtMillis: Long = 0L
@@ -39,7 +43,7 @@ class VoiceSession(
     fun currentOrNull(nowMillis: Long): String? {
         ensureLoaded()
         val id = sessionId ?: return null
-        return if (nowMillis - lastTurnAtMillis < IDLE_WINDOW_MILLIS) id else null
+        return if (nowMillis - lastTurnAtMillis < idleWindowMillis) id else null
     }
 
     /** Record the session id returned by the server and stamp the turn time (persisted). */

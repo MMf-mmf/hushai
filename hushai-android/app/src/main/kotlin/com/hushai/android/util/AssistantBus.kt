@@ -4,7 +4,10 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.update
 
 enum class AssistantPhase {
-    OFF, LISTENING, AWAIT_QUESTION, THINKING, SPEAKING, ENROLLING
+    OFF, LISTENING, AWAIT_QUESTION, THINKING, SPEAKING, ENROLLING,
+    // Wake-word-free window while a multi-turn advisor consult waits for the owner's answer to
+    // the advisor's follow-up questions (see assistant/VoiceAssistant advisor consult loop).
+    AWAIT_FOLLOWUP
 }
 
 /** Live voice-assistant state shared from the service to the UI. */

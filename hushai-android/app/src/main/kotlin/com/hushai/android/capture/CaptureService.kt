@@ -22,6 +22,7 @@ import com.hushai.android.net.ConnectivityState
 import com.hushai.android.net.Http
 import com.hushai.android.net.NetworkMonitor
 import com.hushai.android.assistant.VoiceSession
+import com.hushai.android.net.AdvisorClient
 import com.hushai.android.net.RagChatClient
 import com.hushai.android.net.RagClient
 import com.hushai.android.net.TtsClient
@@ -209,6 +210,16 @@ class CaptureService : Service() {
         val chatClient = RagChatClient(Http.rag, ragUrl, ragToken)
         val ragClient = RagClient(Http.rag, ragUrl, ragToken) // older-server fallback
         val ttsClient = TtsClient(Http.rag, ragUrl, ragToken)
+        // Advisor consult client + its own session (30-min idle window; the +2-min consult call
+        // timeout lives in Http.advisor). A stale DataStore advisor_token would 401 every consult,
+        // so the harness pushes it via the --es advisor_token extra (the rag_token lesson).
+        val advisorClient = AdvisorClient(Http.advisor, settings.advisorUrlBlocking(), settings.advisorTokenBlocking())
+        val advisorSession = VoiceSession(
+            load = { settings.loadAdvisorSessionBlocking() },
+            save = { id, at -> settings.saveAdvisorSessionBlocking(id, at) },
+            clear = { settings.clearAdvisorSessionBlocking() },
+            idleWindowMillis = ADVISOR_SESSION_IDLE_MILLIS,
+        )
         // Multi-vector profile; a legacy single-centroid string parses as a 1-vector profile.
         val owner = SpeakerMath.parseProfile(settings.ownerEmbeddingBlocking())
         // Session state lives in DataStore (not this object), so a rebuilt assistant resumes the
@@ -226,6 +237,8 @@ class CaptureService : Service() {
             ragClient = ragClient,
             ttsClient = ttsClient,
             voiceSession = voiceSession,
+            advisorClient = advisorClient,
+            advisorSession = advisorSession,
             initialOwnerProfile = owner,
             // Already serialized (SpeakerMath.formatProfile) — store verbatim.
             onEnrollComplete = { serialized -> settings.setOwnerEmbeddingBlocking(serialized) },
@@ -865,6 +878,11 @@ class CaptureService : Service() {
         const val EXTRA_TOKEN = "token"
         const val EXTRA_RAG_URL = "rag_url"
         const val EXTRA_RAG_TOKEN = "rag_token"
+        const val EXTRA_ADVISOR_URL = "advisor_url"
+        const val EXTRA_ADVISOR_TOKEN = "advisor_token"
+        // Advisor consults are weightier than rag chat; a longer idle window keeps a multi-turn
+        // consult continuable, and cross-session pgvector memory covers anything past it.
+        const val ADVISOR_SESSION_IDLE_MILLIS = 30L * 60L * 1000L
         const val EXTRA_AUDIO_ONLY = "audio_only"
         const val EXTRA_UPRIGHT_BAKE = "upright_bake"
         const val EXTRA_IMPORT_URIS = "import_uris"

@@ -72,6 +72,11 @@ class Settings(private val context: Context) {
      *  Empty ⇒ no bearer (a dev rag with no RAG_TOKEN). Set it to match the server's
      *  RAG_TOKEN once rag auth is on. */
     suspend fun ragToken(): String = context.dataStore.data.map { it[KEY_RAG_TOKEN] ?: DEFAULT_RAG_TOKEN }.first()
+    /** Base URL of the hushai-advisor service the voice consult calls (`/v1/advisor/chat`). */
+    suspend fun advisorUrl(): String = context.dataStore.data.map { it[KEY_ADVISOR_URL] ?: DEFAULT_ADVISOR_URL }.first()
+    /** Bearer the voice consult presents to hushai-advisor (matches the server's ADVISOR_TOKEN;
+     *  empty ⇒ no bearer). Without the extra a stale DataStore token 401s every consult. */
+    suspend fun advisorToken(): String = context.dataStore.data.map { it[KEY_ADVISOR_TOKEN] ?: DEFAULT_ADVISOR_TOKEN }.first()
     suspend fun assistantEnabled(): Boolean = context.dataStore.data.map { it[KEY_ASSISTANT_ENABLED] ?: false }.first()
     suspend fun ownerEmbedding(): String = context.dataStore.data.map { it[KEY_OWNER_EMBEDDING] ?: "" }.first()
 
@@ -95,6 +100,10 @@ class Settings(private val context: Context) {
     fun ragUrlBlocking(): String = runBlocking { ragUrl() }
     fun ragTokenBlocking(): String = runBlocking { ragToken() }
     fun setRagTokenBlocking(value: String) = runBlocking { edit(KEY_RAG_TOKEN, value.trim()) }
+    fun advisorUrlBlocking(): String = runBlocking { advisorUrl() }
+    fun setAdvisorUrlBlocking(value: String) = runBlocking { edit(KEY_ADVISOR_URL, value.trim()) }
+    fun advisorTokenBlocking(): String = runBlocking { advisorToken() }
+    fun setAdvisorTokenBlocking(value: String) = runBlocking { edit(KEY_ADVISOR_TOKEN, value.trim()) }
     fun assistantEnabledBlocking(): Boolean = runBlocking { assistantEnabled() }
     fun ownerEmbeddingBlocking(): String = runBlocking { ownerEmbedding() }
     fun setWakeWordBlocking(value: String) = runBlocking { edit(KEY_WAKE_WORD, value.trim()) }
@@ -129,6 +138,29 @@ class Settings(private val context: Context) {
         }
     }
 
+    // --- Advisor consult session (separate from the rag voice session; 30-min idle window) ---
+    fun loadAdvisorSessionBlocking(): Pair<String, Long>? = runBlocking {
+        context.dataStore.data.map {
+            val id = it[KEY_ADVISOR_SESSION_ID]
+            val at = it[KEY_ADVISOR_SESSION_AT] ?: 0L
+            if (id.isNullOrBlank()) null else id to at
+        }.first()
+    }
+
+    fun saveAdvisorSessionBlocking(sessionId: String, atMillis: Long) = runBlocking {
+        context.dataStore.edit {
+            it[KEY_ADVISOR_SESSION_ID] = sessionId
+            it[KEY_ADVISOR_SESSION_AT] = atMillis
+        }
+    }
+
+    fun clearAdvisorSessionBlocking() = runBlocking {
+        context.dataStore.edit {
+            it.remove(KEY_ADVISOR_SESSION_ID)
+            it.remove(KEY_ADVISOR_SESSION_AT)
+        }
+    }
+
     private suspend fun edit(key: androidx.datastore.preferences.core.Preferences.Key<String>, value: String) {
         context.dataStore.edit { it[key] = value }
     }
@@ -147,6 +179,10 @@ class Settings(private val context: Context) {
         val KEY_OWNER_EMBEDDING = stringPreferencesKey("owner_embedding")
         val KEY_VOICE_SESSION_ID = stringPreferencesKey("voice_session_id")
         val KEY_VOICE_SESSION_AT = longPreferencesKey("voice_session_at_millis")
+        val KEY_ADVISOR_URL = stringPreferencesKey("advisor_url")
+        val KEY_ADVISOR_TOKEN = stringPreferencesKey("advisor_token")
+        val KEY_ADVISOR_SESSION_ID = stringPreferencesKey("advisor_session_id")
+        val KEY_ADVISOR_SESSION_AT = longPreferencesKey("advisor_session_at_millis")
         // Debug/dev defaults (cleartext over the USB `adb reverse` tunnel / emulator).
         // RELEASE builds forbid cleartext (see src/release/network_security_config.xml),
         // so a release deployment MUST set an `https://<lan-ip>:8080` URL (cert SAN) via
@@ -160,5 +196,7 @@ class Settings(private val context: Context) {
         // A common word the small ASR model recognizes reliably; user-changeable.
         const val DEFAULT_WAKE_WORD = "computer"
         const val DEFAULT_RAG_URL = "http://localhost:8090"
+        const val DEFAULT_ADVISOR_URL = "http://localhost:8095"
+        const val DEFAULT_ADVISOR_TOKEN = ""
     }
 }
