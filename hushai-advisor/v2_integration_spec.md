@@ -732,8 +732,26 @@ seams + `AdvisorPane` are the shared infra both consume (`Gotham.md` §2.7, PR-s
    (4 finders → 1 confirmed low finding = test-coverage gap, fixed). **Live Phase F still needs the
    rig** (staging calibration is INCONCLUSIVE without the running advisor service).
 2. **PR: viewer integration** (Part 1 + Phase B/C e2e checks) — fastest human-visible demo.
-3. **PR: Android voice integration** (Part 2 + unit tests; Phase D/E run on the rig).
+   **✅ LANDED** with Gotham G4 Phase G (`72d95be`).
+3. **PR: Android voice integration** (Part 2 + unit tests; Phase D/E run on the rig). **⬜ NOT
+   STARTED on mainline.** Pickup: the full-v2 branch `feat/advisor-v2-pr1-eval-memory` (`c3400ac`,
+   origin) already has this coded + live-verified (2026-07-07) — and Gotham (G1–G5) NEVER touched
+   `hushai-android`, so its Android commits (`AssistantRouting.kt`, `AWAIT_FOLLOWUP`,
+   `AdvisorClient.kt`, `VoiceSession` idle-window param, the consult loop, §2.7 markers, 3 test
+   classes) should **cherry-pick ~clean** onto mainline rather than be rewritten. Verify at the unit
+   level here (`./gradlew :app:testDebugUnitTest`); Phase D/E are spoken/phone → a rig session.
+   Unblocks Gotham G4 Phase H (the "detective" keyword reuses this seam).
 4. **PR: fixture bank + phone rig** (§3.2 + §3.4 + `voice_advisor_loop.py`; Phases F/G/H
-   executed and the result matrix filled).
+   executed and the result matrix filled). **⬜ NOT STARTED on mainline.** Pickup: do NOT cherry-pick
+   the old branch's eval/manifest bits — they are 19 Gotham commits stale AND fold the corpus into
+   ALL cases (would clobber `d4acc862`). The harness this PR needs already landed d4acc862-safe in
+   PR1; only add the 6 fixtures F1–F6 (§3.2) + the phone rig, then run Phases F/G/H on the rig.
+
+> **Branch note (2026-07-13):** `feat/advisor-v2-pr1-eval-memory` (`c3400ac`) holds a complete,
+> once-live-verified v2 but forked at `f30c5fa`, now 19 Gotham commits behind mainline; its
+> corpus-fingerprint-into-every-case would clobber the frozen `d4acc862` graph lineage. v2 is
+> therefore being **re-built incrementally on `feat/hushai-voice-assistant`** (viewer = `72d95be`,
+> PR1 = `e72bfcd`), not merged. Salvage the old branch's Android track by cherry-pick; rebuild the
+> eval/fixture track fresh.
 
 Each PR updates this spec's result matrix for the phases it makes executable.
