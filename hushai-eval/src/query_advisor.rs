@@ -21,6 +21,14 @@ use serde_json::{Value, json};
 /// recalling → routing → drafting → reviewing → polishing → memorizing).
 const ASK_TIMEOUT_SECS: u64 = 300;
 
+/// Per-turn cap, env-overridable (HUSHAI_ADVISOR_ASK_TIMEOUT_SECS) for a very slow CPU endpoint.
+fn ask_timeout_secs() -> u64 {
+    std::env::var("HUSHAI_ADVISOR_ASK_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(ASK_TIMEOUT_SECS)
+}
+
 /// One turn's full result: which terminal shape the turn took + the evidence the scorer asserts on.
 #[derive(Debug, Clone, Default)]
 pub struct AdvisorTurnResult {
@@ -137,9 +145,10 @@ pub async fn ask(ctx: &Ctx, message: &str, session_id: Option<&str>) -> Result<A
         Ok::<AdvisorTurnResult, anyhow::Error>(out)
     };
 
-    match tokio::time::timeout(std::time::Duration::from_secs(ASK_TIMEOUT_SECS), fut).await {
+    let ask_timeout = ask_timeout_secs();
+    match tokio::time::timeout(std::time::Duration::from_secs(ask_timeout), fut).await {
         Ok(res) => res,
-        Err(_) => anyhow::bail!("advisor chat timed out after {ASK_TIMEOUT_SECS}s for turn {message:?}"),
+        Err(_) => anyhow::bail!("advisor chat timed out after {ask_timeout}s for turn {message:?}"),
     }
 }
 

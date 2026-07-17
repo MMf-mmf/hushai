@@ -1,0 +1,17 @@
+{
+  "case_id": "advisor_memory_cross_session",
+  "config_hash": "965d2b39478453cd",
+  "git_sha": "9cbf415",
+  "metrics": {
+    "advisor.t0.errored": 1.0,
+    "advisor.t0.final_answer": 1.0,
+    "advisor.t0.memory_rows": 1.0,
+    "advisor.t0.questions": 1.0,
+    "advisor.t1.contains_any": 1.0,
+    "advisor.t1.errored": 1.0,
+    "advisor.t1.final_answer": 1.0,
+    "advisor.t1.memory_nearest_distance": 0.20028053512076704,
+    "advisor.t1.memory_recalled": 1.0,
+    "advisor.t1.session_isolated": 1.0
+  }
+}

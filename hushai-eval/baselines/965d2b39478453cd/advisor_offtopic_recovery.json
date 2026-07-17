@@ -1,0 +1,11 @@
+{
+  "case_id": "advisor_offtopic_recovery",
+  "config_hash": "965d2b39478453cd",
+  "git_sha": "9cbf415",
+  "metrics": {
+    "advisor.t0.errored": 1.0,
+    "advisor.t1.errored": 1.0,
+    "advisor.t1.final_answer": 1.0,
+    "advisor.t1.session_continuous": 1.0
+  }
+}

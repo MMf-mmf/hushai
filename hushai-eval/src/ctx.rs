@@ -39,8 +39,20 @@ impl Ctx {
             .connect(&database_url)
             .await
             .with_context(|| format!("connecting to {database_url}"))?;
+        // Whole-request ceiling (includes streaming body). Advisor SSE answers run the full
+        // pipeline (route→recall→ground→draft→review→refine→polish→memorize) and legitimately
+        // take 130-170s on CPU with qwen2.5:7b at ADVISOR_NUM_CTX=16384, so 120s would abort a
+        // valid stream mid-flight. Kept above the advisor path's own ASK_TIMEOUT_SECS=300
+        // (query_advisor.rs) so that per-turn tokio guard — not this client ceiling — governs.
+        // Env override (HUSHAI_EVAL_HTTP_TIMEOUT_SECS) for a very slow CPU endpoint where a single
+        // advisor turn can exceed 360 s; keep it >= the advisor path's ASK_TIMEOUT_SECS so that
+        // per-turn tokio guard governs.
+        let http_timeout_secs: u64 = std::env::var("HUSHAI_EVAL_HTTP_TIMEOUT_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(360);
         let http = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(120))
+            .timeout(std::time::Duration::from_secs(http_timeout_secs))
             .build()?;
         let scratch = repo_root.join("hushai-eval/.work");
         std::fs::create_dir_all(&scratch).ok();

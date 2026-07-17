@@ -1,0 +1,12 @@
+{
+  "case_id": "advisor_direct_hardnews",
+  "config_hash": "965d2b39478453cd",
+  "git_sha": "9cbf415",
+  "metrics": {
+    "advisor.t0.chapters_any": 1.0,
+    "advisor.t0.contains_any": 1.0,
+    "advisor.t0.errored": 1.0,
+    "advisor.t0.final_answer": 1.0,
+    "advisor.t0.questions": 1.0
+  }
+}

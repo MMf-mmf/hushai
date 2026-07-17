@@ -2,17 +2,17 @@
   "advisor": {
     "turns": [
       {
-        "message": "I need advice about a person at work.",
+        "message": "I am really upset about a personal situation and do not know what to do.",
         "expect_questions": true,
         "expect_final_answer": false
       },
       {
-        "message": "It's my manager. Things have been difficult lately.",
+        "message": "It involves my brother and some old resentment between us.",
         "expect_questions": true,
         "expect_final_answer": false
       },
       {
-        "message": "I was passed over for a promotion my manager had encouraged me to expect, and it went to a less experienced peer. My goal is to get a concrete development plan and a timeline for the next opening without burning the relationship. I have my quarterly one-on-one with her next Tuesday.",
+        "message": "I want to repair the relationship with my brother before our father's memorial next month, and set a clear boundary about the family business debt he owes me, without splitting the family. How should I approach the conversation?",
         "expect_questions": false,
         "expect_final_answer": true
       }

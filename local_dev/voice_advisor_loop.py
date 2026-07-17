@@ -51,10 +51,23 @@ SCRATCH = os.path.join(ROOT, "local_dev", ".advisor_rig")
 # "advice"/"or" (spec Risk 1) — AssistantRouting normalizes "adviser" to the advisor route.
 WAKE = os.environ.get("WAKE_WORD", "computer")
 TRIGGER = os.environ.get("ADVISOR_TRIGGER", "adviser")
-OPENER_SMOKE = f"{WAKE} {TRIGGER} my client keeps stalling our contract renewal, how do I get him to sign this week"
-OPENER_MULTI = f"{WAKE} {TRIGGER} I need advice about a person at work"
-ANSWER_1 = "it is a supplier renewal, they opened at nine percent, I want under four percent"
-ANSWER_2 = "sign this quarter and keep our priority production slots"
+# Openers/answers are env-overridable (like WAKE/TRIGGER) so the rig can adapt to a model whose
+# sufficiency gate PROCEEDs on a given phrasing. NOTE: the multi-turn opener must be vague enough to
+# FAIL the intake gate (no concrete problem + goal) or the advisor answers directly and no follow-up
+# round is exercised — an emotional "something happened, I don't know what to do" reliably gates on
+# qwen2.5:7b, whereas a work-problem opener PROCEEDs. See ADVISOR_OPENER_MULTI below.
+OPENER_SMOKE = os.environ.get(
+    "ADVISOR_OPENER_SMOKE",
+    "my client keeps stalling our contract renewal, how do I get him to sign this week",
+)
+OPENER_MULTI = os.environ.get(
+    "ADVISOR_OPENER_MULTI",
+    "I need advice about a person at work",
+)
+OPENER_SMOKE = f"{WAKE} {TRIGGER} {OPENER_SMOKE}"
+OPENER_MULTI = f"{WAKE} {TRIGGER} {OPENER_MULTI}"
+ANSWER_1 = os.environ.get("ADVISOR_ANSWER_1", "it is a supplier renewal, they opened at nine percent, I want under four percent")
+ANSWER_2 = os.environ.get("ADVISOR_ANSWER_2", "sign this quarter and keep our priority production slots")
 PLANTED_KEYWORDS = ["renewal", "supplier", "percent", "negotiation", "client"]
 
 # Marker patterns (the §2.7 contract). Byte-stable once shipped.

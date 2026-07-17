@@ -1,0 +1,22 @@
+{
+  "case_id": "advisor_memory_selectivity",
+  "config_hash": "965d2b39478453cd",
+  "git_sha": "9cbf415",
+  "metrics": {
+    "advisor.t0.errored": 1.0,
+    "advisor.t0.final_answer": 1.0,
+    "advisor.t0.memory_rows": 1.0,
+    "advisor.t1.errored": 1.0,
+    "advisor.t1.final_answer": 1.0,
+    "advisor.t1.memory_nearest_distance": 0.5922861695289583,
+    "advisor.t1.memory_rows": 2.0,
+    "advisor.t1.session_isolated": 1.0,
+    "advisor.t2.clean": 1.0,
+    "advisor.t2.contains_any": 1.0,
+    "advisor.t2.errored": 1.0,
+    "advisor.t2.final_answer": 1.0,
+    "advisor.t2.memory_nearest_distance": 0.21584450726373516,
+    "advisor.t2.memory_recalled": 2.0,
+    "advisor.t2.session_isolated": 1.0
+  }
+}

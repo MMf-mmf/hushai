@@ -1,0 +1,16 @@
+{
+  "case_id": "advisor_followup",
+  "config_hash": "965d2b39478453cd",
+  "git_sha": "9cbf415",
+  "metrics": {
+    "advisor.t0.errored": 1.0,
+    "advisor.t0.final_answer": 1.0,
+    "advisor.t0.questions": 1.0,
+    "advisor.t1.errored": 1.0,
+    "advisor.t1.session_continuous": 1.0,
+    "advisor.t2.errored": 1.0,
+    "advisor.t2.final_answer": 1.0,
+    "advisor.t2.memory_nearest_distance": 0.17978077055312824,
+    "advisor.t2.session_continuous": 1.0
+  }
+}
