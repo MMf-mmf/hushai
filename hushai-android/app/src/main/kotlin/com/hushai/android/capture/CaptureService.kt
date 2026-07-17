@@ -23,6 +23,7 @@ import com.hushai.android.net.Http
 import com.hushai.android.net.NetworkMonitor
 import com.hushai.android.assistant.VoiceSession
 import com.hushai.android.net.AdvisorClient
+import com.hushai.android.net.DetectiveClient
 import com.hushai.android.net.RagChatClient
 import com.hushai.android.net.RagClient
 import com.hushai.android.net.TtsClient
@@ -220,6 +221,16 @@ class CaptureService : Service() {
             clear = { settings.clearAdvisorSessionBlocking() },
             idleWindowMillis = ADVISOR_SESSION_IDLE_MILLIS,
         )
+        // Gotham "Detective" rides the SAME /v1/rag/chat endpoint as the RAG voice path (only
+        // agent_id="gotham" differs), so it reuses the rag host/token — no second port/URL/extra.
+        // Its own 30-min session keeps investigations off the plain-chat conversation history.
+        val detectiveClient = DetectiveClient(Http.rag, ragUrl, ragToken)
+        val detectiveSession = VoiceSession(
+            load = { settings.loadDetectiveSessionBlocking() },
+            save = { id, at -> settings.saveDetectiveSessionBlocking(id, at) },
+            clear = { settings.clearDetectiveSessionBlocking() },
+            idleWindowMillis = ADVISOR_SESSION_IDLE_MILLIS,
+        )
         // Multi-vector profile; a legacy single-centroid string parses as a 1-vector profile.
         val owner = SpeakerMath.parseProfile(settings.ownerEmbeddingBlocking())
         // Session state lives in DataStore (not this object), so a rebuilt assistant resumes the
@@ -239,6 +250,8 @@ class CaptureService : Service() {
             voiceSession = voiceSession,
             advisorClient = advisorClient,
             advisorSession = advisorSession,
+            detectiveClient = detectiveClient,
+            detectiveSession = detectiveSession,
             initialOwnerProfile = owner,
             // Already serialized (SpeakerMath.formatProfile) — store verbatim.
             onEnrollComplete = { serialized -> settings.setOwnerEmbeddingBlocking(serialized) },

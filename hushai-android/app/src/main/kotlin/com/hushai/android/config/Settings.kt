@@ -161,6 +161,29 @@ class Settings(private val context: Context) {
         }
     }
 
+    // --- Detective (Gotham) consult session (separate from rag/advisor; 30-min idle window) ---
+    fun loadDetectiveSessionBlocking(): Pair<String, Long>? = runBlocking {
+        context.dataStore.data.map {
+            val id = it[KEY_DETECTIVE_SESSION_ID]
+            val at = it[KEY_DETECTIVE_SESSION_AT] ?: 0L
+            if (id.isNullOrBlank()) null else id to at
+        }.first()
+    }
+
+    fun saveDetectiveSessionBlocking(sessionId: String, atMillis: Long) = runBlocking {
+        context.dataStore.edit {
+            it[KEY_DETECTIVE_SESSION_ID] = sessionId
+            it[KEY_DETECTIVE_SESSION_AT] = atMillis
+        }
+    }
+
+    fun clearDetectiveSessionBlocking() = runBlocking {
+        context.dataStore.edit {
+            it.remove(KEY_DETECTIVE_SESSION_ID)
+            it.remove(KEY_DETECTIVE_SESSION_AT)
+        }
+    }
+
     private suspend fun edit(key: androidx.datastore.preferences.core.Preferences.Key<String>, value: String) {
         context.dataStore.edit { it[key] = value }
     }
@@ -183,6 +206,8 @@ class Settings(private val context: Context) {
         val KEY_ADVISOR_TOKEN = stringPreferencesKey("advisor_token")
         val KEY_ADVISOR_SESSION_ID = stringPreferencesKey("advisor_session_id")
         val KEY_ADVISOR_SESSION_AT = longPreferencesKey("advisor_session_at_millis")
+        val KEY_DETECTIVE_SESSION_ID = stringPreferencesKey("detective_session_id")
+        val KEY_DETECTIVE_SESSION_AT = longPreferencesKey("detective_session_at_millis")
         // Debug/dev defaults (cleartext over the USB `adb reverse` tunnel / emulator).
         // RELEASE builds forbid cleartext (see src/release/network_security_config.xml),
         // so a release deployment MUST set an `https://<lan-ip>:8080` URL (cert SAN) via

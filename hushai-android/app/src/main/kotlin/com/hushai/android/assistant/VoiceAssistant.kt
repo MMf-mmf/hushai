@@ -3,6 +3,7 @@ package com.hushai.android.assistant
 import android.content.Context
 import com.hushai.android.capture.PcmSink
 import com.hushai.android.net.AdvisorClient
+import com.hushai.android.net.DetectiveClient
 import com.hushai.android.net.RagChatClient
 import com.hushai.android.net.RagClient
 import com.hushai.android.net.TtsClient
@@ -52,6 +53,10 @@ class VoiceAssistant(
     /** The advisor consult client + its own (30-min) session — invoked by name ("advisor …"). */
     private val advisorClient: AdvisorClient,
     private val advisorSession: VoiceSession,
+    /** The Gotham "Detective" client + its own (30-min) session — invoked by name ("detective …").
+     *  Rides the SAME `/v1/rag/chat` pipeline as the RAG path, only `agent_id="gotham"` differs. */
+    private val detectiveClient: DetectiveClient,
+    private val detectiveSession: VoiceSession,
     initialOwnerProfile: SpeakerMath.OwnerProfile?,
     /** Persist the SERIALIZED multi-vector profile (SpeakerMath.formatProfile). Called on a
      *  verified enrollment commit and on each guarded adaptation append. */
@@ -85,6 +90,13 @@ class VoiceAssistant(
     private var advisorPending = false
     // The follow-up round the advisor is currently on (for the followup-captured marker). Worker only.
     private var advisorRound = 0
+    // A bare "⟨wake⟩ detective" is awaiting its question (mirrors advisorPending). Worker-thread only.
+    private var detectivePending = false
+    // Which persona owns the CURRENT AWAIT_FOLLOWUP window, so the shared follow-up code (owner
+    // utterance dispatch + the window-open/timeout markers) routes to the right consult. Worker only.
+    private var followupAgent = FollowupAgent.NONE
+
+    private enum class FollowupAgent { NONE, ADVISOR, DETECTIVE }
 
     // Guided-enrollment state (worker thread only): accepted core samples, the current prompt
     // index, reject strikes, whether we're at the final self-verification step, and whether
@@ -169,7 +181,13 @@ class VoiceAssistant(
             // a wake-prefixed "advisor …" continues the same server session.
             if (phase == AssistantPhase.AWAIT_FOLLOWUP && awaitDeadlineNanos > 0L && now >= awaitDeadlineNanos) {
                 awaitDeadlineNanos = 0
-                HushaiLog.info("advisor followup timeout — resuming listen")
+                // Marker before resumeListening (which clears followupAgent). The consult survives in
+                // its session, so a wake-prefixed "advisor …"/"detective …" continues it.
+                if (followupAgent == FollowupAgent.DETECTIVE) {
+                    HushaiLog.info("detective followup timeout — resuming listen")
+                } else {
+                    HushaiLog.info("advisor followup timeout — resuming listen")
+                }
                 resumeListening(rec)
             }
             // Watchdog: never get stuck SPEAKING if synth/playback hangs past the deadline.
@@ -228,13 +246,30 @@ class VoiceAssistant(
                         advisorPending = true
                         speakThen("What would you like advice on?", AssistantPhase.AWAIT_QUESTION)
                     }
+                    is AssistantRouting.Route.Detective -> {
+                        // "⟨wake⟩ detective ⟨question⟩" in one utterance — verify on it, then investigate.
+                        if (verifyOwner(spk)) {
+                            HushaiLog.info("detective owner verified")
+                            detectiveConsult(rec, route.question, ownerVerified(spk), continueSession = true)
+                        } else reject(rec)
+                    }
+                    AssistantRouting.Route.DetectiveBare -> {
+                        // Bare "⟨wake⟩ detective": prompt for the question (mirrors AdvisorBare).
+                        HushaiLog.info("detective route: awaiting question")
+                        detectivePending = true
+                        speakThen("What would you like me to investigate?", AssistantPhase.AWAIT_QUESTION)
+                    }
                     is AssistantRouting.Route.Rag -> {
                         if (tailTokens.size >= MIN_QUESTION_WORDS) {
                             // Single utterance: wake + question together — verify on it.
                             if (verifyOwner(spk)) answer(rec, route.question, ownerVerified(spk)) else reject(rec)
                         } else {
                             // Bare wake word: wait for the question (a longer, better voice sample).
+                            // Clear BOTH consult-pending flags — a fresh bare wake is a plain-RAG
+                            // question until proven otherwise, so a stale advisor/detective-pending
+                            // from an abandoned bare consult must not capture it (would misroute).
                             advisorPending = false
+                            detectivePending = false
                             rec.reset()
                             phase = AssistantPhase.AWAIT_QUESTION
                             awaitDeadlineNanos = System.nanoTime() + QUESTION_TIMEOUT_NANOS
@@ -254,10 +289,17 @@ class VoiceAssistant(
                     advisorConsult(rec, text, continueSession = true)
                     return
                 }
+                // A pending bare-detective invocation routes this whole utterance as the question.
+                if (detectivePending) {
+                    detectivePending = false
+                    HushaiLog.info("detective owner verified")
+                    detectiveConsult(rec, text, ownerVerified(spk), continueSession = true)
+                    return
+                }
                 // Otherwise re-route the utterance: this also covers the two-clip rig path, where the
-                // wake ("computer") and "advisor ⟨question⟩" arrive as SEPARATE utterances — the wake
-                // lands here as a bare AWAIT_QUESTION, and the "advisor …" utterance must still route
-                // by name rather than becoming a rag question.
+                // wake ("computer") and "advisor/detective ⟨question⟩" arrive as SEPARATE utterances —
+                // the wake lands here as a bare AWAIT_QUESTION, and the "advisor …"/"detective …"
+                // utterance must still route by name rather than becoming a rag question.
                 when (val route = AssistantRouting.route(SpeakerMath.tokens(text))) {
                     is AssistantRouting.Route.Advisor -> advisorConsult(rec, route.question, continueSession = true)
                     AssistantRouting.Route.AdvisorBare -> {
@@ -265,26 +307,46 @@ class VoiceAssistant(
                         advisorPending = true
                         speakThen("What would you like advice on?", AssistantPhase.AWAIT_QUESTION)
                     }
+                    is AssistantRouting.Route.Detective -> {
+                        HushaiLog.info("detective owner verified")
+                        detectiveConsult(rec, route.question, ownerVerified(spk), continueSession = true)
+                    }
+                    AssistantRouting.Route.DetectiveBare -> {
+                        HushaiLog.info("detective route: awaiting question")
+                        detectivePending = true
+                        speakThen("What would you like me to investigate?", AssistantPhase.AWAIT_QUESTION)
+                    }
                     is AssistantRouting.Route.Rag -> answer(rec, text, ownerVerified(spk))
                 }
             }
             AssistantPhase.AWAIT_FOLLOWUP -> {
                 if (text.isBlank()) return
+                val forDetective = followupAgent == FollowupAgent.DETECTIVE
                 // Per-turn owner verify: a rejected speaker is IGNORED and the phase stays
                 // AWAIT_FOLLOWUP until the deadline — a stranger must not consume the owner's window.
                 if (!verifyOwner(spk)) {
-                    HushaiLog.info("speaker rejected (advisor follow-up) — ignoring, still awaiting")
+                    HushaiLog.info(
+                        if (forDetective) "speaker rejected (detective follow-up) — ignoring, still awaiting"
+                        else "speaker rejected (advisor follow-up) — ignoring, still awaiting",
+                    )
                     return
                 }
                 // "cancel"/"never mind" aborts the round (server session kept), returning to LISTENING.
                 if (AssistantRouting.isAbort(text)) {
-                    HushaiLog.info("advisor follow-up aborted by user")
+                    HushaiLog.info(if (forDetective) "detective follow-up aborted by user" else "advisor follow-up aborted by user")
                     speakAnswer("Okay.")
                     return
                 }
                 publish { it.copy(lastHeard = text) }
-                HushaiLog.info("advisor followup captured (round=$advisorRound, words=${SpeakerMath.tokens(text).size})")
-                advisorConsult(rec, text, continueSession = true)
+                if (forDetective) {
+                    // The detective follow-up is the spoken yes/no to a confirm gate; the server
+                    // intercepts it before routing (execution additionally needs owner_verified).
+                    HushaiLog.info("detective followup captured (words=${SpeakerMath.tokens(text).size})")
+                    detectiveConsult(rec, text, ownerVerified(spk), continueSession = true)
+                } else {
+                    HushaiLog.info("advisor followup captured (round=$advisorRound, words=${SpeakerMath.tokens(text).size})")
+                    advisorConsult(rec, text, continueSession = true)
+                }
             }
             else -> {}
         }
@@ -420,6 +482,8 @@ class VoiceAssistant(
         phase = AssistantPhase.LISTENING
         awaitDeadlineNanos = 0
         advisorPending = false
+        detectivePending = false
+        followupAgent = FollowupAgent.NONE
         HushaiLog.info("speaker rejected (cosine below threshold)")
         publish { it.copy(phase = AssistantPhase.LISTENING, note = "speaker not recognized — ignoring") }
     }
@@ -468,7 +532,12 @@ class VoiceAssistant(
         speakDeadlineNanos = 0
         phase = AssistantPhase.AWAIT_FOLLOWUP
         awaitDeadlineNanos = System.nanoTime() + FOLLOWUP_TIMEOUT_NANOS
-        HushaiLog.info("advisor questions spoken — awaiting answer")
+        // The window-open anchor (post-TTS): rig sequencing depends on it firing only after playback.
+        if (followupAgent == FollowupAgent.DETECTIVE) {
+            HushaiLog.info("detective confirm — awaiting yes/no")
+        } else {
+            HushaiLog.info("advisor questions spoken — awaiting answer")
+        }
         publish { it.copy(phase = AssistantPhase.AWAIT_FOLLOWUP, note = null) }
     }
 
@@ -478,6 +547,8 @@ class VoiceAssistant(
         awaitDeadlineNanos = 0
         speakDeadlineNanos = 0
         advisorPending = false
+        detectivePending = false
+        followupAgent = FollowupAgent.NONE
         phase = AssistantPhase.LISTENING
         publish { it.copy(phase = AssistantPhase.LISTENING, note = note) }
     }
@@ -522,6 +593,7 @@ class VoiceAssistant(
             is AdvisorClient.Result.Questions -> {
                 advisorSession.record(result.sessionId, now)
                 advisorRound = result.round
+                followupAgent = FollowupAgent.ADVISOR
                 HushaiLog.info("advisor questions round=${result.round} count=${result.questions.size} (session=${result.sessionId})")
                 speakQuestions(buildQuestionsTts(result.questions))
             }
@@ -566,6 +638,99 @@ class VoiceAssistant(
         return sb.toString()
     }
 
+    // --- Detective consult (the "detective …" route; Gotham §2.7 voice) ------------
+    //
+    // LISTENING --"⟨wake⟩ detective ⟨q⟩"--> [verify] --> THINKING (gotham chat, agent_id="gotham")
+    //   THINKING --Answer--> SPEAKING (investigation result) --> LISTENING
+    //   THINKING --Confirm(summary)--> SPEAKING (summary + "say yes to confirm")
+    //        --speech done--> AWAIT_FOLLOWUP (30 s) --owner "yes"/"no"--> THINKING (same session;
+    //        the server intercepts the yes/no before routing) --> Answer --> SPEAKING --> LISTENING
+    // The confirm path is DORMANT in Phase 1 (mutations off) but present + exercised, mirroring the
+    // viewer's confirm bubble. The Detective streams a SUPERSET SSE; the voice client ignores every
+    // phase/tool trace event and speaks only the answer (unknown-event tolerance in DetectiveClient).
+    // The worker BLOCKS on the chat call — PCM is dropped during THINKING, so the phone never
+    // transcribes its own reply.
+
+    private fun detectiveConsult(
+        rec: Recognizer,
+        question: String,
+        ownerVerified: Boolean,
+        continueSession: Boolean,
+    ) {
+        // "new chat"/"start over" resets the investigation on-device (never sent to the server).
+        if (VoiceSession.isResetCommand(question)) {
+            detectiveSession.reset()
+            HushaiLog.info("detective session reset by spoken command")
+            publish { it.copy(lastQuestion = question) }
+            speakAnswer("Okay, starting fresh.")
+            return
+        }
+        phase = AssistantPhase.THINKING
+        val now = System.currentTimeMillis()
+        val tzOffsetSecs = TimeZone.getDefault().getOffset(now) / 1000L
+        val sid = if (continueSession) detectiveSession.currentOrNull(now) else null
+        HushaiLog.info("detective route (session=${sid ?: "new"})")
+        publish { it.copy(phase = AssistantPhase.THINKING, lastQuestion = question, note = null) }
+        deliverDetectiveResult(
+            rec,
+            detectiveClient.chat(question, sid, ownerVerified, deviceId, tzOffsetSecs),
+            now, question, ownerVerified, allowRetry = true,
+        )
+    }
+
+    /** Dispatch one Detective turn's result: speak the answer, or the confirm summary (→ follow-up
+     *  window for the spoken yes/no), retry once on a lost session, else speak a graceful fallback. */
+    private fun deliverDetectiveResult(
+        rec: Recognizer,
+        result: DetectiveClient.Result,
+        now: Long,
+        question: String,
+        ownerVerified: Boolean,
+        allowRetry: Boolean,
+    ) {
+        when (result) {
+            is DetectiveClient.Result.Answer -> {
+                detectiveSession.record(result.sessionId, now)
+                HushaiLog.info("detective answer ok (session=${result.sessionId})")
+                speakAnswer(result.text)
+            }
+            is DetectiveClient.Result.Confirm -> {
+                detectiveSession.record(result.sessionId, now)
+                followupAgent = FollowupAgent.DETECTIVE
+                HushaiLog.info("detective confirm spoken (session=${result.sessionId})")
+                // speakQuestions resumes into AWAIT_FOLLOWUP (the yes/no window); the deterministic
+                // summary is server-composed (§2.5 — never the model). 30 s window, wake-free.
+                speakQuestions("${result.summary} Say yes to confirm.")
+            }
+            DetectiveClient.Result.SessionNotFound -> {
+                if (allowRetry) {
+                    // The stored session was pruned / the DB wiped — forget it and retry once fresh.
+                    HushaiLog.info("detective session gone — retrying sessionless")
+                    detectiveSession.reset()
+                    val tz = TimeZone.getDefault().getOffset(now) / 1000L
+                    deliverDetectiveResult(
+                        rec,
+                        detectiveClient.chat(question, null, ownerVerified, deviceId, tz),
+                        now, question, ownerVerified, allowRetry = false,
+                    )
+                } else {
+                    HushaiLog.info("detective error: session lost")
+                    speakAnswer("Sorry — the detective isn't available right now.")
+                }
+            }
+            DetectiveClient.Result.EndpointMissing -> {
+                // Older rag server without the gotham agent — degrade gracefully.
+                HushaiLog.info("detective error: endpoint missing")
+                speakAnswer("Sorry — the detective isn't available on this server.")
+            }
+            is DetectiveClient.Result.Error -> {
+                // Empty answers map to Error upstream — treated identically (spoken fallback → LISTENING).
+                HushaiLog.info("detective error: ${result.reason}")
+                speakAnswer("Sorry — the detective isn't available right now.")
+            }
+        }
+    }
+
     // --- Guided enrollment --------------------------------------------------------
     //
     // Six prompted samples (varied phrases; the last two ask for a different distance /
@@ -586,6 +751,12 @@ class VoiceAssistant(
         enrollVerifying = false
         enrollVerifyRetried = false
         enrollStrikes = 0
+        // Enrollment supersedes any in-flight consult: clear the pending/follow-up flags so a bare
+        // advisor/detective invocation interrupted by Enroll can't leave a stale flag that misroutes
+        // the next question after enrollment returns to LISTENING.
+        advisorPending = false
+        detectivePending = false
+        followupAgent = FollowupAgent.NONE
         phase = AssistantPhase.ENROLLING
         rec.reset()
         queue.clear()

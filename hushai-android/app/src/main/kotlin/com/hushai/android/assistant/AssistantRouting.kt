@@ -6,9 +6,13 @@ import java.util.Locale
  * Decides where an utterance goes AFTER the wake word is stripped. Pure and side-effect-free so
  * the routing contract is unit-testable without the Vosk loop.
  *
- * The advisor is invoked by NAME — token[0] of the tail must be the keyword "advisor" (the ASR
- * "adviser" spelling is normalized here, NOT aliased). "advisor" anywhere else in the utterance
- * ("is my advisor lying") is a plain RAG question — the keyword only counts as the first token.
+ * Two personas are invoked by NAME — token[0] of the tail must be the keyword. The advisor
+ * (book-grounded consult) triggers on "advisor" (the ASR "adviser" spelling is normalized here,
+ * NOT aliased); the Gotham Detective (investigation over the entity graph, `agent_id="gotham"`)
+ * triggers on "detective" (with "inspector"/"sherlock" accepted as Vosk-orthography fallbacks — the
+ * §2.7 risk note: whichever the small acoustic model recognizes reliably wins, mirroring how
+ * "adviser" hedges "advisor"). A keyword anywhere else in the utterance ("is my advisor lying",
+ * "the detective show") is a plain RAG question — a keyword only counts as the first token.
  */
 object AssistantRouting {
 
@@ -19,10 +23,19 @@ object AssistantRouting {
         data object AdvisorBare : Route
         /** "⟨wake⟩ advisor ⟨question⟩" — consult the advisor with [question]. */
         data class Advisor(val question: String) : Route
+        /** "⟨wake⟩ detective" with no real question — prompt for one, then await it. */
+        data object DetectiveBare : Route
+        /** "⟨wake⟩ detective ⟨question⟩" — investigate with the Gotham Detective (`agent_id="gotham"`). */
+        data class Detective(val question: String) : Route
     }
 
     /** ASR orthographies of the trigger word (normalization, not an alias — no "Ahithophel"). */
     private val ADVISOR_KEYWORDS = setOf("advisor", "adviser")
+
+    /** Detective trigger + its Vosk-orthography fallbacks (§2.7). "detective" is primary; the
+     *  fallbacks are accepted so a small-model that mishears the primary still routes — the same
+     *  hedge "adviser" gives "advisor". All disjoint from [ADVISOR_KEYWORDS]. */
+    private val DETECTIVE_KEYWORDS = setOf("detective", "inspector", "sherlock")
 
     /** A tail must carry at least this many words to count as a real question (mirrors the
      *  VoiceAssistant wake-path threshold), else it's treated as a bare invocation. */
@@ -33,12 +46,19 @@ object AssistantRouting {
      */
     fun route(tailTokens: List<String>): Route {
         val head = tailTokens.firstOrNull()?.lowercase(Locale.US)
+        val remainder = tailTokens.drop(1)
         if (head != null && head in ADVISOR_KEYWORDS) {
-            val remainder = tailTokens.drop(1)
             return if (remainder.size >= MIN_QUESTION_WORDS) {
                 Route.Advisor(remainder.joinToString(" "))
             } else {
                 Route.AdvisorBare
+            }
+        }
+        if (head != null && head in DETECTIVE_KEYWORDS) {
+            return if (remainder.size >= MIN_QUESTION_WORDS) {
+                Route.Detective(remainder.joinToString(" "))
+            } else {
+                Route.DetectiveBare
             }
         }
         return Route.Rag(tailTokens.joinToString(" "))
