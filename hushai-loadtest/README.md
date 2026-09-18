@@ -44,7 +44,8 @@ Ollama up if `SENTIMENT_ENABLED`/embeddings are on.
 
 # 2) ramp to 30 cameras, full pipeline
 cargo run -p hushai-loadtest -- \
-  --video IMG_7256.mp4 --max-cameras 30 --soak-secs 90 --profile everything
+  --video "$PWD/local_dev/.demo_work/clips/front_door.mp4" \
+  --max-cameras 30 --soak-secs 90 --profile everything
 #   --no-powermetrics    # skip the sudo GPU/ANE sampler (CPU/RSS via `ps` still works)
 
 # 3) remove the synthetic devices when done

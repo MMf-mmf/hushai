@@ -1,128 +1,146 @@
-# Hushai workspace
+# Hushai
 
-A Cargo workspace for the Hushai data-intake + retrieval system.
+**A self-hosted NVR that transcribes, identifies and indexes everything your cameras see and
+hear — then answers questions about it in plain English. Nothing leaves the machine.**
 
-| crate | role |
-|-------|------|
-| [`hushai-backend`](hushai-backend/) | Durable, idempotent **segment-ingest** server (camera→backend contract v0.1.0, `:8080`). Owns the DB schema + the authenticated admin API (speakers/persons/plates/devices/events/watchlist/audit). |
-| [`hushai-worker`](hushai-worker/) | Durable, resumable, idempotent **processing** worker: two SKIP-LOCKED queues — audio (whisper ASR → embeddings → sentiment → speaker ID) and vision (faces → objects → ALPR) — plus event production + alert delivery. |
-| [`hushai-rag`](hushai-rag/) | **RAG** service (`:8090`): grounded Q&A + multi-turn SSE chat over the recordings with auto-routed agents, source citations, and local TTS. |
-| [`hushai-viewer`](hushai-viewer/) | The unified **browser app** (NVR timeline + chat + admin modals + dashboard + Events/Files pages, `127.0.0.1:8070`); reverse-proxies `/v1/*`; reuses `hushai-backend` as a library. |
-| [`hushai-android`](hushai-android/) | Native Kotlin capture client: ~2s segments, live preview, battery-saver, audio-only mode, on-device voice assistant, and Voices/People/Plates/Events screens. |
-| [`hushai-eval`](hushai-eval/) | End-to-end regression harness: inject known clips → wait → score vs ground truth → verdict + exit code. |
-| [`hushai-loadtest`](hushai-loadtest/) | Capacity harness: replay one clip as N synthetic cameras and find the saturation point. |
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-edition%202024-orange.svg)](https://www.rust-lang.org/)
+[![Local-first](https://img.shields.io/badge/cloud-none-brightgreen.svg)](#privacy)
 
-All crates reuse `hushai-backend` as a library (DB `Config` + pool + shared TLS/observe/logging) and
-are **fully local / privacy-first**: ASR via whisper.cpp, embeddings + LLM via a local Ollama server,
-vision + TTS via local ONNX models — captured media never leaves the machine. See
-[`AGENTS.md`](AGENTS.md) for the full architecture and [`CHANGELOG.md`](CHANGELOG.md) for history.
+![The Hushai timeline: a scrubbable HLS NVR stitched from thousands of 2-second segments](docs/img/01-timeline.png)
 
-## Quick start on a new machine
+Point a camera at something. Hushai stores every 2-second segment exactly once, transcribes the
+audio, learns who the voices and faces belong to, reads licence plates, notices when something is
+unusual — and lets you ask *"was anything delivered on Tuesday?"* instead of scrubbing three hours
+of footage. Speech recognition, embeddings, language models, vision and text-to-speech all run
+locally: there is no cloud account, no subscription and no egress.
 
-One interactive command takes a clean checkout to a running stack with your device(s)
-streaming live:
+## What it does
 
-```bash
-./local_dev/onboard.sh
-```
+- **Ask your footage questions.** Grounded retrieval over every transcript, with streaming answers
+  and source citations that deep-link straight to the moment in the timeline.
+- **Know who and what.** Voiceprints, face re-identification, open-vocabulary object detection and
+  licence-plate recognition, each maintaining its own catalog you can name and merge.
+- **Notice things.** Sessionized events, an alert-rule engine (camera, type, severity, time window,
+  cooldown), watchlists, webhook delivery, and daily digests.
+- **Scrub like an NVR.** A single continuous timeline stitched from thousands of 2-second clips,
+  with per-second AI processing status, a detections overlay, and clip export.
+- **Never phone home.** whisper.cpp for speech, Ollama for embeddings and generation, ONNX for
+  vision and speech synthesis, Postgres + pgvector for storage. All on your hardware.
 
-It asks what you need (how many devices, USB or WiFi, which AI features), then does the
-rest — installs missing dependencies (asking first), starts Postgres + Ollama, downloads
-the transcription model, writes `.env`, mints a per-device token for each camera, brings
-the whole stack up, and (for USB phones) builds + launches the app so it streams over the
-cable. It ends by printing every URL, token, and password you need, and holds the stack in
-the foreground (Ctrl-C stops everything). Re-running is always safe — it tears down any
-stack left over from a previous run first.
+## Screenshots
 
-macOS (Apple Silicon) is the tested path; Linux (apt/dnf) is supported best-effort. If you
-already have `.env` + models set up, skip onboarding and use `./local_dev/run_stack.sh`
-directly (see **Run** below).
+| | |
+|---|---|
+| ![Detections overlay: people and objects boxed on the live frame](docs/img/02-detections.png) <br> **Detections overlay** — faces, people and objects boxed on the frame, named where Hushai recognises them. | ![Chat answering a question with citations into the timeline](docs/img/03-chat.png) <br> **Ask the footage** — a grounded answer with citations that jump to the exact second. |
+| ![Investigate: an entity page with same-identity candidates and the evidence behind each match](docs/img/04-investigate.png) <br> **Investigate** — who an identity was seen with, which cameras it frequents, and the matches it proposed but wasn't sure enough to make. | ![System dashboard: cameras, services, work queues and audit trail](docs/img/05-dashboard.png) <br> **Operate** — cameras, service health, work queues and the audit trail in one place. |
 
-## Prerequisites
+The alert centre, and notes on how every image here is generated, are in
+[docs/screenshots.md](docs/screenshots.md).
 
-```bash
-# Postgres + pgvector (the backend's schema must be migrated)
-createdb hushai            # or use the existing DB
-export DATABASE_URL=postgres://localhost/hushai
+## Quickstart
 
-# ffmpeg (audio extraction)
-brew install ffmpeg
-
-# Local models
-brew install ollama && ollama serve &
-ollama pull mxbai-embed-large    # embeddings, 1024-dim (hard requirement)
-ollama pull qwen2.5:7b           # RAG answer LLM (RAG_LLM_MODEL; config-driven)
-ollama pull llama3.2:3b          # worker sentiment lane (config-driven)
-
-# whisper.cpp GGML model (local ASR)
-mkdir -p models
-curl -L -o models/ggml-base.en.bin \
-  https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin
-```
-
-Configuration is env-driven (`.env` at the workspace root; see each crate's `.env.example`).
-
-## Run
-
-One command brings up all four services (backend, worker, rag, viewer) and tears the whole
-thing down with a single Ctrl-C:
+macOS on Apple Silicon is the tested path; Linux is supported best-effort.
 
 ```bash
-./local_dev/run_stack.sh
+git clone https://github.com/MMf-mmf/hushai.git && cd hushai
+./local_dev/onboard.sh          # installs deps, starts Postgres + Ollama, fetches models,
+                                # writes .env, mints a camera token, brings the stack up
 ```
 
-It preflights the infra deps (Postgres, Ollama), builds the workspace, launches every service,
-health-checks the ports, and prints a URL map. **On start it first tears down any stack left
-running from a previous run** (its own processes only — an unrelated app on a port makes it stop
-and tell you), so a plain re-run is always clean; you rarely need `--down`. See
-[`AGENTS.md`](AGENTS.md) "Run the full stack locally" for flags (`--with-android`, `--no-build`,
-`--release`, `--pull`, `--tls`, `--add-camera`, `--down`) and the manual per-terminal flow with its
-gotchas.
+`onboard.sh` asks what you need and does the rest; re-running it is always safe. Once set up:
 
-Run it on a shared network with `--tls` (HTTPS + admin IP-allowlist/password + per-device camera
-tokens — see [`AGENTS.md`](AGENTS.md) "LAN security model"). To onboard a new camera, run
+```bash
+./local_dev/run_stack.sh        # backend + worker + rag + viewer; one Ctrl-C stops everything
+open http://127.0.0.1:8070
+```
+
+To see the UI with data before you have a camera, build a demo dataset — every frame comes from a
+public-domain photograph and every word is synthesized, so it is safe to show anyone:
+
+```bash
+createdb hushai_demo
+DATABASE_URL="postgres://$USER@localhost:5432/hushai_demo" \
+BLOB_DIR="$PWD/local_dev/.demo_work/blobs" VISION_MOTION_SKIP_ENABLED=false \
+  ./local_dev/run_stack.sh &
+./local_dev/build_demo.sh        # three cameras, three days; the worker then needs ~an hour
+```
+
+It builds three fictional cameras from public-domain stills, synthesizes the dialogue with `say`,
+and refuses to run against any database whose name doesn't end in `_demo`. Every screenshot in this
+README comes from it — see [docs/screenshots.md](docs/screenshots.md).
+
+Adding a real camera: install the Android client (`hushai-android`) or write your own against
+[the camera→backend contract](contracts/cameraToBackendContract.md), then
 `./local_dev/run_stack.sh --add-camera <name>` and follow
-[`docs/onboarding-a-camera.md`](docs/onboarding-a-camera.md).
+[docs/onboarding-a-camera.md](docs/onboarding-a-camera.md).
 
-To reach the admin viewer by a friendly, no-port name — **`https://hushai.local/`** — just run
-**`./local_dev/serve.sh`** (macOS): one command that generates + trusts the TLS cert, sets the
-Bonjour name + a 443→8070 redirect, then starts the stack on the LAN. It's idempotent (re-running
-skips whatever's already set up; `./local_dev/serve.sh --check` reports status without changing
-anything). **Linux/Windows:** see [`docs/friendly-url-linux.md`](docs/friendly-url-linux.md) and
-[`docs/friendly-url-windows.md`](docs/friendly-url-windows.md).
+**Requirements:** Rust (edition 2024), Postgres 16 with the `vector`, `pg_trgm` and
+`fuzzystrmatch` extensions (tested against pgvector 0.8), ffmpeg, and Ollama with
+`mxbai-embed-large`, `qwen2.5:7b` and `llama3.2:3b`. The vision lanes need ONNX weights, which
+`./local_dev/provision_vision.sh` fetches; **each lane self-disables when its weights are absent**,
+so you can run only the parts you want.
 
-Or run each service manually:
+## How it works
 
-```bash
-# 1. Ingest server (accepts segments; also applies migrations)
-cargo run -p hushai-backend            # :8080
+A capture client cuts ~2-second muxed fMP4 segments and POSTs each one with a manifest. The backend
+stores the blob content-addressed and the metadata in Postgres, exactly once, resumably. A worker
+drains two `FOR UPDATE SKIP LOCKED` queues — audio (speech → embeddings → sentiment → speaker
+identity) and vision (faces → objects → plates) — and produces events. The RAG service answers
+questions over the result; the viewer is the browser app and the authenticating gateway in front of
+everything.
 
-# 2. Transcription + embedding worker (drains backlog, then keeps up)
-cargo run -p hushai-worker
+| Component | Port | Role |
+|---|---|---|
+| [`hushai-backend`](hushai-backend/) | `:8080` | Segment ingest, schema and migrations, admin API |
+| [`hushai-worker`](hushai-worker/) | — | Audio and vision processing lanes, events, alert delivery |
+| [`hushai-rag`](hushai-rag/) | `:8090` | Grounded Q&A, streaming chat, local text-to-speech |
+| [`hushai-viewer`](hushai-viewer/) | `:8070` | Browser NVR, admin console, auth gateway, reverse proxy |
+| [`hushai-advisor`](hushai-advisor/) | `:8095` | Optional book-grounded advice agent |
+| [`hushai-android`](hushai-android/) | — | Kotlin capture client with an on-device voice assistant |
+| [`hushai-eval`](hushai-eval/) · [`hushai-loadtest`](hushai-loadtest/) | — | Regression harness · capacity harness |
 
-# 3. RAG endpoint
-cargo run -p hushai-rag                # :8090
-curl -s -X POST localhost:8090/v1/rag/query \
-  -H 'content-type: application/json' \
-  -d '{"query":"what did they say about the cameras?","top_k":8}' | jq
+Crash safety is the design centre: a killed worker's in-flight segment is re-leased and finished on
+restart with no duplicate sentences, and re-POSTing a segment is a no-op. Schema changes are
+forward-only migrations applied at startup (currently through `0031`).
 
-# 4. Viewer (unified browser app: NVR timeline + chat)
-cargo run -p hushai-viewer             # http://127.0.0.1:8070 (or https://hushai.local/ — see --lan / setup_hostname.sh)
-```
+## Status & limitations
 
-## Test
+Hushai runs a real household. It is also honest about what it is not:
 
-```bash
-export DATABASE_URL=postgres://localhost/hushai
-cargo test --workspace                 # unit + live-DB integration (skips DB tests if unset)
-```
+- **Single-owner, single-node.** No multi-tenancy, no roles, no horizontal scale. Everyone who can
+  authenticate is assumed to be the owner. A capture-device token also reaches the destructive admin
+  API — keep `:8080` off untrusted networks. See [SECURITY.md](SECURITY.md) for the full list.
+- **Identity is a hint, not evidence.** Speaker, face and plate thresholds are tuned against clean
+  audio and clean photographs. On noisy real footage they both over-merge and over-split.
+- **No containers and no CI yet.** You build it and run it from source.
+- **Transcription is as good as whisper.cpp on your audio** — which on a doorbell in the rain is
+  not very good.
 
-## Notes
+Capacity: the network is never the limit, compute is. At stock settings one machine saturates
+**below** 30 cameras; a Linux host with an NVIDIA GPU is the realistic path to 30 on a single box,
+Apple Silicon reaches good mid density, and CPU-only needs several. Measure your own with
+`./local_dev/run_loadtest.sh` — see
+[docs/hardware-sizing-30-cameras.md](docs/hardware-sizing-30-cameras.md).
 
-- **Embedding dimension is fixed at 1024** (`mxbai-embed-large` / BGE-large) to match
-  `transcript_sentences.embedding vector(1024)`; every vector is dimension-checked before write.
-- The workspace is on `sqlx 0.9` + `pgvector 0.4.2`; embeddings bind as native `pgvector::Vector`
-  over the binary protocol — there are no `::vector` text casts left.
-- The worker is crash-safe: `segment_transcription_status` + `FOR UPDATE SKIP LOCKED` + a claim
-  lease mean a killed worker's in-flight segment is re-leased and finished on restart, with no
-  duplicate sentences (atomic delete-then-insert per segment).
+## Privacy
+
+Captured media never leaves the machine. There is no telemetry, no analytics and no cloud
+dependency; the only outbound traffic is what you configure yourself, such as an alert webhook.
+
+Recording people is regulated, and the rules differ by jurisdiction — consent for audio, notice for
+video, and separate rules again for biometric data like faceprints and voiceprints. Hushai puts
+face recognition, voice identification and plate reading in one box. **Operating it lawfully is
+your responsibility.** Please don't point it at people who haven't agreed to it.
+
+## Contributing
+
+Issues and pull requests are welcome — start with [CONTRIBUTING.md](CONTRIBUTING.md). Architecture,
+invariants and the non-obvious gotchas are in [AGENTS.md](AGENTS.md); per-component detail is in
+each crate's own README; dated history is in [CHANGELOG.md](CHANGELOG.md).
+
+## License
+
+MIT — see [LICENSE](LICENSE). The machine-learning models Hushai downloads at setup time carry
+their own licenses, some of them restrictive: see
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) before any commercial deployment.

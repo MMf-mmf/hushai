@@ -103,7 +103,7 @@ It declares the **saturation point** = the largest N where the worker keeps up w
 ./local_dev/run_stack.sh
 
 # 2) single profile (full pipeline), ramp to 30
-cargo run -p hushai-loadtest -- --video IMG_7256.mp4 --max-cameras 30 --profile everything
+cargo run -p hushai-loadtest -- --video "$PWD/local_dev/.demo_work/clips/front_door.mp4" --max-cameras 30 --profile everything
 #    (add --no-powermetrics to skip the sudo GPU/ANE sampler)
 
 # 3) attribute per-subsystem cost across profiles

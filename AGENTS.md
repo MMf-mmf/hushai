@@ -613,8 +613,36 @@ of the shared `eval.env` so a plain run's config-hash stays `d4acc862`; the agen
 lineage (`a5bb8a7054745a55`). A
 physical camera-at-screen tier is `local_dev/physical_loopback.py`. Read the playbook before using the loop.
 
-Unit + integration tests: `cargo test --workspace` (the DB-touching integration tests are
-`DATABASE_URL`-gated; the vision tests are additionally model-gated and SKIP until provisioned).
+Unit + integration tests: `cargo test --workspace -- --test-threads=1` (the DB-touching
+integration tests are `DATABASE_URL`-gated; the vision tests are additionally model-gated and SKIP
+until provisioned). **`--test-threads=1` is load-bearing**: the DB-backed tests share real tables
+and `delivery::run_once` claims a whole batch of pending rows, so concurrent tests steal each
+other's fixtures and fail non-deterministically (`claimed at least our delivery`, a row stuck
+`pending`). Serial on a freshly migrated DB: 422 passed, 0 failed, 1 ignored.
+
+### Publishable demo dataset + screenshots (`local_dev/build_demo.sh`, `hushai-viewer/e2e/shots.mjs`)
+
+The README's images live in `docs/img/` and are regenerated, never hand-made. `build_demo.sh`
+creates a `hushai_demo` database from **public-domain stills plus `say`-synthesized dialogue** —
+three fictional cameras over three days, exercising every lane (ASR, embeddings, sentiment, speaker
+ID, faces, objects, ALPR, events, graph) — and refuses any DB whose name doesn't end in `_demo`.
+`shots.mjs` then captures it through real Chrome. This exists because the owner's real `hushai` DB
+is footage of real people and must never reach a screenshot or a committed fixture.
+
+Three non-obvious constraints, all documented at length in
+[`docs/screenshots.md`](docs/screenshots.md):
+
+- **Two capture passes.** `SHOTS_PASS=player` must run with nothing feeding the stack;
+  `SHOTS_PASS=live` needs `local_dev/demo_live_feed.sh` running (the dashboard calls a camera
+  offline after 5m of silence), and that feeder must be `--cleanup`'d afterwards. The feeder moves
+  each camera's newest segment to *now*, and the player can only navigate the last
+  `VIEWER_MAX_WINDOW_NANOS` (6h) back from there — so leaving it running, or leaving its segments
+  behind, makes the player shots silently land on the live tail.
+- **No faces are published.** Two of the three demo cameras are built from real people's
+  public-domain portraits, so the captured set deliberately avoids every surface that renders a
+  person crop (the camera wall, a `person` watchlist row, the binding review queue).
+- **Never edit a running bash script.** `bash` reads a script by byte offset, so editing
+  `build_demo.sh` mid-run resumes it mid-line (`psql "$DB_UR` + `L -tAF...: command not found`).
 
 ## Build/run gotchas (non-obvious)
 

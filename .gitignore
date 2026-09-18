@@ -72,6 +72,10 @@ local_dev/.venv*/
 *.dump
 *.sql.gz
 
-# Screenshot campaign output (regenerable; see hushai-viewer/e2e/shots.mjs)
+# Generated demo dataset: public-domain source stills, synthesized dialogue, built clips,
+# and the demo blob store. All regenerable with ./local_dev/build_demo.sh.
+local_dev/.demo_work/
+
+# Test-campaign output (regenerable). Note that docs/img/ is deliberately NOT ignored: those
+# screenshots are committed, and regenerated with hushai-viewer/e2e/shots.mjs.
 local_dev/campaign_out/
-docs/img/*.orig.png

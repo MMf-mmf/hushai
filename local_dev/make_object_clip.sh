@@ -3,7 +3,7 @@
 # object-lane decode + the cross-modal CLIP test have a deterministic fixture (the always-on capture
 # corpus is mostly empty desks; AGENTS.md notes faces/objects are often absent there).
 #
-# Mirrors the IMG_7256.mp4 convention: a single .mp4 at the repo root, gitignored, operator-made.
+# Mirrors the build_demo.sh convention: generated media, gitignored, operator-made.
 # It's a slow "ken-burns" pan/zoom over a still image (so multiple sampled frames all contain the
 # object), encoded H.264/yuv420p like the real capture client's segments.
 #

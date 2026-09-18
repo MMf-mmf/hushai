@@ -22,8 +22,21 @@ is [contracts/cameraToBackendContract.md](contracts/cameraToBackendContract.md).
 cargo fmt --all
 cargo clippy --workspace --all-targets
 SQLX_OFFLINE=true cargo build --workspace
-DATABASE_URL=postgres://localhost/hushai cargo test --workspace
+
+createdb hushai_dev_test   # once
+DATABASE_URL="postgres://$USER@localhost:5432/hushai_dev_test" \
+  cargo test --workspace -- --test-threads=1
 ```
+
+`--test-threads=1` is required, not a preference. The DB-backed tests share real tables, and the
+alert-delivery loop claims a *batch* of pending rows — so two tests running at once steal each
+other's fixtures and fail with things like `claimed at least our delivery`. Serially the suite is
+**422 passed, 0 failed, 1 ignored**; in parallel it fails differently on different runs.
+
+Point the tests at a **throwaway database**, never at the one your cameras record into — several
+integration tests truncate the tables they exercise. Include the role in the URL
+(`postgres://$USER@…`): without it libpq falls back to the OS user in a way that can fail with
+`role "anonymous" does not exist`.
 
 There is **no CI yet** — these checks are on you. Two notes on the test suite:
 
@@ -31,7 +44,7 @@ There is **no CI yet** — these checks are on you. Two notes on the test suite:
   additionally gated on the ONNX weights being provisioned. Keep new model-dependent tests
   gated the same way, so the suite stays runnable on a machine without multi-gigabyte
   downloads.
-- Worker tests must run serially — see
+- Worker tests must run serially (the `--test-threads=1` above) — see
   [docs/worker-parallelism-and-scaling.md](docs/worker-parallelism-and-scaling.md) §6.
 
 Android:
@@ -49,6 +62,11 @@ Viewer UI changes should pass the headless sweep, which needs **real Google Chro
 ```bash
 cd hushai-viewer/e2e && npm i && node run.mjs
 ```
+
+It needs a stack with footage in it. If you have no camera, `./local_dev/build_demo.sh` builds a
+`hushai_demo` database from public-domain stills and synthesized dialogue that exercises every
+lane. The README's screenshots are regenerated from that same dataset — see
+[docs/screenshots.md](docs/screenshots.md) if you change the UI enough to date them.
 
 ## Conventions
 

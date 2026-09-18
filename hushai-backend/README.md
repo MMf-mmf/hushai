@@ -130,18 +130,21 @@ curl -w '%{http_code}\n' localhost:8080/healthz   # 200
 
 ## Feed the real video
 
-`../local_dev/feed_segments.py` splits `IMG_7256.mp4` into conforming MUXED ~2 s fMP4
-segments (ffmpeg) and POSTs them:
+`../local_dev/feed_segments.py` splits a video file into conforming MUXED ~2 s fMP4
+segments (ffmpeg) and POSTs them. Build a public-domain demo clip first with
+`../local_dev/build_demo.sh`, or pass `--video` an absolute path to your own:
 
 ```bash
 cd ../local_dev
-python3 feed_segments.py --device cam-A                 # 10/10 accepted
-python3 feed_segments.py --device cam-A                 # re-run: all idempotent 200s
-python3 feed_segments.py --device cam-B & python3 feed_segments.py --device cam-C & wait
+V="$PWD/.demo_work/clips/front_door.mp4"                # --video must be an ABSOLUTE path
+python3 feed_segments.py --device cam-A --video "$V"              # 10/10 accepted
+python3 feed_segments.py --device cam-A --video "$V"              # re-run: all idempotent 200s
+python3 feed_segments.py --device cam-B --video "$V" &
+python3 feed_segments.py --device cam-C --video "$V" & wait
 # negative paths:
-python3 feed_segments.py --device cam-A --bad-token     # 401
-python3 feed_segments.py --device cam-A --corrupt-body  # 422
-python3 feed_segments.py --device cam-A --conflict      # 422 (segment_id reuse, different bytes)
+python3 feed_segments.py --device cam-A --video "$V" --bad-token    # 401
+python3 feed_segments.py --device cam-A --video "$V" --corrupt-body # 422
+python3 feed_segments.py --device cam-A --video "$V" --conflict     # 422 (id reuse, new bytes)
 ```
 
 ## Tests
@@ -164,7 +167,7 @@ cargo test                      # unit + source_kind §7 guard; integration runs
 **Ticket:** `Issues/initial-backend.md` — *Initial backend: durable, idempotent
 segment-ingest server (video+audio) with a vector-ready database.*
 **Status:** ✅ **Complete and verified end-to-end.** All acceptance criteria pass against
-the real video (`IMG_7256.mp4`) and a live Postgres 16 + pgvector. Built on macOS arm64
+a real video clip and a live Postgres 16 + pgvector. Built on macOS arm64
 with `cargo`/`rustc` 1.96 (edition 2024).
 
 ## What was built (file map)
@@ -229,15 +232,15 @@ local_dev/
 
 ## Verification log (observed results)
 
-All run against the real server + real Postgres + `IMG_7256.mp4` (10 MUXED ~2 s fMP4
-segments):
+All run against the real server + real Postgres + a real ~20 s video clip (10 MUXED ~2 s
+fMP4 segments):
 
 | Check | Result |
 |-------|--------|
 | `cargo build` / `cargo run` / `SQLX_OFFLINE=true cargo build` | clean, no warnings |
 | `cargo test` | 7 unit + 1 integration + §7 guard — all pass |
 | `healthz` / `readyz` | `200` / `200` |
-| Feed `IMG_7256.mp4` (`cam-A`) | **10/10** accepted; blobs match digest+length; gapless (`count == max(seq)+1`) |
+| Feed the clip (`cam-A`) | **10/10** accepted; blobs match digest+length; gapless (`count == max(seq)+1`) |
 | Idempotent re-run | all `200`; rows + blobs **unchanged** (exactly-once) |
 | Reuse `segment_id`, different bytes | **422**; stored `content_sha256` unchanged |
 | Corrupt body / bad token / missing part / oversized | **422** / **401** / **400** / **413**; nothing written |
@@ -287,8 +290,9 @@ cargo run &                                  # listens on :8080
 
 # 3. Feed + checks
 cd ../local_dev
-python3 feed_segments.py --device cam-A                # 10/10 -> 200
-python3 feed_segments.py --device cam-A                # idempotent: counts unchanged
+V="$PWD/.demo_work/clips/front_door.mp4"               # ./build_demo.sh makes this
+python3 feed_segments.py --device cam-A --video "$V"   # 10/10 -> 200
+python3 feed_segments.py --device cam-A --video "$V"   # idempotent: counts unchanged
 psql "$DATABASE_URL" -c "SELECT device_id,count(*),max(sequence)+1 FROM segments GROUP BY 1;"
 cargo test                                             # back-up unit/integration suite
 ```

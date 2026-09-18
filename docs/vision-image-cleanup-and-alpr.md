@@ -357,7 +357,8 @@ The ONNX I/O contracts the decoders expect (validate against the real export):
    `fetch_onnxruntime.sh` / face / RF-DETR / CLIP scripts).
 2. Run the decode-validation tests; fix any decode mismatch they surface (that's their job).
 3. Apply migrations (start `hushai-backend`), run the worker with `DYLD_FALLBACK_LIBRARY_PATH=target/debug/deps`,
-   feed a clip with faces and a vehicle+plate (`local_dev/feed_segments.py`; repo has `IMG_7256.mp4`).
+   feed a clip with faces and a vehicle+plate — `./local_dev/build_demo.sh` builds both from
+   public-domain stills, or replay your own file with `local_dev/feed_segments.py --video`.
 4. Confirm: faces that previously produced zero `person_segments` now attribute + `GET /v1/persons/{id}/sample-face`
    returns a cleaned crop; `GET /v1/plates` lists the plate; the viewer overlay draws faces+plates; the
    RAG query *"when did I see plate <X>"* returns the sighting time.

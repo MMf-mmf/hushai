@@ -13,12 +13,13 @@ Pipeline:
      SHA-256 + byte_len over the EXACT body bytes, and source_kind="file_replay".
   3. POST multipart/form-data (`manifest` + `body`) with a Bearer token.
 
-Examples:
-  python feed_segments.py --device cam-A
-  python feed_segments.py --device cam-A            # re-run -> all idempotent 200s
-  python feed_segments.py --device cam-A --conflict # reused ids, different bytes -> 422
-  python feed_segments.py --device cam-A --corrupt-body   # body != manifest sha -> 422
-  python feed_segments.py --device cam-A --bad-token      # -> 401
+Examples (--video is required and must be an ABSOLUTE path; generate a demo clip with
+./local_dev/build_demo.sh, or point it at your own file):
+  python feed_segments.py --device cam-A --video "$PWD/local_dev/.demo_work/clips/front_door.mp4"
+  python feed_segments.py --device cam-A --video "$V"            # re-run -> all idempotent 200s
+  python feed_segments.py --device cam-A --video "$V" --conflict # reused ids, different bytes -> 422
+  python feed_segments.py --device cam-A --video "$V" --corrupt-body  # body != manifest sha -> 422
+  python feed_segments.py --device cam-A --video "$V" --bad-token     # -> 401
 """
 
 import argparse
@@ -165,7 +166,10 @@ def main() -> int:
     ap.add_argument("--session", default=None, help="hex(16-byte) session_id override")
     ap.add_argument("--url", default="http://localhost:8080/v1/segments")
     ap.add_argument("--token", default=os.environ.get("DEVICE_TOKEN", "dev-secret-token"))
-    ap.add_argument("--video", default=str(REPO_ROOT / "IMG_7256.mp4"))
+    # No default clip: a clean checkout ships no media. Generate one with
+    # ./local_dev/build_demo.sh (public-domain stills + synthesized dialogue) or point
+    # --video at your own file. Must be an absolute path.
+    ap.add_argument("--video", required=True)
     ap.add_argument("--seg-seconds", type=int, default=2)
     ap.add_argument("--work-dir", default=None, help="ffmpeg output dir (default: scratch per video)")
     ap.add_argument("--state-file", default=None, help="sidecar JSON for stable segment_ids")

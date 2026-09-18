@@ -28,7 +28,9 @@ PROFILE="debug"
 MAX_CAMERAS=30
 SOAK=150
 SAMPLE=5
-VIDEO="$REPO_ROOT/IMG_7256.mp4"
+# Default replay clip: built by ./local_dev/build_demo.sh from public-domain stills.
+# Override with --video <ABSOLUTE PATH> to benchmark against your own footage.
+VIDEO="$REPO_ROOT/local_dev/.demo_work/clips/front_door.mp4"
 NO_PM=""
 PROFILES=()
 

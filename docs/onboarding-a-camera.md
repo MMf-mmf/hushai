@@ -105,6 +105,7 @@ Present `Authorization: Bearer <token>` over HTTPS and trust the CA. Example wit
 python local_dev/feed_segments.py \
   --url https://<host-LAN-IP>:8080/v1/segments \
   --token <token> \
+  --video "$PWD/local_dev/.demo_work/clips/front_door.mp4" \
   --cacert local_dev/certs/ca.crt
 ```
 
