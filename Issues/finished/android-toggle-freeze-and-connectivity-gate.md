@@ -114,7 +114,6 @@
   - `AGENTS.md` / `REVIEW.md` — **not changed**: AGENTS.md only covers the Android client at a
     high level (build/test/phone) and doesn't describe the capture-service internals or start/stop
     flow, so the change doesn't make it inaccurate; REVIEW.md doesn't exist in this repo.
-  - Plan file: `/Users/mf/.claude/plans/currently-it-seems-like-wise-conway.md`.
 
 - **How to test** (real, end-to-end over `adb`)
 

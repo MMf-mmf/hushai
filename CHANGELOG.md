@@ -8,7 +8,7 @@ Newest first. Dates are when the work landed on the current development branch
 ## Unreleased (in-flight)
 
 - **Gotham G4 / Phase G — viewer investigation UX + advisor-v2 viewer seam (2026-07-13, specs
-  `Gotham.md` §2.7 / Part 4 Phase G + `hushai-advisor/v2_integration_spec.md` Part 1)** — the
+  `docs/design/gotham.md` §2.7 / Part 4 Phase G + `hushai-advisor/v2_integration_spec.md` Part 1)** — the
   browser surface for the Detective, built on the advisor-v2 slash/pane infrastructure (Part 1 of
   the advisor integration spec, landed here). **Proxy:** `hushai-viewer/src/proxy.rs` gains a third
   upstream — `is_advisor_path` routes `/v1/advisor*` to hushai-advisor with a server-side
@@ -48,7 +48,7 @@ Newest first. Dates are when the work landed on the current development branch
   placeholder reset). **NOT in this change:** Phase H (Android "detective" voice keyword +
   `AWAIT_FOLLOWUP`) — waits on the advisor-v2 Android voice PRs.
 
-- **Gotham Wave 2 / Pillar G2 — daily briefing / digest (PR5, 2026-07-08, spec `Gotham.md` §1.6,
+- **Gotham Wave 2 / Pillar G2 — daily briefing / digest (PR5, 2026-07-08, spec `docs/design/gotham.md` §1.6,
   Phase E, uses migration 0029 `daily_digests`)** — new `patterns::build_and_upsert_digest`: for a
   pinned civil day it materializes a deterministic `daily_digests` row — `sections` jsonb
   (`new_entities`, `top_visitors`, `anomalies`, `conversations`, `first_time_pairings`, `journeys`,
@@ -73,7 +73,7 @@ Newest first. Dates are when the work landed on the current development branch
   guard extended with an outlier-day digest assertion (the anomaly surfaces in `sections`; the
   subject is not "new" that day). Adversarial multi-agent review: 1 confirmed finding (a
   calendar-invalid but shape-valid date returned 500 not 400) fixed + verified live.
-- **Gotham Wave 2 / Pillar G2 — baselines + pattern anomalies (2026-07-08, spec `Gotham.md`
+- **Gotham Wave 2 / Pillar G2 — baselines + pattern anomalies (2026-07-08, spec `docs/design/gotham.md`
   §1.6, uses migration 0029)** — new `hushai-backend::patterns` producer: per-touched-subject
   `entity_baselines` recompute (168 hour-of-week histogram, dwell p50/p90, device/companion
   top-K — pure math in `graph.rs`, deterministic) + `off_schedule_presence` anomaly emission,
@@ -96,7 +96,7 @@ Newest first. Dates are when the work landed on the current development branch
   predicates are PR5/follow-ups; alert-DELIVERY E2E (Phase D feed/webhook) rides the shipped
   A-pillar and is the tracked remaining Phase-D item.
 - **Gotham intelligence layer — Wave 1 / Pillar G1 data layer (2026-07-08, migrations
-  0028–0030, spec `Gotham.md`)** — the entity/link graph: `entity_edges` (co_present /
+  0028–0030, spec `docs/design/gotham.md`)** — the entity/link graph: `entity_edges` (co_present /
   conversed_with / arrived_with_vehicle / visits_place / the review-queued voice↔face
   `same_identity_candidate` binding) + `graph_state` watermark (0028); `entity_baselines` /
   `daily_digests` (0029) and `entity_journeys` + `camera_adjacency` view (0030) ship their

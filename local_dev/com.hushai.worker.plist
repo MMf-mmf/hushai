@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
+  NOTE: every /ABSOLUTE/PATH/TO/hushai below is a placeholder — launchd does no variable
+  expansion, so replace all of them with your own checkout path before `launchctl load`.
   launchd job: run hushai-worker as a supervised, always-on daemon.
 
   Why this exists: the worker is the ASR + speaker-attribution pipeline. If it isn't
@@ -28,7 +30,7 @@
   Logs: /tmp/hushai-worker.log
 
   NOTE: paths below are absolute and assume this repo lives at
-  /Users/mf/Documents/Rust_Code/Rig AI Agent — adjust if you move it. All other config
+  /ABSOLUTE/PATH/TO/hushai — adjust if you move it. All other config
   (DATABASE_URL, OLLAMA_BASE_URL, SPEAKER_* thresholds, SPEAKER_BACKFILL_ON_START, …) is
   loaded from the workspace-root .env via dotenvy given the WorkingDirectory below.
 -->
@@ -39,12 +41,12 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Users/mf/Documents/Rust_Code/Rig AI Agent/target/release/hushai-worker</string>
+        <string>/ABSOLUTE/PATH/TO/hushai/target/release/hushai-worker</string>
     </array>
 
     <!-- REQUIRED: model paths (./models/*) and .env are resolved relative to this. -->
     <key>WorkingDirectory</key>
-    <string>/Users/mf/Documents/Rust_Code/Rig AI Agent</string>
+    <string>/ABSOLUTE/PATH/TO/hushai</string>
 
     <key>EnvironmentVariables</key>
     <dict>
@@ -57,7 +59,7 @@
              bakes no @loader_path rpath, so a directly-launched binary can't find them. Point
              the loader at the build dir. Use target/debug here if you run the debug binary. -->
         <key>DYLD_FALLBACK_LIBRARY_PATH</key>
-        <string>/Users/mf/Documents/Rust_Code/Rig AI Agent/target/release:/usr/local/lib:/usr/lib</string>
+        <string>/ABSOLUTE/PATH/TO/hushai/target/release:/usr/local/lib:/usr/lib</string>
     </dict>
 
     <key>RunAtLoad</key>

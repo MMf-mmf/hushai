@@ -12,12 +12,12 @@ Android client, the viewer, or advice *quality* beyond structural grounding chec
 (quality is the eval harness's job, Phase H).
 
 **Conventions.** Run everything from the repo root
-(`/Users/mf/Documents/Rust_Code/Rig AI Agent` — adjust if relocated). Each phase ends
+(`/ABSOLUTE/PATH/TO/hushai` — adjust if relocated). Each phase ends
 with explicit **PASS** criteria; a failed criterion stops the run. `psql` commands
 assume `DATABASE_URL` in the root `.env`; extract it once:
 
 ```bash
-cd "/Users/mf/Documents/Rust_Code/Rig AI Agent"
+cd "/ABSOLUTE/PATH/TO/hushai"
 DBURL=$(grep -E "^DATABASE_URL" .env | cut -d= -f2-)
 ```
 

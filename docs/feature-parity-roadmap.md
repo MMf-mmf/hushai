@@ -100,11 +100,18 @@ Make the stack observable, packaged, and horizontally honest — the table stake
 - [ ] **C4. Floor-plan / camera map view.**
 - [ ] **C5. Time-limited share links** — share a clip without an account.
 - [~] **C6. Intelligence layer (entity graph · link analysis · anomaly baselines · agentic
-  "Detective") → [`Gotham.md`](../Gotham.md).** Wave 1 / Pillar G1 data layer landed
+  "Detective") → [`design/gotham.md`](design/gotham.md).** Wave 1 / Pillar G1 data layer landed
   (migrations 0028–0030, `graph.rs`/`graph_pass.rs`/`graph_api.rs`) + its deterministic eval
   `graph` modality (harness built + SQL-validated; F1–F3 in staging pending rig calibration →
   train). Later waves add baselines/anomalies (G2), the tool-calling runtime (G3), UI + voice
   (G4), journeys (G5).
+
+- [ ] **C7. Custom-trained detection + edge deployment → [`design/osprey.md`](design/osprey.md).**
+  Our own detectors trained on our own labeled footage (`hushai-train/`), a human-in-the-loop
+  Label mode + hard-example queue, a bbox-level `detections` eval modality (mAP, AP-small,
+  recall at the operating point), an additive `CUSTOM_DET_*` lane in the worker, and quantized
+  on-device inference on the phone + a dedicated edge box. New capability lanes: wildlife,
+  small/far objects, smoke/fire.
 
 ---
 

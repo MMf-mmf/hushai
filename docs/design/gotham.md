@@ -833,7 +833,7 @@ Each PR updates this spec's result matrix for the phases it makes executable.
 - [x] `AGENTS.md`: component-map row for the Gotham layer (PR 6 — added the "Gotham Detective runtime" row + bumped registry count 7→8); **:384–387 tool-calling correction** (PR 6 ✅). Testing section names both the `graph` and `agent` modalities (PRs 3/7 — both ✅; PR7 added the `agent` modality paragraph + the `eval.agent.env` run recipe + the PR7 runtime-fixes note at AGENTS.md:465). **G4 (Phase G): viewer component row updated (slash-plugin chat + Investigate page + 3-upstream proxy); REVIEW.md viewer-proxy note extended (`is_advisor_path`, un-audited privacy upstreams).**
 - [x] `hushai-backend/migrations/README.md`: rows for 0028–0031 (0028–0030 prior; **0031 added PR 6**).
 - [x] `CHANGELOG.md`: entry per landed wave (G4 Phase G / advisor-v2 viewer seam added).
-- [ ] `docs/feature-parity-roadmap.md`: one-line pointer under Pillar C — "intelligence layer → `Gotham.md`" (PR 2).
+- [ ] `docs/feature-parity-roadmap.md`: one-line pointer under Pillar C — "intelligence layer → `gotham.md`" (PR 2).
 - [ ] `local_dev/eval.env` + `run_stack.sh`: `GRAPH_*`/`GOTHAM_*` determinism pins (PRs 3/7); **`run_stack.sh` TLS block gains `ADVISOR_BASE_URL=https://…` (G4).**
 
 

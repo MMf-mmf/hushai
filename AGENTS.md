@@ -142,7 +142,7 @@ Ollama call; set `EMBED_OLLAMA_BASE_URL` (worker + rag query embedding) and/or
 
 Migrations live in `hushai-backend/migrations/` and **auto-apply** on backend/worker startup
 via `sqlx::migrate!`. Full one-line index: [`hushai-backend/migrations/README.md`](hushai-backend/migrations/README.md).
-Current head: **`0024_entity_profiles`** (24 migrations, `0001`→`0024`).
+Current head: **`0031_gotham`** (31 migrations, `0001`→`0031`).
 
 ### `transcript_sentences` storage (post-0003 — read before touching RAG/worker writes)
 
@@ -327,7 +327,7 @@ dropped — **media is ALWAYS stored regardless of gating.**
   separation are absolute; disjoint-speaker-set separation needs the speaker lane to actually
   separate the voices.
 
-### Gotham entity graph (migrations 0028–0030, Wave 1 / Pillar G1) — spec `Gotham.md`
+### Gotham entity graph (migrations 0028–0030, Wave 1 / Pillar G1) — spec `docs/design/gotham.md`
 
 - **What it is:** the intelligence layer's materialized inter-entity relationships — the links
   the perception pipeline perceives but never joins. `entity_edges` (0028) carries five edge
@@ -479,7 +479,7 @@ DB-backed `chat_sessions`/`chat_messages`, migration 0008) answer over pgvector 
   rewritten in PR7 to hit the REAL id-keyed `/v1/graph/*` routes + render names, and `tool_ok` now
   reports a failed tool correctly). **Graph tools authenticate with `GOTHAM_BACKEND_TOKEN` — the
   stack rag must have it set (via `local_dev/eval.agent.env`, now sourced by `run_stack.sh --test-db`),
-  else every graph tool 401s.** See `Gotham.md` Part 2.
+  else every graph tool 401s.** See `docs/design/gotham.md` Part 2.
 - **Unified auto-routing:** the web/voice chat is ONE box bound to `auto`; per message the handler
   deterministically pre-routes some phrasings, else calls `llm::classify_agent` (a cheap
   qwen2.5:7b classification) and dispatches. The auto-router stays a classification prompt by
@@ -487,7 +487,7 @@ DB-backed `chat_sessions`/`chat_messages`, migration 0008) answer over pgvector 
   **`rig-core 0.38.2`**, which ships the full tool stack (`Tool` trait, `ToolSet`, agent
   `.tool(..)`/`.multi_turn(n)`, `PromptHook`), wired to Ollama's native `tools` JSON. That
   tool-calling machinery is what the **Gotham "Detective" agent** (`hushai-rag/src/gotham/`, G3)
-  uses for its plan→act→observe loop; see `Gotham.md` Part 2 §2.1. Pin `rig` EXACTLY (the facade
+  uses for its plan→act→observe loop; see `docs/design/gotham.md` Part 2 §2.1. Pin `rig` EXACTLY (the facade
   floats rig-core minors — a lockfile refresh would silently shift the agent-loop semantics).
 - **Deterministic-first answers** where a wrong number matters: identity ("what's my name"),
   recency ("what did we last discuss"), speaker roster, presence counts (`presence.rs`),
@@ -661,3 +661,4 @@ Tracked in [`Issues/unfinished/`](Issues/unfinished/); the load-bearing ones:
 - **Dated history:** [`CHANGELOG.md`](CHANGELOG.md). **Human runbooks/design:** [`docs/`](docs/).
   **Migrations index:** [`hushai-backend/migrations/README.md`](hushai-backend/migrations/README.md).
 - **Code-review conventions:** [`REVIEW.md`](REVIEW.md).
+- **Forward specs:** [`docs/design/gotham.md`](docs/design/gotham.md) (intelligence layer) · [`docs/design/osprey.md`](docs/design/osprey.md) (custom-trained detection, the label flywheel, bbox-level eval, edge deployment) · [`docs/design/gauntlet.md`](docs/design/gauntlet.md) (omnibus test campaign).

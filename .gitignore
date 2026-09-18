@@ -57,3 +57,21 @@ local_dev/.venv*/
 
 # Self-managed git repo (has its own history)
 /Agent Ahithophel/
+
+# Editor / agent-tool local config (host-specific; may contain local paths + permission rules)
+.claude/
+.vscode/
+.idea/
+*.iml
+
+# Personal media accidentally dropped at the repo root (feed clips live in local_dev/captures/)
+/IMG_*.mp4
+/IMG_*.mov
+
+# Database dumps
+*.dump
+*.sql.gz
+
+# Screenshot campaign output (regenerable; see hushai-viewer/e2e/shots.mjs)
+local_dev/campaign_out/
+docs/img/*.orig.png

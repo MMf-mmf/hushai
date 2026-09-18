@@ -1,5 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
+  NOTE: every /ABSOLUTE/PATH/TO/hushai below is a placeholder — launchd does no variable
+  expansion, so replace all of them with your own checkout path before `launchctl load`.
   launchd job: run transcript_sentences partition maintenance monthly.
 
   Runs local_dev/partition_maintenance.sh on the 1st of each month at 00:05 to
@@ -18,7 +20,7 @@
   Logs: /tmp/hushai-partition-maintenance.log
 
   NOTE: paths below are absolute and assume this repo lives at
-  /Users/mf/Documents/Rust_Code/Rig AI Agent — adjust if you move it.
+  /ABSOLUTE/PATH/TO/hushai — adjust if you move it.
   RETAIN_MONTHS=12 DROPS month partitions older than ~12 months (irreversible);
   set it to 0 to disable dropping. Rehearse with DRY_RUN first (see the script).
 -->
@@ -30,7 +32,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/mf/Documents/Rust_Code/Rig AI Agent/local_dev/partition_maintenance.sh</string>
+        <string>/ABSOLUTE/PATH/TO/hushai/local_dev/partition_maintenance.sh</string>
     </array>
 
     <key>EnvironmentVariables</key>

@@ -674,7 +674,7 @@ audio).
 | H | voice multi-turn: marker order + session continuity + DB shape | ⬜ (PR4 `00cfe82` `voice_advisor_loop.py` landed — rig-gated: phone) |
 
 **All three tracks now LANDED at the unit level** (2026-07-13): Part 1 viewer (`72d95be`, alongside
-Gotham G4 / Phase G — the slash picker + `ChatPane` seams + `AdvisorPane` are shared infra, `Gotham.md`
+Gotham G4 / Phase G — the slash picker + `ChatPane` seams + `AdvisorPane` are shared infra, `docs/design/gotham.md`
 §2.7, PR-slicing #9), Track 2 Android voice (PR3 `32beb77`, gradlew 99/0), Track 3 harness (PR1
 `e72bfcd`) + fixtures F1–F6 (PR4 `00cfe82`). **Everything that remains — Phases D/E/F/G/H — is
 rig-gated** (physical phone + a free stack for live calibration).

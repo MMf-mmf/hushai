@@ -213,7 +213,14 @@ class Settings(private val context: Context) {
         // so a release deployment MUST set an `https://<lan-ip>:8080` URL (cert SAN) via
         // the Settings UI or the `url`/`rag_url` Intent extras; the bundled LAN CA is trusted.
         const val DEFAULT_URL = "http://10.0.2.2:8080"
-        const val DEFAULT_TOKEN = "dev-secret-token"
+        // No default device token on purpose: the operator mints one per camera
+        // (`local_dev/run_stack.sh --add-camera <name>`) and supplies it via the Settings
+        // UI or the `token` Intent extra. Shipping a guessable fallback would hand every
+        // reader of this source a working bearer for any stack left unconfigured, and the
+        // same token also reaches the destructive admin API (see SECURITY.md). Empty means
+        // the backend answers 401 until a real token is set — matching DEFAULT_RAG_TOKEN
+        // and DEFAULT_ADVISOR_TOKEN below.
+        const val DEFAULT_TOKEN = ""
         const val DEFAULT_RAG_TOKEN = ""
         // 2 GB default offline buffer cap; generous for hours of audio + a long
         // video outage, well within typical free space. User-adjustable.
