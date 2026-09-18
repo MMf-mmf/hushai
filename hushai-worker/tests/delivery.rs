@@ -14,7 +14,11 @@ use uuid::Uuid;
 
 async fn pool() -> Option<PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
-    PgPoolOptions::new().max_connections(4).connect(&url).await.ok()
+    PgPoolOptions::new()
+        .max_connections(4)
+        .connect(&url)
+        .await
+        .ok()
 }
 
 fn cfg(max_attempts: i32, allow_private: bool) -> DeliveryConfig {
@@ -41,7 +45,9 @@ async fn spawn_sink() -> (String, Arc<Mutex<Vec<Vec<u8>>>>) {
     let recv2 = recv.clone();
     tokio::spawn(async move {
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { break };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
             let recv3 = recv2.clone();
             tokio::spawn(async move {
                 let mut buf = vec![0u8; 16384];
@@ -49,7 +55,9 @@ async fn spawn_sink() -> (String, Arc<Mutex<Vec<Vec<u8>>>>) {
                 buf.truncate(n);
                 recv3.lock().unwrap().push(buf);
                 let _ = sock
-                    .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok",
+                    )
                     .await;
             });
         }
@@ -119,7 +127,10 @@ async fn webhook_success_marks_sent_and_posts_body() {
         let s = String::from_utf8_lossy(b);
         s.starts_with("POST ") && s.contains(&id.to_string()) && s.contains("hushai.alert.v1")
     });
-    assert!(got, "sink received a POST carrying the delivery_id + schema tag");
+    assert!(
+        got,
+        "sink received a POST carrying the delivery_id + schema tag"
+    );
     drop(bodies);
     cleanup(&pool, marker).await;
 }
@@ -141,10 +152,19 @@ async fn transient_failure_schedules_retry_then_fails() {
     let client = delivery::build_client(&c3).unwrap();
     delivery::run_once(&pool, &client, &c3).await.unwrap();
     let (status, attempts, err, has_next) = status_of(&pool, id_a).await;
-    assert_eq!(status, "pending", "transient failure stays pending for retry");
+    assert_eq!(
+        status, "pending",
+        "transient failure stays pending for retry"
+    );
     assert_eq!(attempts, 1);
     assert!(has_next, "a backoff next_attempt_at is scheduled");
-    assert!(err.unwrap_or_default().contains("error") || true, "last_error recorded");
+    // Assert that a reason was recorded, not what it says: the text comes from reqwest and its
+    // wording is not ours to pin. (This was `contains("error") || true`, which clippy correctly
+    // flags as a dead assertion — `|| true` made it pass for any value at all.)
+    assert!(
+        err.as_deref().is_some_and(|e| !e.trim().is_empty()),
+        "last_error recorded, got {err:?}",
+    );
     // A second run_once must NOT re-claim it (backoff not elapsed).
     delivery::run_once(&pool, &client, &c3).await.unwrap();
     let (_s, attempts2, _e, _n) = status_of(&pool, id_a).await;
@@ -159,7 +179,10 @@ async fn transient_failure_schedules_retry_then_fails() {
     delivery::run_once(&pool, &client, &c1).await.unwrap();
     let (status, _a, err, has_next) = status_of(&pool, id_b).await;
     assert_eq!(status, "failed", "no retries left → failed");
-    assert!(err.unwrap_or_default().contains("gave up"), "failure records the give-up reason");
+    assert!(
+        err.unwrap_or_default().contains("gave up"),
+        "failure records the give-up reason"
+    );
     assert!(!has_next, "next_attempt_at cleared on terminal failure");
     cleanup(&pool, marker_b).await;
 }
@@ -179,6 +202,9 @@ async fn metadata_ip_is_blocked_without_network() {
     delivery::run_once(&pool, &client, &c).await.unwrap();
     let (status, _a, err, _n) = status_of(&pool, id).await;
     assert_eq!(status, "failed", "metadata IP → blocked → failed");
-    assert!(err.unwrap_or_default().to_lowercase().contains("metadata"), "blocked reason names metadata");
+    assert!(
+        err.unwrap_or_default().to_lowercase().contains("metadata"),
+        "blocked reason names metadata"
+    );
     cleanup(&pool, marker).await;
 }

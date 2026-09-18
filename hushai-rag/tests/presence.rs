@@ -15,7 +15,11 @@ const DAY: i64 = 86_400_000_000_000;
 
 async fn pool() -> Option<PgPool> {
     let url = std::env::var("DATABASE_URL").ok()?;
-    PgPoolOptions::new().max_connections(5).connect(&url).await.ok()
+    PgPoolOptions::new()
+        .max_connections(5)
+        .connect(&url)
+        .await
+        .ok()
 }
 
 async fn insert_dss(pool: &PgPool, device_id: &str) -> Uuid {
@@ -23,7 +27,11 @@ async fn insert_dss(pool: &PgPool, device_id: &str) -> Uuid {
     sqlx::query("INSERT INTO devices (device_id, source_kind) VALUES ($1,'test') ON CONFLICT (device_id) DO NOTHING")
         .bind(device_id).execute(pool).await.unwrap();
     sqlx::query("INSERT INTO sessions (session_id, device_id) VALUES ($1,$2)")
-        .bind(session_id).bind(device_id).execute(pool).await.unwrap();
+        .bind(session_id)
+        .bind(device_id)
+        .execute(pool)
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO streams (session_id, stream_id, device_id, media_type, codec, container) VALUES ($1,'cam0-video',$2,2,'h264','fmp4')")
         .bind(session_id).bind(device_id).execute(pool).await.unwrap();
     session_id
@@ -50,7 +58,13 @@ async fn insert_person(pool: &PgPool, device_id: &str, name: Option<&str>) -> Uu
     person_id
 }
 
-async fn insert_person_segment(pool: &PgPool, segment_id: Uuid, device_id: &str, person_id: Uuid, start: i64) {
+async fn insert_person_segment(
+    pool: &PgPool,
+    segment_id: Uuid,
+    device_id: &str,
+    person_id: Uuid,
+    start: i64,
+) {
     let mut v = vec![0f32; 512];
     v[0] = 1.0;
     sqlx::query(
@@ -96,10 +110,23 @@ async fn presence_counts_first_last_and_rhythm_deduped() {
         }
     }
 
-    let s = presence::person_presence(&pool, &[alice.to_string()], Some(&device), None, None, 0)
-        .await
-        .unwrap();
-    assert_eq!(s.count, 4, "4 distinct segments = 4 sightings (frame dedup)");
+    // Last two args: tz offset, and the visit-merge gap (PRESENCE_VISIT_GAP_SECS default, 120s).
+    // Every fixture visit is at least an hour from the next, so the gap cannot merge any of them.
+    let s = presence::person_presence(
+        &pool,
+        &[alice.to_string()],
+        Some(&device),
+        None,
+        None,
+        0,
+        120 * 1_000_000_000,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        s.count, 4,
+        "4 distinct segments = 4 sightings (frame dedup)"
+    );
     assert_eq!(s.first_ns, Some(base), "first sighting timestamp");
     assert_eq!(s.last_ns, Some(base + 2 * DAY), "last sighting timestamp");
     assert_eq!(s.by_hour.iter().sum::<i64>(), 4);
@@ -107,7 +134,10 @@ async fn presence_counts_first_last_and_rhythm_deduped() {
     // 3 of 4 sightings share one time-of-day → that hour bucket holds 3 and is the peak.
     let ph = s.peak_hours();
     assert!(!ph.is_empty(), "a peak hour exists");
-    assert_eq!(s.by_hour[ph[0]], 3, "the busiest hour has 3 of the 4 sightings");
+    assert_eq!(
+        s.by_hour[ph[0]], 3,
+        "the busiest hour has 3 of the 4 sightings"
+    );
 
     let line = presence::render_presence(&s, "Alice", base + 3 * DAY, 0);
     assert!(line.contains("4 times"), "count narrated verbatim: {line}");
@@ -140,9 +170,19 @@ async fn presence_is_uncapped_where_the_sighting_list_caps() {
     assert_eq!(capped.len(), 50, "sighting list is capped at top_k");
 
     // Presence engine → the true count, uncapped.
-    let s = presence::person_presence(&pool, &[bob.to_string()], Some(&device), None, None, 0)
-        .await
-        .unwrap();
+    // Last two args: tz offset, and the visit-merge gap (PRESENCE_VISIT_GAP_SECS default, 120s).
+    // The fixture's sightings are an hour apart, so no gap short of that changes `count`.
+    let s = presence::person_presence(
+        &pool,
+        &[bob.to_string()],
+        Some(&device),
+        None,
+        None,
+        0,
+        120 * 1_000_000_000,
+    )
+    .await
+    .unwrap();
     assert_eq!(s.count, n, "presence counts every sighting past the cap");
 
     cleanup(&pool, &device).await;

@@ -2081,7 +2081,10 @@ details.voice-section > summary::marker {
   display: grid;
   /* sev · type · subject · device+when · ▶ view; the fixed columns may shrink a
      little under pressure before the ≤720px card collapse below kicks in. */
-  grid-template-columns: 92px minmax(110px, 150px) 1fr minmax(120px, 150px) auto;
+  /* The device+when column needs room for "Back Garden · just now · Sep 17, 09:45 PM": capped
+     at 150px it overflowed its track (`.ev-when` is nowrap) and printed straight through the
+     ▶ view link. The 1fr subject column absorbs the extra width. */
+  grid-template-columns: 92px minmax(110px, 150px) 1fr minmax(120px, 270px) auto;
   gap: 10px;
   align-items: center;
   padding: 8px 12px;
@@ -2138,6 +2141,10 @@ details.voice-section > summary::marker {
   color: var(--muted);
   font-size: 12px;
   white-space: nowrap;
+  /* Belt and braces with the widened track above: clip rather than overlap the neighbour when
+     a long camera name still outgrows the column, the same way `.ev-sub` does. */
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .ev-sub {
   color: var(--text);

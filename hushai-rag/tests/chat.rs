@@ -27,15 +27,16 @@ async fn pool() -> Option<PgPool> {
 }
 
 fn fake_source(text: &str, start: i64) -> Source {
+    // Spread over `Default` rather than naming every field: this helper only cares about the
+    // four it sets, and an exhaustive initializer breaks the whole test binary every time
+    // `Source` gains an enrichment field (it has twice — `visual_context`, `conversation_id`).
     Source {
         segment_id: Uuid::now_v7(),
         device_id: "test-cam".into(),
         text: text.into(),
         start_unix_nanos: start,
         distance: 0.12,
-        speaker_id: None,
-        speaker_name: None,
-        time_label: String::new(),
+        ..Default::default()
     }
 }
 
@@ -84,7 +85,7 @@ async fn chat_session_roundtrip() {
     .unwrap();
 
     // History comes back in chronological order (DESC fetch reversed).
-    let history = chat::load_history(&pool, session_id, 10).await.unwrap();
+    let history = chat::load_history(&pool, session_id, 10, 0).await.unwrap();
     assert_eq!(history.len(), 2);
     assert_eq!(history[0].0, "user");
     assert_eq!(history[0].1, "What did we discuss?");
@@ -113,7 +114,7 @@ async fn chat_session_roundtrip() {
     )
     .await
     .unwrap();
-    let trimmed = chat::load_history(&pool, session_id, 2).await.unwrap();
+    let trimmed = chat::load_history(&pool, session_id, 2, 0).await.unwrap();
     assert_eq!(trimmed.len(), 2);
     assert_eq!(trimmed[0].1, "The meeting is on Tuesday.");
     assert_eq!(trimmed[1].1, "And the time?");
