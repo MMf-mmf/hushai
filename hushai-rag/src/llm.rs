@@ -71,7 +71,7 @@ impl Llm {
     /// Route a chat message to one capability for the unified "auto" assistant: returns one of
     /// the agent ids (`recordings`/`reflection`/`people`/`objects`/`plates`). A single cheap
     /// classification call to the same local model; `recent_context` (the last turn or two) lets
-    /// follow-ups like "Mendel" after a clarifying question route correctly. Always returns a valid
+    /// follow-ups like "Morgan" after a clarifying question route correctly. Always returns a valid
     /// id (`recordings` on any uncertainty) — see [`crate::agents::parse_agent_label`].
     pub async fn classify_agent(
         &self,
@@ -869,14 +869,14 @@ mod tests {
     #[test]
     fn conversation_prompt_summarizes_in_order() {
         let mut a = src("morning plan");
-        a.speaker_name = Some("Mendel".into());
+        a.speaker_name = Some("Morgan".into());
         a.time_label = "today at 9:00 AM".into();
         let mut b = src("sounds good");
         b.speaker_name = Some("Sarah".into());
         b.time_label = "today at 9:01 AM".into();
         let p = build_conversation_prompt("what did we last discuss?", &[a, b], &HashMap::new());
         assert!(p.contains("most recent recorded conversation"));
-        assert!(p.contains("[1] (Mendel, today at 9:00 AM) morning plan"));
+        assert!(p.contains("[1] (Morgan, today at 9:00 AM) morning plan"));
         assert!(p.contains("[2] (Sarah, today at 9:01 AM) sounds good"));
         assert!(p.to_lowercase().contains("summary"));
         assert_no_machine_values(&p);
@@ -891,7 +891,7 @@ mod tests {
     #[test]
     fn build_prompt_renders_visual_context_suffix() {
         let mut s = src("let's meet tuesday");
-        s.speaker_name = Some("Mendel".into());
+        s.speaker_name = Some("Morgan".into());
         s.visual_context = Some("on camera: Bob; in view: laptop".into());
         let p = build_prompt("what was said?", &[s], &HashMap::new());
         assert!(p.contains("let's meet tuesday — on camera: Bob; in view: laptop"));

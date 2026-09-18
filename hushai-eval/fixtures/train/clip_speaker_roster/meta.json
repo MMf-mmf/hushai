@@ -1,6 +1,6 @@
 {
   "case_id": "clip_speaker_roster",
-  "description": "Deictic 'who was speaking in this video clip' with the voice pre-enrolled as Mendel (same JFK window as jfk_moon; that window is the verified mints-exactly-1-voice substrate). Scores the playback-anchored deterministic speaker roster (viewer playback context -> ±2min window -> named answer + attributed citation), the no-playback CAMERA_CLARIFY fallback, and the RECENCY path ('what did we last discuss' scoped to this device -> gap-grouped latest_conversation summary with a citation, routed to recordings).",
+  "description": "Deictic 'who was speaking in this video clip' with the voice pre-enrolled as Morgan (same JFK window as jfk_moon; that window is the verified mints-exactly-1-voice substrate). Scores the playback-anchored deterministic speaker roster (viewer playback context -> ±2min window -> named answer + attributed citation), the no-playback CAMERA_CLARIFY fallback, and the RECENCY path ('what did we last discuss' scoped to this device -> gap-grouped latest_conversation summary with a citation, routed to recordings).",
   "device_id": "eval-clip-roster",
   "media_file": "media.mp4",
   "media_kind": "muxed",
@@ -14,7 +14,7 @@
   "enroll": [
     {
       "modality": "speaker",
-      "name": "Mendel",
+      "name": "Morgan",
       "ref": "media.mp4"
     }
   ],

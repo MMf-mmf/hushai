@@ -151,7 +151,7 @@ pub async fn rag_chat(
     )
     .await
     .map_err(internal)?;
-    // The last turn or two as plain text, for the auto-router (so a follow-up like "Mendel" after
+    // The last turn or two as plain text, for the auto-router (so a follow-up like "Morgan" after
     // a clarifying question routes with context).
     let recent_context: String = history_rows
         .iter()
@@ -1002,7 +1002,7 @@ pub async fn rag_chat(
                 } else
                 // "How many PEOPLE did you see" is a DISTINCT-people question over the roster —
                 // it must never fall into the single-person frequency rollup below (the observed
-                // "Mendel was seen 62 times" answer to "how many people in the last 10 min").
+                // "Morgan was seen 62 times" answer to "how many people in the last 10 min").
                 // The roster sources are one row per distinct person; enumerate them verbatim.
                 if crate::routes::is_people_count_query(&message) {
                     let mut seen = std::collections::BTreeSet::new();
@@ -1719,11 +1719,11 @@ mod tests {
 
     #[test]
     fn roster_names_single_known_speaker() {
-        let s = [src(Some("id-mendel"), 1)];
-        let n = names(&[("id-mendel", "Mendel")]);
+        let s = [src(Some("id-morgan"), 1)];
+        let n = names(&[("id-morgan", "Morgan")]);
         assert_eq!(
             render_speaker_roster(&s, &n, true),
-            "Mendel was speaking in this clip."
+            "Morgan was speaking in this clip."
         );
     }
 
@@ -1731,11 +1731,11 @@ mod tests {
     fn roster_mixes_named_and_unnamed_with_matching_ordinals() {
         // The unnamed voice must render as "unidentified speaker 1" — the same label
         // enrich_for_display puts on its citation chip (same ordinal inputs, same order).
-        let s = [src(Some("id-mendel"), 1), src(Some("id-stranger"), 2)];
-        let n = names(&[("id-mendel", "Mendel")]);
+        let s = [src(Some("id-morgan"), 1), src(Some("id-stranger"), 2)];
+        let n = names(&[("id-morgan", "Morgan")]);
         assert_eq!(
             render_speaker_roster(&s, &n, true),
-            "Mendel and unidentified speaker 1 were speaking in this clip."
+            "Morgan and unidentified speaker 1 were speaking in this clip."
         );
     }
 
@@ -1749,20 +1749,20 @@ mod tests {
 
     #[test]
     fn roster_appends_unattributed_note_alongside_names() {
-        let s = [src(Some("id-mendel"), 1), src(None, 2)];
-        let n = names(&[("id-mendel", "Mendel")]);
+        let s = [src(Some("id-morgan"), 1), src(None, 2)];
+        let n = names(&[("id-morgan", "Morgan")]);
         let out = render_speaker_roster(&s, &n, true);
-        assert!(out.starts_with("Mendel was speaking in this clip."), "got: {out}");
+        assert!(out.starts_with("Morgan was speaking in this clip."), "got: {out}");
         assert!(out.contains("isn't attributed to a known voice"), "got: {out}");
     }
 
     #[test]
     fn roster_windowed_phrasing_without_deictic_clip() {
-        let s = [src(Some("id-mendel"), 1)];
-        let n = names(&[("id-mendel", "Mendel")]);
+        let s = [src(Some("id-morgan"), 1)];
+        let n = names(&[("id-morgan", "Morgan")]);
         assert_eq!(
             render_speaker_roster(&s, &n, false),
-            "Mendel was speaking during that period."
+            "Morgan was speaking during that period."
         );
     }
 

@@ -43,12 +43,12 @@ class RagChatClientTest {
         server.enqueue(
             MockResponse()
                 .setHeader("Content-Type", "text/event-stream")
-                .setBody(sseBody("sess-1", "recordings", "You're ", "Mendel."))
+                .setBody(sseBody("sess-1", "recordings", "You're ", "Morgan."))
         )
         val r = client().chat("what's my name", null, ownerVerified = true, deviceId = "android-1", tzOffsetSecs = -14400)
         assertTrue(r is RagChatClient.Result.Answer)
         r as RagChatClient.Result.Answer
-        assertEquals("You're Mendel.", r.text)
+        assertEquals("You're Morgan.", r.text)
         assertEquals("sess-1", r.sessionId)
         assertEquals("recordings", r.routedAgentId)
     }

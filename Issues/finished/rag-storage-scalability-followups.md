@@ -98,7 +98,7 @@
 - **How to Test**:
 
   Prereqs (same as the stack today): `ollama serve` with `mxbai-embed-large` + `llama3.2:3b`;
-  Postgres `hushai` on `localhost:5432`; `DATABASE_URL=postgres://mf@localhost:5432/hushai`.
+  Postgres `hushai` on `localhost:5432`; `DATABASE_URL=postgres://$USER@localhost:5432/hushai`.
 
   **Item 1 — binary vector encoding (real-world):**
   1. Capture a baseline first: with the current text-cast code, start the RAG service

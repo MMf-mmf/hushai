@@ -31,7 +31,7 @@ hushai-eval run --tier {fast|full} [--case ID] [--fixtures train|holdout|all] \
 ```bash
 # 1. Test DB (isolated from the dev `hushai` DB — the harness TRUNCATEs everything each run).
 createdb hushai_test
-DATABASE_URL=postgres://mf@localhost:5432/hushai_test sqlx migrate run --source hushai-backend/migrations
+DATABASE_URL=postgres://$USER@localhost:5432/hushai_test sqlx migrate run --source hushai-backend/migrations
 
 # 2. Generate the fixture media (gitignored; ground truth in meta/expected is committed).
 ./local_dev/build_fixtures.sh
@@ -116,7 +116,7 @@ Current corpus — synthetic (macOS `say`, `build_fixtures.sh`) + real public-do
 | `face_id` | train (full) | persons | PD Judith Resnik NASA portrait; SCRFD detect + ArcFace identity (`distinct_count: 1`) |
 | `plate_ocr` | train (full) | plates | PD Auckland street plate `EMD774`; full ALPR: RF-DETR ROI → YOLOv9-t plate detect → fast-plate-ocr |
 | `money_talk` | train (full) | transcript, sentiment, **chat** | 2-voice worry/reassure dialogue; RAG money-recall + worried-tone recall + no-hallucination decline |
-| `clip_speaker_roster` | train (full) | transcript, **chat** | voice enrolled as Mendel (JFK window); deictic "who was speaking in this clip" → named answer + attributed citation, plus no-playback fallback + recency path |
+| `clip_speaker_roster` | train (full) | transcript, **chat** | voice enrolled as Morgan (JFK window); deictic "who was speaking in this clip" → named answer + attributed citation, plus no-playback fallback + recency path |
 | `repeat_visitor` | train (full) | transcript, **chat** | same voice on 2 cameras a day apart (multi-clip `Meta.injections[]`); RAG recall + routing + no-hallucination decline + a counting probe |
 | `silence_no_speech` | holdout (full) | transcript, speakers | counter-fixture: must mint **0** speakers |
 

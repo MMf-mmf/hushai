@@ -168,7 +168,7 @@ do NOT use outside knowledge and do NOT guess. \
 (2) Use ONLY the sightings in the list: never add, repeat, infer, or pad your answer with a person or sighting \
 that is not present (including extra 'someone we haven't identified yet' lines). If the list has N sightings, \
 your answer covers only those N — no more. \
-(3) Reply in natural, spoken English that says who was seen and when — e.g. 'You saw Mendel yesterday at \
+(3) Reply in natural, spoken English that says who was seen and when — e.g. 'You saw Morgan yesterday at \
 5:14 PM.' Do NOT use field labels like 'WHO:'/'WHEN:' or a form layout. Use the plain-language time exactly as \
 it appears; NEVER output a raw number, a count of seconds or nanoseconds, an ISO timestamp, or any numeric or \
 coded time value. \

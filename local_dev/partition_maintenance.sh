@@ -20,7 +20,7 @@
 # retention drop here is ALSO the privacy purge for raw voiceprints.
 #
 # Environment:
-#   DATABASE_URL   (required)  e.g. postgres://mf@localhost:5432/hushai
+#   DATABASE_URL   (required)  e.g. postgres://$USER@localhost:5432/hushai
 #   MONTHS_AHEAD   (default 3) number of future month partitions to pre-create.
 #   RETAIN_MONTHS  (default 12) retention window. Month partitions older than the
 #                  trailing RETAIN_MONTHS (plus the current month) are DROPPED.
@@ -32,12 +32,12 @@
 #                  idempotent and additive.) Always rehearse with DRY_RUN=1 first.
 #
 # Examples:
-#   DATABASE_URL=postgres://mf@localhost:5432/hushai ./partition_maintenance.sh
+#   DATABASE_URL=postgres://$USER@localhost:5432/hushai ./partition_maintenance.sh
 #   DRY_RUN=1 RETAIN_MONTHS=6 DATABASE_URL=... ./partition_maintenance.sh   # preview
 #   RETAIN_MONTHS=0 DATABASE_URL=... ./partition_maintenance.sh             # never drop
 set -euo pipefail
 
-: "${DATABASE_URL:?set DATABASE_URL (e.g. postgres://mf@localhost:5432/hushai)}"
+: "${DATABASE_URL:?set DATABASE_URL (e.g. postgres://$USER@localhost:5432/hushai)}"
 MONTHS_AHEAD="${MONTHS_AHEAD:-3}"
 RETAIN_MONTHS="${RETAIN_MONTHS:-12}"
 DRY_RUN="${DRY_RUN:-0}"

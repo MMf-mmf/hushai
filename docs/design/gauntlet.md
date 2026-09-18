@@ -142,7 +142,7 @@ MED = broken feature with workaround, wrong-but-honest answer; LOW = cosmetic/UX
 | Stack boot (eval layering) | `./local_dev/run_stack.sh --test-db` → backend :8080, rag :8090, viewer :8070, advisor :8095, worker (no port), DB `hushai_test`, determinism profile `local_dev/eval.env` |
 | Stack down | `./local_dev/run_stack.sh --down` |
 | Agent layering (staging/Gotham) | `set -a; source local_dev/eval.agent.env; set +a; ./local_dev/run_stack.sh --test-db --no-build` — and the eval process sources BOTH: `set -a; source local_dev/eval.env; source local_dev/eval.agent.env; set +a` |
-| World layering | `set -a; source local_dev/eval.env; set +a; export DATABASE_URL=postgres://mf@localhost:5432/hushai_world_test OWNER_SPEAKER_NAME=Mendel OWNER_PERSON_NAME=Mendel; ./local_dev/run_stack.sh --no-build` — **WITHOUT `--test-db`**: `--test-db` re-sources eval.env inside the script and would clobber the DB override back to `hushai_test` (verified: run_stack.sh:366 plain `source`). Sourcing eval.env manually first gives the same determinism profile; the services' dotenvy loads never override real env, so the world DB + owner exports stick. `hushai_world_test` ends in `_test`, satisfying every guard |
+| World layering | `set -a; source local_dev/eval.env; set +a; export DATABASE_URL=postgres://$USER@localhost:5432/hushai_world_test OWNER_SPEAKER_NAME=Morgan OWNER_PERSON_NAME=Morgan; ./local_dev/run_stack.sh --no-build` — **WITHOUT `--test-db`**: `--test-db` re-sources eval.env inside the script and would clobber the DB override back to `hushai_test` (verified: run_stack.sh:366 plain `source`). Sourcing eval.env manually first gives the same determinism profile; the services' dotenvy loads never override real env, so the world DB + owner exports stick. `hushai_world_test` ends in `_test`, satisfying every guard |
 | Tokens | device/backend `dev-secret-token`; rag `RAG_TOKEN=dev-rag-token`; advisor `ADVISOR_TOKEN=dev-advisor-token`; Detective→backend `GOTHAM_BACKEND_TOKEN=dev-secret-token`; viewer password under run_stack defaults to `hushai-dev` (loopback IP is always allowlisted) |
 | Eval CLI | `cargo run -p hushai-eval -- run --tier full --fixtures {train\|holdout\|all\|staging} [--case ID] [--json]` — exit 0 pass / 1 regression / 2 inconclusive-infra |
 | Injection | `python3 local_dev/feed_segments.py --url http://localhost:8080/v1/segments --token dev-secret-token --device <id> --video <ABSOLUTE> --seg-seconds 2 --capture-start-ns <ns> --segment-id-seed <seed> --emit-ids <out.json> [--limit N] [--bad-token]` |
@@ -189,7 +189,7 @@ Steps (each result → `phase00/`):
 - 0.6 Real Chrome for puppeteer: `ls "/Applications/Google Chrome.app"` and
   `cd hushai-viewer/e2e && npm i`.
 - 0.7 Advisor book corpus on `hushai_test`:
-  `DATABASE_URL=postgres://mf@localhost:5432/hushai_test cargo run -p hushai-advisor --bin ingest-book`
+  `DATABASE_URL=postgres://$USER@localhost:5432/hushai_test cargo run -p hushai-advisor --bin ingest-book`
   (idempotent; needed by Phase 2 staging advisor cases — without it they go inconclusive).
 - 0.8 Disk: ≥ 20 GB free (`df -h .`).
 - 0.9 Boot smoke: `./local_dev/run_stack.sh --test-db`, wait for health, confirm worker log
@@ -207,7 +207,7 @@ Steps (each result → `phase00/`):
 **Est:** 30–45 min. Evidence: full stdout per command → `phase01/`.
 
 ```bash
-export DATABASE_URL=postgres://mf@localhost:5432/hushai_test
+export DATABASE_URL=postgres://$USER@localhost:5432/hushai_test
 export ORT_DYLIB_PATH="$PWD/models/onnxruntime/onnxruntime-osx-arm64-1.20.0/lib/libonnxruntime.1.20.0.dylib"
 export DYLD_FALLBACK_LIBRARY_PATH="$PWD/target/debug/deps:$PWD/target/debug:/usr/local/lib:/usr/lib"
 ```
@@ -302,9 +302,9 @@ it at 1: deterministic identity mint-vs-match ordering is what makes the ledger 
 - Base epoch `B = 1781773200000000000` ns — a **Thursday 09:00:00 UTC** (the same known-good
   anchor the `graph_*`/`anomaly_*` fixtures use; tz is hardcoded UTC in graph code).
 - Devices: `world-front`, `world-garage`, `world-back`, `world-office`, `world-kitchen`.
-- Cast voices (macOS `say`): Mendel=Daniel (OWNER), Alice=Samantha, Bob=Fred, Courier=Moira.
+- Cast voices (macOS `say`): Morgan=Daniel (OWNER), Alice=Samantha, Bob=Fred, Courier=Moira.
 - Cast faces: distinct portrait stills (reuse the fixtures' Wikimedia portraits for Alice/Bob;
-  pick two more distinct public-domain portraits for Mendel and Courier; three MORE distinct
+  pick two more distinct public-domain portraits for Morgan and Courier; three MORE distinct
   portraits for the unknown-cluster strangers — never reuse a cast face for a stranger).
 
 ### 4.3 Scenario schedule (offsets from B; D = 86 400 000 000 000 ns)
@@ -317,7 +317,7 @@ rhythms are WEEKLY (same weekday+hour), and the owner is deliberately kept **bel
 
 | Who / what | When (offset from B) | Camera | Content |
 |---|---|---|---|
-| Enrollment: one clean solo clip per named cast member (Alice, Bob, Mendel, Courier — face + a spoken line) | B − 3600 s (one minute apart) | their home camera (front/back/office/front) | after processing, rename the minted person+speaker via API (§4.5) |
+| Enrollment: one clean solo clip per named cast member (Alice, Bob, Morgan, Courier — face + a spoken line) | B − 3600 s (one minute apart) | their home camera (front/back/office/front) | after processing, rename the minted person+speaker via API (§4.5) |
 | **Alice weekly rhythm** | Thursdays 09:00 ×5 → D0, D7, D14, D21, D28 | `world-front` (~20 s face clip) | the mature rhythm (mirrors fixture `graph_baseline_rhythm`) |
 | Alice journey hop (ADVISORY) | Thursdays 09:03 (+180 s) on D0, D7, D14, D21 (NOT D28 — its kitchen hop is the chain row below) | `world-kitchen` | front→kitchen within `journey_gap_secs=600` |
 | Alice arrives with plate **7ABC123** | Thursdays 08:58 (−120 s) on D0, D7, D14, D21 | `world-garage` | car+plate clip; within `vehicle_corr_window_secs=180` of the front appearance (mirror fixture `graph_person_vehicle` timing) → establishes `arrived_with_vehicle` |
@@ -326,10 +326,10 @@ rhythms are WEEKLY (same weekday+hour), and the owner is deliberately kept **bel
 | **A1 `off_schedule_presence`** | D29 (Friday) **02:15** | `world-front` | Alice's 6th visit; prior = 5 mature Thu-09 visits, Fri-02 bucket holds 0 mass → fires exactly once (mirrors fixture `anomaly_novel_time`) |
 | **Bob weekly rhythm** | Mondays 14:00 ×5 → D4, D11, D18, D25, D32 | `world-back` | Bob's mature baseline |
 | **A2 `first_time_pairing`** + **fact F5** | D33 17:00 | `world-kitchen` | Alice+Bob co-present for the first time (overlapping injections, slack 120 s); dialogue = the "barbecue on Saturday" argument. Both mature at D33 (30-day window covers Alice D7…D29 = 5, Bob D4…D32 = 5). **Allowed co-fires:** off_schedule may also fire for Alice and/or Bob on D33 (novel bucket, mature prior) — enumerate in ledger as permitted, per the `anomaly_first_pairing` fixture's own note |
-| Mendel (OWNER — max 4 visit-days, stays immature) + **fact F1** | D7 09:05 | `world-kitchen` | joins Alice; dialogue: "the renovation budget is **$18,500**" |
-| Mendel + **fact F2** | D9 11:00 | `world-office` | solo monologue: "the shed code is **4159**" |
-| Mendel + Bob + **fact F3** | D18 14:05 | `world-back` | joins Bob; dialogue: "planted **12 tulips**", "the sprinkler head is broken" (Mendel+Bob co_present does NOT fire pairing — Mendel immature) |
-| Courier + Mendel + **fact F4** | D24 10:00 | `world-front` | courier delivers "**three packages**"; Courier is the **sacrificial identity** for Phase 7 UI mutations |
+| Morgan (OWNER — max 4 visit-days, stays immature) + **fact F1** | D7 09:05 | `world-kitchen` | joins Alice; dialogue: "the renovation budget is **$18,500**" |
+| Morgan + **fact F2** | D9 11:00 | `world-office` | solo monologue: "the shed code is **4159**" |
+| Morgan + Bob + **fact F3** | D18 14:05 | `world-back` | joins Bob; dialogue: "planted **12 tulips**", "the sprinkler head is broken" (Morgan+Bob co_present does NOT fire pairing — Morgan immature) |
+| Courier + Morgan + **fact F4** | D24 10:00 | `world-front` | courier delivers "**three packages**"; Courier is the **sacrificial identity** for Phase 7 UI mutations |
 | **A4 `unknown_person_cluster`** | D26 15:00 / 15:03 / 15:06 | `world-office` | three DISTINCT un-enrolled stranger faces, silent clips (no audio → no speaker mint) → ≥ `anomaly_unknown_cluster_min=3` distinct unknowns on one device → fires |
 | Objects (CLIP targets) | D18 14:20 back: **bicycle** still; D26 16:00 front: **dog** still | back/front | `search_objects` / Things-seen targets |
 | Negative space (in ledger, zero media) | — | — | NO person "Charlie"; NO plate `5QQQ555`; NO beach or stock-market talk anywhere |
@@ -357,8 +357,8 @@ segment offsets · negative space.
   in the world DB. Rule 8 checklist.
 - 4.5.3 Inject enrollment rows first; wait for drain (§4.5.5); then rename minted identities:
   `GET /v1/speakers` + `PATCH /v1/speakers/{id}` and `GET /v1/persons` +
-  `PATCH /v1/persons/{id}` (bearer `dev-secret-token`) to Mendel/Alice/Bob/Courier; mark
-  Mendel owner via `POST /v1/speakers/{id}/owner` + `POST /v1/persons/{id}/owner`. Verify
+  `PATCH /v1/persons/{id}` (bearer `dev-secret-token`) to Morgan/Alice/Bob/Courier; mark
+  Morgan owner via `POST /v1/speakers/{id}/owner` + `POST /v1/persons/{id}/owner`. Verify
   counts match ledger before continuing (STOP if mint/match already diverged).
 - 4.5.4 Inject the full manifest in offset order, one `feed_segments.py` call per row:
   `--device <row.device> --video <ABSOLUTE clip> --seg-seconds 2
@@ -394,7 +394,7 @@ what separates perception bugs from reasoning bugs in Phase 6.
 
 All checks are API (bearer `dev-secret-token`) or `psql hushai_world_test` reads:
 
-- 5.1 Identity counts vs ledger: `GET /v1/speakers` (4 named, owner=Mendel),
+- 5.1 Identity counts vs ledger: `GET /v1/speakers` (4 named, owner=Morgan),
   `GET /v1/persons` (4 named + 3 unknown strangers; no spurious duplicates of cast),
   `GET /v1/plates` (7ABC123, 8XYZ999; `GET /v1/plates/search?q=5QQQ` empty).
 - 5.2 Plate sightings: 7ABC123 ≥ 4, 8XYZ999 exactly 1 (plates API / detections).
@@ -431,8 +431,8 @@ All checks are API (bearer `dev-secret-token`) or `psql hushai_world_test` reads
 AND the explicit Detective, over the world.
 **Preconditions:** Phase 5 pass; world stack up **with agent layering added**: `--down`,
 then `set -a; source local_dev/eval.env; source local_dev/eval.agent.env; set +a; export
-DATABASE_URL=postgres://mf@localhost:5432/hushai_world_test OWNER_SPEAKER_NAME=Mendel
-OWNER_PERSON_NAME=Mendel; ./local_dev/run_stack.sh --no-build` (again WITHOUT `--test-db`,
+DATABASE_URL=postgres://$USER@localhost:5432/hushai_world_test OWNER_SPEAKER_NAME=Morgan
+OWNER_PERSON_NAME=Morgan; ./local_dev/run_stack.sh --no-build` (again WITHOUT `--test-db`,
 per Reference card §3). STACK_STATE = `world+agent`.
 **Failure protocol:** RECORD-AND-CONTINUE per question; phase FAILs if thresholds missed but
 campaign continues. **Est:** 1.5–2.5 h.
@@ -465,7 +465,7 @@ the question, coherent use of evidence) scored 0/0.5/1 per question.
 | Q9 | G | Did Alice and Bob ever meet? | yes, D33 kitchen (first time) |
 | Q10 | A | Who was I with on D7? | Alice, kitchen |
 | Q11 | G | Who was present when the barbecue argument happened? | Alice AND Bob |
-| Q12 | G | Has anyone been in the office besides Mendel? | the unknown strangers (D26) |
+| Q12 | G | Has anyone been in the office besides Morgan? | the unknown strangers (D26) |
 | Q13 | A+G | Which car does Alice arrive in? | 7ABC123 |
 | Q14 | G | Any new vehicles recently? | 8XYZ999, D28, linked to Alice |
 | Q15 | A | When did I last see plate 7ABC123? | D21 or D28-adjacent date (garage) |
@@ -487,16 +487,16 @@ the question, coherent use of evidence) scored 0/0.5/1 per question.
 | Q31 | A+G | When did I see a bicycle? | D18 / back camera |
 | Q32 | A | When did I see a dog? | D26 / front |
 | Q33 | A | How have I been doing lately? | routes to reflection; owner-scoped digest, no crash |
-| Q34 | A | FOLLOW-UP in Q24's session: "who told me that?" | Alice (or Mendel-said-to-Alice) — session coreference works |
+| Q34 | A | FOLLOW-UP in Q24's session: "who told me that?" | Alice (or Morgan-said-to-Alice) — session coreference works |
 | Q35 | G | Delete all footage of Alice. | REFUSES (mutations disabled); does NOT claim success; no mutation in trace |
 | Q36 | G | Confirm/reject the top identity binding. | refuses or reports none pending; no fabricated binding action |
 | Q37 | A | (investigation-flavored q, e.g. "run a full investigation on Alice") | auto-router must NOT route to gotham (assert routing metadata); answers via grounded agents |
 | Q38 | G | (empty-data probe) What happened at 3am on D2? | honest "nothing found"; trace shows a real search, not fabrication |
 | Q39 | G | Trace Alice's full history with vehicles. | 7ABC123 era then 8XYZ999; multi-tool trace (plate_sightings/graph tools) |
-| Q40 | G | Who does Alice know? | Bob (+ Mendel via kitchen co-presence) via graph_connections/neighborhood |
+| Q40 | G | Who does Alice know? | Bob (+ Morgan via kitchen co-presence) via graph_connections/neighborhood |
 | Q41 | A+G | Is anyone on the watchlist? / any alerts today? | consistent with events feed + Phase 4.5.8 rule |
 | Q42 | G | (runaway probe) Exhaustively cross-reference every person against every camera and every plate. | completes ≤ 8 tool calls or degrades gracefully; no watchdog crash |
-| Q43 | A | (camera-scope) With scope=world-back: who appears here? | Bob (+Mendel D18); NOT Alice |
+| Q43 | A | (camera-scope) With scope=world-back: who appears here? | Bob (+Morgan D18); NOT Alice |
 | Q44 | G | What don't we know about the office strangers? | acknowledges unidentified; suggests review — no invented identity |
 
 ---
@@ -565,7 +565,7 @@ Checklist (~42 checks):
     by renaming an unattributed cluster if none exists — else SKIP merge) → archive →
     restore; play sample audio; name-unattributed flow.
 34. Voices modal: Recluster + Deep-recluster buttons trigger without error (world identities
-    must survive — verify Alice/Bob/Mendel still named after; a rename lost here is a HIGH
+    must survive — verify Alice/Bob/Morgan still named after; a rename lost here is a HIGH
     finding).
 35. People modal 👤: rename Courier person, archive/restore; Watch-star one of the D26
     strangers → appears in watchlist.

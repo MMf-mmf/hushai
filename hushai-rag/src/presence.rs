@@ -406,22 +406,22 @@ mod tests {
         let times: Vec<i64> = (0..300).map(|i| base + i * 2 * SEC).collect();
         let s = PresenceSummary::from_sighting_times(&times, 0, GAP);
         assert_eq!(s.count, 1);
-        let line = render_presence(&s, "Mendel", base + DAY, 0);
+        let line = render_presence(&s, "Morgan", base + DAY, 0);
         assert!(line.contains("once"), "one visit, not 300 sightings: {line}");
         assert!(line.contains("from") && line.contains("until"), "span narrated: {line}");
         // A single blink-and-gone detection reads as a moment, not a span.
         let s = PresenceSummary::from_sighting_times(&[base], 0, GAP);
-        let line = render_presence(&s, "Mendel", base + DAY, 0);
+        let line = render_presence(&s, "Morgan", base + DAY, 0);
         assert!(line.contains("once") && !line.contains("until"), "moment phrasing: {line}");
     }
 
     #[test]
     fn people_count_lists_everyone() {
         assert!(render_people_count(&[]).contains("didn't see anyone"));
-        let one = render_people_count(&["Mendel".into()]);
-        assert!(one.contains("1 person") && one.contains("Mendel"), "{one}");
-        let two = render_people_count(&["Mendel".into(), "someone we haven't identified yet".into()]);
-        assert!(two.contains("2 people") && two.contains("Mendel") && two.contains("haven't identified"), "{two}");
+        let one = render_people_count(&["Morgan".into()]);
+        assert!(one.contains("1 person") && one.contains("Morgan"), "{one}");
+        let two = render_people_count(&["Morgan".into(), "someone we haven't identified yet".into()]);
+        assert!(two.contains("2 people") && two.contains("Morgan") && two.contains("haven't identified"), "{two}");
     }
 
     #[test]

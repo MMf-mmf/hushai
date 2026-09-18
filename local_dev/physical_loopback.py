@@ -13,13 +13,14 @@ Prereqs: the stack is up on hushai_test (./local_dev/run_stack.sh --test-db, or 
 worker), the phone is plugged in with the hushai app installed, ffplay + psql on PATH.
 
 Usage:
-  physical_loopback.py --media IMG_7256.mp4 --case obj_live --duration 25 \
+  physical_loopback.py --media local_dev/.demo_work/clips/driveway.mp4 --case obj_live --duration 25 \
       --expect-objects refrigerator --expect-text "camera"
   physical_loopback.py --media portrait.jpg --case face_live --duration 20 --expect-face
   physical_loopback.py --media clip.wav --case audio_live --audio-only --expect-text "we choose"
 """
 import argparse
 import json
+import getpass
 import os
 import re
 import subprocess
@@ -29,7 +30,7 @@ import time
 # Default: the PHYSICAL tier's own DB (hushai_test_phys) so a physical run can never TRUNCATE
 # the deterministic Tier-1 DB out from under a concurrent `cargo run -p hushai-eval` (the old
 # shared-hushai_test contention). Same `_test` name guard as the eval harness's ctx.rs.
-PG = os.environ.get("DATABASE_URL", "postgres://mf@localhost:5432/hushai_test_phys")
+PG = os.environ.get("DATABASE_URL", f"postgres://{getpass.getuser()}@localhost:5432/hushai_test_phys")
 if "_test" not in PG.rsplit("/", 1)[-1]:
     raise SystemExit(f"refusing to run against non-test DB: {PG} (name must contain '_test')")
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))

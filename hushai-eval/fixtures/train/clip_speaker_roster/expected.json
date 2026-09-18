@@ -17,16 +17,16 @@
         },
         "expect_routed_agent": "recordings",
         "must_contain": [
-          "mendel"
+          "morgan"
         ],
         "must_not_contain": [
           "don't have"
         ],
         "min_citations": 1,
         "citation_must_attribute": [
-          "Mendel"
+          "Morgan"
         ],
-        "reference_answer": "Mendel was speaking in this clip."
+        "reference_answer": "Morgan was speaking in this clip."
       },
       {
         "ask": "Who was speaking in this video clip?",
@@ -35,7 +35,7 @@
           "which video"
         ],
         "must_not_contain": [
-          "mendel"
+          "morgan"
         ],
         "reference_answer": "You're searching across all cameras, so I'm not sure which video you mean. Pick a camera and ask again."
       },

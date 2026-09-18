@@ -47,14 +47,14 @@
         ]
       },
       {
-        "ask": "What did Mendel say about the moon?",
+        "ask": "What did Morgan say about the moon?",
         "session": "s1",
         "must_contain": [
           "moon"
         ],
         "min_citations": 1,
         "citation_must_attribute": [
-          "Mendel"
+          "Morgan"
         ]
       },
       {
@@ -67,10 +67,10 @@
         "min_citations": 1
       },
       {
-        "ask": "Tell me about Mendel.",
+        "ask": "Tell me about Morgan.",
         "expect_routed_agent": "recordings",
         "must_contain": [
-          "mendel"
+          "morgan"
         ],
         "must_not_contain": [
           "don't have"

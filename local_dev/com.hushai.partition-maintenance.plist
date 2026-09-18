@@ -38,7 +38,7 @@
     <key>EnvironmentVariables</key>
     <dict>
         <key>DATABASE_URL</key>
-        <string>postgres://mf@localhost:5432/hushai</string>
+        <string>postgres://YOUR-POSTGRES-USER@localhost:5432/hushai</string>
         <key>MONTHS_AHEAD</key>
         <string>3</string>
         <key>RETAIN_MONTHS</key>

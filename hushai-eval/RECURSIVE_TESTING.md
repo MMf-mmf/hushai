@@ -49,7 +49,7 @@ each run — it refuses any DB whose name lacks `_test`). One-time:
 
 ```bash
 createdb hushai_test
-DATABASE_URL=postgres://mf@localhost:5432/hushai_test sqlx migrate run --source hushai-backend/migrations
+DATABASE_URL=postgres://$USER@localhost:5432/hushai_test sqlx migrate run --source hushai-backend/migrations
 ./local_dev/build_fixtures.sh        # synthetic (macOS `say`) fixture media
 ./local_dev/fetch_eval_clips.sh      # real public-domain clip media (JFK/FDR/Armstrong)
 ```
@@ -59,11 +59,11 @@ Bring up the stack with the **determinism profile** (`local_dev/eval.env`). The 
 
 ```bash
 # backend (ingest) — CWD = hushai-backend
-( cd hushai-backend && DATABASE_URL=postgres://mf@localhost:5432/hushai_test SQLX_OFFLINE=true \
+( cd hushai-backend && DATABASE_URL=postgres://$USER@localhost:5432/hushai_test SQLX_OFFLINE=true \
     ../target/debug/hushai-backend ) &
 
 # worker — CWD = repo root. The env below IS the determinism lockdown + vision wiring.
-DATABASE_URL=postgres://mf@localhost:5432/hushai_test SQLX_OFFLINE=true RUST_LOG=info \
+DATABASE_URL=postgres://$USER@localhost:5432/hushai_test SQLX_OFFLINE=true RUST_LOG=info \
   WORKER_CONCURRENCY=1 SPEAKER_AUTOHEAL_ENABLED=false SPEAKER_BACKFILL_ON_START=false \
   SPEAKER_REPROCESS_REJECTS_ON_START=false POLL_INTERVAL_SECS=2 VISION_COREML=false \
   VISION_MOTION_SKIP_ENABLED=false \
@@ -346,7 +346,7 @@ offset from base like `ChatFilters`) — the simulated viewer playback context f
   the single-shot `/v1/rag/query` (chat auto-routes it). No eval fixture yet (events come from the worker
   producer; add a scenario that injects event-producing media, or L1-seed the `events` table).
 - ✅ **Deictic "who was speaking in this video clip" — FIXED (2026-07-01).** With a clip clearly
-  playing and the owner's voice enrolled ("Mendel"), chat answered "I don't have information…": the
+  playing and the owner's voice enrolled ("Morgan"), chat answered "I don't have information…": the
   viewer sent only `filters.device_id` (no time anchor) and the Grounded agent ran an UNANCHORED
   semantic NN on "who was speaking" → nothing relevant. Fix: (a) viewer sends a `playback` object
   (`{device_id, playhead_unix_nanos}` — on-screen camera + wall-clock playhead; `store.js`
@@ -356,8 +356,8 @@ offset from base like `ChatFilters`) — the simulated viewer playback context f
   deterministically (the LLM router's "who" drifts to `people`/faces) and, with a bounded window,
   answers from `retrieve::list_speakers_in_window` (deterministic distinct-speaker roster; empty →
   `window_has_footage` distinguishes silence from worker lag). Fixture: `clip_speaker_roster`
-  (JFK window enrolled as "Mendel" — the first `enroll:` use in a train fixture; Q1 =
-  playback-anchored roster → "mendel" + attributed citation, Q2 = same ask, no playback →
+  (JFK window enrolled as "Morgan" — the first `enroll:` use in a train fixture; Q1 =
+  playback-anchored roster → "morgan" + attributed citation, Q2 = same ask, no playback →
   CAMERA_CLARIFY guard).
 - ◐ **Objects SEMANTIC recall false-negative (still OPEN)** — see above; the F1 count path is unaffected.
 

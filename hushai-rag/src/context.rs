@@ -61,7 +61,7 @@ pub async fn assemble_briefing(st: &AppState, tz_offset_secs: i64, now_unix_nano
     out
 }
 
-/// "Known voices in the recordings: Mendel, Sarah (and 3 other unnamed voices)." Named speakers by
+/// "Known voices in the recordings: Morgan, Sarah (and 3 other unnamed voices)." Named speakers by
 /// sample count, plus a count of the still-unnamed. `None` when the catalog is empty.
 async fn voices_line(pool: &PgPool, roster_max: i64) -> anyhow::Result<Option<String>> {
     let named: Vec<String> = sqlx::query(
@@ -83,7 +83,7 @@ async fn voices_line(pool: &PgPool, roster_max: i64) -> anyhow::Result<Option<St
     Ok(roster_sentence("Known voices in the recordings", &named, unnamed, "unnamed voice"))
 }
 
-/// "People recognized on camera: Mendel, Bob (and 1 other unrecognized face)."
+/// "People recognized on camera: Morgan, Bob (and 1 other unrecognized face)."
 async fn people_line(pool: &PgPool, roster_max: i64) -> anyhow::Result<Option<String>> {
     let named: Vec<String> = sqlx::query(
         "SELECT display_name FROM persons \
@@ -375,16 +375,16 @@ mod tests {
 
     #[test]
     fn roster_sentence_named_only() {
-        let s = roster_sentence("Known voices", &["Mendel".into(), "Sarah".into()], 0, "unnamed voice");
-        assert_eq!(s.as_deref(), Some("Known voices: Mendel, Sarah."));
+        let s = roster_sentence("Known voices", &["Morgan".into(), "Sarah".into()], 0, "unnamed voice");
+        assert_eq!(s.as_deref(), Some("Known voices: Morgan, Sarah."));
     }
 
     #[test]
     fn roster_sentence_named_plus_unnamed() {
-        let s = roster_sentence("Known voices", &["Mendel".into()], 3, "unnamed voice");
+        let s = roster_sentence("Known voices", &["Morgan".into()], 3, "unnamed voice");
         assert_eq!(
             s.as_deref(),
-            Some("Known voices: Mendel (and 3 other unnamed voices).")
+            Some("Known voices: Morgan (and 3 other unnamed voices).")
         );
     }
 

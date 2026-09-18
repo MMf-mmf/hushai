@@ -1044,7 +1044,7 @@ pub(crate) fn is_participants_conversation_query(query: &str) -> bool {
 /// the roster — rather than a frequency question about one subject ("how many TIMES did I see
 /// Bob", which stays on the per-person presence rollup)? Same narrow-phrase idiom as
 /// [`is_speaker_roster_query`]. The People arm answers it deterministically from the distinct
-/// roster instead of letting the single-person rollup misfire ("Mendel was seen 62 times").
+/// roster instead of letting the single-person rollup misfire ("Morgan was seen 62 times").
 pub(crate) fn is_people_count_query(query: &str) -> bool {
     let q = query.to_lowercase();
     // Frequency phrasings are about ONE subject, never a distinct-people count.
@@ -1605,10 +1605,10 @@ mod tests {
     #[test]
     fn identity_answer_depends_on_verification_and_owner() {
         // Verified + known name -> greeted by name.
-        assert_eq!(render_identity(Some("Mendel"), true), "Your name is Mendel.");
+        assert_eq!(render_identity(Some("Morgan"), true), "Your name is Morgan.");
         // Known name but unverified -> non-confirming reply (no false "you are X").
-        let unverified = render_identity(Some("Mendel"), false);
-        assert!(unverified.contains("Mendel"));
+        let unverified = render_identity(Some("Morgan"), false);
+        assert!(unverified.contains("Morgan"));
         assert!(unverified.contains("can't confirm"));
         // No owner configured -> the setup hint, regardless of verification.
         assert_eq!(render_identity(None, true), IDENTITY_NO_OWNER);
@@ -1664,7 +1664,7 @@ mod tests {
         for q in [
             "who said we should buy the house",
             "who mentioned the invoice",
-            "what did Mendel say yesterday",
+            "what did Morgan say yesterday",
             "who did I see in this video",
         ] {
             assert!(!is_speaker_roster_query(q), "should not be roster: {q:?}");

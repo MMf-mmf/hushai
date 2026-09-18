@@ -185,8 +185,8 @@ name & merge the faces in your recordings
 Refresh
 ✕
 Known people (1)
-Mendel
-Mendel
+Morgan
+Morgan
 20 sightings · last seen 6/28/2026, 4:06:11 PM
 which is only partially correct since it was not 20 sightings. It was only seemingly one sighting in one single video...
 I'm not sure where I got the number 20. Maybe it's from 20 video segments definitely something that needs to be locked into unfixed since it was in fact, part of the same few second clip
@@ -261,13 +261,13 @@ Which demonstrates a lack of tool usage and just a all-around very raw experienc
 
 - Second question i asked that it got it wrong:
 "how many peaple have we seen in the last 10 min?" and it responded with 
-"Mendel was seen 62 times in the recordings. First today at 8:19 PM; most recently today at 8:29 PM. Usually on Sundays around 8 PM.
+"Morgan was seen 62 times in the recordings. First today at 8:19 PM; most recently today at 8:29 PM. Usually on Sundays around 8 PM.
 
 [1]
-Mendel
+Morgan
 today at 8:29 PM
 (seen on camera)"
-which is incorrect since Mendel has seen in one video just because behind the scenes we clip up each video. It should not be looked at as 60 something different times it should really be seen as once from this time to this time etc. this bug tells us more what's going on in the background. It shows us that the chat does not have a good idea on how to string together the video and audio segments into a straight and clear picture and it's viewing it as standalone bits of information.
+which is incorrect since Morgan has seen in one video just because behind the scenes we clip up each video. It should not be looked at as 60 something different times it should really be seen as once from this time to this time etc. this bug tells us more what's going on in the background. It shows us that the chat does not have a good idea on how to string together the video and audio segments into a straight and clear picture and it's viewing it as standalone bits of information.
 
 One clear piece that I am putting together from this is that we need to build our chat like the flagship chat box do how overtime it gets to know the people it's talking to and the people it deals with by building profiles on the people it comes in contact with so that, for example, it's season an unidentified person and then eventually you were able to identify who that person is you should already have somewhat of a running memory on that unidentified person as soon as we are able to identify that person we should already be able to put together a picture that's just one example another example would be if someone's having a Conversation we should use the most modern tools in the genic AI workflows how to keep up a memory of what's really going on to be able to correctly summarize the conversation conversations and again not to get tunnel vision by the incoming few second segments.
 

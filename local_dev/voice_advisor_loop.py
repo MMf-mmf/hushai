@@ -23,6 +23,7 @@ report-only on run 1 (frozen as a bar thereafter, the voice-matrix precedent).
 """
 
 import argparse
+import getpass
 import os
 import re
 import subprocess
@@ -39,7 +40,7 @@ PHONE_ADVISOR_PORT = "8095"
 PHYS_ADVISOR_PORT = os.environ.get("PHYS_ADVISOR_PORT", "8097")
 PHYS_BACKEND_PORT = os.environ.get("PHYS_BACKEND_PORT", "8082")
 PHYS_RAG_PORT = os.environ.get("PHYS_RAG_PORT", "8092")
-DB_URL = os.environ.get("DATABASE_URL", "postgres://mf@localhost:5432/hushai_test_phys")
+DB_URL = os.environ.get("DATABASE_URL", f"postgres://{getpass.getuser()}@localhost:5432/hushai_test_phys")
 OWNER_VOICE = os.environ.get("OWNER_VOICE", "Samantha")
 
 SCRATCH = os.path.join(ROOT, "local_dev", ".advisor_rig")

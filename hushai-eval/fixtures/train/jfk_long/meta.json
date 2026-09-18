@@ -1,6 +1,6 @@
 {
   "case_id": "jfk_long",
-  "description": "LONG-CLIP RAG interrogation: ~4 min of the JFK Rice speech (source window 300-540s; the proven jfk_moon mints-1-voice window sits at clip offsets 34-48s), voice enrolled as Mendel via the same-audio ref. Exercises: long-corpus semantic recall, window-scoped summary (A3), footage stats (A2), attribution, session coreference (D1), speaker profile (Track C). Media via fetch_eval_clips.sh. Measured wall time on first run -> tighten poll.timeout_secs to ~2x.",
+  "description": "LONG-CLIP RAG interrogation: ~4 min of the JFK Rice speech (source window 300-540s; the proven jfk_moon mints-1-voice window sits at clip offsets 34-48s), voice enrolled as Morgan via the same-audio ref. Exercises: long-corpus semantic recall, window-scoped summary (A3), footage stats (A2), attribution, session coreference (D1), speaker profile (Track C). Media via fetch_eval_clips.sh. Measured wall time on first run -> tighten poll.timeout_secs to ~2x.",
   "device_id": "eval-jfk-long",
   "media_file": "media.mp4",
   "media_kind": "muxed",
@@ -15,7 +15,7 @@
   "enroll": [
     {
       "modality": "speaker",
-      "name": "Mendel",
+      "name": "Morgan",
       "ref": "refs/enroll.mp4"
     }
   ],
